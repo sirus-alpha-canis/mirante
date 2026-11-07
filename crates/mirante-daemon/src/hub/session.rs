@@ -523,7 +523,7 @@ impl Hub {
             let driver = l.driver.clone().ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
             // Before the driver acts: its watcher may report Ready right after.
             l.boot = BootState::Booting;
-            let out = (task.id.clone(), l.session_id.clone(), driver, l.native_id.is_some());
+            let out = (task.id.clone(), l.session_id.clone(), driver, l.resumed);
             st.event(Some(&task.id), "trust_answered", json!({ "accept": answer.accept }))?;
             st.publish();
             out
@@ -1101,6 +1101,20 @@ mod tests {
         assert_eq!(r.boot, BootState::Booting);
         assert_eq!(k.calls(), vec!["trust:true".to_string()]);
         assert!(k.kinds(&t.id).contains(&"trust_answered".to_string()));
+    }
+
+    /// Task 21 live run: Claude is launched with its session id, so the native id is known
+    /// before the trust prompt; answering trust on a fresh start must not say "resumed".
+    #[test]
+    fn trust_on_a_fresh_start_is_not_reported_as_resumed() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "a").task;
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        assert!(!r.resumed);
+        k.emit(DriverEvent::NativeId("7c4d2e92".into()));
+        k.emit(DriverEvent::Boot(BootState::TrustPrompt));
+        let r = k.hub.trust(TrustAnswer { task: t.id.clone(), accept: true }).unwrap();
+        assert!(!r.resumed, "a fresh conversation was not resumed");
     }
 
     #[test]

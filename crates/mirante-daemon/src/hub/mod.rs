@@ -115,6 +115,9 @@ pub(crate) struct Live {
     pub(crate) engine: StatusEngine,
     pub(crate) turn_id: Option<String>,
     pub(crate) native_id: Option<String>,
+    /// Launched on an existing native conversation (`--resume` / `thread/resume`). Not the
+    /// same as `native_id` being known: a fresh Claude learns its id at launch.
+    pub(crate) resumed: bool,
     pub(crate) transcript_path: Option<String>,
     pub(crate) boot: BootState,
     pub(crate) detail: Option<String>,
@@ -223,6 +226,7 @@ impl Live {
             driver: None,
             engine: StatusEngine::new(),
             turn_id: None,
+            resumed: native_id.is_some(),
             native_id,
             transcript_path: None,
             boot: BootState::Booting,
