@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 use mirante_core::model::{AgentKind, Event, Status};
 use mirante_core::store::Store;
 use mirante_daemon::driver::real::RealFactory;
-use mirante_daemon::hub::Hub;
+use mirante_daemon::hub::{Hub, HubError};
 use mirante_daemon::server;
 use mirante_ipc::test_dir::TestDir;
-use mirante_ipc::types::{AnswerPermission, BootState, CreateTask, SendMessage, SendMode, StartSession, TrustAnswer};
+use mirante_ipc::types::{AnswerPermission, AttachParams, BootState, CreateTask, SendMessage, SendMode, StartSession, TrustAnswer};
 use mirante_ipc::Paths;
 
 struct Rig {
@@ -116,6 +116,18 @@ impl Rig {
         self.hub.send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Steer }).unwrap();
     }
 
+    /// Answers the dialog in the agent's terminal, as the user does in `mirante attach`:
+    /// only when the screen shows this command's dialog.
+    fn answer_in_terminal(&self, task: &str, command: &str, key: &[u8]) {
+        let (driver, a) = self.hub.attach(AttachParams { task: task.into(), rows: 40, cols: 120 }).unwrap();
+        let screen = String::from_utf8_lossy(&a.initial).replace("\x1b[C", " ");
+        assert!(
+            screen.contains(command) && screen.contains("Do you want to proceed?"),
+            "not this command's dialog:\n{screen}"
+        );
+        driver.input(a.id, key).unwrap();
+    }
+
     /// Last assistant text in the live session's transcript (read through a second store
     /// connection; WAL allows a concurrent reader).
     fn last_answer(&self, task: &str) -> String {
@@ -151,7 +163,12 @@ fn claude_turn_permission_stop_and_resume() {
     r.wait_event(&t, "permission_requested", 120, |_| true);
     let p = r.hub.permissions().unwrap();
     assert_eq!(p.len(), 1, "{p:?}");
-    r.hub.answer_permission(AnswerPermission { id: p[0].request.id.clone(), allow: true }).unwrap();
+    // Inline answers are off by default (founder decision 12): Mirante types nothing and
+    // says to answer in the terminal. The test then answers there, as the user would, the
+    // one dialog it provoked (a `touch` inside the throwaway worktree).
+    let refused = r.hub.answer_permission(AnswerPermission { id: p[0].request.id.clone(), allow: true });
+    assert!(matches!(refused, Err(HubError::AnswerInTerminal { .. })), "{refused:?}");
+    r.answer_in_terminal(&t, "touch allowed.txt", b"1");
     r.wait_event(&t, "turn_ended", 120, |_| true);
     let worktree = r.hub.get_task(&t).unwrap().task.worktree_path;
     assert!(Path::new(&worktree).join("allowed.txt").exists());
