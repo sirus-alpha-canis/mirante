@@ -977,7 +977,13 @@ impl Driver for CodexDriver {
         Ok(())
     }
 
-    fn answer_permission(&self, key: &str, _tool: &str, allow: bool) -> Result<(), DriverError> {
+    fn answer_permission(
+        &self,
+        key: &str,
+        _tool: &str,
+        _description: Option<&str>,
+        allow: bool,
+    ) -> Result<(), DriverError> {
         let mut s = lock(&self.shared);
         let (id, method, params) =
             s.approvals.remove(key).ok_or_else(|| DriverError::NoDialog(format!("no pending approval {key}")))?;
@@ -1264,9 +1270,9 @@ mod tests {
         );
         let ev = next_event(&rx, status_to(Status::NeedsYou));
         assert!(matches!(ev, DriverEvent::Status { turn_open: true, .. }));
-        d.answer_permission("n:41", "command", true).unwrap();
+        d.answer_permission("n:41", "command", None, true).unwrap();
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 41, "result": {"decision": "accept"}}));
-        assert!(matches!(d.answer_permission("n:41", "command", true), Err(DriverError::NoDialog(_))));
+        assert!(matches!(d.answer_permission("n:41", "command", None, true), Err(DriverError::NoDialog(_))));
         next_event(&rx, status_to(Status::Working));
         // Request id 0, then resolved by the server (e.g. answered elsewhere).
         fake.send(json!({"jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
@@ -1278,7 +1284,7 @@ mod tests {
             DriverEvent::PermissionResolved { key: "n:0".into() }
         );
         next_event(&rx, status_to(Status::Working));
-        assert!(matches!(d.answer_permission("n:0", "command", false), Err(DriverError::NoDialog(_))));
+        assert!(matches!(d.answer_permission("n:0", "command", None, false), Err(DriverError::NoDialog(_))));
         // A request still open when its turn ends is withdrawn too.
         fake.send(json!({"jsonrpc": "2.0", "id": "r7", "method": "item/fileChange/requestApproval",
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f1", "startedAtMs": 1}}));
@@ -1578,7 +1584,7 @@ mod tests {
         fake.send(json!({"jsonrpc": "2.0", "id": 3, "method": "item/fileChange/requestApproval",
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f2", "startedAtMs": 1, "grantRoot": "/Users/u/data"}}));
         next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { tool, .. } if tool == GRANT_TOOL));
-        d.answer_permission("n:3", GRANT_TOOL, true).unwrap();
+        d.answer_permission("n:3", GRANT_TOOL, None, true).unwrap();
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 3, "result": {"decision": "accept"}}));
         stream(&a, "[allowed: write access under /Users/u/data for the rest of the session]");
         // The effective sandbox shown everywhere now includes the granted root.

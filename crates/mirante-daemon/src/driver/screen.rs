@@ -60,12 +60,30 @@ fn is_question(l: &str) -> bool {
     t.starts_with("Do you want to") && t.ends_with('?')
 }
 
+/// A drawn box border: a row of `─` (Claude Code draws one above a dialog's tool box and
+/// around the input box; real 2.1.285 grids in `docs/spikes/raw/s3-status-check.md`).
+fn is_border(l: &str) -> bool {
+    let t = l.trim();
+    t.chars().count() >= 3 && t.chars().all(|c| c == '─')
+}
+
+/// The input prompt (a cursor line that is not a numbered option).
+fn is_input_prompt(l: &str) -> bool {
+    starts_with_cursor(l) && option(l).is_none()
+}
+
 /// In the bottom rows: the index of the last permission-dialog header (`Do you want to …?`)
-/// that is followed by a `1.` option and then a footer at the very bottom.
+/// that is followed by a `1.` option and then a footer at the very bottom, with nothing
+/// between the header and the footer that belongs outside a dialog (an input prompt or a
+/// box border): a dialog quoted in the conversation above the input box, with an
+/// "Esc to …" status line below, is not a live dialog.
 fn dialog_start(lines: &[&str]) -> Option<usize> {
     let footer = footer_at_bottom(lines, is_footer)?;
     (0..footer).rev().find(|&i| {
-        is_question(lines[i]) && lines[i + 1..footer].iter().any(|l| option(l).is_some_and(|(d, _)| d == '1'))
+        let below = &lines[i + 1..footer];
+        is_question(lines[i])
+            && below.iter().any(|l| option(l).is_some_and(|(d, _)| d == '1'))
+            && !below.iter().any(|l| is_input_prompt(l) || is_border(l))
     })
 }
 
@@ -119,7 +137,7 @@ pub fn dialog_open(grid: &str) -> bool {
 /// The input box is on screen: a `❯` / `›` / `>` prompt line in the bottom rows that is not
 /// a dialog option.
 pub fn has_input_prompt(grid: &str) -> bool {
-    bottom(grid).iter().any(|l| starts_with_cursor(l) && option(l).is_none())
+    bottom(grid).iter().any(|l| is_input_prompt(l))
 }
 
 /// The ready fast path: Mirante launches with `--permission-mode manual`, whose footer
@@ -131,11 +149,13 @@ pub fn has_manual_mode_footer(grid: &str) -> bool {
 /// The titles Claude Code (2.1.285) puts on the tool box of a permission dialog, per tool.
 /// "Bash command" and "Edit file" are from real grids; the others are to be confirmed in
 /// the Task 21 real run. A tool not listed here is never matched (answer it in attach).
+/// Each title belongs to one tool only: `Write` never gets "Edit file" (a Write card must
+/// not answer an Edit dialog of the same path).
 fn titles(tool: &str) -> &'static [&'static str] {
     match tool {
         "Bash" => &["Bash command"],
         "Edit" | "MultiEdit" => &["Edit file"],
-        "Write" => &["Create file", "Overwrite file", "Edit file"],
+        "Write" => &["Create file", "Write file"],
         "NotebookEdit" => &["Edit notebook"],
         "Read" => &["Read file"],
         "WebFetch" => &["Fetch"],
@@ -144,10 +164,15 @@ fn titles(tool: &str) -> &'static [&'static str] {
 }
 
 const ALL_TITLES: [&str; 7] =
-    ["Bash command", "Edit file", "Create file", "Overwrite file", "Edit notebook", "Read file", "Fetch"];
+    ["Bash command", "Edit file", "Create file", "Write file", "Edit notebook", "Read file", "Fetch"];
 
-fn squash(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
+/// Glyphs that start conversation lines (Claude's messages, tool results, the turn summary)
+/// or a prompt / option: never a line of a dialog's tool box.
+const CHROME: [char; 5] = ['⏺', '⎿', '✻', '❯', '›'];
+
+/// Leading spaces.
+fn indent(l: &str) -> usize {
+    l.len() - l.trim_start_matches(' ').len()
 }
 
 /// What the dialog box shows for `detail`: an absolute path inside the worktree is shown
@@ -166,17 +191,92 @@ fn shown_detail(detail: &str, worktree: Option<&Path>) -> String {
     detail.to_string()
 }
 
-/// Is the dialog on screen exactly the one for this request (`tool` and its `detail`, a
-/// command or a path)? All of it must hold:
-/// - a permission dialog is live (question, options, footer at the very bottom);
-/// - the nearest tool-box title above its question is one of `tool`'s titles, and no other
-///   question sits between them;
-/// - the box's first lines, whitespace removed (a command wraps across lines), are exactly
-///   the whole detail, ending at a line boundary: a shared prefix, a longer command or a
-///   file with the same name in another directory is another request;
+/// One screen line against `card` from `pos`: every character must be the card's next one,
+/// and a run of spaces must be a run of whitespace in the card (the same length when the
+/// card's run is only spaces; never a newline). Where the card is then, or `None`.
+fn walk_line(line: &[char], card: &[char], mut pos: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] == ' ' {
+            let run = line[i..].iter().take_while(|c| **c == ' ').count();
+            let crun = card[pos..].iter().take_while(|c| c.is_whitespace() && **c != '\n').count();
+            if crun == 0 || (card[pos..pos + crun].iter().all(|c| *c == ' ') && crun != run) {
+                return None;
+            }
+            i += run;
+            pos += crun;
+        } else {
+            if card.get(pos) != Some(&line[i]) {
+                return None;
+            }
+            i += 1;
+            pos += 1;
+        }
+    }
+    Some(pos)
+}
+
+/// The screen lines show exactly `card`, character by character (see [`walk_line`]). At a
+/// screen line break the card may have a newline (consumed: a newline in the card must
+/// fall on a line break), one whitespace character the wrap took (consumed or not), or
+/// nothing (a wrap inside a word). The card must end exactly at the end of the last line.
+fn walk(lines: &[Vec<char>], card: &[char]) -> bool {
+    let mut starts = vec![0usize];
+    for (li, line) in lines.iter().enumerate() {
+        let last = li + 1 == lines.len();
+        let mut next = Vec::new();
+        for &s in &starts {
+            let Some(p) = walk_line(line, card, s) else {
+                continue;
+            };
+            if last {
+                if p == card.len() {
+                    return true;
+                }
+                continue;
+            }
+            match card.get(p) {
+                None => {}
+                Some('\n') => next.push(p + 1),
+                Some(c) if c.is_whitespace() => next.extend([p + 1, p]),
+                Some(_) => next.push(p),
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        if next.is_empty() && !last {
+            return false;
+        }
+        starts = next;
+    }
+    false
+}
+
+/// Is the dialog on screen exactly the one for this request (`tool`, its `detail` — a
+/// command or a path — and the hook's `description`, when it had one)? All of it must hold:
+/// - a permission dialog is live (question, options, footer at the very bottom, nothing of
+///   the input box between them);
+/// - the box: when a `─` border is drawn above the question, the nearest one is the box's
+///   top and the title is the line right below it; with no border, the nearest known title
+///   above the question. The title must be one of `tool`'s titles;
+/// - every line between the title and the question belongs to the box: none starts with a
+///   conversation or prompt glyph (⏺ ⎿ ✻ ❯ ›), none is a border or another question, and
+///   all are indented deeper than the title (except one "Tip:" line right below the title,
+///   at its indentation, as Claude Code 2.1.285 draws it);
+/// - those lines are, character by character (see [`walk`]), the whole detail, then exactly
+///   the description when the request has one (Claude shows it below the command), else
+///   nothing: a shared prefix, a longer or multi-line command, different spacing or a file
+///   with the same name in another directory is another request (a description is required
+///   when known, so a wrapped command is never read as a command plus a description);
 /// - an empty detail never matches anything.
-pub fn dialog_matches(grid: &str, tool: &str, detail: &str, worktree: Option<&Path>) -> bool {
-    let needle = squash(&shown_detail(detail.trim(), worktree));
+pub fn dialog_matches(
+    grid: &str,
+    tool: &str,
+    detail: &str,
+    description: Option<&str>,
+    worktree: Option<&Path>,
+) -> bool {
+    let needle: Vec<char> = shown_detail(detail.trim(), worktree).chars().collect();
     if needle.is_empty() || titles(tool).is_empty() {
         return false;
     }
@@ -186,23 +286,38 @@ pub fn dialog_matches(grid: &str, tool: &str, detail: &str, worktree: Option<&Pa
         return false;
     };
     let from = question.saturating_sub(BOX_ROWS);
-    let Some(title) = (from..question).rev().find(|&i| ALL_TITLES.contains(&all[i].trim())) else {
-        return false;
+    let title = match (from..question).rev().find(|&i| is_border(all[i])) {
+        Some(border) => border + 1,
+        None => match (from..question).rev().find(|&i| ALL_TITLES.contains(&all[i].trim())) {
+            Some(t) => t,
+            None => return false,
+        },
     };
-    if !titles(tool).contains(&all[title].trim()) || all[title + 1..question].iter().any(|l| is_question(l)) {
+    if title >= question || !titles(tool).contains(&all[title].trim()) {
         return false;
     }
-    let mut acc = String::new();
-    for line in &all[title + 1..question] {
-        acc.push_str(&squash(line));
-        if acc == needle {
-            return true;
-        }
-        if !needle.starts_with(&acc) {
-            return false;
-        }
+    let ti = indent(all[title]);
+    let mut body = &all[title + 1..question];
+    if body.first().is_some_and(|l| indent(l) == ti && l.trim_start().starts_with("Tip:")) {
+        body = &body[1..];
     }
-    false
+    let foreign = |l: &&str| is_question(l) || is_border(l) || l.trim_start().starts_with(CHROME) || indent(l) <= ti;
+    if body.is_empty() || body.iter().any(foreign) {
+        return false;
+    }
+    let base = body.iter().map(|l| indent(l)).min().unwrap_or(0);
+    if indent(body[0]) != base {
+        return false;
+    }
+    let lines: Vec<Vec<char>> = body.iter().map(|l| l[base..].trim_end().chars().collect()).collect();
+    let desc: Option<Vec<char>> = description.map(str::trim).filter(|d| !d.is_empty()).map(|d| d.chars().collect());
+    (1..=lines.len()).any(|j| {
+        walk(&lines[..j], &needle)
+            && match &desc {
+                Some(d) => j < lines.len() && walk(&lines[j..], d),
+                None => j == lines.len(),
+            }
+    })
 }
 
 /// Last `n` non-blank lines.
@@ -227,6 +342,24 @@ mod tests {
  Do you want to proceed?
  ❯ 1. Yes
    2. Yes, and always allow access to /home/u/s3 from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+ Esc to cancel · Tab to amend";
+    const DIALOG_DESC: &str = "Create empty file s3-allowed.txt";
+    /// The same dialog as drawn in full (S3 run 1, `docs/spikes/raw/s3-status-check.md`): a
+    /// `─` border above the title and a tip line right below it.
+    const REAL_BOXED: &str = "\
+❯ Use o Bash para rodar exatamente touch s3-allowed.txt e diga se deu certo.
+⏺ Creating empty file s3-allowed.txt
+  ⎿  $ touch s3-allowed.txt
+────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose \"switch to auto mode\" below
+   touch s3-allowed.txt
+   Create empty file s3-allowed.txt
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /Users/u/.mirante-spike/s3 from this project
    3. Yes, and switch to auto mode · auto mode handles these prompts for you
    4. No
  Esc to cancel · Tab to amend";
@@ -315,25 +448,35 @@ mod tests {
 
     #[test]
     fn dialog_matches_the_request_detail() {
-        assert!(dialog_matches(DIALOG, "Bash", "touch s3-allowed.txt", None));
-        assert!(!dialog_matches(DIALOG, "Bash", "rm -rf /", None));
+        assert!(dialog_matches(DIALOG, "Bash", "touch s3-allowed.txt", Some(DIALOG_DESC), None));
+        assert!(!dialog_matches(DIALOG, "Bash", "rm -rf /", Some(DIALOG_DESC), None));
         assert!(dialog_matches(
             EDIT_DIALOG,
             "Edit",
             "/Users/u/.mirante/worktrees/app/feat/src/main.rs",
+            None,
             Some(Path::new(WT_DIR))
         ));
-        assert!(!dialog_matches(IDLE, "Bash", "touch s3-denied.txt", None));
+        assert!(!dialog_matches(IDLE, "Bash", "touch s3-denied.txt", None, None));
         let wrapped = "Bash command\n  cargo test --workspace --all-\n  features -- --nocapture\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
-        assert!(dialog_matches(wrapped, "Bash", "cargo test --workspace --all-features -- --nocapture", None));
+        assert!(dialog_matches(wrapped, "Bash", "cargo test --workspace --all-features -- --nocapture", None, None));
     }
 
     #[test]
     fn a_command_sharing_a_long_prefix_is_another_request() {
         let shown = "Bash command\n  cargo test --workspace --all-features -- --nocapture && rm -rf ~\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
         // The first 30+ characters are the same: still not this request.
-        assert!(!dialog_matches(shown, "Bash", "cargo test --workspace --all-features -- --nocapture", None));
-        assert!(!dialog_matches(DIALOG, "Bash", "touch s3", None), "a prefix of the command is not the command");
+        assert!(!dialog_matches(
+            shown,
+            "Bash",
+            "cargo test --workspace --all-features -- --nocapture",
+            Some("Run tests"),
+            None
+        ));
+        assert!(
+            !dialog_matches(DIALOG, "Bash", "touch s3", Some(DIALOG_DESC), None),
+            "a prefix of the command is not the command"
+        );
     }
 
     #[test]
@@ -342,38 +485,44 @@ mod tests {
             EDIT_DIALOG,
             "Edit",
             "/Users/u/.mirante/worktrees/app/feat/tests/main.rs",
+            None,
             Some(Path::new(WT_DIR))
         ));
         assert!(!dialog_matches(
             EDIT_DIALOG,
             "Edit",
             "/Users/u/.mirante/worktrees/app/feat/main.rs",
+            None,
             Some(Path::new(WT_DIR))
         ));
-        assert!(!dialog_matches(EDIT_DIALOG, "Edit", "/elsewhere/src/main.rs", Some(Path::new(WT_DIR))));
+        assert!(!dialog_matches(EDIT_DIALOG, "Edit", "/elsewhere/src/main.rs", None, Some(Path::new(WT_DIR))));
         // Relative paths are compared as they are.
-        assert!(dialog_matches(EDIT_DIALOG, "Edit", "src/main.rs", Some(Path::new(WT_DIR))));
+        assert!(dialog_matches(EDIT_DIALOG, "Edit", "src/main.rs", None, Some(Path::new(WT_DIR))));
     }
 
     #[test]
     fn an_empty_detail_never_matches() {
-        assert!(!dialog_matches(DIALOG, "Bash", "", None));
-        assert!(!dialog_matches(DIALOG, "Bash", " \n ", None));
+        assert!(!dialog_matches(DIALOG, "Bash", "", None, None));
+        assert!(!dialog_matches(DIALOG, "Bash", " \n ", None, None));
     }
 
     #[test]
     fn the_dialog_title_must_be_the_requests_tool() {
-        assert!(!dialog_matches(DIALOG, "Edit", "touch s3-allowed.txt", None));
-        assert!(!dialog_matches(EDIT_DIALOG, "Bash", "src/main.rs", Some(Path::new(WT_DIR))));
-        assert!(!dialog_matches(DIALOG, "mcp__srv__run", "touch s3-allowed.txt", None), "unknown tools never match");
+        assert!(!dialog_matches(DIALOG, "Edit", "touch s3-allowed.txt", Some(DIALOG_DESC), None));
+        assert!(!dialog_matches(EDIT_DIALOG, "Bash", "src/main.rs", None, Some(Path::new(WT_DIR))));
+        assert!(
+            !dialog_matches(DIALOG, "mcp__srv__run", "touch s3-allowed.txt", None, None),
+            "unknown tools never match"
+        );
     }
 
     #[test]
     fn a_stale_card_never_matches_the_dialog_shown_now() {
         // Card A ("touch a") is still pending in the hub while Claude shows dialog B.
         let b = "⏺ Bash(touch a)\n  ⎿  done\n Bash command\n   touch b\n   Create b\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
-        assert!(!dialog_matches(b, "Bash", "touch a", None));
-        assert!(dialog_matches(b, "Bash", "touch b", None));
+        assert!(!dialog_matches(b, "Bash", "touch a", None, None));
+        assert!(!dialog_matches(b, "Bash", "touch a", Some("Create b"), None));
+        assert!(dialog_matches(b, "Bash", "touch b", Some("Create b"), None));
     }
 
     #[test]
@@ -396,6 +545,101 @@ mod tests {
         let gt = "Would you like to proceed?\n> 1. Yes, and auto-accept edits\n  2. No\nEsc to cancel";
         assert!(has_any_dialog(gt) && dialog_open(gt));
         assert!(has_input_prompt("› \n"));
+    }
+
+    #[test]
+    fn the_real_boxed_dialog_matches_with_its_border_tip_and_description() {
+        assert!(dialog_matches(REAL_BOXED, "Bash", "touch s3-allowed.txt", Some(DIALOG_DESC), None));
+        assert!(!dialog_matches(REAL_BOXED, "Bash", "touch s3-allowed.txt", None, None));
+        assert_eq!(option_key(REAL_BOXED, "Yes"), Some('1'));
+        // The title must be right below the nearest border: a title further up is not the box.
+        let moved = REAL_BOXED.replace(" Bash command\n", "").replacen("────", " Bash command\n────", 1);
+        assert!(!dialog_matches(&moved, "Bash", "touch s3-allowed.txt", Some(DIALOG_DESC), None));
+    }
+
+    fn boxed(body: &str) -> String {
+        format!(" Bash command\n{body}\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel")
+    }
+
+    #[test]
+    fn spacing_newlines_and_wraps_are_matched_character_by_character() {
+        // Same spaces, or a run of whitespace for a run of spaces.
+        assert!(dialog_matches(&boxed("   echo a  b"), "Bash", "echo a  b", None, None));
+        assert!(!dialog_matches(&boxed("   echo a  b"), "Bash", "echo a b", None, None));
+        assert!(dialog_matches(&boxed("   echo a    b"), "Bash", "echo a\tb", None, None));
+        // A newline in the card falls on a line break, and only there.
+        assert!(dialog_matches(&boxed("   cd x\n   make"), "Bash", "cd x\nmake", None, None));
+        assert!(!dialog_matches(&boxed("   cd x make"), "Bash", "cd x\nmake", None, None));
+        assert!(!dialog_matches(&boxed("   cd x\n   make"), "Bash", "cd x make", Some("make"), None));
+        // A wrap takes one space, or none inside a word.
+        assert!(dialog_matches(&boxed("   cargo test\n   --all"), "Bash", "cargo test --all", None, None));
+        assert!(dialog_matches(&boxed("   cargo te\n   st"), "Bash", "cargo test", None, None));
+        // The description may follow the command, never anything else.
+        assert!(dialog_matches(&boxed("   ls\n   List files"), "Bash", "ls", Some("List files"), None));
+        assert!(!dialog_matches(&boxed("   ls\n   List files"), "Bash", "ls", Some("List"), None));
+        assert!(!dialog_matches(&boxed("   ls\n   List files"), "Bash", "ls", None, None));
+        assert!(!dialog_matches(&boxed("   ls"), "Bash", "ls", Some("List files"), None));
+    }
+
+    #[test]
+    fn lines_outside_the_box_end_it() {
+        // Indented no deeper than the title, or a conversation glyph, inside the box.
+        assert!(!dialog_matches(&boxed(" touch a"), "Bash", "touch a", None, None));
+        assert!(!dialog_matches(&boxed("   touch a\n⏺ x"), "Bash", "touch a", Some("x"), None));
+        assert!(!dialog_matches(&boxed("   touch a\n  ⎿  x"), "Bash", "touch a", Some("⎿  x"), None));
+        // A tip line is skipped only right below the title and at its indentation.
+        assert!(dialog_matches(&boxed(" Tip: t\n   touch a"), "Bash", "touch a", None, None));
+        assert!(!dialog_matches(&boxed("   Tip: t\n   touch a"), "Bash", "touch a", None, None));
+    }
+
+    // Ported from the driver review's probes: each one showed a hole (the assertion was the
+    // opposite) and must now hold.
+
+    #[test]
+    fn probe_p1_a_multi_line_command_starting_with_the_cards_command_is_another_request() {
+        let g = " Bash command\n   touch a\n   rm -rf ~\n   Make a, clean\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
+        assert!(!dialog_matches(g, "Bash", "touch a", None, None));
+        assert!(!dialog_matches(g, "Bash", "touch a", Some("Make a, clean"), None));
+        assert!(dialog_matches(g, "Bash", "touch a\nrm -rf ~", Some("Make a, clean"), None));
+    }
+
+    #[test]
+    fn probe_p2_different_spacing_is_another_command() {
+        let g =
+            " Bash command\n   rm -rf build /\n   Clean\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
+        assert!(!dialog_matches(g, "Bash", "rm -rf build/", Some("Clean"), None));
+        assert!(dialog_matches(g, "Bash", "rm -rf build /", Some("Clean"), None));
+        let g2 =
+            " Bash command\n   chmod -R 777 . /\n   x\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
+        assert!(!dialog_matches(g2, "Bash", "chmod -R 777 ./", Some("x"), None));
+    }
+
+    #[test]
+    fn probe_p3_a_title_quoted_in_the_conversation_is_not_the_dialogs() {
+        let g = "⏺ For reference the earlier prompt was:\n Bash command\n   touch a\n⏺ Now calling the MCP tool.\n Tool use\n   srv - wipe(target: \"prod\") (MCP)\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for srv - wipe\n   3. No\n Esc to cancel";
+        assert!(has_permission_prompt(g));
+        assert!(!dialog_matches(g, "Bash", "touch a", None, None));
+    }
+
+    #[test]
+    fn probe_p5_other_tools_paths_and_a_quoted_dialog_above_a_status_line() {
+        let g = " Bash command\n   touch s3-allowed.txt\n   x\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
+        assert!(!dialog_matches(g, "Bash", "s3-allowed.txt", Some("x"), None));
+        assert!(!dialog_matches(g, "Bash", "touch s3-allowed.txt.bak", Some("x"), None));
+        assert!(!dialog_matches(g, "Read", "touch s3-allowed.txt", Some("x"), None));
+        let e = " Edit file\n   src/main.rs\n Do you want to make this edit to main.rs?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
+        assert!(!dialog_matches(e, "Edit", "/other/src/main.rs", None, Some(Path::new("/wt"))));
+        assert!(
+            !dialog_matches(e, "Write", "/wt/src/main.rs", None, Some(Path::new("/wt"))),
+            "Write card, Edit dialog"
+        );
+        let q = "⏺ It said:\n Bash command\n   touch a\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n────\n❯ \n────\n  ⏸ manual mode on";
+        assert!(!has_permission_prompt(q) && !dialog_matches(q, "Bash", "touch a", None, None));
+        // The status line below the input prompt says "Esc to …": still not a live dialog.
+        let q2 = "⏺ It said:\n Bash command\n   touch a\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n❯ \n  Esc to interrupt";
+        assert!(!has_permission_prompt(q2));
+        assert!(!dialog_matches(q2, "Bash", "touch a", None, None));
+        assert_eq!(option_key(q2, "Yes"), None);
     }
 
     #[test]

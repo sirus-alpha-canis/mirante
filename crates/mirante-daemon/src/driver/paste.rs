@@ -5,9 +5,12 @@
 //! nothing in it can act as a terminal control (no escape sequences, so a smuggled
 //! `ESC[201~` cannot end the paste early; no control characters; no bidi or zero-width
 //! characters that could hide a prefix). Some first characters are special:
-//! - `/…` is a Claude slash command. Only `/` and the command name (`[A-Za-z0-9:_-]+`) are
-//!   typed as keystrokes, so Claude runs the command the user named; its arguments follow
-//!   as a bracketed paste, so nothing in them can act as a key. It must be one line.
+//! - `/…` is a Claude slash command. Only `/` and the command name are typed as keystrokes,
+//!   so Claude runs the command the user named; its arguments follow as a bracketed paste,
+//!   so nothing in them can act as a key. It must be one line. The name is a letter, then
+//!   letters, `:`, `_` or `-` (`[A-Za-z][A-Za-z:_-]*`): never a digit anywhere, because a
+//!   digit typed as a keystroke selects a numbered option if a dialog opened under it
+//!   (`/1`, `/2 x`). A command whose name has a digit is typed by the user in attach.
 //! - `!…` is Claude's bash mode, which runs a shell command with no permission prompt.
 //!   Mirante refuses it: a relayed message must never run a shell command unasked; the user
 //!   attaches and types it.
@@ -88,8 +91,10 @@ pub fn line_count(text: &str) -> usize {
     sanitize_for_pty(text).lines().count().max(1)
 }
 
+/// `[A-Za-z][A-Za-z:_-]*`: no digit anywhere (a typed digit can select a dialog option).
 fn command_name_ok(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphabetic() || matches!(c, ':' | '_' | '-'))
 }
 
 /// The bytes to type for a message (Enter is sent separately), or why it is refused.
@@ -125,7 +130,8 @@ pub fn typed_message(text: &str) -> Result<Vec<u8>, String> {
         let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         if !command_name_ok(name) {
             return Err(format!(
-                "`/{name}` is not a slash command name (letters, digits, `:`, `_`, `-`); attach and type it yourself"
+                "`/{name}` is not a slash command Mirante types (a letter, then letters, `:`, `_`, `-`; no \
+                 digits); attach and type it yourself"
             ));
         }
         let mut out = format!("/{name}").into_bytes();
@@ -176,8 +182,8 @@ mod tests {
             typed_message("  /compact keep the plan\n").unwrap(),
             [b"/compact ".as_slice(), b"\x1b[200~keep the plan\x1b[201~"].concat()
         );
-        assert_eq!(typed_message("/mcp__srv:do-it_2 x").unwrap()[..15], *b"/mcp__srv:do-it");
-        for bad in ["/", "/ compact", "/comp;act", "/../x", "/com\u{200b}pact!", "/é"] {
+        assert_eq!(typed_message("/mcp__srv:do-it x").unwrap()[..16], *b"/mcp__srv:do-it ");
+        for bad in ["/", "/ compact", "/comp;act", "/../x", "/com\u{200b}pact!", "/é", "/mcp__srv:do-it_2 x", "/-x"] {
             assert!(typed_message(bad).unwrap_err().contains("slash command"), "{bad:?}");
         }
     }
@@ -205,5 +211,21 @@ mod tests {
     fn line_count_of_the_sanitized_text() {
         assert_eq!(line_count("one"), 1);
         assert_eq!(line_count("a\r\nb\rc\n"), 3);
+    }
+}
+
+/// Ported from the driver review's probe (`digit_names_are_keystrokes`), which showed digits
+/// in a slash command name typed as keystrokes: each must now be refused.
+#[cfg(test)]
+mod probes {
+    #[test]
+    fn digit_names_are_refused_not_typed() {
+        for bad in ["/1", "/2 x", "/9", "/a1", "/model2 x"] {
+            let e = super::typed_message(bad).unwrap_err();
+            assert!(e.contains("no digits") && e.contains("attach"), "{bad:?}: {e}");
+        }
+        // A digit in the arguments is pasted, never typed as a key (whether a bracketed paste
+        // of a bare digit can select an option is a Task 21 real-run check).
+        assert_eq!(super::typed_message("/model 2").unwrap(), [b"/model ".as_slice(), b"\x1b[200~2\x1b[201~"].concat());
     }
 }

@@ -17,6 +17,10 @@ pub struct FakeDriver {
     pub root: Mutex<Option<Proc>>,
     /// When set, `send` fails with this error (after recording the call).
     pub send_error: Mutex<Option<DriverError>>,
+    /// When set, the next `answer_permission` signals the first channel, then waits on the
+    /// second before answering (a test acts on the hub meanwhile).
+    #[allow(clippy::type_complexity)]
+    pub answer_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 impl FakeDriver {
@@ -41,11 +45,24 @@ impl Driver for FakeDriver {
         self.record("interrupt".into());
         Ok(())
     }
-    fn answer_permission(&self, key: &str, tool: &str, allow: bool) -> Result<(), DriverError> {
+    fn answer_permission(
+        &self,
+        key: &str,
+        tool: &str,
+        description: Option<&str>,
+        allow: bool,
+    ) -> Result<(), DriverError> {
+        if let Some((entered, go)) = self.answer_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = go.recv();
+        }
         if self.fail_answers.load(Ordering::SeqCst) {
             return Err(DriverError::NoDialog("fake".into()));
         }
         self.record(format!("answer:{key}:{tool}:{allow}"));
+        if let Some(d) = description {
+            self.record(format!("description:{d}"));
+        }
         Ok(())
     }
     fn trust(&self, accept: bool) -> Result<(), DriverError> {

@@ -542,8 +542,17 @@ impl Hub {
         st.view(t)
     }
 
+    /// Claude: refused while the session has a pending permission (Esc would answer its
+    /// dialog); the driver also refuses while a dialog is on screen.
     pub fn interrupt(&self, reference: &str) -> Result<()> {
-        let (task_id, _, driver) = self.live_driver(reference)?;
+        let (task_id, session_id, driver) = self.live_driver(reference)?;
+        {
+            let st = self.lock();
+            let claude = st.live.get(&task_id).is_some_and(|l| l.agent == AgentKind::Claude);
+            if claude && st.store.pending_permissions(&task_id)?.iter().any(|p| p.session_id == session_id) {
+                return Err(HubError::Driver(DriverError::NotNow(crate::driver::claude::INTERRUPT_REFUSED.into())));
+            }
+        }
         driver.ok_or_else(|| HubError::Conflict("agent still starting".into()))?.interrupt()?;
         let mut st = self.lock();
         st.event(Some(&task_id), "interrupt_sent", json!({}))?;
@@ -769,21 +778,47 @@ impl Hub {
 
 impl State {
     /// Persists the card for a Claude `PermissionRequest` and remembers which tool call it
-    /// is about. A repeat of a dialog that already has a pending card adds none.
+    /// is about. A repeat of a dialog that already has a pending card adds none. One agent
+    /// (the main one, or a side agent by `agent_id`) never has two dialogs open: its older
+    /// pending cards are settled as superseded (`permission_superseded`, recorded denied),
+    /// so Mirante never answers a dialog that is no longer the one on screen.
     fn open_card(&mut self, task_id: &str, session_id: &str, ev: &HookEvent) -> Result<()> {
         let Some(l) = self.live.get(task_id) else {
             return Ok(());
         };
+        let description = ev
+            .tool_input
+            .as_ref()
+            .and_then(|i| i["description"].as_str())
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
         let key = DialogKey {
             agent: ev.agent_id.clone(),
             tool_use_id: l.engine.tool_use_id_for(ev),
             tool_name: ev.tool_name.clone(),
+            description,
         };
         if key.tool_use_id.is_some() && l.dialogs.values().any(|k| *k == key) {
             return Ok(());
         }
+        let older: Vec<String> = self
+            .store
+            .pending_permissions(task_id)?
+            .into_iter()
+            .filter(|p| p.session_id == session_id && l.dialogs.get(&p.id).is_some_and(|k| k.agent == key.agent))
+            .map(|p| p.id)
+            .collect();
         let tool = ev.tool_name.clone().unwrap_or_else(|| "unknown".into());
         let card = self.store.create_permission_request(session_id, &tool, &ev.permission_detail())?;
+        for id in older {
+            self.store.answer_permission(&id, PermissionStatus::Denied)?;
+            if let Some(l) = self.live.get_mut(task_id) {
+                l.dialogs.remove(&id);
+            }
+            let payload = json!({ "permission_id": id, "by": card.id, "agent_id": key.agent });
+            self.event(Some(task_id), "permission_superseded", payload)?;
+        }
         if let Some(l) = self.live.get_mut(task_id) {
             l.dialogs.insert(card.id, key);
         }
@@ -1109,16 +1144,29 @@ mod tests {
         assert!(k.calls().contains(&"attach:30x100".to_string()));
     }
 
+    /// Tool call `t2` belongs to a side agent (`a-1`): one agent never has two dialogs open
+    /// (a newer one supersedes its older card).
+    fn with_agent(mut v: Value, id: &str) -> Value {
+        if id == "t2" {
+            v["agent_id"] = json!("a-1");
+        }
+        v
+    }
+
     fn tool(name: &str, id: &str) -> Value {
-        json!({"hook_event_name": name, "tool_name": "Bash", "tool_use_id": id})
+        with_agent(json!({"hook_event_name": name, "tool_name": "Bash", "tool_use_id": id}), id)
     }
 
     fn perm(id: &str, cmd: &str) -> Value {
-        json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": id,
-            "tool_input": {"command": cmd}})
+        with_agent(
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": id,
+                "tool_input": {"command": cmd}}),
+            id,
+        )
     }
 
-    /// Started Claude task with two dialogs open (t1 "older", then t2 "newer").
+    /// Started Claude task with two dialogs open (t1 "older" from the main agent, then t2
+    /// "newer" from side agent `a-1`).
     fn two_dialogs(k: &Kit) -> String {
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "go"}));

@@ -134,19 +134,99 @@ impl Hub {
 
     /// Answers a pending request once: the driver acts first (Claude: types the exact
     /// one-time option; Codex: answers the JSON-RPC request); only then is the answer
-    /// persisted. Claude dialogs are answered in order, oldest first. Once the driver has
-    /// answered, the answer stands: a failure to record it is logged, not returned.
-    /// Repeating the answer a request already has returns its stored row without acting
-    /// again (a client retry); a different answer to it is a conflict.
+    /// persisted. Once the driver has answered, the answer stands: a failure to record it is
+    /// logged, not returned. Repeating the answer a request already has returns its stored
+    /// row without acting again (a client retry); a different answer to it is a conflict.
+    ///
+    /// Claude: Mirante answers a card only when it is the only pending card of its session.
+    /// With two or more, the dialog on screen cannot be tied to one card for sure (two
+    /// agents may even ask for the same tool and command), so the user answers in
+    /// `mirante attach`.
+    ///
+    /// The hub lock is not held while the driver types: the card is checked and marked
+    /// under the lock, the lock is released for the driver, then re-taken; if the card was
+    /// settled or the session changed meanwhile, what was typed is recorded
+    /// (`permission_answer_unrecorded`) and the answer is a conflict.
     pub fn answer_permission(&self, a: AnswerPermission) -> Result<PermissionRequest> {
-        let mut st = self.lock();
-        let p = match st.find_permission(&a.id) {
-            Ok(p) => p,
-            // Not pending: a retry of an answer that already stands returns the stored row
-            // (idempotent); any other answer to an answered card is a conflict.
-            Err(HubError::NotFound(m)) => return st.answered_permission(&a.id, a.allow, m),
-            Err(e) => return Err(e),
+        let waited = std::time::Instant::now();
+        let (p, driver, key, description, agent) = loop {
+            let mut st = self.lock();
+            let p = match st.find_permission(&a.id) {
+                Ok(p) => p,
+                // Not pending: a retry of an answer that already stands returns the stored
+                // row (idempotent); any other answer to an answered card is a conflict.
+                Err(HubError::NotFound(m)) => return st.answered_permission(&a.id, a.allow, m),
+                Err(e) => return Err(e),
+            };
+            let l = st
+                .live
+                .get(&p.task_id)
+                .filter(|l| l.session_id == p.session_id)
+                .ok_or_else(|| HubError::Conflict("the session that asked has ended".into()))?;
+            let driver = l.driver.clone().ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
+            let agent = l.agent;
+            // Another answer to this card is being typed: wait for it (lock released), then
+            // look again (a repeat of the same answer then returns the stored row).
+            if l.answering.contains(&p.id) {
+                if waited.elapsed() > IN_FLIGHT_WAIT {
+                    return Err(HubError::Conflict(format!("permission request {} is being answered already", p.id)));
+                }
+                drop(st);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            let (key, description) = match agent {
+                AgentKind::Claude => {
+                    let pending: Vec<PermissionRequest> = st
+                        .store
+                        .pending_permissions(&p.task_id)?
+                        .into_iter()
+                        .filter(|q| q.session_id == p.session_id)
+                        .collect();
+                    if pending.len() > 1 {
+                        return Err(HubError::Conflict(several_cards(&pending)));
+                    }
+                    (p.detail.clone(), l.dialogs.get(&p.id).and_then(|k| k.description.clone()))
+                }
+                AgentKind::Codex => {
+                    let key = l.perm_keys.get(&p.id).cloned().ok_or_else(|| {
+                        HubError::Conflict(format!("permission request {} has no pending approval in the agent", p.id))
+                    })?;
+                    (key, None)
+                }
+            };
+            if let Some(l) = st.live.get_mut(&p.task_id) {
+                l.answering.insert(p.id.clone());
+            }
+            break (p, driver, key, description, agent);
         };
+        let typed = driver.answer_permission(&key, &p.tool, description.as_deref(), a.allow);
+        let mut st = self.lock();
+        let live = st.live.get_mut(&p.task_id).filter(|l| l.session_id == p.session_id);
+        let same_session = live.is_some();
+        if let Some(l) = live {
+            l.answering.remove(&p.id);
+        }
+        typed?;
+        let still_pending = st.store.pending_permissions(&p.task_id)?.iter().any(|q| q.id == p.id);
+        if !same_session || !still_pending {
+            let why = if same_session { "the card was settled meanwhile" } else { "the session ended meanwhile" };
+            let payload = json!({
+                "permission_id": p.id,
+                "tool": p.tool,
+                "detail": p.detail,
+                "allow": a.allow,
+                "reason": why,
+            });
+            if let Err(e) = st.event(Some(&p.task_id), "permission_answer_unrecorded", payload) {
+                st.log_error(Some(&p.task_id), "unrecorded permission answer not audited", &e);
+            }
+            st.publish();
+            return Err(HubError::Conflict(format!(
+                "the answer to {} was typed but {why}; it is recorded in the task's events, not on the card",
+                p.id
+            )));
+        }
         // A Codex `grantRoot` allowed lasts for the rest of the session: recorded as such.
         let grant = p.tool == crate::driver::codex::GRANT_TOOL;
         let status = match (a.allow, grant) {
@@ -154,30 +234,6 @@ impl Hub {
             (true, false) => PermissionStatus::AllowedOnce,
             (true, true) => PermissionStatus::AllowedSession,
         };
-        let l = st
-            .live
-            .get(&p.task_id)
-            .filter(|l| l.session_id == p.session_id)
-            .ok_or_else(|| HubError::Conflict("the session that asked has ended".into()))?;
-        let driver = l.driver.clone().ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
-        let agent = l.agent;
-        let key = match agent {
-            AgentKind::Claude => {
-                let oldest =
-                    st.store.pending_permissions(&p.task_id)?.into_iter().find(|q| q.session_id == p.session_id);
-                if oldest.as_ref().is_some_and(|o| o.id != p.id) {
-                    return Err(HubError::Conflict(format!(
-                        "answer the older request {} first (Claude shows one dialog at a time)",
-                        oldest.map(|o| o.id).unwrap_or_default()
-                    )));
-                }
-                p.detail.clone()
-            }
-            AgentKind::Codex => l.perm_keys.get(&p.id).cloned().ok_or_else(|| {
-                HubError::Conflict(format!("permission request {} has no pending approval in the agent", p.id))
-            })?,
-        };
-        driver.answer_permission(&key, &p.tool, a.allow)?;
         let answered = match st.store.answer_permission(&p.id, status) {
             Ok(answered) => answered,
             Err(e) => {
@@ -203,6 +259,30 @@ impl Hub {
         st.publish();
         Ok(answered)
     }
+}
+
+/// How long an answer waits for another answer to the same card that is being typed.
+const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Why Mirante will not answer one of several pending Claude cards, listing them.
+fn several_cards(pending: &[PermissionRequest]) -> String {
+    let list: Vec<String> = pending.iter().map(|q| format!("{} {}: {}", q.id, q.tool, q.detail)).collect();
+    let same = pending
+        .iter()
+        .enumerate()
+        .any(|(i, x)| pending[i + 1..].iter().any(|y| (&x.tool, &x.detail) == (&y.tool, &y.detail)));
+    let twin = if same {
+        " Two of them ask for the same tool and command (from different agents), so the dialog on screen \
+         cannot be told apart."
+    } else {
+        ""
+    };
+    format!(
+        "{} permission requests are pending in this session; Mirante answers only when one is.{twin} \
+         Answer them in `mirante attach`: {}",
+        pending.len(),
+        list.join("; ")
+    )
 }
 
 #[cfg(test)]
@@ -373,26 +453,170 @@ mod tests {
         assert!(k.hub.lock().live[&t.id].perm_keys.is_empty());
     }
 
+    fn perm(id: &str, cmd: &str, agent: Option<&str>) -> Value {
+        let mut v = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": id,
+            "tool_input": {"command": cmd}});
+        if let Some(a) = agent {
+            v["agent_id"] = json!(a);
+        }
+        v
+    }
+
+    fn pre(id: &str, agent: Option<&str>) -> Value {
+        let mut v = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": id});
+        if let Some(a) = agent {
+            v["agent_id"] = json!(a);
+        }
+        v
+    }
+
     #[test]
-    fn answering_the_older_of_two_dialogs_keeps_the_newer_one_pending_and_listed() {
+    fn a_newer_dialog_of_the_same_agent_supersedes_the_older_card() {
         let k = Kit::new();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
-        for (id, cmd) in [("t1", "older"), ("t2", "newer")] {
-            k.hook(&t.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": id}));
-            k.hook(
-                &t.id,
-                json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": id,
-                    "tool_input": {"command": cmd}}),
-            );
-        }
+        k.hook(&t.id, pre("t1", None));
+        k.hook(&t.id, perm("t1", "older", None));
+        k.hook(&t.id, pre("s1", Some("a-1")));
+        k.hook(&t.id, perm("s1", "side", Some("a-1")));
+        let first = k.hub.permissions().unwrap();
+        assert_eq!(first.len(), 2);
+        // The main agent asks again: its older card is superseded; the side agent's stays.
+        k.hook(&t.id, pre("t2", None));
+        k.hook(&t.id, perm("t2", "newer", None));
+        let left: Vec<String> = k.hub.permissions().unwrap().into_iter().map(|p| p.request.detail).collect();
+        assert_eq!(left, vec!["side".to_string(), "newer".to_string()]);
+        let sup: Vec<Value> = k
+            .hub
+            .lock()
+            .store
+            .task_events(&t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "permission_superseded")
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(sup.len(), 1);
+        assert_eq!(sup[0]["permission_id"], json!(first[0].request.id));
+        // A superseded card is no longer answerable; nothing is typed for it.
+        let r = k.hub.answer_permission(AnswerPermission { id: first[0].request.id.clone(), allow: true });
+        assert!(matches!(r, Err(HubError::Conflict(_))), "{r:?}");
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")));
+    }
+
+    #[test]
+    fn a_card_is_answered_only_when_it_is_the_only_one_pending_in_its_session() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "touch a", None));
+        k.hook(&t.id, perm("s1", "touch b", Some("a-1")));
         let p = k.hub.permissions().unwrap();
+        for card in &p {
+            let r = k.hub.answer_permission(AnswerPermission { id: card.request.id.clone(), allow: true });
+            let Err(HubError::Conflict(m)) = r else { panic!("{r:?}") };
+            assert!(m.contains("mirante attach") && m.contains("touch a") && m.contains("touch b"), "{m}");
+        }
+        assert!(k.calls().is_empty());
+        assert_eq!(k.hub.permissions().unwrap().len(), 2);
+        // Once the side agent's tool ran (answered in the terminal), the main card is alone.
+        k.hook(
+            &t.id,
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "s1", "agent_id": "a-1"}),
+        );
         k.hub.answer_permission(AnswerPermission { id: p[0].request.id.clone(), allow: true }).unwrap();
-        let left = k.hub.permissions().unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].request.id, p[1].request.id);
-        let v = k.hub.get_task(&t.id).unwrap();
-        assert_eq!((v.task.status, v.needs_you), (Status::NeedsYou, 1));
+        assert_eq!(k.calls(), vec!["answer:touch a:Bash:true".to_string()]);
+    }
+
+    #[test]
+    fn two_agents_asking_for_the_same_command_are_never_answered_by_mirante() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "rm -rf build", None));
+        k.hook(&t.id, perm("s1", "rm -rf build", Some("a-1")));
+        for card in k.hub.permissions().unwrap() {
+            let r = k.hub.answer_permission(AnswerPermission { id: card.request.id, allow: true });
+            let Err(HubError::Conflict(m)) = r else { panic!("{r:?}") };
+            assert!(m.contains("same tool and command") && m.contains("mirante attach"), "{m}");
+        }
+        assert!(k.calls().is_empty());
+    }
+
+    #[test]
+    fn the_hook_description_reaches_the_driver() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(
+            &t.id,
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": "touch x", "description": "Create x"}}),
+        );
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        k.hub.answer_permission(AnswerPermission { id, allow: false }).unwrap();
+        assert_eq!(k.calls(), vec!["answer:touch x:Bash:false".to_string(), "description:Create x".to_string()]);
+    }
+
+    #[test]
+    fn the_hub_lock_is_free_while_the_driver_types_and_a_card_settled_meanwhile_is_a_conflict() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, pre("t1", None));
+        k.hook(&t.id, perm("t1", "touch x", None));
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        *k.factory.driver.answer_gate.lock().unwrap() = Some((entered_tx, go_rx));
+        let hub = k.hub.clone();
+        let answer_id = id.clone();
+        let answer = std::thread::spawn(move || hub.answer_permission(AnswerPermission { id: answer_id, allow: true }));
+        entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // A second answer to the same card waits for the one being typed (no second key).
+        let (hub, again_id) = (k.hub.clone(), id.clone());
+        let again = std::thread::spawn(move || hub.answer_permission(AnswerPermission { id: again_id, allow: true }));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // The driver is typing: the hub still takes hooks (the lock is free), and the user
+        // answered in the terminal meanwhile: the tool ran.
+        k.hook(&t.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t1"}));
+        go.send(()).unwrap();
+        let r = answer.join().unwrap();
+        assert!(matches!(r, Err(HubError::Conflict(ref m)) if m.contains("typed")), "{r:?}");
+        // The waiting repeat finds the card answered the same way: its stored row.
+        assert_eq!(again.join().unwrap().unwrap().status, PermissionStatus::AllowedOnce);
+        assert_eq!(k.calls().iter().filter(|c| c.starts_with("answer:")).count(), 1);
+        let ev: Vec<Value> = k
+            .hub
+            .lock()
+            .store
+            .task_events(&t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "permission_answer_unrecorded")
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(ev.len(), 1);
+        assert_eq!((ev[0]["permission_id"].clone(), ev[0]["allow"].clone()), (json!(id), json!(true)));
+        // The card keeps what really happened (the tool ran).
+        let row = k.hub.lock().store.permissions_matching(&id).unwrap().remove(0);
+        assert_eq!(row.status, PermissionStatus::AllowedOnce);
+        assert!(k.hub.lock().live[&t.id].answering.is_empty());
+    }
+
+    #[test]
+    fn a_claude_interrupt_is_refused_while_a_card_is_pending() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "touch x", None));
+        let e = k.hub.interrupt(&t.id).unwrap_err();
+        assert!(e.to_string().contains("dialog open"), "{e}");
+        assert_eq!(mirante_ipc::RpcError::from(e).code, mirante_ipc::rpc::code::CONFLICT);
+        assert!(k.calls().iter().all(|c| c != "interrupt"));
+        k.hook(&t.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t1"}));
+        k.hub.interrupt(&t.id).unwrap();
+        assert!(k.calls().contains(&"interrupt".to_string()));
     }
 
     #[test]
@@ -432,18 +656,19 @@ mod tests {
     }
 
     #[test]
-    fn older_claude_dialog_must_be_answered_first() {
+    fn neither_of_two_cards_of_different_agents_is_answered() {
         let k = Kit::new();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
         k.hook(&t.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}));
         k.hook(&t.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Edit", "agent_id": "a-1"}));
-        let p = k.hub.permissions().unwrap();
-        let newer = p[1].request.id.clone();
-        assert!(matches!(
-            k.hub.answer_permission(AnswerPermission { id: newer, allow: true }),
-            Err(HubError::Conflict(_))
-        ));
+        for p in k.hub.permissions().unwrap() {
+            assert!(matches!(
+                k.hub.answer_permission(AnswerPermission { id: p.request.id, allow: true }),
+                Err(HubError::Conflict(_))
+            ));
+        }
+        assert!(k.calls().is_empty());
     }
 
     #[test]

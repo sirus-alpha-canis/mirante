@@ -256,13 +256,21 @@ pub trait Driver: Send + Sync {
     /// Delivers a message now: types it into the TUI (Claude) or steers / starts a turn
     /// (Codex). Returns once the message is handed to the driver's worker.
     fn send(&self, text: &str) -> Result<(), DriverError>;
-    /// Esc (Claude) or `turn/interrupt` (Codex).
+    /// Esc (Claude; refused with `NotNow` while a permission is pending or a dialog is open,
+    /// where Esc would answer it) or `turn/interrupt` (Codex).
     fn interrupt(&self) -> Result<(), DriverError>;
     /// Answers the permission dialog / approval request named by `key` (Codex: the request
-    /// id; Claude: the request detail, checked with `tool` against the dialog on screen).
-    /// Selects only a one-time "Yes" or "No", never an "always" or "auto" option. May wait
-    /// briefly (Claude: until the typist typed the key or refused to).
-    fn answer_permission(&self, key: &str, tool: &str, allow: bool) -> Result<(), DriverError>;
+    /// id; Claude: the request detail, checked with `tool` and the hook's `description`, when
+    /// it had one, against the dialog on screen). Selects only a one-time "Yes" or "No",
+    /// never an "always" or "auto" option. May wait briefly (Claude: until the typist typed
+    /// the key or refused to); the hub does not hold its lock meanwhile.
+    fn answer_permission(
+        &self,
+        key: &str,
+        tool: &str,
+        description: Option<&str>,
+        allow: bool,
+    ) -> Result<(), DriverError>;
     /// Answers Claude's workspace-trust dialog. `false` ends the session.
     fn trust(&self, accept: bool) -> Result<(), DriverError>;
     /// True while a dialog would capture typed text (a message must not be typed then).

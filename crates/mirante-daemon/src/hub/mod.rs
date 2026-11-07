@@ -2,7 +2,7 @@
 //! the `Store` (which persists each transition with its audit event), then publishes the
 //! new events to subscribers. Submodules add the session lifecycle (`session`) and
 //! messaging / permissions (`messages`).
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +113,9 @@ pub(crate) struct Live {
     /// Permission id -> the Claude dialog it shows (to settle exactly that card when its
     /// tool runs).
     pub(crate) dialogs: HashMap<String, DialogKey>,
+    /// Permission ids whose answer is being typed right now (the hub lock is released
+    /// meanwhile): a second answer to the same card waits for it, then looks again.
+    pub(crate) answering: HashSet<String>,
     /// A message was handed to the idle agent and the status has not left `Idle` since:
     /// nothing else is delivered meanwhile (it would land in the turn it starts). Expires
     /// after [`DELIVERY_GRACE`] in case the message started no turn (a local command).
@@ -159,6 +162,9 @@ pub(crate) struct DialogKey {
     pub(crate) agent: Option<String>,
     pub(crate) tool_use_id: Option<String>,
     pub(crate) tool_name: Option<String>,
+    /// The hook's `tool_input.description` (Bash shows it in the dialog box below the
+    /// command); the driver matches it too.
+    pub(crate) description: Option<String>,
 }
 
 impl DialogKey {
@@ -192,6 +198,7 @@ impl Live {
             queue: VecDeque::new(),
             perm_keys: HashMap::new(),
             dialogs: HashMap::new(),
+            answering: HashSet::new(),
             delivery_in_flight: None,
             steers: Vec::new(),
             transcript: Vec::new(),

@@ -19,6 +19,9 @@
 //!   be taking keys); the pasted text is left in the input box and cleared (Ctrl-E Ctrl-U,
 //!   one more Ctrl-U per pasted line) right before the next paste, once nothing blocks
 //!   typing, so the requeued message is never sent twice. Never Enter, Esc or a digit.
+//!   While the hub holds the session (a permission is pending) the typist hands queued
+//!   messages back at once, and cuts the pauses of the one it is typing short, so an answer
+//!   never waits behind steers.
 //! - A blocked `send` is `NotNow`, its reason starting with `hold` (a permission request is
 //!   pending) or `dialog` (a dialog is on screen). Once nothing blocks any more, the driver
 //!   reports `DialogClosed` so the hub delivers what it requeued.
@@ -27,6 +30,8 @@
 //!   `screen::dialog_matches`). Checked when asked AND again by the typist right before the
 //!   key, on the screen as it is then; if the dialog changed, nothing is typed and the
 //!   answer fails (`NoDialog`). Trust answers are re-checked the same way.
+//! - Interrupt (Esc) is refused (`NotNow`) while a permission is pending or a dialog is
+//!   open: Esc would answer that dialog ("Esc to cancel").
 //! - Stop ends the whole process tree (SIGTERM, grace, SIGKILL; see `proctree`), also what
 //!   an agent that already exited left behind (see `pty`).
 //! - A `--resume` whose process exits within `resume_window`, before `SessionStart` or
@@ -52,6 +57,8 @@ const END_OF_LINE: u8 = 0x05;
 const CLEAR_LINE: u8 = 0x15;
 /// How long an answer may wait for the typist (it may be finishing a message).
 const ANSWER_WAIT: Duration = Duration::from_secs(3);
+/// Why an interrupt is refused while a dialog is pending or open.
+pub const INTERRUPT_REFUSED: &str = "dialog open — answer or deny it first (mirante perms / mirante attach)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeTiming {
@@ -101,7 +108,14 @@ enum Typing {
     /// Keys for the TUI (Esc): typed as they are.
     Keys(Vec<u8>),
     /// A permission answer, checked against the screen right before its key is typed.
-    Answer { detail: String, tool: String, label: &'static str, deadline: Instant, reply: Reply },
+    Answer {
+        detail: String,
+        tool: String,
+        description: Option<String>,
+        label: &'static str,
+        deadline: Instant,
+        reply: Reply,
+    },
     /// "Yes, I trust this folder", checked against the screen right before its key is typed.
     Trust { deadline: Instant, reply: Reply },
 }
@@ -139,6 +153,23 @@ fn blocked(pty: &PtyProcess, sink: &Sink) -> Option<&'static str> {
     }
 }
 
+/// Sleeps `d`, in short slices, and returns early (true) as soon as the hub holds the
+/// session: a held session types nothing more, so the typist must not sit out its pauses.
+fn pause(sink: &Sink, d: Duration) -> bool {
+    const SLICE: Duration = Duration::from_millis(5);
+    let end = Instant::now() + d;
+    loop {
+        if sink.held() {
+            return true;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(SLICE));
+    }
+}
+
 /// Clears what an aborted paste of `lines` lines left in the input box: Ctrl-E, Ctrl-U,
 /// then one more Ctrl-U per line. The exact sequence Claude Code needs for a multi-line
 /// input is to be confirmed in the Task 21 real run.
@@ -160,7 +191,7 @@ fn type_message(
     dirty: &mut Option<usize>,
     owed: &AtomicBool,
 ) {
-    std::thread::sleep(timing.pre_type);
+    pause(sink, timing.pre_type);
     if let Some(why) = blocked(pty, sink) {
         sink.emit(DriverEvent::DeliveryAborted { text, reason: format!("{why}; nothing was typed") });
         // After the event: the hub must have requeued it before it hears `DialogClosed`.
@@ -173,7 +204,7 @@ fn type_message(
         sink.emit(DriverEvent::DeliveryAborted { text, reason: "the agent's terminal is closed".into() });
         return;
     }
-    std::thread::sleep(timing.type_pause);
+    pause(sink, timing.type_pause);
     if let Some(why) = blocked(pty, sink) {
         // Nothing more now: a dialog may be taking keys. The leftover is cleared before the
         // next paste, once nothing blocks typing.
@@ -188,11 +219,18 @@ fn type_message(
 }
 
 /// The answer key for the request, from the screen as it is now.
-fn answer_key(grid: &str, tool: &str, detail: &str, label: &str, cwd: &Path) -> Result<char, DriverError> {
+fn answer_key(
+    grid: &str,
+    tool: &str,
+    detail: &str,
+    description: Option<&str>,
+    label: &str,
+    cwd: &Path,
+) -> Result<char, DriverError> {
     if !screen::has_permission_prompt(grid) {
         return Err(DriverError::NoDialog("no permission dialog on screen".into()));
     }
-    if !screen::dialog_matches(grid, tool, detail, Some(cwd)) {
+    if !screen::dialog_matches(grid, tool, detail, description, Some(cwd)) {
         return Err(DriverError::NoDialog(
             "the dialog on screen is not exactly this request; answer it in `mirante attach`".into(),
         ));
@@ -266,9 +304,9 @@ impl ClaudeDriver {
                     Typing::Keys(k) => {
                         let _ = typist_pty.write(&k);
                     }
-                    Typing::Answer { detail, tool, label, deadline, reply } => {
+                    Typing::Answer { detail, tool, description, label, deadline, reply } => {
                         let r = type_checked(&typist_pty, &typist_sink, "permission answer", deadline, |g| {
-                            answer_key(g, &tool, &detail, label, &cwd)
+                            answer_key(g, &tool, &detail, description.as_deref(), label, &cwd)
                         });
                         let _ = reply.send(r);
                     }
@@ -428,15 +466,25 @@ impl Driver for ClaudeDriver {
     }
 
     fn interrupt(&self) -> Result<(), DriverError> {
+        // Esc answers a dialog ("Esc to cancel"): never typed while one is pending or open.
+        if blocked(&self.pty, &self.sink).is_some() {
+            return Err(DriverError::NotNow(INTERRUPT_REFUSED.into()));
+        }
         self.type_(Typing::Keys(ESC.to_vec()))
     }
 
-    fn answer_permission(&self, detail: &str, tool: &str, allow: bool) -> Result<(), DriverError> {
+    fn answer_permission(
+        &self,
+        detail: &str,
+        tool: &str,
+        description: Option<&str>,
+        allow: bool,
+    ) -> Result<(), DriverError> {
         let label = if allow { "Yes" } else { "No" };
         // Checked now for a quick answer, and again by the typist right before the key.
-        answer_key(&self.pty.grid(), tool, detail, label, &self.cwd)?;
-        let (detail, tool) = (detail.to_string(), tool.to_string());
-        self.type_answer(|deadline, reply| Typing::Answer { detail, tool, label, deadline, reply })
+        answer_key(&self.pty.grid(), tool, detail, description, label, &self.cwd)?;
+        let (detail, tool, description) = (detail.to_string(), tool.to_string(), description.map(str::to_string));
+        self.type_answer(|deadline, reply| Typing::Answer { detail, tool, description, label, deadline, reply })
     }
 
     fn trust(&self, accept: bool) -> Result<(), DriverError> {
@@ -783,7 +831,7 @@ mod tests {
         wait_grid(&f.d, "pasted");
         f.d.pty.mirror(DIALOG);
         let d = f.d.clone();
-        let answer = std::thread::spawn(move || d.answer_permission("touch x", "Bash", true));
+        let answer = std::thread::spawn(move || d.answer_permission("touch x", "Bash", None, true));
         std::thread::sleep(Duration::from_millis(150));
         // Before the typist gets to it, another dialog replaced the one that was asked about.
         f.d.pty.mirror(b"\x1b[2J\x1b[H Bash command\r\n   rm -rf ~\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n");
@@ -791,6 +839,62 @@ mod tests {
         assert!(matches!(r, Err(DriverError::NoDialog(_))), "{r:?}");
         next(&f.rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "answer_aborted"));
         wait_grid(&f.d, "next:[]");
+    }
+
+    #[test]
+    fn interrupt_is_refused_while_a_permission_is_pending_or_a_dialog_is_open() {
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let f = fake(&format!(
+            "{READY}; stty min 0 time 15; dd bs=1 count=1 of={} 2>/dev/null; printf 'read'; sleep 5",
+            out.display()
+        ));
+        ready(&f);
+        f.hold.store(true, Ordering::SeqCst);
+        let e = f.d.interrupt().unwrap_err();
+        assert!(matches!(e, DriverError::NotNow(ref m) if m.starts_with("dialog open")), "{e:?}");
+        f.hold.store(false, Ordering::SeqCst);
+        f.d.pty.mirror(DIALOG);
+        assert!(matches!(f.d.interrupt(), Err(DriverError::NotNow(_))));
+        wait_grid(&f.d, "read");
+        assert_eq!(std::fs::read(&out).unwrap_or_default(), b"", "no Esc reached the agent");
+        f.d.pty.mirror(b"\x1b[2J\x1b[H> \r\n  manual mode on\r\n");
+        f.d.interrupt().unwrap();
+    }
+
+    /// Ported from the driver review's probe (`probe_answer_latency_behind_steers`): with
+    /// five messages handed to the typist, an answer waited out every message's pauses.
+    #[test]
+    fn probe_an_answer_does_not_wait_behind_queued_steers() {
+        let f = fake_with(
+            &format!("{READY}; sleep 8"),
+            ClaudeTiming {
+                tick: Duration::from_millis(20),
+                monitor: Duration::from_millis(20),
+                ..ClaudeTiming::default()
+            },
+            false,
+        );
+        ready(&f);
+        for m in ["one", "two", "three", "four", "five"] {
+            f.d.send(m).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        f.d.pty.mirror(DIALOG);
+        f.hold.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let r = f.d.answer_permission("touch x", "Bash", None, true);
+        let took = t0.elapsed();
+        assert!(r.is_ok(), "{r:?}");
+        assert!(took < Duration::from_millis(300), "the answer waited {took:?} behind the steers");
+        // Every message not typed was handed back.
+        let mut aborted = 0;
+        while let Ok((_, e)) = f.rx.recv_timeout(Duration::from_millis(200)) {
+            if matches!(e, DriverEvent::DeliveryAborted { .. }) {
+                aborted += 1;
+            }
+        }
+        assert_eq!(aborted, 5);
     }
 
     #[test]
