@@ -50,6 +50,37 @@ pub fn parse_jsonl_counted(text: &str) -> (Vec<Value>, usize) {
     (out, skipped)
 }
 
+/// Inherited variables that make a child `claude` believe it is nested inside another
+/// Claude Code session (or a terminal wrapper's integration). Auth variables are kept.
+pub const NESTED_SESSION_ENV: [&str; 13] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+    "CMUX_CLAUDE_PID",
+];
+
+/// Names of the variables to remove before spawning a spike `claude`: the nested-session
+/// list plus any terminal-wrapper (cmux) integration variables present in this process.
+pub fn env_to_scrub() -> Vec<String> {
+    let mut keys: Vec<String> = NESTED_SESSION_ENV.iter().map(|k| k.to_string()).collect();
+    keys.extend(std::env::vars().map(|(k, _)| k).filter(|k| k.starts_with("CMUX_CLAUDE_") || k.starts_with("CMUX_AGENT_")));
+    keys
+}
+
+/// The `claude` binary for spikes: `MIRANTE_CLAUDE_BIN` or `claude` on PATH.
+pub fn claude_bin() -> String {
+    std::env::var("MIRANTE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

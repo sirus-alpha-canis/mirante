@@ -3,6 +3,8 @@
 //! resume: sets a secret, exits, resumes by session id and asks for the secret (S4).
 //! status: scripted session(s) in a fresh sandbox; compares hook-derived status with the
 //!         status read off the emulated screen at checkpoints (S3 accuracy).
+//! prompts: types prompts one by one (default: the three S2 prompts), waiting for each Stop,
+//!         then /exit; prints session id + transcript for `spike usage` (S2 interactive).
 //!
 //! `MIRANTE_CLAUDE_BIN` overrides the binary (default `claude` on PATH), e.g. to skip a
 //! terminal-app wrapper shim that would inject its own hooks.
@@ -20,24 +22,6 @@ const SECOND: &str = "Mudança de planos: pare o que está fazendo e responda ap
 const SECRET_SET: &str = "A palavra secreta é JABUTICABA. Responda apenas OK.";
 const SECRET_ASK: &str = "Qual é a palavra secreta? Responda só a palavra.";
 
-/// Inherited variables that make a child `claude` believe it is nested inside another
-/// Claude Code session (or a terminal wrapper's integration). Auth variables are kept.
-const NESTED_SESSION_ENV: [&str; 13] = [
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SSE_PORT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-    "AI_AGENT",
-    "CMUX_CLAUDE_PID",
-];
-
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
@@ -53,8 +37,7 @@ struct Session {
 impl Session {
     fn start(cwd: &str, settings: &str, hooks_log: &Path, task: &str, extra: &[&str]) -> Result<Session> {
         let pair = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
-        let bin = std::env::var("MIRANTE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-        let mut cmd = CommandBuilder::new(bin);
+        let mut cmd = CommandBuilder::new(util::claude_bin());
         for a in extra {
             cmd.arg(a);
         }
@@ -65,14 +48,9 @@ impl Session {
         cmd.arg("--permission-mode");
         cmd.arg("manual");
         cmd.cwd(cwd);
-        for k in NESTED_SESSION_ENV {
+        // Nested-session and terminal-wrapper (cmux) variables would pollute the measurement.
+        for k in util::env_to_scrub() {
             cmd.env_remove(k);
-        }
-        // Terminal-wrapper (cmux) integration hooks would pollute the measurement.
-        for (k, _) in std::env::vars() {
-            if k.starts_with("CMUX_CLAUDE_") || k.starts_with("CMUX_AGENT_") {
-                cmd.env_remove(k);
-            }
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("MIRANTE_TASK_ID", task);
@@ -318,6 +296,39 @@ fn resume(cwd: &str, settings: &str, hooks_log: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- S2 prompts
+
+const S2_PROMPTS: [&str; 3] = [
+    "Liste os arquivos e diga quantos são.",
+    "Crie hello.txt com o texto oi.",
+    "Execute `sleep 1 && echo ok` e diga o resultado.",
+];
+
+fn prompts(cwd: &str, settings: &str, hooks_log: &Path, list: &[String]) -> Result<()> {
+    let list: Vec<String> = if list.is_empty() { S2_PROMPTS.iter().map(|p| p.to_string()).collect() } else { list.to_vec() };
+    let task = format!("prompts-{}", util::now_ms());
+    let mut s = Session::start(cwd, settings, hooks_log, &task, &[])?;
+    s.boot()?;
+    for (i, p) in list.iter().enumerate() {
+        s.type_line(p)?;
+        let events = wait_for(hooks_log, &task, "Stop", i + 1, Duration::from_secs(180))?;
+        if events.iter().filter(|e| e.event.hook_event_name == "Stop").count() <= i {
+            bail!("prompt {} did not finish (no Stop); not typing the rest", i + 1);
+        }
+    }
+    let screen = s.finish();
+    let out = screen_path(hooks_log, &task);
+    std::fs::write(&out, &screen)?;
+    let events = hook::load_events(&util::read_jsonl(hooks_log)?, Some(&task));
+    let sid = events.iter().find_map(|e| e.event.session_id.clone()).unwrap_or_default();
+    let tp = events.iter().rev().find_map(|e| e.event.transcript_path.clone()).unwrap_or_default();
+    println!("task: {task}  screen: {}", out.display());
+    print_timeline(&events);
+    println!("session id: {sid}");
+    println!("transcript: {tp}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------- S3 status accuracy
 
 const S3_OK: &str = "Responda apenas OK.";
@@ -554,7 +565,7 @@ fn s3(cwd: &str, settings: &str, hooks_log: &Path, runs: usize) -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: spike-claude-pty <cwd> <settings.json> <hooks.jsonl> <delay-secs> [steer|resume|status [runs]]";
+    let usage = "usage: spike-claude-pty <cwd> <settings.json> <hooks.jsonl> <delay-secs> [steer|resume|status [runs]|prompts [prompt...]]";
     let cwd = args.first().context(usage)?;
     let settings = args.get(1).context(usage)?;
     let hooks_log = PathBuf::from(args.get(2).context(usage)?);
@@ -563,6 +574,7 @@ fn main() -> Result<()> {
         "steer" => steer(cwd, settings, &hooks_log, delay),
         "resume" => resume(cwd, settings, &hooks_log),
         "status" => s3(cwd, settings, &hooks_log, args.get(5).map(|r| r.parse()).transpose()?.unwrap_or(3)),
+        "prompts" => prompts(cwd, settings, &hooks_log, &args[5..]),
         other => bail!("unknown mode {other}"),
     }
 }

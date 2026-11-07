@@ -66,6 +66,9 @@ pub fn classify_hooks(events: &[LoggedEvent]) -> Delivery {
 /// - A turn is over at its final assistant line (`message.stop_reason == "end_turn"`), then
 ///   `{"type":"system","subtype":"stop_hook_summary"}` / `"turn_duration"`. A typed prompt
 ///   (`type:"user"` with `origin.kind:"human"`; tool results have no `origin`) starts a turn.
+/// - Headless `-p --input-format stream-json` (Task 9): the prompt line has no `origin`, only
+///   `promptSource:"sdk"`; it also starts a turn. A mid-turn stream-json message is logged
+///   like the interactive case (enqueue, queued_command, remove absorbed_mid_turn).
 ///
 /// Positions are FILE ORDER, not `timestamp`: lines are appended as things happen, but
 /// timestamps are not monotonic (an assistant line had a timestamp 4s older than the
@@ -77,7 +80,7 @@ pub fn classify_hooks(events: &[LoggedEvent]) -> Delivery {
 /// after it: none → `Never`; before the running turn's end (or no end at all) → `Steered`;
 /// otherwise → `Queued`.
 pub fn classify_transcript(lines: &[Value]) -> Delivery {
-    let is_prompt = |v: &Value| v["type"] == "user" && v["origin"]["kind"] == "human";
+    let is_prompt = |v: &Value| v["type"] == "user" && (v["origin"]["kind"] == "human" || v["promptSource"] == "sdk");
     let is_turn_end = |v: &Value| {
         (v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")
             || (v["type"] == "system" && (v["subtype"] == "stop_hook_summary" || v["subtype"] == "turn_duration"))
@@ -219,6 +222,19 @@ mod tests {
         t.push(json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "BANANA please"}}));
         t.push(answer("BANANA"));
         t.extend(turn_end());
+        assert_eq!(classify_transcript(&t), Delivery::Steered);
+    }
+
+    #[test]
+    fn transcript_headless_sdk_prompt_starts_a_turn() {
+        // Real order from Task 9 (claude -p, stream-json in): enqueue+dequeue of the initial
+        // prompt while idle, the sdk prompt, then the 2nd message absorbed mid-turn.
+        let mut t = vec![queue("enqueue"), json!({"type": "queue-operation", "operation": "dequeue"})];
+        t.push(json!({"type": "user", "promptSource": "sdk",
+                      "message": {"role": "user", "content": [{"type": "text", "text": "run five steps"}]}}));
+        t.extend([tool_use(), queue("enqueue"), tool_result()]);
+        t.push(json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "BANANA please"}}));
+        t.extend([removed("absorbed_mid_turn"), answer("BANANA")]);
         assert_eq!(classify_transcript(&t), Delivery::Steered);
     }
 
