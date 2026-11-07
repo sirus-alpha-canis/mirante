@@ -76,10 +76,20 @@ pub fn classify_hooks(events: &[LoggedEvent]) -> Delivery {
 ///
 /// Classification: take the first `enqueue` that happens inside a running turn (after a
 /// human prompt and before that turn's end; headless `-p` also logs enqueue/dequeue for its
-/// initial prompt while idle). None → `Inconclusive`. Then the first `remove`/`dequeue`
-/// after it: none → `Never`; before the running turn's end (or no end at all) → `Steered`;
-/// otherwise → `Queued`.
+/// initial prompt while idle). None → `Inconclusive`. The first in-turn enqueue is matched
+/// with the first subsequent `remove`/`dequeue` (FIFO). None → `Never`. A `remove` with
+/// `reason == "absorbed_mid_turn"` before the running turn's end (or no end at all) →
+/// `Steered`. Any other remove/dequeue → `Queued` if it comes after the turn's end or a
+/// `promptSource:"queued"` user line follows, else `Never`.
+///
+/// Subagent/sidechain lines (`isSidechain == true`, or carrying `agentId` /
+/// `parentToolUseID`) are ignored by every predicate.
 pub fn classify_transcript(lines: &[Value]) -> Delivery {
+    // Subagent/sidechain lines (own turns, own stop_reason) must not drive the parent's state.
+    let is_sidechain = |v: &Value| {
+        v["isSidechain"] == true || !v["agentId"].is_null() || !v["parentToolUseID"].is_null()
+    };
+    let lines: Vec<&Value> = lines.iter().filter(|v| !is_sidechain(v)).collect();
     let is_prompt = |v: &Value| v["type"] == "user" && (v["origin"]["kind"] == "human" || v["promptSource"] == "sdk");
     let is_turn_end = |v: &Value| {
         (v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")
@@ -105,12 +115,20 @@ pub fn classify_transcript(lines: &[Value]) -> Delivery {
         return Delivery::Inconclusive;
     };
     let after = &lines[enqueue + 1..];
+    // FIFO: the first in-turn enqueue pairs with the first remove/dequeue after it.
     let Some(taken) = after.iter().position(|v| is_op(v, &["remove", "dequeue"])) else {
         return Delivery::Never;
     };
-    match after.iter().position(|v| is_turn_end(v) || is_prompt(v)) {
-        Some(end) if end < taken => Delivery::Queued,
-        _ => Delivery::Steered,
+    let end = after.iter().position(|v| is_turn_end(v) || is_prompt(v));
+    let before_end = end.is_none_or(|e| taken < e);
+    if before_end && after[taken]["reason"] == "absorbed_mid_turn" {
+        return Delivery::Steered;
+    }
+    let queued_user_follows = after.iter().any(|v| v["type"] == "user" && v["promptSource"] == "queued");
+    if queued_user_follows || !before_end {
+        Delivery::Queued
+    } else {
+        Delivery::Never
     }
 }
 
@@ -301,6 +319,68 @@ mod tests {
         let mut t = vec![removed("dequeued"), prompt("one"), queue("enqueue"), answer("done")];
         t.extend(turn_end());
         assert_eq!(classify_transcript(&t), Delivery::Never);
+    }
+
+    #[test]
+    fn transcript_sidechain_end_turn_does_not_end_parent_turn() {
+        let t = vec![
+            prompt("one"),
+            tool_use(),
+            queue("enqueue"),
+            json!({"type": "assistant", "isSidechain": true, "agentId": "a1",
+                   "message": {"stop_reason": "end_turn", "content": []}}),
+            json!({"type": "system", "subtype": "turn_duration", "parentToolUseID": "toolu_1"}),
+            removed("absorbed_mid_turn"),
+            answer("BANANA"),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Steered);
+    }
+
+    #[test]
+    fn transcript_sidechain_prompt_and_enqueue_are_ignored() {
+        let t = vec![
+            json!({"type": "user", "isSidechain": true, "origin": {"kind": "human"}, "message": {}}),
+            queue_sidechain(),
+            answer("done"),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Inconclusive);
+    }
+
+    fn queue_sidechain() -> Value {
+        json!({"type": "queue-operation", "operation": "enqueue", "agentId": "a1"})
+    }
+
+    #[test]
+    fn transcript_non_absorbed_remove_mid_turn_is_never() {
+        let t = vec![prompt("one"), tool_use(), queue("enqueue"), removed("cancelled"), answer("done")];
+        assert_eq!(classify_transcript(&t), Delivery::Never);
+    }
+
+    #[test]
+    fn transcript_non_absorbed_remove_then_queued_user_is_queued() {
+        let t = vec![
+            prompt("one"),
+            queue("enqueue"),
+            json!({"type": "queue-operation", "operation": "dequeue"}),
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {}}),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Queued);
+    }
+
+    #[test]
+    fn transcript_multiple_enqueues_pair_first_with_first_remove() {
+        // FIFO: first enqueue <-> first remove (absorbed mid-turn); the second stays pending.
+        let t = vec![prompt("one"), tool_use(), queue("enqueue"), queue("enqueue"), removed("absorbed_mid_turn"), answer("x")];
+        assert_eq!(classify_transcript(&t), Delivery::Steered);
+        // Both enqueued, turn ends, then the first is dequeued -> Queued.
+        let t = vec![
+            prompt("one"),
+            queue("enqueue"),
+            queue("enqueue"),
+            answer("x"),
+            json!({"type": "queue-operation", "operation": "dequeue"}),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Queued);
     }
 
     #[test]

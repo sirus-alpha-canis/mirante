@@ -6,17 +6,29 @@ use crate::status::Status;
 pub const PERMISSION_MARKER: &str = "Do you want to proceed?";
 const SPINNER_GLYPHS: [char; 7] = ['·', '✢', '✳', '✶', '✻', '✽', '*'];
 
-/// A spinner line: `<glyph> <Verb>… (...)` while a turn runs. After the turn the same glyph
-/// prefixes `<Verb>ed for 3s`, which has no ellipsis.
+/// A spinner line: `<glyph> <Verb>… (...)` while a turn runs; the ellipsis must be followed
+/// by the timing suffix ` (`, so a markdown bullet like `* Loading…` does not count. After
+/// the turn the same glyph prefixes `<Verb>ed for 3s`, which has no ellipsis.
 pub fn has_spinner(text: &str) -> bool {
     text.lines().any(|l| {
         let t = l.trim_start();
-        t.starts_with(SPINNER_GLYPHS) && t.contains('…')
+        t.starts_with(SPINNER_GLYPHS) && t.contains("… (")
+    })
+}
+
+/// Index of the last permission dialog: a `Do you want to …?` line (Bash: "proceed", Edit /
+/// Write: "make this edit", …) followed later by a numbered `1.` option line.
+fn dialog_start(lines: &[&str]) -> Option<usize> {
+    let is_option_one = |l: &str| l.trim_start().trim_start_matches('❯').trim_start().starts_with("1. ");
+    (0..lines.len()).rev().find(|&i| {
+        let t = lines[i].trim();
+        t.starts_with("Do you want to") && t.ends_with('?') && lines[i + 1..].iter().any(|l| is_option_one(l))
     })
 }
 
 pub fn has_permission_prompt(text: &str) -> bool {
-    text.contains(PERMISSION_MARKER)
+    let lines: Vec<&str> = text.lines().collect();
+    dialog_start(&lines).is_some()
 }
 
 /// Screen-derived status; `exited` = the claude process is gone.
@@ -35,7 +47,10 @@ pub fn status(text: &str, exited: bool) -> Status {
 /// The digit of the numbered dialog option whose label is exactly `label` (e.g. "Yes", "No"),
 /// ignoring longer labels such as "Yes, and don't ask again ...". Lines may carry a `❯` cursor.
 pub fn option_key(text: &str, label: &str) -> Option<char> {
-    text.lines().find_map(|l| {
+    let lines: Vec<&str> = text.lines().collect();
+    // Only the live dialog counts: history above it may contain look-alike "1. Yes" lines.
+    let start = dialog_start(&lines)?;
+    lines[start + 1..].iter().find_map(|l| {
         let t = l.trim().trim_start_matches('❯').trim();
         let (num, rest) = t.split_once(". ")?;
         let digit = num.parse::<u8>().ok().filter(|d| *d < 10)?;
@@ -96,6 +111,42 @@ mod tests {
     #[test]
     fn exited_process_is_ended_whatever_the_screen() {
         assert_eq!(status(DIALOG, true), Status::Ended);
+    }
+
+    const EDIT_DIALOG: &str = "\
+ Edit file
+   src/main.rs
+ Do you want to make this edit to main.rs?
+ ❯ 1. Yes
+   2. Yes, allow all edits during this session
+   3. No
+ Esc to cancel";
+
+    #[test]
+    fn edit_dialog_is_needs_you() {
+        assert!(has_permission_prompt(EDIT_DIALOG));
+        assert!(has_permission_prompt(DIALOG));
+        assert_eq!(status(EDIT_DIALOG, false), Status::NeedsYou);
+        assert_eq!(option_key(EDIT_DIALOG, "No"), Some('3'));
+    }
+
+    #[test]
+    fn question_without_numbered_option_is_not_a_dialog() {
+        assert!(!has_permission_prompt("Do you want to proceed?\nsure"));
+    }
+
+    #[test]
+    fn option_key_ignores_lookalikes_above_the_dialog() {
+        let screen = format!("1. Yes\n4. No\n{EDIT_DIALOG}");
+        assert_eq!(option_key(&screen, "Yes"), Some('1'));
+        assert_eq!(option_key(&screen, "No"), Some('3'));
+        assert_eq!(option_key("1. Yes\n4. No\nno dialog here", "Yes"), None);
+    }
+
+    #[test]
+    fn bullet_without_timing_suffix_is_not_a_spinner() {
+        assert!(!has_spinner("* Loading…"));
+        assert!(has_spinner("* Loading… (2s)"));
     }
 
     #[test]
