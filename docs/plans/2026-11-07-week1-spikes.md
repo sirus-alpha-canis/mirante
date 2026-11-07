@@ -80,6 +80,8 @@ Expected: a version string. If the founder skips Codex for now, Tasks 10–11 ar
 
 ---
 
+> **Note (2026-11-07):** the library code in Tasks 1–6 below is the original plan. Commit `407361e` supersedes it: atomic JSONL appends, a `Delivery::Inconclusive` variant, events sorted by timestamp, per-field max token dedupe, structural Codex matching, `codex::capture_last`, and `fill` returning `Result`. The source in `crates/spike-kit` is authoritative; do not re-apply these code blocks.
+
 ### Task 1: Bootstrap the repo
 
 **Files:**
@@ -1075,7 +1077,7 @@ echo '{"hook_event_name":"Stop","session_id":"s1"}' | MIRANTE_TASK_ID=smoke MIRA
 ./target/debug/spike timeline /tmp/mirante-smoke.jsonl smoke
 ./target/debug/spike settings "$PWD/target/debug/mirante-hook" "$HOME/.mirante-spike/settings.json"
 ```
-Expected: the timeline prints one line ending `Stop -> Idle` and `mid-run delivery (hooks): Never`. Then `wrote /Users/.../.mirante-spike/settings.json`.
+Expected: the timeline prints one line ending `Stop -> Idle` and `mid-run delivery (hooks): Inconclusive`. Then `wrote /Users/.../.mirante-spike/settings.json`.
 
 - [ ] **Step 5: Commit**
 
@@ -1296,7 +1298,7 @@ Expected: Claude answers. If it rejects `PermissionRequest` as an unknown hook e
 SANDBOX=$(scripts/make-sandbox.sh)
 ./target/debug/spike-claude-pty "$SANDBOX" "$HOME/.mirante-spike/settings.json" "$HOME/.mirante-spike/hooks.jsonl" 6 steer
 ```
-Expected: a status timeline, then `mid-run delivery (pty+hooks): Steered | Queued | Never`. Open the `*.screen.txt` next to the hooks log and confirm by eye what the agent did with BANANA. Copy both into FINDINGS.
+Expected: a status timeline, then `mid-run delivery (pty+hooks): Steered | Queued | Never | Inconclusive`. Open the `*.screen.txt` next to the hooks log and confirm by eye what the agent did with BANANA. Copy both into FINDINGS.
 
 - [ ] **Step 5: Run S4**
 
@@ -1430,7 +1432,7 @@ Expected: no errors.
 SANDBOX=$(scripts/make-sandbox.sh)
 ./target/debug/spike-claude-stream "$SANDBOX" "$HOME/.mirante-spike/stream.jsonl" 6
 ```
-Expected: `results seen: 1|2` and `mid-run delivery (stream-json): Steered | Queued | Never`. Record both in FINDINGS.
+Expected: `results seen: 1|2` and `mid-run delivery (stream-json): Steered | Queued | Never | Inconclusive`. Record both in FINDINGS.
 
 - [ ] **Step 4: Run S2 (quota) — same 3 tasks, both modes**
 
@@ -1587,7 +1589,7 @@ cargo build -p spike-kit --bins
 SANDBOX=$(scripts/make-sandbox.sh)
 ./target/debug/spike-codex "$SANDBOX" scripts/codex-steer.jsonl "$HOME/.mirante-spike/codex.jsonl" 60
 ```
-Expected: `mid-run delivery (codex): Steered | Queued | Never`. If you get `Never`, inspect `codex.jsonl` for JSON-RPC `error` responses to ids 2–4, fix the script per the schema and re-run. Record the final working script in FINDINGS.
+Expected: `mid-run delivery (codex): Steered | Queued | Never | Inconclusive`. If you get `Never`, inspect `codex.jsonl` for JSON-RPC `error` responses to ids 2–4, fix the script per the schema and re-run. Record the final working script in FINDINGS.
 
 - [ ] **Step 5: Commit**
 
