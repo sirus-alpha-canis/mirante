@@ -64,18 +64,25 @@ pub enum Lifecycle {
     Created,
     /// At least one session was started.
     Active,
+    /// The worktree is being removed. Persisted before the removal starts, so a crash
+    /// mid-archive is finished (or undone) by recovery. No session may start.
+    Archiving,
     /// Worktree removed, branch kept. Terminal.
     Archived,
 }
-text_enum!(Lifecycle, "lifecycle", { Created => "created", Active => "active", Archived => "archived" });
+text_enum!(Lifecycle, "lifecycle", {
+    Created => "created", Active => "active", Archiving => "archiving", Archived => "archived"
+});
 
 impl Lifecycle {
+    /// `Created -> Active`; `Created | Active -> Archiving -> Archived`; `Archiving -> Active`
+    /// when the worktree could not be removed.
     pub fn can_transition_to(self, to: Lifecycle) -> bool {
         matches!(
             (self, to),
             (Lifecycle::Created, Lifecycle::Active)
-                | (Lifecycle::Created, Lifecycle::Archived)
-                | (Lifecycle::Active, Lifecycle::Archived)
+                | (Lifecycle::Created | Lifecycle::Active, Lifecycle::Archiving)
+                | (Lifecycle::Archiving, Lifecycle::Archived | Lifecycle::Active)
         )
     }
 }
@@ -199,11 +206,25 @@ mod tests {
     #[test]
     fn lifecycle_transitions() {
         assert!(Lifecycle::Created.can_transition_to(Lifecycle::Active));
-        assert!(Lifecycle::Created.can_transition_to(Lifecycle::Archived));
-        assert!(Lifecycle::Active.can_transition_to(Lifecycle::Archived));
         assert!(!Lifecycle::Active.can_transition_to(Lifecycle::Created));
         assert!(!Lifecycle::Archived.can_transition_to(Lifecycle::Active));
         assert!(!Lifecycle::Active.can_transition_to(Lifecycle::Active));
+    }
+
+    #[test]
+    fn archiving_sits_between_live_and_archived() {
+        // Archived is only reached through Archiving (set before the worktree is removed).
+        assert!(Lifecycle::Created.can_transition_to(Lifecycle::Archiving));
+        assert!(Lifecycle::Active.can_transition_to(Lifecycle::Archiving));
+        assert!(Lifecycle::Archiving.can_transition_to(Lifecycle::Archived));
+        // A failed removal puts the task back.
+        assert!(Lifecycle::Archiving.can_transition_to(Lifecycle::Active));
+        assert!(!Lifecycle::Created.can_transition_to(Lifecycle::Archived));
+        assert!(!Lifecycle::Active.can_transition_to(Lifecycle::Archived));
+        assert!(!Lifecycle::Archived.can_transition_to(Lifecycle::Archiving));
+        assert!(!Lifecycle::Archiving.can_transition_to(Lifecycle::Created));
+        assert_eq!(Lifecycle::parse("archiving").unwrap(), Lifecycle::Archiving);
+        assert_eq!(Lifecycle::Archiving.as_str(), "archiving");
     }
 
     #[test]

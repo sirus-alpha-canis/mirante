@@ -2,8 +2,10 @@
 //! `root` = `~/.mirante/worktrees` by default. The branch name is the user's choice (no
 //! forced prefix), and the base is the repo's current branch unless one is given: never
 //! an assumed `main`. Removing a worktree keeps its branch.
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{CoreError, Result};
 
@@ -160,14 +162,29 @@ fn root_from_home(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
     }
 }
 
+/// One mutex per repository (keyed by its canonical git common dir).
+type RepoLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
+
+/// Clones share the per-repo locks: `git worktree add/remove/prune` of one repository run
+/// one at a time (they edit the same `.git/worktrees` metadata and config).
 #[derive(Debug, Clone)]
 pub struct WorktreeManager {
     root: PathBuf,
+    locks: RepoLocks,
 }
 
 impl WorktreeManager {
     pub fn new(root: &Path) -> Self {
-        WorktreeManager { root: root.to_path_buf() }
+        WorktreeManager { root: root.to_path_buf(), locks: Arc::default() }
+    }
+
+    /// The lock of the repository `repo` belongs to (the same for its main checkout and
+    /// every worktree of it).
+    fn repo_lock(&self, repo: &Path) -> Result<Arc<Mutex<()>>> {
+        let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        let key = std::fs::canonicalize(&common).unwrap_or_else(|_| PathBuf::from(common));
+        let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(locks.entry(key).or_default().clone())
     }
 
     /// `~/.mirante/worktrees`.
@@ -187,6 +204,8 @@ impl WorktreeManager {
         if let Some(b) = base {
             validate_base(b)?;
         }
+        let lock = self.repo_lock(repo)?;
+        let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
         let path = self.path_for(repo, branch)?;
         if path.exists() {
             return Err(CoreError::Git {
@@ -220,7 +239,9 @@ impl WorktreeManager {
     /// then deletes its branch only if `create` made it and it still points at the commit
     /// it started from (an atomic compare-and-delete), so no work is ever lost.
     pub fn discard(&self, repo: &Path, wt: &Worktree) -> Result<()> {
-        self.remove(repo, &wt.path)?;
+        let lock = self.repo_lock(repo)?;
+        let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.remove_locked(repo, &wt.path)?;
         if let (true, Some(branch)) = (wt.created_branch, &wt.branch) {
             let r#ref = format!("refs/heads/{branch}");
             let now = git(repo, &["rev-parse", "--verify", "--quiet", "--end-of-options", &r#ref]);
@@ -236,6 +257,13 @@ impl WorktreeManager {
     /// If the directory is already gone (deleted by hand), the path is checked against the
     /// root lexically and `git worktree prune` drops the stale metadata.
     pub fn remove(&self, repo: &Path, path: &Path) -> Result<()> {
+        let lock = self.repo_lock(repo)?;
+        let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.remove_locked(repo, path)
+    }
+
+    /// [`WorktreeManager::remove`] with the repo lock already held.
+    fn remove_locked(&self, repo: &Path, path: &Path) -> Result<()> {
         let root = resolve(&self.root)?;
         let path = resolve(path)?;
         if path == root || !path.starts_with(&root) {
@@ -247,6 +275,31 @@ impl WorktreeManager {
             git(repo, &["worktree", "prune"])?;
         }
         Ok(())
+    }
+
+    /// Every checkout directory under the root (canonical paths): a directory holding a
+    /// `.git` entry, not descended into. Whatever repository it belongs to.
+    pub fn checkouts(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone())];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.filter_map(|e| e.ok()) {
+                // Not following symlinks: only real directories under the root count.
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let p = e.path();
+                if p.join(".git").exists() {
+                    out.push(p);
+                } else {
+                    stack.push(p);
+                }
+            }
+        }
+        out
     }
 
     /// Worktrees of `repo` that live under this manager's root.
@@ -460,6 +513,52 @@ mod tests {
         let escape = dir.path().join("wt/my-app/../../elsewhere/x");
         assert!(matches!(mgr.remove(&repo, &escape), Err(CoreError::OutsideRoot { .. })));
         assert!(matches!(mgr.remove(&repo, &dir.path().join("nowhere/x")), Err(CoreError::OutsideRoot { .. })));
+    }
+
+    #[test]
+    fn concurrent_creates_on_one_repo_with_different_branches_all_succeed() {
+        let dir = TempDir::new("wt-concurrent");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (mgr, repo) = (mgr.clone(), repo.clone());
+                std::thread::spawn(move || mgr.create(&repo, &format!("par-{i}"), None).map(|w| w.path))
+            })
+            .collect();
+        for h in handles {
+            let path = h.join().unwrap().unwrap();
+            assert!(path.join("README.md").is_file());
+        }
+        assert_eq!(mgr.list(&repo).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn one_lock_per_repository_shared_by_its_worktrees_and_clones() {
+        let dir = TempDir::new("wt-lock");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let wt = mgr.create(&repo, "a", None).unwrap();
+        let other = WorktreeManager::new(&dir.path().join("wt")).clone();
+        let a = mgr.repo_lock(&repo).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &mgr.repo_lock(&wt.path).unwrap()), "a worktree locks its repository");
+        assert!(std::sync::Arc::ptr_eq(&a, &mgr.clone().repo_lock(&repo.join(".")).unwrap()), "clones share locks");
+        assert!(!std::sync::Arc::ptr_eq(&a, &other.repo_lock(&repo).unwrap()), "separate managers do not");
+    }
+
+    #[test]
+    fn checkouts_lists_every_worktree_directory_under_the_root() {
+        let dir = TempDir::new("wt-checkouts");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        assert!(mgr.checkouts().is_empty(), "no root yet");
+        let a = mgr.create(&repo, "a", None).unwrap();
+        let b = mgr.create(&repo, "pedro/b", None).unwrap();
+        std::fs::create_dir_all(dir.path().join("wt/my-app/not-a-checkout/x")).unwrap();
+        let mut got = mgr.checkouts();
+        got.sort();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        assert_eq!(got, vec![canon(&a.path), canon(&b.path)]);
     }
 
     #[test]

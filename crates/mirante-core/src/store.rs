@@ -11,8 +11,11 @@ use crate::model::{
 };
 
 /// Embedded, ordered schema migrations. `PRAGMA user_version` records the last applied one.
-const MIGRATIONS: &[(i64, &str)] =
-    &[(1, include_str!("migrations/0001_init.sql")), (2, include_str!("migrations/0002_permission_answered_once.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("migrations/0001_init.sql")),
+    (2, include_str!("migrations/0002_permission_answered_once.sql")),
+    (3, include_str!("migrations/0003_lifecycle_archiving.sql")),
+];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
@@ -67,13 +70,23 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens (creating if needed) the database at `path`. The file is created `0600` and
+    /// SQLite gives its `-wal` / `-shm` files the database file's mode; an existing file
+    /// (and its sidecars) is tightened to `0600` too: the store holds prompts and code.
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
             }
         }
-        Store::init(Connection::open(path)?)
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path)?;
+        }
+        make_private(path)?;
+        let store = Store::init(Connection::open(path)?)?;
+        make_private(path)?;
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Store> {
@@ -85,8 +98,8 @@ impl Store {
         // Returns the resulting mode ("wal" on disk, "memory" for in-memory databases).
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         check_journal_mode(&mode)?;
-        conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Leaves foreign keys on.
         migrate(&mut conn)?;
         Ok(Store { conn, boot_id: new_id() })
     }
@@ -105,14 +118,39 @@ impl Store {
     }
 }
 
+/// `0600` on the database file and its existing `-wal` / `-shm` sidecars.
+fn make_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+            other => other?,
+        }
+    }
+    Ok(())
+}
+
+/// Applies the pending migrations, each in its own transaction. Foreign keys are off while
+/// they run (a table rebuild drops the parent table; `PRAGMA foreign_keys` is a no-op inside
+/// a transaction) and every migration must leave `foreign_key_check` clean.
 fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
     for (version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v > current) {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
+        let broken: Option<String> = tx.query_row("PRAGMA foreign_key_check", [], |r| r.get(0)).optional()?;
+        if let Some(table) = broken {
+            return Err(CoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some(format!("migration {version} left a dangling foreign key in {table}")),
+            )));
+        }
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
     }
+    conn.pragma_update(None, "foreign_keys", true)?;
     Ok(())
 }
 
@@ -120,16 +158,37 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    use std::path::PathBuf;
 
     #[test]
     fn migrates_to_latest_version_once() {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 2);
+        assert_eq!(s.schema_version().unwrap(), 3);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 2);
+        assert_eq!(s.schema_version().unwrap(), 3);
+    }
+
+    #[test]
+    fn database_files_are_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("store-perms");
+        let path = dir.path().join("mirante.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.append_event(None, "x", &json!({})).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(p.exists(), "{}", p.display());
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
+        }
+        drop(s);
+        // A database created world-readable by an older build is tightened on open.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _s = Store::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
@@ -375,6 +434,9 @@ mod task_tests {
     fn archived_tasks_are_hidden_unless_asked() {
         let mut s = Store::open_in_memory().unwrap();
         let a = s.create_task(sample_task("feat-a")).unwrap();
+        s.transition_lifecycle(&a.id, Lifecycle::Archiving).unwrap();
+        // Still listed while its worktree is being removed.
+        assert_eq!(s.list_tasks(false).unwrap().len(), 1);
         s.transition_lifecycle(&a.id, Lifecycle::Archived).unwrap();
         assert!(s.list_tasks(false).unwrap().is_empty());
         assert_eq!(s.list_tasks(true).unwrap().len(), 1);
@@ -523,7 +585,7 @@ impl Store {
 
     /// Starts a process activation. Per-task lock: fails with `TaskBusy` while another session
     /// of the task is live (also enforced by a partial unique index). A `Created` task becomes
-    /// `Active`; an `Archived` task cannot start sessions.
+    /// `Active`; an `Archiving` or `Archived` task cannot start sessions.
     pub fn start_session(&mut self, task_id: &str, conversation_id: &str) -> Result<Session> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = load_task(&tx, task_id)?;
@@ -537,8 +599,12 @@ impl Store {
                 task_id: task_id.to_string(),
             });
         }
-        if task.lifecycle == Lifecycle::Archived {
-            return Err(CoreError::InvalidTransition { kind: "session", from: "archived".into(), to: "live".into() });
+        if matches!(task.lifecycle, Lifecycle::Archiving | Lifecycle::Archived) {
+            return Err(CoreError::InvalidTransition {
+                kind: "session",
+                from: task.lifecycle.as_str().into(),
+                to: "live".into(),
+            });
         }
         let busy: Option<String> = tx
             .query_row("SELECT id FROM sessions WHERE task_id = ?1 AND ended_at IS NULL", [task_id], |r| r.get(0))
@@ -754,6 +820,9 @@ mod session_tests {
         let sess = s.start_session(&t.id, &c.id).unwrap();
         assert_eq!(s.get_task(&t.id).unwrap().lifecycle, Lifecycle::Active);
         s.end_session(&sess.id).unwrap();
+        s.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
+        let err = s.start_session(&t.id, &c.id).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidTransition { kind: "session", .. }), "archiving: {err}");
         s.transition_lifecycle(&t.id, Lifecycle::Archived).unwrap();
         let err = s.start_session(&t.id, &c.id).unwrap_err();
         assert!(matches!(err, CoreError::InvalidTransition { kind: "session", .. }), "{err}");
@@ -897,6 +966,17 @@ impl Store {
         Ok(p)
     }
 
+    /// Requests of any status whose id is `id` or ends with it (a suffix of at least 4
+    /// characters), oldest first.
+    pub fn permissions_matching(&self, id: &str) -> Result<Vec<PermissionRequest>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PERMISSION_COLUMNS} FROM permission_requests
+             WHERE id = ?1 OR (length(?1) >= 4 AND substr(id, -length(?1)) = ?1) ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map([id], permission_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn pending_permissions(&self, task_id: &str) -> Result<Vec<PermissionRequest>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PERMISSION_COLUMNS} FROM permission_requests WHERE task_id = ?1 AND status = 'pending' ORDER BY created_at, id"
@@ -931,6 +1011,22 @@ mod permission_tests {
         assert!(s.pending_permissions(&t.id).unwrap().is_empty());
         let again = s.answer_permission(&p.id, PermissionStatus::AllowedOnce).unwrap_err();
         assert!(matches!(again, CoreError::InvalidTransition { kind: "permission", .. }), "{again}");
+    }
+
+    #[test]
+    fn permissions_are_found_by_id_or_suffix_whatever_their_status() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = s.create_task(sample_task("feat-a")).unwrap();
+        let c = s.create_conversation(&t.id).unwrap();
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        let p = s.create_permission_request(&sess.id, "Bash", "ls").unwrap();
+        s.answer_permission(&p.id, PermissionStatus::Denied).unwrap();
+        let by_id = s.permissions_matching(&p.id).unwrap();
+        assert_eq!((by_id.len(), by_id[0].status), (1, PermissionStatus::Denied));
+        assert_eq!(s.permissions_matching(&p.id[p.id.len() - 6..]).unwrap().len(), 1);
+        // Too short for a suffix, or not a match (LIKE wildcards are not special).
+        assert!(s.permissions_matching(&p.id[p.id.len() - 3..]).unwrap().is_empty());
+        assert!(s.permissions_matching("%%%%").unwrap().is_empty());
     }
 
     #[test]
@@ -1025,6 +1121,39 @@ mod hardening_tests {
         assert!(raw.is_err(), "trigger must block re-answering a pre-upgrade row");
         let err = s.answer_permission("p", PermissionStatus::AllowedOnce).unwrap_err();
         assert!(matches!(err, CoreError::InvalidTransition { kind: "permission", .. }), "{err}");
+    }
+
+    /// A v2 database (lifecycle CHECK without 'archiving') is rebuilt by 0003: rows and
+    /// foreign keys survive, and 'archiving' is accepted.
+    #[test]
+    fn v2_database_upgrades_to_accept_archiving() {
+        let dir = crate::test_support::TempDir::new("store-v2");
+        let path = dir.path().join("m.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0].1).unwrap();
+            conn.execute_batch(MIGRATIONS[1].1).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks VALUES ('t', 'x', '/r', '/w', 'b', 'claude', 'g', 'n', 'active', 'idle', 5, 6);
+                 INSERT INTO conversations VALUES ('c', 't', NULL, 0);
+                 INSERT INTO sessions VALUES ('s', 't', 'c', 0, 1, NULL, 0);",
+            )
+            .unwrap();
+            assert!(conn.execute("UPDATE tasks SET lifecycle = 'archiving'", []).is_err());
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 3);
+        let t = s.get_task("t").unwrap();
+        assert_eq!((t.goal.as_str(), t.notes.as_str(), t.created_at, t.updated_at), ("g", "n", 5, 6));
+        assert_eq!(s.transition_lifecycle("t", Lifecycle::Archiving).unwrap().lifecycle, Lifecycle::Archiving);
+        let fk: i64 = s.conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 1);
+        let dangling = s.conn.execute("INSERT INTO conversations VALUES ('c2', 'no-such-task', NULL, 0)", []);
+        assert!(dangling.is_err(), "foreign keys still point at the rebuilt table");
+        let broken: Option<String> = s.conn.query_row("PRAGMA foreign_key_check", [], |r| r.get(0)).optional().unwrap();
+        assert_eq!(broken, None);
+        assert!(s.conn.execute("UPDATE tasks SET lifecycle = 'bogus'", []).is_err());
     }
 
     #[test]

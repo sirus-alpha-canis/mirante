@@ -51,6 +51,32 @@ fn watch_log(path: PathBuf) {
     });
 }
 
+/// Exit code when the driver-event pump stops (EX_SOFTWARE).
+const PUMP_DIED: i32 = 70;
+
+/// The pump applies every driver event (status, exits, permissions); a daemon without it
+/// would serve stale state forever. Should it ever end (a panic past its per-event guard,
+/// or its channel closing) the daemon says so and exits non-zero; `mirante` starts a
+/// fresh one, whose recovery ends the orphaned sessions.
+fn watch_pump(pump: std::thread::JoinHandle<()>, socket: PathBuf) {
+    std::thread::spawn(move || {
+        let how = match pump.join() {
+            Ok(()) => "its channel closed".to_string(),
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown panic".into());
+                format!("it panicked: {msg}")
+            }
+        };
+        eprintln!("mirante-daemon: FATAL: the driver-event pump stopped ({how}); exiting");
+        let _ = std::fs::remove_file(&socket);
+        std::process::exit(PUMP_DIED);
+    });
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = Paths::from_env()?;
     paths.ensure_home()?;
@@ -64,7 +90,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let hub = Arc::new(hub);
     let report = hub.recover()?;
     eprintln!("mirante-daemon: recovered {report:?}");
-    hub.spawn_pump(rx);
+    let pump = hub.spawn_pump(rx);
+    watch_pump(pump, paths.socket());
     let listener = server::bind(&paths.socket())?;
     eprintln!("mirante-daemon: pid {} listening on {}", std::process::id(), paths.socket().display());
     let socket = paths.socket();

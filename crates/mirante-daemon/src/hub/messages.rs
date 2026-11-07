@@ -27,6 +27,36 @@ impl State {
     }
 }
 
+impl State {
+    /// An already answered request named by `id` (full id or unique suffix): returned as
+    /// stored when its answer is `answer`, a conflict otherwise. `not_found` is the error
+    /// when nothing matches.
+    fn answered_permission(&self, id: &str, answer: PermissionStatus, not_found: String) -> Result<PermissionRequest> {
+        let mut found: Vec<PermissionRequest> = self
+            .store
+            .permissions_matching(id.trim())?
+            .into_iter()
+            .filter(|p| p.status != PermissionStatus::Pending)
+            .collect();
+        match found.len() {
+            0 => Err(HubError::NotFound(not_found)),
+            1 => {
+                let p = found.remove(0);
+                if p.status == answer {
+                    Ok(p)
+                } else {
+                    Err(HubError::Conflict(format!(
+                        "permission request {} was already answered: {}",
+                        p.id,
+                        p.status.as_str()
+                    )))
+                }
+            }
+            _ => Err(HubError::Conflict(format!("permission id {id} is ambiguous"))),
+        }
+    }
+}
+
 impl Hub {
     /// Steer: hand the message to the agent now (starts a turn if idle). Refused while a
     /// dialog is open, because typed text would answer it. Queue: hold it until the running
@@ -99,9 +129,18 @@ impl Hub {
     /// one-time option; Codex: answers the JSON-RPC request); only then is the answer
     /// persisted. Claude dialogs are answered in order, oldest first. Once the driver has
     /// answered, the answer stands: a failure to record it is logged, not returned.
+    /// Repeating the answer a request already has returns its stored row without acting
+    /// again (a client retry); a different answer to it is a conflict.
     pub fn answer_permission(&self, a: AnswerPermission) -> Result<PermissionRequest> {
         let mut st = self.lock();
-        let p = st.find_permission(&a.id)?;
+        let status = if a.allow { PermissionStatus::AllowedOnce } else { PermissionStatus::Denied };
+        let p = match st.find_permission(&a.id) {
+            Ok(p) => p,
+            // Not pending: a retry of an answer that already stands returns the stored row
+            // (idempotent); any other answer to an answered card is a conflict.
+            Err(HubError::NotFound(m)) => return st.answered_permission(&a.id, status, m),
+            Err(e) => return Err(e),
+        };
         let l = st
             .live
             .get(&p.task_id)
@@ -126,7 +165,6 @@ impl Hub {
             })?,
         };
         driver.answer_permission(&key, a.allow)?;
-        let status = if a.allow { PermissionStatus::AllowedOnce } else { PermissionStatus::Denied };
         let answered = match st.store.answer_permission(&p.id, status) {
             Ok(answered) => answered,
             Err(e) => {
@@ -243,7 +281,33 @@ mod tests {
         assert_eq!(a.status, PermissionStatus::AllowedOnce);
         assert_eq!(k.calls(), vec!["answer:touch x:true".to_string()]);
         assert_eq!(k.hub.get_task(&t.id).unwrap().task.status, Status::Working);
-        assert!(matches!(k.hub.answer_permission(AnswerPermission { id, allow: false }), Err(HubError::NotFound(_))));
+        assert!(matches!(k.hub.answer_permission(AnswerPermission { id, allow: false }), Err(HubError::Conflict(_))));
+    }
+
+    #[test]
+    fn repeating_the_same_answer_returns_the_stored_row() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}));
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        let first = k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }).unwrap();
+        // A retry (the client lost the reply), by full id or by suffix: same row, nothing typed again.
+        let again = k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }).unwrap();
+        assert_eq!(again, first);
+        let by_suffix = k.hub.answer_permission(AnswerPermission { id: id[id.len() - 6..].into(), allow: true });
+        assert_eq!(by_suffix.unwrap(), first);
+        assert_eq!(k.calls().iter().filter(|c| c.starts_with("answer:")).count(), 1);
+        // A different answer to the answered card stays a conflict.
+        let other = k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: false });
+        assert!(matches!(other, Err(HubError::Conflict(_))), "{other:?}");
+        // The idempotent path also works once the session is gone.
+        k.hub.stop(&t.id).unwrap();
+        assert_eq!(k.hub.answer_permission(AnswerPermission { id, allow: true }).unwrap(), first);
+        assert!(matches!(
+            k.hub.answer_permission(AnswerPermission { id: "no-such-permission".into(), allow: true }),
+            Err(HubError::NotFound(_))
+        ));
     }
 
     #[test]

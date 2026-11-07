@@ -2,7 +2,7 @@
 //! the `Store` (which persists each transition with its audit event), then publishes the
 //! new events to subscribers. Submodules add the session lifecycle (`session`) and
 //! messaging / permissions (`messages`).
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -189,8 +189,6 @@ pub(crate) struct State {
     pub(crate) last_seq: u64,
     /// Bounded ([`SUB_QUEUE`]): a subscriber that falls behind is dropped, not buffered.
     pub(crate) subscribers: Vec<mpsc::SyncSender<Event>>,
-    /// Tasks whose worktree is being removed by `archive` (no session may start meanwhile).
-    pub(crate) archiving: HashSet<String>,
     /// Recently applied hook `event_id`s (a hook may deliver and also spool one event).
     pub(crate) seen_hooks: session::SeenHooks,
 }
@@ -335,7 +333,6 @@ impl Hub {
                 live: HashMap::new(),
                 last_seq,
                 subscribers: Vec::new(),
-                archiving: HashSet::new(),
                 seen_hooks: session::SeenHooks::default(),
             }),
             worktrees: WorktreeManager::new(&paths.worktrees()),
@@ -365,7 +362,11 @@ impl Hub {
             return Err(HubError::Invalid("the goal is empty".into()));
         }
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
-        // git is slow: no lock held while the worktree is created.
+        // Worktree first, then the task row (rolled back below if the row fails). A crash in
+        // between leaves a checkout no task owns: recovery reports it as an orphan and never
+        // deletes it (it may hold the user's branch). The other order would need a row
+        // state for "worktree not made yet" and deleting rows the audit trail names.
+        // git is slow: no hub lock held while the worktree is created.
         let wt = self.worktrees.create(&repo, &p.branch, p.base.as_deref())?;
         let title = p.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| title_from_goal(&p.goal));
         let new = NewTask {
@@ -406,6 +407,11 @@ impl Hub {
 
     /// Removes the worktree (git refuses a dirty one) and archives the task. The branch is
     /// kept. Refused while a session is live.
+    ///
+    /// Crash-safe: `Archiving` is persisted before the worktree is touched (no session may
+    /// start meanwhile), then `Archived` after. A removal that fails puts the task back to
+    /// `Active` (`archive_failed` says why); a crash in between is finished or undone by
+    /// [`Hub::recover`].
     pub fn archive(&self, reference: &str) -> Result<TaskView> {
         let task = {
             let mut st = self.lock();
@@ -413,24 +419,31 @@ impl Hub {
             if st.live.contains_key(&t.id) {
                 return Err(HubError::Conflict(format!("task {} has a live session: stop it first", t.branch)));
             }
-            if st.archiving.contains(&t.id) {
-                return Err(HubError::Conflict(format!("task {} is already being archived", t.branch)));
+            match t.lifecycle {
+                Lifecycle::Archiving => {
+                    return Err(HubError::Conflict(format!("task {} is already being archived", t.branch)))
+                }
+                Lifecycle::Archived => {
+                    return Err(HubError::Conflict(format!("task {} is already archived", t.branch)))
+                }
+                Lifecycle::Created | Lifecycle::Active => {}
             }
-            if t.lifecycle == Lifecycle::Archived {
-                return Err(HubError::Conflict(format!("task {} is already archived", t.branch)));
-            }
-            // Until the worktree is gone no session may start (it would run in a directory
-            // being deleted).
-            st.archiving.insert(t.id.clone());
+            let t = st.store.transition_lifecycle(&t.id, Lifecycle::Archiving)?;
+            st.publish();
             t
         };
         let removed = self.worktrees.remove(Path::new(&task.repo_path), Path::new(&task.worktree_path));
         let mut st = self.lock();
-        let archived = removed
-            .map_err(HubError::from)
-            .and_then(|()| st.store.transition_lifecycle(&task.id, Lifecycle::Archived).map_err(HubError::from));
-        st.archiving.remove(&task.id);
-        let t = archived?;
+        if let Err(e) = removed {
+            let undo = st.store.transition_lifecycle(&task.id, Lifecycle::Active);
+            let _ = st.event(Some(&task.id), "archive_failed", json!({ "error": e.to_string() }));
+            if let Err(u) = undo {
+                st.log_error(Some(&task.id), "archive rollback", &u);
+            }
+            st.publish();
+            return Err(e.into());
+        }
+        let t = st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
         let v = st.view(t)?;
         st.publish();
         Ok(v)
@@ -625,6 +638,41 @@ mod tests {
         assert!(k.hub.list_tasks(false).unwrap().is_empty());
         assert_eq!(k.hub.list_tasks(true).unwrap().len(), 1);
         assert!(matches!(k.hub.archive(&t.id), Err(HubError::Conflict(_))));
+    }
+
+    fn lifecycle_moves(k: &Kit, task: &str) -> Vec<String> {
+        k.hub
+            .lock()
+            .store
+            .task_events(task)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "lifecycle")
+            .map(|e| e.payload["to"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn archive_persists_archiving_before_removing_the_worktree() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "gone").task;
+        k.hub.archive("gone").unwrap();
+        assert_eq!(lifecycle_moves(&k, &t.id), vec!["archiving", "archived"]);
+    }
+
+    #[test]
+    fn a_failed_archive_puts_the_task_back_and_says_why() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "dirty").task;
+        std::fs::write(Path::new(&t.worktree_path).join("wip.txt"), "unsaved\n").unwrap();
+        assert!(k.hub.archive("dirty").is_err());
+        let v = k.hub.get_task(&t.id).unwrap();
+        assert_eq!(v.task.lifecycle, Lifecycle::Active);
+        assert!(Path::new(&t.worktree_path).join("wip.txt").exists());
+        assert_eq!(lifecycle_moves(&k, &t.id), vec!["archiving", "active"]);
+        assert!(k.kinds(&t.id).contains(&"archive_failed".to_string()));
+        // A session may start again.
+        k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
     }
 
     #[test]

@@ -161,8 +161,8 @@ impl State {
     /// leaving `NeedsYou` because the turn ended (or was interrupted) settles the requests
     /// still pending; reaching `Idle` classifies Claude steers and delivers the next queued
     /// message. Leaving it because Mirante answered (`mirante:permission_*` /
-    /// `mirante:approval_*`, already persisted) or because a tool ran (`hook:PostToolUse`,
-    /// which settles only its own card) settles nothing else.
+    /// `mirante:approval_*`, already persisted) or because a tool ran (`hook:PostToolUse` /
+    /// `hook:PostToolUseFailure`, which settle only their own card) settles nothing else.
     pub(crate) fn after_input(
         &mut self,
         task_id: &str,
@@ -178,7 +178,8 @@ impl State {
             // `mirante:approval_answered`) is already persisted; a tool run settles its card.
             let targeted = cause.starts_with("mirante:permission_")
                 || cause.starts_with("mirante:approval_")
-                || cause == "hook:PostToolUse";
+                || cause == "hook:PostToolUse"
+                || cause == "hook:PostToolUseFailure";
             if from == Status::NeedsYou && to != Status::NeedsYou && !targeted {
                 self.settle_permissions(task_id, &cause)?;
             }
@@ -220,8 +221,9 @@ impl State {
         Ok(())
     }
 
-    /// A `PostToolUse` of the live Claude session: the tool behind the oldest matching card
-    /// ran, so the user allowed it (in the attached terminal).
+    /// A `PostToolUse` / `PostToolUseFailure` of the live Claude session: the tool behind the
+    /// oldest matching card ran (successfully or not), so the user allowed it (in the
+    /// attached terminal).
     fn settle_tool_ran(&mut self, task_id: &str, session_id: &str, ev: &HookEvent) -> Result<()> {
         let Some(l) = self.live.get(task_id) else {
             return Ok(());
@@ -233,7 +235,10 @@ impl State {
             .filter(|p| p.session_id == session_id)
             .find(|p| l.dialogs.get(&p.id).is_some_and(|k| k.answered_by(ev)));
         match card {
-            Some(p) => self.settle_card(task_id, &p.id, PermissionStatus::AllowedOnce, "hook:PostToolUse"),
+            Some(p) => {
+                let cause = format!("hook:{}", ev.hook_event_name);
+                self.settle_card(task_id, &p.id, PermissionStatus::AllowedOnce, &cause)
+            }
             None => Ok(()),
         }
     }
@@ -252,6 +257,11 @@ impl State {
     }
 
     fn handle(&mut self, task_id: &str, session_id: &str, event: DriverEvent) -> Result<()> {
+        #[cfg(test)]
+        if let DriverEvent::Step(v) = &event {
+            // Test-only: a bug reached while handling an event.
+            assert!(v.get("test_panic").is_none(), "test panic handling {v}");
+        }
         match event {
             DriverEvent::Transcript(line) => {
                 if let Some(l) = self.live.get_mut(task_id) {
@@ -320,11 +330,13 @@ impl Hub {
             if task.lifecycle == Lifecycle::Archived {
                 return Err(HubError::Conflict(format!("task {} is archived", task.branch)));
             }
+            // Until the worktree is gone no session may start (it would run in a directory
+            // being deleted).
+            if task.lifecycle == Lifecycle::Archiving {
+                return Err(HubError::Conflict(format!("task {} is being archived", task.branch)));
+            }
             if st.live.contains_key(&task.id) {
                 return Err(HubError::Conflict(format!("task {} already has a live session", task.branch)));
-            }
-            if st.archiving.contains(&task.id) {
-                return Err(HubError::Conflict(format!("task {} is being archived", task.branch)));
             }
             // Resume continues the latest conversation; a plain start opens a fresh one
             // unless the latest never got a native id (nothing to lose).
@@ -524,8 +536,8 @@ impl Hub {
     /// already seen is dropped (the hook may deliver an event and also spool it). Records
     /// the native session id and the transcript path (starting the tailer), persists
     /// permission requests, and feeds the status engine. A payload for a task without a
-    /// live Claude session, or (once the native session id is known) from another native
-    /// session, is only logged.
+    /// live Claude session, stamped with another Mirante session (`hook_stale`), or (once
+    /// the native session id is known) from another native session, is only logged.
     pub fn apply_hook_envelope(&self, e: HookEnvelope) -> Result<()> {
         let mut st = self.lock();
         if let Some(id) = &e.event_id {
@@ -533,6 +545,7 @@ impl Hub {
                 return Ok(());
             }
         }
+        let stamped = e.session;
         let p = e.params;
         let ev = match HookEvent::parse(&p.payload) {
             Ok(ev) => ev,
@@ -550,6 +563,15 @@ impl Hub {
         };
         let session_id = live.session_id.clone();
         let native = live.native_id.clone();
+        // Generation fence: a hook stamped with an earlier Mirante session of this task (its
+        // Claude process outlived the session, or the hook was slow) must not touch the new
+        // one. Unstamped hooks (an older hook binary) are still applied.
+        if let Some(stale) = stamped.filter(|s| *s != session_id) {
+            let payload = json!({ "hook": ev.hook_event_name, "session": stale, "live_session": session_id });
+            st.event(Some(&p.task), "hook_stale", payload)?;
+            st.publish();
+            return Ok(());
+        }
         if ev.hook_event_name != "SessionStart" {
             if let (Some(known), Some(sid)) = (native.as_deref(), ev.session_id.as_deref()) {
                 if known != sid {
@@ -571,7 +593,8 @@ impl Hub {
         if ev.hook_event_name == "PermissionRequest" {
             st.open_card(&p.task, &session_id, &ev)?;
         }
-        let tool_ran = ev.hook_event_name == "PostToolUse";
+        // A tool that failed still ran: its dialog was allowed.
+        let tool_ran = matches!(ev.hook_event_name.as_str(), "PostToolUse" | "PostToolUseFailure");
         st.feed_claude(&p.task, &Input::Hook(ev.clone()))?;
         if tool_ran {
             st.settle_tool_ran(&p.task, &session_id, &ev)?;
@@ -593,18 +616,48 @@ impl Hub {
         st.publish();
     }
 
-    /// Applies every queued driver event now (tests; the daemon uses the pump thread).
-    pub fn drain(&self, rx: &EventRx) {
-        while let Ok((session_id, event)) = rx.try_recv() {
-            self.handle_driver_event(&session_id, event);
+    /// [`Hub::handle_driver_event`] that survives a panic: the panic is logged (stderr and a
+    /// `daemon_error` event) and the next event is handled as usual. One bad event must not
+    /// stop every session's status updates. The hub mutex may be left poisoned; [`Hub::lock`]
+    /// recovers it.
+    pub fn handle_driver_event_guarded(&self, session_id: &str, event: DriverEvent) {
+        let kind = format!("{event:?}").chars().take(80).collect::<String>();
+        let run = std::panic::AssertUnwindSafe(|| self.handle_driver_event(session_id, event));
+        if let Err(panic) = std::panic::catch_unwind(run) {
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".into());
+            let mut st = self.lock();
+            let task = st.task_of_session(session_id);
+            eprintln!("mirante-daemon: driver event panicked (session {session_id}, {kind}): {msg}");
+            let payload = json!({
+                "context": "driver event panicked",
+                "error": msg,
+                "session_id": session_id,
+                "event": kind,
+            });
+            let _ = st.event(task.as_deref(), "daemon_error", payload);
+            st.publish();
         }
     }
 
+    /// Applies every queued driver event now (tests; the daemon uses the pump thread).
+    pub fn drain(&self, rx: &EventRx) {
+        while let Ok((session_id, event)) = rx.try_recv() {
+            self.handle_driver_event_guarded(&session_id, event);
+        }
+    }
+
+    /// The thread that applies driver events. It only ends if the channel closes (never:
+    /// the hub keeps a sender) or a panic escapes the guard; the daemon watches the handle
+    /// and exits loudly then.
     pub fn spawn_pump(self: &Arc<Self>, rx: EventRx) -> std::thread::JoinHandle<()> {
         let hub = Arc::clone(self);
         std::thread::spawn(move || {
             for (session_id, event) in rx {
-                hub.handle_driver_event(&session_id, event);
+                hub.handle_driver_event_guarded(&session_id, event);
             }
         })
     }
@@ -682,6 +735,19 @@ impl super::testkit::Kit {
     pub fn hook(&self, task_id: &str, payload: Value) {
         self.hub
             .apply_hook(mirante_ipc::types::HookParams { task: task_id.into(), payload: payload.to_string(), ts_ms: 0 })
+            .unwrap();
+    }
+
+    /// A hook stamped with the Mirante session it ran under (`MIRANTE_SESSION_ID`).
+    pub fn hook_session(&self, task_id: &str, payload: Value, session: &str) {
+        self.hub
+            .apply_hook_envelope(mirante_ipc::types::HookEnvelope {
+                params: HookParams { task: task_id.into(), payload: payload.to_string(), ts_ms: 0 },
+                event_id: None,
+                received_ts_ms: None,
+                truncated: None,
+                session: Some(session.into()),
+            })
             .unwrap();
     }
 
@@ -1107,13 +1173,106 @@ mod tests {
     fn start_is_refused_while_the_task_is_being_archived() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
-        k.hub.lock().archiving.insert(t.id.clone());
+        k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
         let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false);
         assert!(matches!(r, Err(HubError::Conflict(_))), "{:?}", r.err());
         assert!(matches!(k.hub.archive(&t.id), Err(HubError::Conflict(_))));
-        k.hub.lock().archiving.clear();
-        k.hub.archive(&t.id).unwrap();
-        assert!(k.hub.lock().archiving.is_empty());
+        k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Active).unwrap();
+        assert_eq!(k.hub.archive(&t.id).unwrap().task.lifecycle, Lifecycle::Archived);
+    }
+
+    #[test]
+    fn a_late_hook_from_an_earlier_session_of_the_task_is_dropped() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        let old = k.hub.lock().live[&t.id].session_id.clone();
+        k.hub.stop(&t.id).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        k.emit(DriverEvent::Boot(BootState::Ready));
+        let new = k.hub.lock().live[&t.id].session_id.clone();
+        assert_ne!(old, new);
+        // The old Claude process's hook arrives after the new session started.
+        k.hook_session(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "late"}), &old);
+        k.hook_session(&t.id, perm("t1", "late"), &old);
+        assert_eq!(status(&k, &t.id), Status::Idle);
+        assert!(k.pending(&t.id).is_empty());
+        let stale: Vec<Value> = k
+            .hub
+            .lock()
+            .store
+            .task_events(&t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "hook_stale")
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0]["session"], json!(old));
+        assert_eq!(stale[0]["live_session"], json!(new));
+        // The live session's own hooks pass.
+        k.hook_session(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "now"}), &new);
+        assert_eq!(status(&k, &t.id), Status::Working);
+    }
+
+    #[test]
+    fn hooks_without_a_session_stamp_are_still_accepted() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "old hook binary"}));
+        assert_eq!(status(&k, &t.id), Status::Working);
+        assert!(!k.kinds(&t.id).contains(&"hook_stale".to_string()));
+    }
+
+    #[test]
+    fn post_tool_use_failure_settles_its_card_as_allowed() {
+        let k = Kit::new();
+        let t = two_dialogs(&k);
+        let older = k.pending(&t)[0].id.clone();
+        // The user allowed the older dialog in the terminal; the tool ran and failed.
+        k.hook(&t, tool("PostToolUseFailure", "t1"));
+        assert_eq!(k.pending(&t).len(), 1, "the other card is not settled");
+        assert_eq!(settled(&k, &t), vec![(older, json!(PermissionStatus::AllowedOnce))]);
+        let ev = k.hub.lock().store.task_events(&t).unwrap();
+        let s = ev.iter().find(|e| e.kind == "permission_settled").unwrap();
+        assert_eq!(s.payload["cause"], json!("hook:PostToolUseFailure"));
+        k.hook(&t, tool("PostToolUseFailure", "t2"));
+        assert!(k.pending(&t).is_empty());
+        assert_eq!(status(&k, &t), Status::Working);
+        k.hook(&t, json!({"hook_event_name": "StopFailure"}));
+        assert_eq!(status(&k, &t), Status::Idle);
+    }
+
+    #[test]
+    fn a_panic_handling_one_driver_event_is_logged_and_the_next_still_applies() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::Step(json!({ "test_panic": true })));
+        k.emit(DriverEvent::Status { to: Status::Working, cause: "codex:x".into(), turn_open: true, detail: None });
+        assert_eq!(status(&k, &t.id), Status::Working);
+        let ev = k.hub.lock().store.task_events(&t.id).unwrap();
+        let err = ev.iter().find(|e| e.kind == "daemon_error").expect("panic logged");
+        assert_eq!(err.payload["context"], json!("driver event panicked"));
+    }
+
+    #[test]
+    fn the_pump_thread_survives_a_panicking_event() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        let super::super::testkit::Kit { hub, rx, factory, dir: _dir, .. } = k;
+        let pump = hub.spawn_pump(rx);
+        factory.emit(DriverEvent::Step(json!({ "test_panic": true })));
+        factory.emit(DriverEvent::Status {
+            to: Status::Working,
+            cause: "codex:x".into(),
+            turn_open: true,
+            detail: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hub.get_task(&t.id).unwrap().task.status != Status::Working {
+            assert!(Instant::now() < deadline, "the pump stopped applying events");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pump.is_finished());
     }
 
     #[test]

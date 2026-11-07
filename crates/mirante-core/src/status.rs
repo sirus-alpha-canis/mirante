@@ -9,10 +9,10 @@
 //!   queued prompt the transcript confirmed, on the first main-agent `PreToolUse` after the
 //!   turn's `Stop` (see [`StatusEngine`]). Local-command transcript lines (`<command-name>`,
 //!   `<local-command-stdout>`, ... wrappers, `isMeta` lines) are never prompts.
-//! - A turn closes on a main-agent `Stop`, the idle `Notification`, or the transcript's
-//!   `system` `turn_duration` / `stop_hook_summary` line. The transcript end covers the
-//!   deny path, where no hook fires (S3 mismatch 1); so does the next prompt while the
-//!   main agent's dialog is open.
+//! - A turn closes on a main-agent `Stop` (or `StopFailure`, its API-error form), the
+//!   idle `Notification`, or the transcript's `system` `turn_duration` /
+//!   `stop_hook_summary` line. The transcript end covers the deny path, where no hook fires
+//!   (S3 mismatch 1); so does the next prompt while the main agent's dialog is open.
 //! - Each source numbers turns on its own and a turn end closes only the turn it names, so
 //!   a late line or a late `Stop` of an earlier turn cannot end a newer one (queued prompt,
 //!   Task 8 probe; or the next hook prompt), and either source may run whole turns ahead.
@@ -20,9 +20,10 @@
 //! - Side-agent events (`agent_id` present, `SubagentStart`/`SubagentStop`; transcript
 //!   `isSidechain` / `agentId` / `parentToolUseID`) never open or close a turn. A side
 //!   agent's `PermissionRequest` still means `NeedsYou`: its dialog blocks the session.
-//! - A permission dialog is cleared only by the asking agent's `PostToolUse` (matched by
-//!   `tool_use_id` when both carry one), by [`Input::PermissionAnswered`], or by the turn
-//!   end. `PreToolUse` never clears it: parallel or stray tool calls start while it is open.
+//! - A permission dialog is cleared only by the asking agent's `PostToolUse` or
+//!   `PostToolUseFailure` (matched by `tool_use_id` when both carry one), by
+//!   [`Input::PermissionAnswered`], or by the turn end. `PreToolUse` never clears it:
+//!   parallel or stray tool calls start while it is open.
 //! - `SessionStart` with `source` `startup` / `resume` / `clear` / `fork` is a fresh
 //!   process or context: the engine resets and goes `Idle`, also from `Ended` (a resumed
 //!   session). `compact` (or no source) fires after a mid-turn compaction and only means
@@ -47,7 +48,9 @@ pub enum Input {
     /// Mirante itself answered the open permission dialog (no hook reports the answer).
     /// Allow: back to `Working` (or `Idle` if the asker was a side agent after the turn).
     /// Deny: Claude interrupts the turn; stay `NeedsYou` until the transcript ends it.
-    PermissionAnswered { allowed: bool },
+    PermissionAnswered {
+        allowed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,7 +425,8 @@ impl StatusEngine {
                 // dialog waits.
                 self.settle(was_open, cause)
             }
-            "PostToolUse" => {
+            // A tool that ran and failed finished all the same.
+            "PostToolUse" | "PostToolUseFailure" => {
                 self.forget_tool(ev);
                 if !side {
                     self.follow_mids(false);
@@ -457,7 +461,8 @@ impl StatusEngine {
                 self.set(Status::Idle, cause)
             }
             "Notification" => self.set(Status::NeedsYou, cause),
-            "Stop" if !side => {
+            // `StopFailure`: the turn ended on an API error instead of normally.
+            "Stop" | "StopFailure" if !side => {
                 self.hook_stop();
                 self.settle(was_open, cause)
             }
@@ -1368,6 +1373,32 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn post_tool_use_failure_clears_its_own_dialog_and_tool_bookkeeping() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[ups("go"), tool("PreToolUse", "t1"), perm("t1"), tool("PreToolUse", "t2"), perm("t2")]);
+        assert_eq!(e.apply(&tool("PostToolUseFailure", "t2")), None);
+        assert_eq!((e.status(), e.pending_dialogs()), (Status::NeedsYou, 1));
+        let t = e.apply(&tool("PostToolUseFailure", "t1")).unwrap();
+        assert_eq!((t.to, t.cause.as_str()), (Status::Working, "hook:PostToolUseFailure"));
+        let bare = HookEvent { tool_name: Some("Bash".into()), ..HookEvent::named("PermissionRequest") };
+        assert_eq!(e.tool_use_id_for(&bare), None, "the failed tool's id is forgotten");
+    }
+
+    #[test]
+    fn stop_failure_ends_the_turn_like_stop() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[start("startup"), ups("go"), tool("PreToolUse", "t1")]);
+        assert_eq!(e.status(), Status::Working);
+        let t = e.apply(&hook("StopFailure")).unwrap();
+        assert_eq!((t.to, t.cause.as_str()), (Status::Idle, "hook:StopFailure"));
+        assert!(!e.turn_open());
+        // A side agent's StopFailure moves no turn boundary.
+        e.apply(&ups("again"));
+        assert_eq!(e.apply(&side_tool("StopFailure", "a-1")), None);
+        assert_eq!(e.status(), Status::Working);
+    }
+
+    #[test]
     fn a_duplicate_permission_request_is_one_dialog() {
         let mut e = StatusEngine::new();
         e.apply_all(&[ups("go"), tool("PreToolUse", "t1"), perm("t1"), perm("t1")]);
@@ -2086,9 +2117,12 @@ mod interleaving_tests {
         Stray,
         /// Two tool calls in one turn, each behind its own allowed dialog (sequential).
         TwoDialogs,
+        /// The API call fails: the tool reports `PostToolUseFailure`, the turn ends with
+        /// `StopFailure` instead of `Stop`.
+        Failure,
     }
 
-    const PICK: [Kind; 12] = [
+    const PICK: [Kind; 13] = [
         Kind::Plain,
         Kind::Tool,
         Kind::Allow,
@@ -2101,6 +2135,7 @@ mod interleaving_tests {
         Kind::LocalUps,
         Kind::Stray,
         Kind::TwoDialogs,
+        Kind::Failure,
     ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2203,6 +2238,21 @@ mod interleaving_tests {
                 if kind == Kind::Stray {
                     h.push(hook_ev(k, Other, "PreToolUse (stray)", HookEvent::named("PreToolUse")));
                 }
+            }
+            Kind::Failure => {
+                h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
+                t.push(tx_ev(k, TxStart, "prompt", user("typed", &p)));
+                tool_use(&mut h, &mut t);
+                // Half the time the failing tool ran behind an allowed dialog.
+                let asked = rng.percent(50);
+                if asked {
+                    h.push(hook_ev(k, Perm, "PermissionRequest", tool("PermissionRequest", &id)));
+                }
+                let role = if asked { PermDone } else { Other };
+                h.push(hook_ev(k, role, "PostToolUseFailure", tool("PostToolUseFailure", &id)));
+                t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                ends(&mut t);
+                h.push(hook_ev(k, Stop, "StopFailure", HookEvent::named("StopFailure")));
             }
             Kind::TwoDialogs => {
                 h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
@@ -2501,7 +2551,8 @@ mod interleaving_tests {
     /// over until the transcript says otherwise. Erring the other way would make every
     /// real tool-less queued turn lag.
     fn dup_stop_before_queued(case: &Case, k: usize) -> bool {
-        case.kinds[k - 1] == Kind::QueuedRun && case.dup.as_ref().is_some_and(|(t, l)| *t + 1 == k && l == "H Stop")
+        case.kinds[k - 1] == Kind::QueuedRun
+            && case.dup.as_ref().is_some_and(|(t, l)| *t + 1 == k && (l == "H Stop" || l == "H StopFailure"))
     }
 
     fn describe(case: &Case, seed: (u64, u64), err: &str) -> String {

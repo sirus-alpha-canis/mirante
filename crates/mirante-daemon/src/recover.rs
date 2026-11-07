@@ -1,6 +1,15 @@
 //! Daemon start: agent processes do not outlive the daemon (their PTY / pipes close with
 //! it), so every session still live in the store is ended, its pending permission requests
-//! expire, and the task becomes `Ended`, ready for `mirante resume`. Then hook payloads
+//! expire, messages it had queued but never sent are reported (`queue_dropped`), and the
+//! task becomes `Ended`, ready for `mirante resume`.
+//!
+//! An archive the crash interrupted (`Archiving`) is finished: the worktree is removed if
+//! still there (git refuses a dirty one: the task then goes back to `Active`, with an
+//! `archive_abandoned` event) and the task becomes `Archived`. Checkouts under the worktree
+//! root that no task owns (a crash between `git worktree add` and the task row) are
+//! reported as `worktree_orphan` events, never deleted.
+//!
+//! Then hook payloads
 //! spooled while the daemon was down are ingested: a `SessionStart` among them still
 //! records the native session id, so a session that started while the daemon was down
 //! can be resumed.
@@ -13,9 +22,9 @@
 use std::path::{Path, PathBuf};
 
 use mirante_core::hook::HookEvent;
-use mirante_core::model::{PermissionStatus, Status};
+use mirante_core::model::{Lifecycle, PermissionStatus, Status, Task};
 use mirante_ipc::types::HookEnvelope;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::hub::{Hub, Result, State};
 
@@ -30,6 +39,14 @@ pub struct Recovery {
     /// Lines older than the task's latest conversation.
     pub spool_stale: usize,
     pub spool_unparseable: usize,
+    /// Sessions ended here whose queued messages never went out (one `queue_dropped` each).
+    pub queued_dropped: usize,
+    /// `Archiving` tasks whose archive recovery completed.
+    pub archives_finished: usize,
+    /// `Archiving` tasks put back to `Active` (their worktree could not be removed).
+    pub archives_abandoned: usize,
+    /// Checkouts under the worktree root that no task owns (reported, never deleted).
+    pub orphan_worktrees: Vec<String>,
 }
 
 /// What one spool line did.
@@ -48,7 +65,13 @@ impl Hub {
             if let Err(e) = end_stale_session(&mut st, &task.id, &mut report) {
                 st.log_error(Some(&task.id), "recovery", &e);
             }
+            if task.lifecycle == Lifecycle::Archiving {
+                if let Err(e) = self.finish_archive(&mut st, &task, &mut report) {
+                    st.log_error(Some(&task.id), "recovery: interrupted archive", &e);
+                }
+            }
         }
+        self.report_orphans(&mut st, &mut report)?;
         for file in self.claim_spools(&mut st) {
             let text = match std::fs::read_to_string(&file) {
                 Ok(t) => t,
@@ -76,6 +99,49 @@ impl Hub {
         }
         st.publish();
         Ok(report)
+    }
+
+    /// Finishes an archive a crash interrupted (git work under the hub lock is fine here:
+    /// no client is served before recovery ends).
+    fn finish_archive(&self, st: &mut State, task: &Task, report: &mut Recovery) -> Result<()> {
+        let path = Path::new(&task.worktree_path);
+        // A missing directory only leaves git metadata to prune; that failing (the repo
+        // itself moved) does not bring the worktree back, so the archive still completes.
+        match self.worktrees.remove(Path::new(&task.repo_path), path) {
+            Err(e) if path.exists() => {
+                st.store.transition_lifecycle(&task.id, Lifecycle::Active)?;
+                st.event(Some(&task.id), "archive_abandoned", json!({ "error": e.to_string() }))?;
+                report.archives_abandoned += 1;
+            }
+            _ => {
+                st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
+                report.archives_finished += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checkouts under the worktree root that no live (non-archived) task owns.
+    fn report_orphans(&self, st: &mut State, report: &mut Recovery) -> Result<()> {
+        let owned: Vec<PathBuf> = st
+            .store
+            .list_tasks(false)?
+            .into_iter()
+            .map(|t| std::fs::canonicalize(&t.worktree_path).unwrap_or_else(|_| PathBuf::from(&t.worktree_path)))
+            .collect();
+        let mut orphans: Vec<String> = self
+            .worktrees
+            .checkouts()
+            .into_iter()
+            .filter(|p| !owned.contains(p))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        orphans.sort();
+        for path in &orphans {
+            st.event(None, "worktree_orphan", json!({ "path": path }))?;
+        }
+        report.orphan_worktrees = orphans;
+        Ok(())
     }
 
     /// Renames the live spool to `hook-spool.<boot_id>.jsonl` and returns every claimed
@@ -119,10 +185,45 @@ fn is_claimed(p: &Path) -> bool {
         .is_some_and(|mid| !mid.is_empty())
 }
 
+/// Texts queued (`message_queued`) during session `session_id` of `task_id` and never sent
+/// (no later `message_sent` with the same text), in queue order. The queue lives in memory:
+/// a crash loses it.
+fn unsent_queue(st: &State, task_id: &str, session_id: &str) -> Result<Vec<String>> {
+    let events = st.store.task_events(task_id)?;
+    let started =
+        events.iter().position(|e| e.kind == "session_started" && e.payload["session_id"].as_str() == Some(session_id));
+    let Some(start) = started else {
+        return Ok(Vec::new());
+    };
+    let text = |p: &Value| p["text"].as_str().map(str::to_string);
+    let mut queue: Vec<String> = Vec::new();
+    for e in &events[start + 1..] {
+        match e.kind.as_str() {
+            "message_queued" => queue.extend(text(&e.payload)),
+            "message_sent" => {
+                if let Some(i) = text(&e.payload).and_then(|t| queue.iter().position(|q| *q == t)) {
+                    queue.remove(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(queue)
+}
+
 fn end_stale_session(st: &mut State, task_id: &str, report: &mut Recovery) -> Result<()> {
     let live = st.store.live_session(task_id)?;
     if let Some(s) = &live {
+        let unsent = unsent_queue(st, task_id, &s.id)?;
         st.store.end_session(&s.id)?;
+        if !unsent.is_empty() {
+            st.event(
+                Some(task_id),
+                "queue_dropped",
+                json!({ "messages": unsent, "session_id": s.id, "cause": "mirante:daemon_restart" }),
+            )?;
+            report.queued_dropped += 1;
+        }
         report.sessions_ended += 1;
         for p in st.store.pending_permissions(task_id)? {
             if p.session_id == s.id {
@@ -180,9 +281,10 @@ mod tests {
     use super::*;
     use crate::driver::DriverEvent;
     use crate::hub::testkit::Kit;
-    use mirante_core::model::AgentKind;
+    use mirante_core::model::{AgentKind, Lifecycle};
     use mirante_core::store::Store;
-    use mirante_ipc::types::{HookEnvelope, HookParams, StartSession};
+    use mirante_core::worktree::WorktreeManager;
+    use mirante_ipc::types::{HookEnvelope, HookParams, SendMessage, SendMode, StartSession};
 
     #[test]
     fn restart_ends_live_sessions_expires_permissions_and_keeps_resume_possible() {
@@ -290,6 +392,101 @@ mod tests {
         let restarted = k.hub.get_task(&t.id).unwrap().task.status;
         assert_eq!(restarted, Status::Ended);
         assert!(k.hub.lock().seen_hooks.contains("dup-1"));
+    }
+
+    /// A second hub over the same database, nothing shut down (a crash), recovered.
+    fn crash_and_recover(k: &Kit) -> (Hub, Recovery) {
+        let paths = k.hub.paths().clone();
+        let (mut hub2, _rx) =
+            Hub::new(Store::open(&paths.database()).unwrap(), paths, Box::new(k.factory.clone())).unwrap();
+        hub2.set_boot_timeout(std::time::Duration::ZERO);
+        let r = hub2.recover().unwrap();
+        (hub2, r)
+    }
+
+    fn file_kit() -> Kit {
+        Kit::with_store(|p| Store::open(&p.database()).unwrap())
+    }
+
+    fn task_kinds(hub: &Hub, task: &str) -> Vec<mirante_core::model::Event> {
+        hub.lock().store.task_events(task).unwrap()
+    }
+
+    #[test]
+    fn messages_queued_but_never_sent_are_reported_dropped_after_a_crash() {
+        let k = file_kit();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        for text in ["first", "second"] {
+            let m = SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Queue };
+            assert_eq!(k.hub.send(m).unwrap().delivered, SendMode::Queue);
+        }
+        // The turn ends: "first" goes out, "second" waits for the next turn end.
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 1);
+        let (hub2, r) = crash_and_recover(&k);
+        assert_eq!(r.queued_dropped, 1);
+        let ev = task_kinds(&hub2, &t.id);
+        let dropped: Vec<&mirante_core::model::Event> = ev.iter().filter(|e| e.kind == "queue_dropped").collect();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].payload["messages"], json!(["second"]));
+        assert_eq!(dropped[0].payload["cause"], json!("mirante:daemon_restart"));
+        // Nothing is reported twice by a second restart.
+        let (_hub3, r3) = crash_and_recover(&k);
+        assert_eq!(r3.queued_dropped, 0);
+    }
+
+    #[test]
+    fn an_interrupted_archive_of_a_clean_worktree_is_finished() {
+        let k = file_kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        // Crash after Archiving was persisted, before the worktree was removed.
+        k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
+        let (hub2, r) = crash_and_recover(&k);
+        assert_eq!((r.archives_finished, r.archives_abandoned), (1, 0));
+        assert_eq!(hub2.get_task(&t.id).unwrap().task.lifecycle, Lifecycle::Archived);
+        assert!(!std::path::Path::new(&t.worktree_path).exists());
+    }
+
+    #[test]
+    fn an_interrupted_archive_whose_worktree_is_gone_is_finished() {
+        let k = file_kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
+        std::fs::remove_dir_all(&t.worktree_path).unwrap();
+        let (hub2, r) = crash_and_recover(&k);
+        assert_eq!(r.archives_finished, 1);
+        assert_eq!(hub2.get_task(&t.id).unwrap().task.lifecycle, Lifecycle::Archived);
+    }
+
+    #[test]
+    fn an_interrupted_archive_of_a_dirty_worktree_goes_back_to_active() {
+        let k = file_kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
+        std::fs::write(std::path::Path::new(&t.worktree_path).join("wip.txt"), "unsaved\n").unwrap();
+        let (hub2, r) = crash_and_recover(&k);
+        assert_eq!((r.archives_finished, r.archives_abandoned), (0, 1));
+        assert_eq!(hub2.get_task(&t.id).unwrap().task.lifecycle, Lifecycle::Active);
+        assert!(std::path::Path::new(&t.worktree_path).join("wip.txt").exists());
+        assert!(task_kinds(&hub2, &t.id).iter().any(|e| e.kind == "archive_abandoned"));
+    }
+
+    #[test]
+    fn orphan_managed_worktrees_are_reported_not_deleted() {
+        let k = file_kit();
+        let kept = k.create(AgentKind::Claude, "kept").task;
+        // A worktree made for a task whose row never got written (crash in task.create).
+        let orphan = WorktreeManager::new(&k.hub.paths().worktrees()).create(&k.repo, "orphan", None).unwrap();
+        let (hub2, r) = crash_and_recover(&k);
+        let canon = std::fs::canonicalize(&orphan.path).unwrap().to_string_lossy().into_owned();
+        assert_eq!(r.orphan_worktrees, vec![canon.clone()]);
+        assert!(orphan.path.exists());
+        assert!(std::path::Path::new(&kept.worktree_path).exists());
+        let st = hub2.lock();
+        let ev = st.store.events_since(0, 10_000).unwrap();
+        let e = ev.iter().find(|e| e.kind == "worktree_orphan").expect("reported");
+        assert_eq!(e.payload["path"], json!(canon));
     }
 
     /// Claimed-but-not-ingested spool files left in the home.
