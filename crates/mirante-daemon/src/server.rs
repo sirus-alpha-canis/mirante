@@ -5,14 +5,16 @@
 //! side closes).
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
-use mirante_ipc::types::{method, AttachParams, AttachResult, ListParams, TaskRef};
+use mirante_ipc::types::{method, AttachParams, AttachResult, ListParams, SubscribeParams, TaskRef};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -21,13 +23,54 @@ use crate::hub::{self, Hub};
 
 pub type OnShutdown = Arc<dyn Fn() + Send + Sync>;
 
-/// Binds the socket with mode 0600, replacing a stale file. Call only while holding the
-/// daemon lock, so a live daemon's socket is never removed.
-pub fn bind(path: &Path) -> io::Result<UnixListener> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
+/// Per-connection limits.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Connections served at once; more are refused with `code::BUSY`.
+    pub max_connections: usize,
+    /// How long a new connection may take to send its first request.
+    pub first_line_timeout: Duration,
+    /// Write timeout on long-lived streams (events, attach): a client that stops reading
+    /// is disconnected instead of blocking its server thread forever.
+    pub stream_write_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_connections: 64,
+            first_line_timeout: Duration::from_secs(10),
+            stream_write_timeout: Duration::from_secs(5),
+        }
     }
-    let listener = UnixListener::bind(path)?;
+}
+
+/// Binds the socket with mode 0600, replacing a stale socket. Call only while holding the
+/// daemon lock, so a live daemon's socket is never removed. Anything at the path that is
+/// not a socket (a file, a directory, a symlink) is left alone and is an error.
+///
+/// The socket is created under umask 0o077 (restored right after), so it is never
+/// reachable by other users, not even between `bind` and `chmod`. (0o077 rather than
+/// 0o177: the umask is process-wide, and a directory created by another thread in that
+/// window must keep its owner `x` bit.)
+pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket; refusing to replace it", path.display()),
+            ))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // SAFETY: umask only swaps the process file-mode mask.
+    let old = unsafe { libc::umask(0o077) };
+    let bound = UnixListener::bind(path);
+    // SAFETY: as above, restoring the previous mask.
+    unsafe { libc::umask(old) };
+    let listener = bound?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
@@ -66,30 +109,88 @@ pub fn my_uid() -> u32 {
 }
 
 pub fn serve(hub: Arc<Hub>, listener: UnixListener, on_shutdown: OnShutdown) -> io::Result<()> {
+    serve_with(hub, listener, on_shutdown, Limits::default())
+}
+
+/// Releases a connection slot when the connection's thread ends.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub fn serve_with(hub: Arc<Hub>, listener: UnixListener, on_shutdown: OnShutdown, limits: Limits) -> io::Result<()> {
+    let open = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
-        let stream = match conn {
+        let mut stream = match conn {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("mirante-daemon: accept: {e}");
                 continue;
             }
         };
+        if open.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
+            open.fetch_sub(1, Ordering::SeqCst);
+            // Read the request first (briefly), so the client is not mid-write when the
+            // connection closes and sees the BUSY answer instead of a broken pipe.
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                if let Ok(r) = stream.try_clone() {
+                    let _ = read_line(&mut BufReader::new(r));
+                }
+                let e = RpcError::new(code::BUSY, "the daemon is at its connection limit; retry");
+                let _ = write_line(&mut stream, &Response::err(None, e));
+            });
+            continue;
+        }
+        let slot = Slot(open.clone());
         let (hub, on_shutdown) = (hub.clone(), on_shutdown.clone());
         std::thread::spawn(move || {
-            let _ = handle(&hub, stream, &*on_shutdown);
+            let _slot = slot;
+            let _ = handle_with(&hub, stream, &*on_shutdown, limits);
         });
     }
     Ok(())
 }
 
 pub fn handle(hub: &Hub, stream: UnixStream, on_shutdown: &(dyn Fn() + Send + Sync)) -> io::Result<()> {
+    handle_with(hub, stream, on_shutdown, Limits::default())
+}
+
+fn handle_with(
+    hub: &Hub,
+    stream: UnixStream,
+    on_shutdown: &(dyn Fn() + Send + Sync),
+    limits: Limits,
+) -> io::Result<()> {
     let mut writer = stream.try_clone()?;
     if peer_uid(&stream)? != my_uid() {
         let e = RpcError::new(code::FORBIDDEN, "peer uid does not match the daemon's");
         return write_line(&mut writer, &Response::err(None, e));
     }
+    // A connection that never sends its first request must not hold a slot forever. Later
+    // requests may be far apart (a watch board's query connection), so only the first is timed.
+    stream.set_read_timeout(Some(limits.first_line_timeout))?;
+    let mut first = true;
     let mut reader = BufReader::new(stream);
-    while let Some(line) = read_line(&mut reader)? {
+    loop {
+        let line = match read_line(&mut reader) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            // Too long or not UTF-8: say why, then close (the stream cannot be resynced).
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let _ =
+                    write_line(&mut writer, &Response::err(None, RpcError::new(code::INVALID_REQUEST, e.to_string())));
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        if std::mem::take(&mut first) {
+            reader.get_ref().set_read_timeout(None)?;
+        }
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -98,8 +199,8 @@ pub fn handle(hub: &Hub, stream: UnixStream, on_shutdown: &(dyn Fn() + Send + Sy
             }
         };
         match req.method.as_str() {
-            method::EVENTS_SUBSCRIBE => return subscribe(hub, req.id, writer),
-            method::ATTACH => return attach(hub, req, reader, writer),
+            method::EVENTS_SUBSCRIBE => return subscribe(hub, req, writer, limits),
+            method::ATTACH => return attach(hub, req, reader, writer, limits),
             method::DAEMON_SHUTDOWN => {
                 write_line(&mut writer, &Response::ok(req.id, json!({})))?;
                 hub.shutdown();
@@ -142,28 +243,48 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         method::SESSION_TRUST => out(hub.trust(params(p)?)),
         method::SESSION_STOP => out(hub.stop(&params::<TaskRef>(p)?.task)),
         method::SESSION_INTERRUPT => out(hub.interrupt(&params::<TaskRef>(p)?.task).map(|()| json!({}))),
+        method::SESSION_RESIZE => out(hub.resize(params(p)?).map(|()| json!({}))),
         method::MESSAGE_SEND => out(hub.send(params(p)?)),
         method::PERMISSION_LIST => out(hub.permissions()),
         method::PERMISSION_ANSWER => out(hub.answer_permission(params(p)?)),
-        method::HOOK_EVENT => out(hub.apply_hook(params(p)?).map(|()| json!({}))),
+        method::HOOK_EVENT => out(hub.apply_hook_envelope(params(p)?).map(|()| json!({}))),
         method::DAEMON_STATUS => out(Ok(hub.status())),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
 
-fn subscribe(hub: &Hub, id: u64, mut writer: UnixStream) -> io::Result<()> {
-    let (snapshot, rx) = match hub.subscribe() {
+/// Snapshot (or resume point), the replayed events, then live events until the client
+/// goes away, stops reading for [`Limits::stream_write_timeout`], or falls
+/// [`hub::SUB_QUEUE`] events behind (the hub drops it; the client resumes with `since_seq`).
+fn subscribe(hub: &Hub, req: Request, mut writer: UnixStream, limits: Limits) -> io::Result<()> {
+    let id = req.id;
+    let p: SubscribeParams = if req.params.is_null() {
+        SubscribeParams::default()
+    } else {
+        match params(req.params) {
+            Ok(p) => p,
+            Err(e) => return write_line(&mut writer, &Response::err(Some(id), e)),
+        }
+    };
+    let sub = match hub.subscribe_from(p.since_seq, p.boot_id.as_deref()) {
         Ok(x) => x,
         Err(e) => return write_line(&mut writer, &Response::err(Some(id), e.into())),
     };
-    write_line(&mut writer, &Response::ok(id, serde_json::to_value(snapshot)?))?;
-    for event in rx {
+    writer.set_write_timeout(Some(limits.stream_write_timeout))?;
+    write_line(&mut writer, &Response::ok(id, serde_json::to_value(sub.snapshot)?))?;
+    for event in sub.replay.into_iter().chain(sub.events) {
         write_line(&mut writer, &Notification::new(method::EVENT, serde_json::to_value(event)?))?;
     }
     Ok(())
 }
 
-fn attach(hub: &Hub, req: Request, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> io::Result<()> {
+fn attach(
+    hub: &Hub,
+    req: Request,
+    mut reader: BufReader<UnixStream>,
+    mut writer: UnixStream,
+    limits: Limits,
+) -> io::Result<()> {
     let p: AttachParams = match params(req.params) {
         Ok(p) => p,
         Err(e) => return write_line(&mut writer, &Response::err(Some(req.id), e)),
@@ -172,6 +293,9 @@ fn attach(hub: &Hub, req: Request, mut reader: BufReader<UnixStream>, mut writer
         Ok(x) => x,
         Err(e) => return write_line(&mut writer, &Response::err(Some(req.id), e.into())),
     };
+    // A client that stops reading is cut off, not left to block the output pump forever
+    // (the driver's per-client queue is bounded, so the agent never waits on it).
+    writer.set_write_timeout(Some(limits.stream_write_timeout))?;
     write_line(&mut writer, &Response::ok(req.id, serde_json::to_value(AttachResult { input: a.input })?))?;
     writer.write_all(&a.initial)?;
     let mut out = writer.try_clone()?;
@@ -188,6 +312,7 @@ fn attach(hub: &Hub, req: Request, mut reader: BufReader<UnixStream>, mut writer
     let mut buf = [0u8; 4096];
     loop {
         match reader.read(&mut buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Ok(0) | Err(_) => break,
             Ok(n) if a.input => {
                 if driver.input(a.id, &buf[..n]).is_err() {
@@ -314,6 +439,137 @@ mod tests {
         }
         assert!(flag.load(Ordering::SeqCst));
         assert!(!k.hub.get_task(&t.id).unwrap().live);
+    }
+
+    #[test]
+    fn a_hook_event_delivered_twice_with_one_event_id_opens_one_card() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "h").task;
+        let (sock, _) = serve_kit(&k);
+        let mut c = Client::connect(&sock).unwrap();
+        let payload = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}).to_string();
+        let env = json!({"task": t.id, "payload": payload, "ts_ms": 1, "event_id": "1-2-3"});
+        let _: Value = c.call(method::HOOK_EVENT, &env).unwrap();
+        let _: Value = c.call(method::HOOK_EVENT, &env).unwrap();
+        assert_eq!(k.pending(&t.id).len(), 1);
+        let kinds = k.kinds(&t.id);
+        assert_eq!(kinds.iter().filter(|k| *k == "permission_requested").count(), 1, "{kinds:?}");
+    }
+
+    fn serve_limits(k: &Kit, limits: Limits) -> std::path::PathBuf {
+        let sock = k.dir.path().join("l.sock");
+        let listener = bind(&sock).unwrap();
+        let hub = k.hub.clone();
+        std::thread::spawn(move || serve_with(hub, listener, Arc::new(|| {}), limits));
+        sock
+    }
+
+    #[test]
+    fn bind_replaces_a_stale_socket_but_never_another_kind_of_file() {
+        let k = Kit::new();
+        let sock = k.dir.path().join("s.sock");
+        drop(UnixListener::bind(&sock).unwrap());
+        let _l = bind(&sock).unwrap();
+        assert_eq!(std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777, 0o600);
+        let file = k.dir.path().join("f.sock");
+        std::fs::write(&file, b"precious").unwrap();
+        assert_eq!(bind(&file).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&file).unwrap(), b"precious");
+        let dir = k.dir.path().join("d.sock");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(bind(&dir).is_err());
+        assert!(dir.is_dir());
+        let link = k.dir.path().join("ln.sock");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(bind(&link).is_err());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn an_invalid_line_gets_an_error_reply_then_the_connection_closes() {
+        let k = Kit::new();
+        let (sock, _) = serve_kit(&k);
+        let mut s = UnixStream::connect(&sock).unwrap();
+        s.write_all(b"\xff\xfe not utf-8\n").unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let resp: Response = serde_json::from_str(&read_line(&mut r).unwrap().unwrap()).unwrap();
+        assert_eq!(resp.error.unwrap().code, code::INVALID_REQUEST);
+        assert_eq!(read_line(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn a_silent_connection_is_closed_after_the_first_line_timeout() {
+        let k = Kit::new();
+        let limits = Limits { first_line_timeout: Duration::from_millis(100), ..Limits::default() };
+        let sock = serve_limits(&k, limits);
+        let s = UnixStream::connect(&sock).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(read_line(&mut BufReader::new(s)).unwrap(), None);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        // Only the first request is timed: a connection that spoke may idle.
+        let mut c = Client::connect(&sock).unwrap();
+        let _: Value = c.call(method::DAEMON_STATUS, Value::Null).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let _: Value = c.call(method::DAEMON_STATUS, Value::Null).unwrap();
+    }
+
+    #[test]
+    fn connections_past_the_cap_are_refused_busy() {
+        let k = Kit::new();
+        let sock = serve_limits(&k, Limits { max_connections: 1, ..Limits::default() });
+        let mut first = Client::connect(&sock).unwrap();
+        let _: Value = first.call(method::DAEMON_STATUS, Value::Null).unwrap();
+        let mut second = Client::connect(&sock).unwrap();
+        match second.call::<Value>(method::DAEMON_STATUS, Value::Null) {
+            Err(ClientError::Rpc(e)) => assert_eq!(e.code, code::BUSY),
+            other => panic!("{other:?}"),
+        }
+        drop(first);
+        // The slot is released when the first connection ends.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut c = Client::connect(&sock).unwrap();
+            match c.call::<Value>(method::DAEMON_STATUS, Value::Null) {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn subscribe_resumes_with_since_seq_and_replays_missed_events() {
+        let k = Kit::new();
+        let (sock, _) = serve_kit(&k);
+        let mut first = Client::connect(&sock).unwrap();
+        let snap: Snapshot = first.call(method::EVENTS_SUBSCRIBE, json!({})).unwrap();
+        drop(first);
+        k.create(AgentKind::Claude, "missed");
+        let mut again = Client::connect(&sock).unwrap();
+        let r: Snapshot = again
+            .call(method::EVENTS_SUBSCRIBE, SubscribeParams { since_seq: Some(snap.seq), boot_id: Some(snap.boot_id) })
+            .unwrap();
+        assert!(r.resumed);
+        let n = again.next_notification().unwrap().unwrap();
+        assert_eq!((n.params["kind"].as_str(), n.params["seq"].as_u64()), (Some("task_created"), Some(snap.seq + 1)));
+        let mut fresh = Client::connect(&sock).unwrap();
+        let full: Snapshot =
+            fresh.call(method::EVENTS_SUBSCRIBE, json!({"since_seq": snap.seq, "boot_id": "another"})).unwrap();
+        assert!(!full.resumed);
+        assert_eq!(full.tasks.len(), 1);
+    }
+
+    #[test]
+    fn session_resize_reaches_the_live_driver() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "r").task;
+        let (sock, _) = serve_kit(&k);
+        let mut c = Client::connect(&sock).unwrap();
+        let _: Value = c.call(method::SESSION_RESIZE, json!({"task": t.id, "rows": 30, "cols": 100})).unwrap();
+        assert!(k.calls().contains(&"resize:30x100".to_string()), "{:?}", k.calls());
+        let e = c.call::<Value>(method::SESSION_RESIZE, json!({"task": "nope", "rows": 1, "cols": 1}));
+        assert!(matches!(e, Err(ClientError::Rpc(e)) if e.code == code::NOT_FOUND));
     }
 
     #[test]

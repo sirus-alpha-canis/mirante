@@ -37,15 +37,45 @@ pub const NESTED_SESSION_ENV: [&str; 13] = [
 ];
 
 /// Prefixes of terminal-wrapper integration variables, scrubbed when present.
-pub const SCRUB_PREFIXES: [&str; 3] = ["CLAUDE_CODE_MESSAGING_", "CMUX_CLAUDE_", "CMUX_AGENT_"];
+pub const SCRUB_PREFIXES: [&str; 4] = ["CLAUDE_CODE_MESSAGING_", "CMUX_CLAUDE_", "CMUX_AGENT_", "VSCODE_"];
+
+/// The launching terminal's multiplexer / editor identity. The agent runs in Mirante's PTY,
+/// not in that terminal: inheriting these makes it talk to the wrong tmux pane or IDE.
+/// (`TERM_PROGRAM` itself is overwritten with `mirante` for the agent, see [`AGENT_TERM_ENV`].)
+pub const TERMINAL_ENV: [&str; 3] = ["TMUX", "TMUX_PANE", "TERM_PROGRAM_VERSION"];
+
+/// Never scrubbed, whatever the lists above say: credentials and the user's config dir.
+pub const PROTECTED_PREFIXES: [&str; 4] = ["ANTHROPIC_", "OPENAI_", "CODEX_", "CLAUDE_CODE_OAUTH"];
+pub const PROTECTED_ENV: [&str; 1] = ["CLAUDE_CONFIG_DIR"];
+
+/// What the agent's PTY is: Mirante's own terminal emulation.
+pub const AGENT_TERM_ENV: [(&str, &str); 3] =
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "mirante")];
 
 /// Hook events registered without a matcher, and tool events registered with `"*"`.
-pub const PLAIN_EVENTS: [&str; 7] =
-    ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "SubagentStop", "SessionEnd", "PreCompact"];
-pub const TOOL_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "PermissionRequest"];
+/// `StopFailure` (a turn ended by an API error) and `PostToolUseFailure` (a tool call that
+/// failed) are forwarded like the rest; the status engine ignores names it does not know.
+pub const PLAIN_EVENTS: [&str; 8] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "Notification",
+    "Stop",
+    "StopFailure",
+    "SubagentStop",
+    "SessionEnd",
+    "PreCompact",
+];
+pub const TOOL_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"];
 
 /// Env var that scopes the hook to a Mirante task; `mirante-hook` does nothing without it.
 pub const TASK_ENV: &str = "MIRANTE_TASK_ID";
+/// Env var naming the Mirante session the agent runs in (forwarded by `mirante-hook`).
+pub const SESSION_ENV: &str = "MIRANTE_SESSION_ID";
+
+/// Credentials and config that no scrub list may remove.
+pub fn is_protected(key: &str) -> bool {
+    PROTECTED_ENV.contains(&key) || PROTECTED_PREFIXES.iter().any(|p| key.starts_with(p))
+}
 
 fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -96,15 +126,25 @@ pub fn resolve_claude_bin_from_env() -> Result<PathBuf> {
     resolve_claude_bin(over.as_deref(), path.as_deref())
 }
 
-/// Variables to remove before spawning: the nested-session list plus any present
-/// variable with a wrapper prefix. `present` is the parent's variable names.
+/// Variables to remove before spawning an agent: the nested-session and terminal lists
+/// plus any present variable with a wrapper prefix, never a protected one. `present` is
+/// the parent's variable names.
 pub fn env_to_scrub<I: IntoIterator<Item = String>>(present: I) -> Vec<String> {
-    let mut keys: Vec<String> = NESTED_SESSION_ENV.iter().map(|k| k.to_string()).collect();
+    let mut keys: Vec<String> = NESTED_SESSION_ENV.iter().chain(TERMINAL_ENV.iter()).map(|k| k.to_string()).collect();
     for k in present {
         if SCRUB_PREFIXES.iter().any(|p| k.starts_with(p)) && !keys.contains(&k) {
             keys.push(k);
         }
     }
+    keys.retain(|k| !is_protected(k));
+    keys
+}
+
+/// Variables to remove before spawning the daemon (which outlives the terminal it was
+/// started from and spawns every agent): the agent list plus `TERM_PROGRAM`.
+pub fn daemon_env_to_scrub<I: IntoIterator<Item = String>>(present: I) -> Vec<String> {
+    let mut keys = env_to_scrub(present);
+    keys.push("TERM_PROGRAM".to_string());
     keys
 }
 
@@ -129,6 +169,8 @@ pub struct LaunchInput<'a> {
     pub worktree: &'a Path,
     pub settings_path: &'a Path,
     pub task_id: &'a str,
+    /// Mirante's session id (`MIRANTE_SESSION_ID`, echoed back by the hook).
+    pub session_id: &'a str,
     /// Native session id to resume (`--resume <id>`), from `Conversation::native_session_id`.
     pub resume: Option<&'a str>,
     /// Names of the variables in the parent environment (for prefix scrubbing).
@@ -161,7 +203,11 @@ pub fn launch_spec(input: LaunchInput<'_>) -> LaunchSpec {
         args,
         cwd: input.worktree.to_path_buf(),
         env_remove: env_to_scrub(input.parent_env),
-        env_set: vec![(TASK_ENV.to_string(), input.task_id.to_string())],
+        env_set: [(TASK_ENV, input.task_id), (SESSION_ENV, input.session_id)]
+            .into_iter()
+            .chain(AGENT_TERM_ENV)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
     }
 }
 #[cfg(test)]
@@ -211,21 +257,47 @@ mod tests {
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CONFIG_DIR",
             "HOME",
+            "VSCODE_PID",
+            "TMUX",
+            "TERM_PROGRAM",
+            "OPENAI_API_KEY",
+            "CODEX_HOME",
         ]
         .map(String::from);
-        let keys = env_to_scrub(present);
-        for k in
-            ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CMUX_CLAUDE_HOOKS", "CMUX_AGENT_X", "CLAUDE_CODE_MESSAGING_FOO"]
-        {
+        let keys = env_to_scrub(present.clone());
+        for k in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "CMUX_CLAUDE_HOOKS",
+            "CMUX_AGENT_X",
+            "CLAUDE_CODE_MESSAGING_FOO",
+            "VSCODE_PID",
+            "TMUX",
+            "TMUX_PANE",
+            "TERM_PROGRAM_VERSION",
+        ] {
             assert!(keys.iter().any(|x| x == k), "{k} missing");
         }
-        for k in
-            ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CONFIG_DIR", "HOME"]
-        {
+        let kept = [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CONFIG_DIR",
+            "HOME",
+            "OPENAI_API_KEY",
+            "CODEX_HOME",
+            // Overwritten with `mirante` for the agent, not removed.
+            "TERM_PROGRAM",
+        ];
+        for k in kept {
             assert!(!keys.iter().any(|x| x == k), "{k} must be kept");
         }
         let unique: std::collections::HashSet<&String> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len());
+        let daemon = daemon_env_to_scrub(present);
+        assert!(daemon.iter().any(|k| k == "TERM_PROGRAM") && daemon.iter().any(|k| k == "VSCODE_PID"));
+        assert!(!daemon.iter().any(|k| is_protected(k)));
+        assert!(kept[..7].iter().all(|k| !daemon.iter().any(|x| x == k)));
     }
 
     #[test]
@@ -235,6 +307,8 @@ mod tests {
             assert_eq!(s["hooks"][*name][0]["hooks"][0]["command"], "'/opt/mirante/bin/mirante-hook'", "{name}");
         }
         assert_eq!(s["hooks"]["PermissionRequest"][0]["matcher"], "*");
+        assert_eq!(s["hooks"]["PostToolUseFailure"][0]["matcher"], "*");
+        assert!(s["hooks"]["StopFailure"][0].get("matcher").is_none());
         assert!(s["hooks"]["Stop"][0].get("matcher").is_none());
         assert_eq!(s["permissions"]["allow"], json!(["Bash(cargo test:*)"]));
         assert!(s["permissions"].get("defaultMode").is_none());
@@ -273,6 +347,7 @@ mod tests {
             worktree: Path::new("/wt/app/feat"),
             settings_path: Path::new("/m/settings/t1.json"),
             task_id: "t1",
+            session_id: "s1",
             resume: None,
             parent_env: vec!["CMUX_AGENT_Y".into()],
         };
@@ -281,7 +356,18 @@ mod tests {
         assert_eq!(spec.args, vec!["--settings", "/m/settings/t1.json", "--permission-mode", "manual"]);
         assert_eq!(spec.cwd, PathBuf::from("/wt/app/feat"));
         assert!(spec.env_remove.contains(&"CMUX_AGENT_Y".to_string()));
-        assert_eq!(spec.env_set, vec![("MIRANTE_TASK_ID".to_string(), "t1".to_string())]);
+        let env: Vec<(&str, &str)> = spec.env_set.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            env,
+            [
+                ("MIRANTE_TASK_ID", "t1"),
+                ("MIRANTE_SESSION_ID", "s1"),
+                ("TERM", "xterm-256color"),
+                ("COLORTERM", "truecolor"),
+                ("TERM_PROGRAM", "mirante"),
+            ]
+        );
+        assert!(!spec.env_remove.iter().any(|k| spec.env_set.iter().any(|(s, _)| s == k)));
         assert!(!spec.args.iter().any(|a| a.contains("dangerously") || a == "--bare" || a == "-p"));
 
         let resumed = launch_spec(LaunchInput { resume: Some("sess-9"), ..input });

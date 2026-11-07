@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
-use mirante_ipc::rpc::MAX_LINE;
+use mirante_ipc::rpc::{code, MAX_LINE};
 use mirante_ipc::types::{method, HookEnvelope, HookParams};
 use mirante_ipc::{Client, ClientError, Paths};
 use serde_json::Value;
@@ -78,22 +78,41 @@ pub fn deliver(paths: &Paths, task: Option<&str>, payload: &str, ts_ms: i64) -> 
 /// `truncated`: the payload was cut at [`STDIN_CAP`]; it is replaced by a small valid-JSON
 /// stub `{"truncated":true,...}` and the envelope is flagged.
 pub fn deliver_with(paths: &Paths, task: Option<&str>, payload: &str, ts_ms: i64, truncated: bool) -> Outcome {
-    deliver_inner(paths, task, payload, ts_ms, truncated, TIMEOUT)
+    deliver_session(paths, task, None, payload, ts_ms, truncated)
+}
+
+/// [`deliver_with`] plus the Mirante session id (`MIRANTE_SESSION_ID`), carried in the
+/// envelope's `session` field when present and non-empty.
+pub fn deliver_session(
+    paths: &Paths,
+    task: Option<&str>,
+    session: Option<&str>,
+    payload: &str,
+    ts_ms: i64,
+    truncated: bool,
+) -> Outcome {
+    deliver_inner(paths, task, session, payload, ts_ms, truncated, TIMEOUT)
 }
 
 fn stub(original_bytes: usize) -> String {
     format!(r#"{{"truncated":true,"original_bytes":{original_bytes}}}"#)
 }
 
-fn envelope(task: &str, payload: &str, ts_ms: i64, truncated: bool) -> HookEnvelope {
+fn envelope(task: &str, session: Option<&str>, payload: &str, ts_ms: i64, truncated: bool) -> HookEnvelope {
+    let session = session.filter(|s| !s.is_empty()).map(String::from);
     let build = |payload: String, truncated: bool, event_id: String| HookEnvelope {
         params: HookParams { task: task.to_string(), payload, ts_ms },
         event_id: Some(event_id),
         received_ts_ms: Some(ts_ms),
         truncated: truncated.then_some(true),
+        session: session.clone(),
     };
     let id = new_event_id(ts_ms);
-    let first = if truncated { build(stub(payload.len()), true, id.clone()) } else { build(payload.to_string(), false, id.clone()) };
+    let first = if truncated {
+        build(stub(payload.len()), true, id.clone())
+    } else {
+        build(payload.to_string(), false, id.clone())
+    };
     // JSON escaping can inflate a payload past the line limit the daemon enforces.
     if serde_json::to_vec(&first).map(|v| v.len() >= MAX_LINE - 1024).unwrap_or(true) {
         return build(stub(payload.len()), true, id);
@@ -101,15 +120,28 @@ fn envelope(task: &str, payload: &str, ts_ms: i64, truncated: bool) -> HookEnvel
     first
 }
 
-fn deliver_inner(paths: &Paths, task: Option<&str>, payload: &str, ts_ms: i64, truncated: bool, deadline: Duration) -> Outcome {
+fn deliver_inner(
+    paths: &Paths,
+    task: Option<&str>,
+    session: Option<&str>,
+    payload: &str,
+    ts_ms: i64,
+    truncated: bool,
+    deadline: Duration,
+) -> Outcome {
     let Some(task) = task.filter(|t| !t.is_empty()) else {
         return Outcome::Skipped;
     };
-    let env = envelope(task, payload, ts_ms, truncated);
+    let env = envelope(task, session, payload, ts_ms, truncated);
     if !breaker_open(paths) {
         match forward(paths, &env, deadline) {
+            // At its connection limit the daemon did not take the payload: spool it.
+            Some(Err(ClientError::Rpc(e))) if e.code == code::BUSY => {}
             // The daemon got the payload; an RPC error (e.g. unparseable) is logged there.
             Some(Ok(())) | Some(Err(ClientError::Rpc(_))) => return Outcome::Forwarded,
+            // A socket timeout and the overall deadline are the same failure (a daemon that
+            // accepts but does not answer): either one trips the breaker.
+            Some(Err(ClientError::Io(e))) if is_timeout(&e) => trip_breaker(paths),
             Some(Err(_)) => {}
             None => trip_breaker(paths),
         }
@@ -137,6 +169,16 @@ fn trip_breaker(paths: &Paths) {
     }
 }
 
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
+/// Socket read/write timeout for a forward: strictly shorter than the overall deadline, so
+/// a stalled daemon usually surfaces as a socket timeout before the deadline fires.
+fn socket_timeout(deadline: Duration) -> Duration {
+    (deadline * 3 / 4).max(Duration::from_millis(1))
+}
+
 /// `None` = the deadline passed (the worker thread is abandoned; the process is about to
 /// exit anyway).
 fn forward(paths: &Paths, env: &HookEnvelope, deadline: Duration) -> Option<Result<(), ClientError>> {
@@ -146,7 +188,7 @@ fn forward(paths: &Paths, env: &HookEnvelope, deadline: Duration) -> Option<Resu
     std::thread::spawn(move || {
         let r = (|| {
             let mut client = Client::connect(&socket)?;
-            client.set_timeout(Some(deadline))?;
+            client.set_timeout(Some(socket_timeout(deadline)))?;
             client.call::<Value>(method::HOOK_EVENT, &env)?;
             Ok(())
         })();
@@ -256,6 +298,36 @@ mod tests {
     }
 
     #[test]
+    fn the_mirante_session_id_rides_along_when_set() {
+        let d = TestDir::new();
+        let paths = Paths::new(&d.path().join("home"));
+        deliver_session(&paths, Some("t"), Some("sess-1"), "{}", 1, false);
+        deliver_session(&paths, Some("t"), Some(""), "{}", 2, false);
+        deliver(&paths, Some("t"), "{}", 3);
+        let v = lines(&paths);
+        assert_eq!(v[0].session.as_deref(), Some("sess-1"));
+        assert_eq!((v[1].session.as_deref(), v[2].session.as_deref()), (None, None));
+    }
+
+    #[test]
+    fn a_busy_daemon_did_not_take_the_event_so_it_is_spooled() {
+        let d = TestDir::new();
+        let paths = Paths::new(d.path());
+        let listener = UnixListener::bind(paths.socket()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = read_line(&mut BufReader::new(stream.try_clone().unwrap()));
+            let mut w = stream;
+            let e = mirante_ipc::RpcError::new(code::BUSY, "busy");
+            write_line(&mut w, &Response::err(None, e)).unwrap();
+        });
+        assert_eq!(deliver(&paths, Some("t"), "{}", 1), Outcome::Spooled);
+        server.join().unwrap();
+        assert_eq!(lines(&paths).len(), 1);
+        assert!(!paths.hook_breaker().exists());
+    }
+
+    #[test]
     fn a_daemon_that_never_answers_cannot_stall_the_hook_and_trips_the_breaker() {
         let d = TestDir::new();
         let paths = Paths::new(d.path());
@@ -266,7 +338,7 @@ mod tests {
             drop(c);
         });
         let t = std::time::Instant::now();
-        let out = deliver_inner(&paths, Some("t"), "{}", 1, false, Duration::from_millis(150));
+        let out = deliver_inner(&paths, Some("t"), None, "{}", 1, false, Duration::from_millis(150));
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         assert_eq!(out, Outcome::Spooled);
         assert!(paths.hook_breaker().exists());
@@ -326,7 +398,7 @@ mod tests {
     fn a_full_spool_loses_the_event_instead_of_growing() {
         let d = TestDir::new();
         let paths = Paths::new(&d.path().join("home"));
-        let env = envelope("t", "{}", 1, false);
+        let env = envelope("t", None, "{}", 1, false);
         spool_capped(&paths, &env, 100).unwrap();
         while std::fs::metadata(paths.spool()).unwrap().len() < 100 {
             spool_capped(&paths, &env, 100).unwrap();

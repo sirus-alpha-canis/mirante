@@ -4,15 +4,17 @@ use std::error::Error;
 use std::io::{self, BufRead, Read, Write};
 use std::net::Shutdown;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mirante_core::model::{PermissionRequest, Status};
 use mirante_ipc::types::{
     method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, ListParams,
-    PermissionView, SendMessage, SendMode, SendResult, Snapshot, StartResult, StartSession, TaskRef, TaskView,
-    TrustAnswer,
+    PermissionView, ResizeParams, SendMessage, SendMode, SendResult, Snapshot, StartResult, StartSession,
+    SubscribeParams, TaskRef, TaskView, TrustAnswer,
 };
-use mirante_ipc::{Client, Paths};
+use mirante_ipc::{signals, Client, Paths};
 use serde_json::{json, Value};
 
 use mirante_cli::args::{self, Cmd, DaemonCmd, USAGE};
@@ -23,11 +25,23 @@ type Res = Result<(), Box<dyn Error>>;
 /// Ctrl-] detaches from `attach`.
 const DETACH: u8 = 0x1d;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn client(paths: &Paths) -> Result<Client, Box<dyn Error>> {
-    let c = daemon_ctl::connect(paths)?;
+    let mut c = daemon_ctl::connect(paths)?;
     // `session.start` may wait up to 45 s for the agent to boot.
     c.set_timeout(Some(Duration::from_secs(90)))?;
+    warn_on_version_skew(&mut c);
     Ok(c)
+}
+
+/// One stderr line when the daemon is another version than this CLI (best effort).
+fn warn_on_version_skew(c: &mut Client) {
+    if let Ok(s) = c.call::<DaemonStatus>(method::DAEMON_STATUS, json!({})) {
+        if let Some(w) = daemon_ctl::version_warning(&s, VERSION) {
+            eprintln!("{w}");
+        }
+    }
 }
 
 fn ask(question: &str) -> io::Result<bool> {
@@ -66,6 +80,40 @@ fn boot_flow(c: &mut Client, mut r: StartResult, trust: bool) -> Res {
     }
 }
 
+/// While attached: SIGWINCH sends the new size (`session.resize`); SIGTERM / SIGHUP /
+/// SIGINT (raw mode turns Ctrl-C into a byte, so these come from outside) restore the
+/// terminal and reset its input modes before exiting.
+fn attach_signals(paths: &Paths, task: &str, saved: libc::termios) -> io::Result<()> {
+    let sigs = signals::subscribe(&[signals::SIGWINCH, signals::SIGTERM, signals::SIGHUP, signals::SIGINT])?;
+    let (paths, task) = (paths.clone(), task.to_string());
+    std::thread::spawn(move || {
+        let mut resize: Option<Client> = None;
+        for sig in sigs {
+            if sig != signals::SIGWINCH {
+                term::restore(&saved);
+                print!("{}\r\nmirante: terminated by signal {sig}\r\n", term::RESET_INPUT_MODES);
+                let _ = io::stdout().flush();
+                std::process::exit(128 + sig);
+            }
+            let (rows, cols) = term::size();
+            if resize.is_none() {
+                resize = Client::connect(&paths.socket()).ok();
+                if let Some(c) = &resize {
+                    let _ = c.set_timeout(Some(Duration::from_secs(5)));
+                }
+            }
+            if let Some(c) = resize.as_mut() {
+                let r = c.call::<Value>(method::SESSION_RESIZE, ResizeParams { task: task.clone(), rows, cols });
+                // A typed refusal (e.g. Codex cannot resize) keeps the connection.
+                if matches!(r, Err(mirante_ipc::ClientError::Io(_) | mirante_ipc::ClientError::Protocol(_))) {
+                    resize = None;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 fn attach(paths: &Paths, task: &str) -> Res {
     if !term::is_tty(0) || !term::is_tty(1) {
         return Err("attach needs a terminal".into());
@@ -76,13 +124,18 @@ fn attach(paths: &Paths, task: &str) -> Res {
     c.set_timeout(None)?;
     eprintln!("attached{}; detach with Ctrl-]", if r.input { "" } else { " (read-only stream)" });
     let (mut reader, writer) = c.into_raw();
+    // Handlers first: a signal arriving right after raw mode is on must still restore it.
+    attach_signals(paths, task, term::get_attrs()?)?;
     let raw = term::RawMode::enable()?;
+    let detached = Arc::new(AtomicBool::new(false));
     let mut w = writer.try_clone()?;
+    let user_left = detached.clone();
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0u8; 1024];
         loop {
             let n = match stdin.read(&mut buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
@@ -97,12 +150,15 @@ fn attach(paths: &Paths, task: &str) -> Res {
                 break;
             }
         }
+        // Ctrl-] or the end of our stdin: the user left (not the session).
+        user_left.store(true, Ordering::SeqCst);
         let _ = w.shutdown(Shutdown::Both);
     });
     let mut out = io::stdout().lock();
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 out.write_all(&buf[..n])?;
@@ -111,8 +167,10 @@ fn attach(paths: &Paths, task: &str) -> Res {
         }
     }
     drop(raw);
-    // Reset attributes and show the cursor in case the agent's TUI left them changed.
-    print!("\x1b[0m\x1b[?25h\r\ndetached\r\n");
+    // The agent's TUI may have left input modes on (mouse, bracketed paste, kitty keys...).
+    let how = if detached.load(Ordering::SeqCst) { "detached" } else { "session ended" };
+    write!(out, "{}\r\n{how}\r\n", term::RESET_INPUT_MODES)?;
+    out.flush()?;
     Ok(())
 }
 
@@ -135,17 +193,25 @@ fn board(tasks: &[TaskView], seen: &mut HashMap<String, Status>, color: bool) {
 fn watch(paths: &Paths) -> Res {
     let color = term::is_tty(1);
     let mut seen = HashMap::new();
+    // Where the stream left off: a reconnect resumes there (the daemon replays what was
+    // missed, e.g. after it dropped this board for falling behind) instead of a snapshot.
+    let mut resume = SubscribeParams::default();
     loop {
         // No auto-start here: after `mirante daemon stop` the board waits, it does not
         // bring the daemon back.
         let session = (|| -> Result<(), Box<dyn Error>> {
             let mut sub = Client::connect(&paths.socket())?;
-            let snap: Snapshot = sub.call(method::EVENTS_SUBSCRIBE, json!({}))?;
-            board(&snap.tasks, &mut seen, color);
+            let snap: Snapshot = sub.call(method::EVENTS_SUBSCRIBE, &resume)?;
             let mut q = Client::connect(&paths.socket())?;
             q.set_timeout(Some(Duration::from_secs(10)))?;
+            let tasks = if snap.resumed { q.call(method::TASK_LIST, ListParams::default())? } else { snap.tasks };
+            board(&tasks, &mut seen, color);
+            resume = SubscribeParams { since_seq: Some(snap.seq), boot_id: Some(snap.boot_id) };
             // The stream is only a hint: every event triggers a fresh snapshot.
-            while sub.next_notification()?.is_some() {
+            while let Some(n) = sub.next_notification()? {
+                if let (Some(seq), Some(boot)) = (n.params["seq"].as_u64(), n.params["boot_id"].as_str()) {
+                    resume = SubscribeParams { since_seq: Some(seq), boot_id: Some(boot.to_string()) };
+                }
                 let tasks: Vec<TaskView> = q.call(method::TASK_LIST, ListParams::default())?;
                 board(&tasks, &mut seen, color);
             }
@@ -170,6 +236,9 @@ fn run(cmd: Cmd) -> Res {
                     "running: pid {} boot {} live sessions {} (v{})",
                     s.pid, s.boot_id, s.live_sessions, s.version
                 );
+                if let Some(w) = daemon_ctl::version_warning(&s, VERSION) {
+                    eprintln!("{w}");
+                }
             }
             Err(_) => println!("not running"),
         },
@@ -189,6 +258,18 @@ fn run(cmd: Cmd) -> Res {
             }
             Err(_) => println!("not running"),
         },
+        Cmd::Daemon(DaemonCmd::Restart) => {
+            if let Ok(mut c) = Client::connect(&paths.socket()) {
+                c.set_timeout(Some(Duration::from_secs(60)))?;
+                let _: Value = c.call(method::DAEMON_SHUTDOWN, json!({}))?;
+                daemon_ctl::wait_stopped(&paths, Duration::from_secs(10))?;
+                println!("stopped (sessions ended; mirante resume <task> restores them)");
+            }
+            let mut c = daemon_ctl::start_daemon(&paths)?;
+            c.set_timeout(Some(Duration::from_secs(10)))?;
+            let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
+            println!("started: pid {} (v{})", s.pid, s.version);
+        }
         Cmd::New { repo, agent, branch, base, title, goal, trust } => {
             let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
             let mut c = client(&paths)?;

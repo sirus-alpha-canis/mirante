@@ -10,7 +10,8 @@ use mirante_core::hook::HookEvent;
 use mirante_core::model::{AgentKind, Lifecycle, PermissionStatus, Status};
 use mirante_core::status::{is_sidechain, Input};
 use mirante_ipc::types::{
-    AttachParams, BootState, HookEnvelope, HookParams, SendMode, StartResult, StartSession, TaskView, TrustAnswer,
+    AttachParams, BootState, HookEnvelope, HookParams, ResizeParams, SendMode, StartResult, StartSession, TaskView,
+    TrustAnswer,
 };
 use serde_json::{json, Value};
 
@@ -473,6 +474,13 @@ impl Hub {
         Ok((driver, a))
     }
 
+    /// The attached terminal changed size: forwarded to the live driver.
+    pub fn resize(&self, p: ResizeParams) -> Result<()> {
+        let (_, _, driver) = self.live_driver(&p.task)?;
+        let driver = driver.ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
+        Ok(driver.resize(p.rows.max(10), p.cols.max(40))?)
+    }
+
     fn live_driver(&self, reference: &str) -> Result<LiveRef> {
         let st = self.lock();
         let task = st.resolve(reference)?;
@@ -503,7 +511,13 @@ impl Hub {
 
     /// One Claude hook payload without an event id (see [`Hub::apply_hook_envelope`]).
     pub fn apply_hook(&self, p: HookParams) -> Result<()> {
-        self.apply_hook_envelope(HookEnvelope { params: p, event_id: None, received_ts_ms: None, truncated: None })
+        self.apply_hook_envelope(HookEnvelope {
+            params: p,
+            event_id: None,
+            received_ts_ms: None,
+            truncated: None,
+            session: None,
+        })
     }
 
     /// One Claude hook payload as `mirante-hook` sends it (`hook.event`). An `event_id`
@@ -679,6 +693,7 @@ impl super::testkit::Kit {
                 event_id: Some(event_id.into()),
                 received_ts_ms: None,
                 truncated: None,
+                session: None,
             })
             .unwrap();
     }

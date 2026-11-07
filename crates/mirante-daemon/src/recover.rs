@@ -267,6 +267,7 @@ mod tests {
             event_id: Some("e9".into()),
             received_ts_ms: None,
             truncated: None,
+            session: None,
         };
         let old = paths.spool().with_file_name("hook-spool.oldboot.jsonl");
         append(&old, &serde_json::to_string(&line).unwrap());
@@ -314,6 +315,7 @@ mod tests {
             event_id: event_id.map(String::from),
             received_ts_ms: None,
             truncated: None,
+            session: None,
         };
         append(&paths.spool(), &serde_json::to_string(&e).unwrap());
     }

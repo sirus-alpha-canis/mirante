@@ -13,6 +13,8 @@ pub mod method {
     pub const SESSION_TRUST: &str = "session.trust";
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_INTERRUPT: &str = "session.interrupt";
+    /// The attached terminal changed size ([`super::ResizeParams`]).
+    pub const SESSION_RESIZE: &str = "session.resize";
     pub const MESSAGE_SEND: &str = "message.send";
     pub const PERMISSION_LIST: &str = "permission.list";
     pub const PERMISSION_ANSWER: &str = "permission.answer";
@@ -153,6 +155,25 @@ pub struct AttachResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeParams {
+    pub task: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// `events.subscribe` parameters. With `since_seq` and the `boot_id` of the snapshot or
+/// event it came from, a reconnecting client resumes: the daemon replays the events after
+/// `since_seq` (as `event` notifications) instead of sending a full snapshot, when it
+/// still can (same boot, gap not too large). Otherwise a full snapshot is sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribeParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookParams {
     pub task: String,
     /// The hook's stdin, verbatim (parsed by the daemon so errors are reported, not lost).
@@ -181,6 +202,10 @@ pub struct HookEnvelope {
     /// The hook's stdin was cut at the size cap; `payload` is a stub, not Claude's JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    /// The Mirante session id the hook ran under (`MIRANTE_SESSION_ID` in Claude's env),
+    /// so the daemon can fence events from an older session of the same task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// First response of `events.subscribe`; `event` notifications with `seq > seq` follow.
@@ -188,7 +213,12 @@ pub struct HookEnvelope {
 pub struct Snapshot {
     pub boot_id: String,
     pub seq: u64,
+    /// Empty when `resumed`.
     pub tasks: Vec<TaskView>,
+    /// The subscription resumed from the requested `since_seq`: `seq` is that value, `tasks`
+    /// is empty, and the missed events follow as notifications. The client keeps its state.
+    #[serde(default)]
+    pub resumed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +256,20 @@ mod tests {
         assert_eq!(j["status"], "needs_you");
         assert_eq!(j["boot"], "ready");
         assert_eq!(serde_json::from_value::<TaskView>(j).unwrap(), v);
+    }
+
+    #[test]
+    fn additive_fields_are_optional_on_the_wire() {
+        let s: SubscribeParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(s, SubscribeParams::default());
+        assert_eq!(serde_json::to_value(&s).unwrap(), json!({}));
+        let snap: Snapshot = serde_json::from_value(json!({"boot_id": "b", "seq": 3, "tasks": []})).unwrap();
+        assert!(!snap.resumed);
+        let e: HookEnvelope = serde_json::from_value(json!({"task": "t", "payload": "{}", "ts_ms": 1})).unwrap();
+        assert_eq!(e.session, None);
+        assert!(serde_json::to_value(&e).unwrap().get("session").is_none());
+        let r: ResizeParams = serde_json::from_value(json!({"task": "t", "rows": 30, "cols": 100})).unwrap();
+        assert_eq!((r.rows, r.cols), (30, 100));
     }
 
     #[test]

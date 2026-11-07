@@ -23,7 +23,8 @@ usage: mirante <command>
   resume <task> [--trust]
                          restart the agent on its native session (context kept)
   archive <task>         remove the worktree (branch kept) and hide the task
-  daemon start|stop|status
+  daemon start|stop|restart|status
+                         restart: stop (ends live sessions) then start, e.g. after an upgrade
 
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
 <perm> is a permission id or a unique suffix.";
@@ -32,6 +33,7 @@ usage: mirante <command>
 pub enum DaemonCmd {
     Start,
     Stop,
+    Restart,
     Status,
 }
 
@@ -192,9 +194,10 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             Ok(Cmd::Resume { task: one(&p, "task")?, trust: !p.bools.is_empty() })
         }
         "archive" => Ok(Cmd::Archive { task: one(&split(rest, none, none)?, "task")? }),
-        "daemon" => match one(&split(rest, none, none)?, "start|stop|status")?.as_str() {
+        "daemon" => match one(&split(rest, none, none)?, "start|stop|restart|status")?.as_str() {
             "start" => Ok(Cmd::Daemon(DaemonCmd::Start)),
             "stop" => Ok(Cmd::Daemon(DaemonCmd::Stop)),
+            "restart" => Ok(Cmd::Daemon(DaemonCmd::Restart)),
             "status" => Ok(Cmd::Daemon(DaemonCmd::Status)),
             other => Err(format!("unknown daemon command {other}")),
         },
@@ -258,6 +261,7 @@ mod tests {
         assert_eq!(p("deny ab12").unwrap(), Cmd::Answer { id: "ab12".into(), allow: false });
         assert_eq!(p("resume feat --trust").unwrap(), Cmd::Resume { task: "feat".into(), trust: true });
         assert_eq!(p("daemon status").unwrap(), Cmd::Daemon(DaemonCmd::Status));
+        assert_eq!(p("daemon restart").unwrap(), Cmd::Daemon(DaemonCmd::Restart));
         assert_eq!(p("watch").unwrap(), Cmd::Watch);
         assert!(p("stop").is_err());
         assert!(p("stop a b").is_err());

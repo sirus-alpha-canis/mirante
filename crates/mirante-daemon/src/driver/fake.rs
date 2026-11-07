@@ -65,6 +65,10 @@ impl Driver for FakeDriver {
         self.record(format!("detach:{attachment}"));
         self.attached.lock().unwrap().take();
     }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), DriverError> {
+        self.record(format!("resize:{rows}x{cols}"));
+        Ok(())
+    }
     fn screen_tail(&self) -> String {
         "fake screen".into()
     }

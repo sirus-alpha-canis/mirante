@@ -29,6 +29,8 @@ pub mod code {
     pub const NEEDS_YOU: i64 = 5;
     /// Rejected by the daemon's peer check.
     pub const FORBIDDEN: i64 = 6;
+    /// The daemon is at its connection limit; retry shortly.
+    pub const BUSY: i64 = 7;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

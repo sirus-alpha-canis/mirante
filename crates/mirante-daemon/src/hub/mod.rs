@@ -119,6 +119,20 @@ pub(crate) struct Live {
     pub(crate) transcript: Vec<Value>,
 }
 
+/// Events queued per subscriber. One that falls this far behind is dropped (its stream
+/// ends after the queued events) and resumes with `events.subscribe { since_seq }`.
+pub const SUB_QUEUE: usize = 1024;
+/// Largest gap `events.subscribe { since_seq }` replays; beyond it a full snapshot is sent.
+pub const REPLAY_MAX: u64 = 10_000;
+
+/// How a subscription starts: the snapshot (or, resumed, its stand-in), the missed events
+/// to send before the live ones, and the live channel.
+pub struct Subscription {
+    pub snapshot: Snapshot,
+    pub replay: Vec<Event>,
+    pub events: mpsc::Receiver<Event>,
+}
+
 /// How long a delivery to an idle agent blocks the next one if no turn shows up.
 pub(crate) const DELIVERY_GRACE: Duration = Duration::from_secs(30);
 
@@ -173,7 +187,8 @@ pub(crate) struct State {
     pub(crate) store: Store,
     pub(crate) live: HashMap<String, Live>,
     pub(crate) last_seq: u64,
-    pub(crate) subscribers: Vec<mpsc::Sender<Event>>,
+    /// Bounded ([`SUB_QUEUE`]): a subscriber that falls behind is dropped, not buffered.
+    pub(crate) subscribers: Vec<mpsc::SyncSender<Event>>,
     /// Tasks whose worktree is being removed by `archive` (no session may start meanwhile).
     pub(crate) archiving: HashSet<String>,
     /// Recently applied hook `event_id`s (a hook may deliver and also spool one event).
@@ -298,7 +313,8 @@ impl State {
                 return;
             };
             self.last_seq = last.seq;
-            self.subscribers.retain(|s| events.iter().all(|e| s.send(e.clone()).is_ok()));
+            // Never blocks under the hub lock: a full queue drops that subscriber.
+            self.subscribers.retain(|s| events.iter().all(|e| s.try_send(e.clone()).is_ok()));
         }
     }
 
@@ -422,12 +438,39 @@ impl Hub {
 
     /// The current snapshot plus a channel of every event after it.
     pub fn subscribe(&self) -> Result<(Snapshot, mpsc::Receiver<Event>)> {
+        let s = self.subscribe_from(None, None)?;
+        Ok((s.snapshot, s.events))
+    }
+
+    /// Like [`Hub::subscribe`], but resumes after `since_seq` when `boot_id` is this boot's
+    /// and the gap is at most [`REPLAY_MAX`]: the snapshot is then `resumed` (no tasks,
+    /// `seq = since_seq`) and `replay` holds the missed events. Otherwise a full snapshot.
+    pub fn subscribe_from(&self, since_seq: Option<u64>, boot_id: Option<&str>) -> Result<Subscription> {
         let mut st = self.lock();
         st.publish();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(SUB_QUEUE);
+        let boot = st.store.boot_id().to_string();
+        let resume = since_seq
+            .filter(|s| boot_id == Some(boot.as_str()) && *s <= st.last_seq)
+            .filter(|s| st.last_seq - s <= REPLAY_MAX);
+        let (snapshot, replay) = match resume {
+            Some(since) => {
+                let mut replay = Vec::new();
+                let mut after = since;
+                while after < st.last_seq {
+                    let page = st.store.events_since(after, 1000)?;
+                    let Some(last) = page.last() else {
+                        break;
+                    };
+                    after = last.seq;
+                    replay.extend(page.into_iter().filter(|e| e.seq <= st.last_seq));
+                }
+                (Snapshot { boot_id: boot, seq: since, tasks: Vec::new(), resumed: true }, replay)
+            }
+            None => (Snapshot { boot_id: boot, seq: st.last_seq, tasks: st.views(false)?, resumed: false }, Vec::new()),
+        };
         st.subscribers.push(tx);
-        let snapshot = Snapshot { boot_id: st.store.boot_id().to_string(), seq: st.last_seq, tasks: st.views(false)? };
-        Ok((snapshot, rx))
+        Ok(Subscription { snapshot, replay, events: rx })
     }
 
     pub fn status(&self) -> DaemonStatus {
@@ -595,6 +638,42 @@ mod tests {
         assert_eq!(ev.kind, "task_created");
         assert_eq!(ev.seq, snap.seq + 1);
         assert_eq!(ev.boot_id, snap.boot_id);
+    }
+
+    #[test]
+    fn a_subscriber_that_never_reads_is_bounded_then_dropped() {
+        let k = Kit::new();
+        let (_snap, rx) = k.hub.subscribe().unwrap();
+        {
+            let mut st = k.hub.lock();
+            for i in 0..SUB_QUEUE + 50 {
+                st.event(None, "noise", json!({ "i": i })).unwrap();
+            }
+            st.publish();
+            assert!(st.subscribers.is_empty(), "the stalled subscriber must be dropped");
+        }
+        // Exactly the queue bound was buffered; then the stream ends (the client resumes).
+        assert_eq!(rx.iter().count(), SUB_QUEUE);
+    }
+
+    #[test]
+    fn subscribe_resumes_from_since_seq_on_the_same_boot_only() {
+        let k = Kit::new();
+        let (snap, _rx) = k.hub.subscribe().unwrap();
+        k.create(AgentKind::Claude, "one");
+        k.create(AgentKind::Claude, "two");
+        let s = k.hub.subscribe_from(Some(snap.seq), Some(&snap.boot_id)).unwrap();
+        assert!(s.snapshot.resumed && s.snapshot.tasks.is_empty());
+        assert_eq!(s.snapshot.seq, snap.seq);
+        let kinds: Vec<&str> = s.replay.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["task_created", "task_created"]);
+        assert_eq!(s.replay[0].seq, snap.seq + 1);
+        // Another boot, or a seq from the future: a full snapshot.
+        let other = k.hub.subscribe_from(Some(snap.seq), Some("old-boot")).unwrap();
+        assert!(!other.snapshot.resumed && other.replay.is_empty());
+        assert_eq!(other.snapshot.tasks.len(), 2);
+        let ahead = k.hub.subscribe_from(Some(snap.seq + 999), Some(&snap.boot_id)).unwrap();
+        assert!(!ahead.snapshot.resumed);
     }
 
     #[test]

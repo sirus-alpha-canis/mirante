@@ -90,15 +90,16 @@ claude (in PTY) ──hook──► mirante-hook ──hook.event──► daemo
 | `session.trust` | `{task, accept}` | same as start |
 | `session.stop` | `{task}` | `TaskView` |
 | `session.interrupt` | `{task}` | `{}` |
+| `session.resize` | `{task, rows, cols}` | `{}` (code 3 when the agent cannot resize) |
 | `message.send` | `{task, text, mode: steer\|queue}` | `{delivered, queued}` |
 | `permission.list` | — | `[PermissionView]` |
 | `permission.answer` | `{id, allow}` | `PermissionRequest` |
-| `events.subscribe` | — | `{boot_id, seq, tasks}` then `event` notifications (`Event` with `seq`, `boot_id`) |
+| `events.subscribe` | `{since_seq?, boot_id?}` or null | `{boot_id, seq, tasks, resumed}` then `event` notifications (`Event` with `seq`, `boot_id`); with a matching `boot_id` it resumes: `resumed`, no tasks, missed events replayed |
 | `attach` | `{task, rows, cols}` | `{input}` then raw bytes both ways until either side closes |
-| `hook.event` | `{task, payload, ts_ms}` | `{}` |
+| `hook.event` | `{task, payload, ts_ms, event_id?, received_ts_ms?, truncated?, session?}` | `{}` (deduped by `event_id`) |
 | `daemon.status` / `daemon.shutdown` | — | `{pid, boot_id, version, live_sessions}` / `{}` |
 
-Error codes: JSON-RPC reserved (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`) plus `1` not found, `2` conflict, `3` unsupported by this agent, `4` driver failure, `5` a dialog needs you, `6` forbidden (peer uid).
+Error codes: JSON-RPC reserved (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`) plus `1` not found, `2` conflict, `3` unsupported by this agent, `4` driver failure, `5` a dialog needs you, `6` forbidden (peer uid), `7` busy (connection limit; retry).
 
 ## Test counts after each task (verified)
 
@@ -6821,18 +6822,42 @@ pub struct Attachment {
     pub input: bool,
 }
 
-/// Fan-out of output bytes to attached clients; dead receivers are dropped on send.
-#[derive(Default)]
+/// Output chunks queued per attached client. A client that falls this far behind stops
+/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
+pub const ATTACH_QUEUE: usize = 256;
+
+struct FanoutSub {
+    tx: mpsc::SyncSender<Vec<u8>>,
+    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
+    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
+    needs_repaint: bool,
+}
+
+/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
+/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
+/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
 pub struct Fanout {
     next: u64,
-    subs: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    cap: usize,
+    subs: HashMap<u64, FanoutSub>,
+}
+
+impl Default for Fanout {
+    fn default() -> Self {
+        Fanout::with_capacity(ATTACH_QUEUE)
+    }
 }
 
 impl Fanout {
+    /// `cap` chunks queued per client (at least 1).
+    pub fn with_capacity(cap: usize) -> Fanout {
+        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
+    }
+
     pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
         self.next += 1;
-        let (tx, rx) = mpsc::channel();
-        self.subs.insert(self.next, tx);
+        let (tx, rx) = mpsc::sync_channel(self.cap);
+        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
         (self.next, rx)
     }
 
@@ -6840,8 +6865,44 @@ impl Fanout {
         self.subs.remove(&id);
     }
 
+    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
     pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, tx| tx.send(bytes.to_vec()).is_ok());
+        self.subs.retain(|_, s| {
+            if s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(bytes.to_vec()) {
+                Ok(()) => true,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    s.needs_repaint = true;
+                    true
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
+    }
+
+    /// Some client dropped chunks and waits for a full screen.
+    pub fn needs_repaint(&self) -> bool {
+        self.subs.values().any(|s| s.needs_repaint)
+    }
+
+    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
+    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
+    pub fn repaint(&mut self, screen: &[u8]) {
+        self.subs.retain(|_, s| {
+            if !s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(screen.to_vec()) {
+                Ok(()) => {
+                    s.needs_repaint = false;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -6868,6 +6929,10 @@ pub trait Driver: Send + Sync {
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
     fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
     fn detach(&self, attachment: u64);
+    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
+    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
+        Err(DriverError::Unsupported("resize"))
+    }
     /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
     fn screen_tail(&self) -> String;
     /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
@@ -6903,6 +6968,24 @@ mod tests {
         assert_eq!(rx_a.recv().unwrap(), b"y");
         f.remove(a);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
+        let mut f = Fanout::with_capacity(2);
+        let (_id, rx) = f.subscribe();
+        for b in [b"1", b"2", b"3", b"4"] {
+            f.send(b);
+        }
+        assert!(f.needs_repaint());
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
+        // Room again, but live bytes stay held back until the full screen is sent.
+        f.send(b"5");
+        assert!(rx.try_recv().is_err());
+        f.repaint(b"SCREEN");
+        assert!(!f.needs_repaint());
+        f.send(b"6");
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
     }
 
     #[test]
@@ -7254,6 +7337,13 @@ impl PtyProcess {
                     let _ = w.write_all(answer.as_bytes()).and_then(|()| w.flush());
                 }
                 f.send(chunk);
+                if f.needs_repaint() {
+                    // A client fell behind and lost chunks (bounded queue): send it the
+                    // whole screen, after which it gets live bytes again.
+                    let mut screen = b"\x1b[2J\x1b[H".to_vec();
+                    screen.extend_from_slice(lock(&parser).screen().contents_formatted().as_bytes());
+                    f.repaint(&screen);
+                }
             }
             // End of output: close every attached stream.
             *lock(&fanout) = Fanout::default();
@@ -7503,18 +7593,42 @@ pub struct Attachment {
     pub input: bool,
 }
 
-/// Fan-out of output bytes to attached clients; dead receivers are dropped on send.
-#[derive(Default)]
+/// Output chunks queued per attached client. A client that falls this far behind stops
+/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
+pub const ATTACH_QUEUE: usize = 256;
+
+struct FanoutSub {
+    tx: mpsc::SyncSender<Vec<u8>>,
+    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
+    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
+    needs_repaint: bool,
+}
+
+/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
+/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
+/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
 pub struct Fanout {
     next: u64,
-    subs: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    cap: usize,
+    subs: HashMap<u64, FanoutSub>,
+}
+
+impl Default for Fanout {
+    fn default() -> Self {
+        Fanout::with_capacity(ATTACH_QUEUE)
+    }
 }
 
 impl Fanout {
+    /// `cap` chunks queued per client (at least 1).
+    pub fn with_capacity(cap: usize) -> Fanout {
+        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
+    }
+
     pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
         self.next += 1;
-        let (tx, rx) = mpsc::channel();
-        self.subs.insert(self.next, tx);
+        let (tx, rx) = mpsc::sync_channel(self.cap);
+        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
         (self.next, rx)
     }
 
@@ -7522,8 +7636,44 @@ impl Fanout {
         self.subs.remove(&id);
     }
 
+    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
     pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, tx| tx.send(bytes.to_vec()).is_ok());
+        self.subs.retain(|_, s| {
+            if s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(bytes.to_vec()) {
+                Ok(()) => true,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    s.needs_repaint = true;
+                    true
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
+    }
+
+    /// Some client dropped chunks and waits for a full screen.
+    pub fn needs_repaint(&self) -> bool {
+        self.subs.values().any(|s| s.needs_repaint)
+    }
+
+    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
+    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
+    pub fn repaint(&mut self, screen: &[u8]) {
+        self.subs.retain(|_, s| {
+            if !s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(screen.to_vec()) {
+                Ok(()) => {
+                    s.needs_repaint = false;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -7550,6 +7700,10 @@ pub trait Driver: Send + Sync {
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
     fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
     fn detach(&self, attachment: u64);
+    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
+    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
+        Err(DriverError::Unsupported("resize"))
+    }
     /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
     fn screen_tail(&self) -> String;
     /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
@@ -7585,6 +7739,24 @@ mod tests {
         assert_eq!(rx_a.recv().unwrap(), b"y");
         f.remove(a);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
+        let mut f = Fanout::with_capacity(2);
+        let (_id, rx) = f.subscribe();
+        for b in [b"1", b"2", b"3", b"4"] {
+            f.send(b);
+        }
+        assert!(f.needs_repaint());
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
+        // Room again, but live bytes stay held back until the full screen is sent.
+        f.send(b"5");
+        assert!(rx.try_recv().is_err());
+        f.repaint(b"SCREEN");
+        assert!(!f.needs_repaint());
+        f.send(b"6");
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
     }
 
     #[test]
@@ -8017,6 +8189,10 @@ impl Driver for ClaudeDriver {
         self.pty.unsubscribe(attachment);
     }
 
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), DriverError> {
+        Ok(self.pty.resize(rows, cols)?)
+    }
+
     fn screen_tail(&self) -> String {
         screen::tail(&self.pty.grid(), 20)
     }
@@ -8108,6 +8284,7 @@ impl RealFactory {
             worktree: Path::new(&req.task.worktree_path),
             settings_path: &settings,
             task_id: &req.task.id,
+            session_id: &req.session_id,
             resume: req.resume.as_deref(),
             parent_env: parent_env(),
         });
@@ -8296,18 +8473,42 @@ pub struct Attachment {
     pub input: bool,
 }
 
-/// Fan-out of output bytes to attached clients; dead receivers are dropped on send.
-#[derive(Default)]
+/// Output chunks queued per attached client. A client that falls this far behind stops
+/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
+pub const ATTACH_QUEUE: usize = 256;
+
+struct FanoutSub {
+    tx: mpsc::SyncSender<Vec<u8>>,
+    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
+    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
+    needs_repaint: bool,
+}
+
+/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
+/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
+/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
 pub struct Fanout {
     next: u64,
-    subs: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    cap: usize,
+    subs: HashMap<u64, FanoutSub>,
+}
+
+impl Default for Fanout {
+    fn default() -> Self {
+        Fanout::with_capacity(ATTACH_QUEUE)
+    }
 }
 
 impl Fanout {
+    /// `cap` chunks queued per client (at least 1).
+    pub fn with_capacity(cap: usize) -> Fanout {
+        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
+    }
+
     pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
         self.next += 1;
-        let (tx, rx) = mpsc::channel();
-        self.subs.insert(self.next, tx);
+        let (tx, rx) = mpsc::sync_channel(self.cap);
+        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
         (self.next, rx)
     }
 
@@ -8315,8 +8516,44 @@ impl Fanout {
         self.subs.remove(&id);
     }
 
+    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
     pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, tx| tx.send(bytes.to_vec()).is_ok());
+        self.subs.retain(|_, s| {
+            if s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(bytes.to_vec()) {
+                Ok(()) => true,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    s.needs_repaint = true;
+                    true
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
+    }
+
+    /// Some client dropped chunks and waits for a full screen.
+    pub fn needs_repaint(&self) -> bool {
+        self.subs.values().any(|s| s.needs_repaint)
+    }
+
+    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
+    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
+    pub fn repaint(&mut self, screen: &[u8]) {
+        self.subs.retain(|_, s| {
+            if !s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(screen.to_vec()) {
+                Ok(()) => {
+                    s.needs_repaint = false;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -8343,6 +8580,10 @@ pub trait Driver: Send + Sync {
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
     fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
     fn detach(&self, attachment: u64);
+    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
+    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
+        Err(DriverError::Unsupported("resize"))
+    }
     /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
     fn screen_tail(&self) -> String;
     /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
@@ -8378,6 +8619,24 @@ mod tests {
         assert_eq!(rx_a.recv().unwrap(), b"y");
         f.remove(a);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
+        let mut f = Fanout::with_capacity(2);
+        let (_id, rx) = f.subscribe();
+        for b in [b"1", b"2", b"3", b"4"] {
+            f.send(b);
+        }
+        assert!(f.needs_repaint());
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
+        // Room again, but live bytes stay held back until the full screen is sent.
+        f.send(b"5");
+        assert!(rx.try_recv().is_err());
+        f.repaint(b"SCREEN");
+        assert!(!f.needs_repaint());
+        f.send(b"6");
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
     }
 
     #[test]
@@ -8969,18 +9228,42 @@ pub struct Attachment {
     pub input: bool,
 }
 
-/// Fan-out of output bytes to attached clients; dead receivers are dropped on send.
-#[derive(Default)]
+/// Output chunks queued per attached client. A client that falls this far behind stops
+/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
+pub const ATTACH_QUEUE: usize = 256;
+
+struct FanoutSub {
+    tx: mpsc::SyncSender<Vec<u8>>,
+    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
+    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
+    needs_repaint: bool,
+}
+
+/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
+/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
+/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
 pub struct Fanout {
     next: u64,
-    subs: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    cap: usize,
+    subs: HashMap<u64, FanoutSub>,
+}
+
+impl Default for Fanout {
+    fn default() -> Self {
+        Fanout::with_capacity(ATTACH_QUEUE)
+    }
 }
 
 impl Fanout {
+    /// `cap` chunks queued per client (at least 1).
+    pub fn with_capacity(cap: usize) -> Fanout {
+        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
+    }
+
     pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
         self.next += 1;
-        let (tx, rx) = mpsc::channel();
-        self.subs.insert(self.next, tx);
+        let (tx, rx) = mpsc::sync_channel(self.cap);
+        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
         (self.next, rx)
     }
 
@@ -8988,8 +9271,44 @@ impl Fanout {
         self.subs.remove(&id);
     }
 
+    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
     pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, tx| tx.send(bytes.to_vec()).is_ok());
+        self.subs.retain(|_, s| {
+            if s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(bytes.to_vec()) {
+                Ok(()) => true,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    s.needs_repaint = true;
+                    true
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
+    }
+
+    /// Some client dropped chunks and waits for a full screen.
+    pub fn needs_repaint(&self) -> bool {
+        self.subs.values().any(|s| s.needs_repaint)
+    }
+
+    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
+    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
+    pub fn repaint(&mut self, screen: &[u8]) {
+        self.subs.retain(|_, s| {
+            if !s.needs_repaint {
+                return true;
+            }
+            match s.tx.try_send(screen.to_vec()) {
+                Ok(()) => {
+                    s.needs_repaint = false;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -9016,6 +9335,10 @@ pub trait Driver: Send + Sync {
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
     fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
     fn detach(&self, attachment: u64);
+    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
+    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
+        Err(DriverError::Unsupported("resize"))
+    }
     /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
     fn screen_tail(&self) -> String;
     /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
@@ -9051,6 +9374,24 @@ mod tests {
         assert_eq!(rx_a.recv().unwrap(), b"y");
         f.remove(a);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
+        let mut f = Fanout::with_capacity(2);
+        let (_id, rx) = f.subscribe();
+        for b in [b"1", b"2", b"3", b"4"] {
+            f.send(b);
+        }
+        assert!(f.needs_repaint());
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
+        // Room again, but live bytes stay held back until the full screen is sent.
+        f.send(b"5");
+        assert!(rx.try_recv().is_err());
+        f.repaint(b"SCREEN");
+        assert!(!f.needs_repaint());
+        f.send(b"6");
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
     }
 
     #[test]
@@ -9504,6 +9845,12 @@ impl Shared {
         self.scrollback.extend_from_slice(text.as_bytes());
         let excess = self.scrollback.len().saturating_sub(SCROLLBACK);
         self.scrollback.drain(..excess);
+        if self.fanout.needs_repaint() {
+            // A client fell behind and lost output (bounded queue): resend the recent stream.
+            let mut again = b"\r\n[mirante: output skipped, recent stream follows]\r\n".to_vec();
+            again.extend_from_slice(&self.scrollback);
+            self.fanout.repaint(&again);
+        }
     }
 
     /// The status event to emit, if anything the hub shows changed.
@@ -9865,6 +10212,7 @@ impl RealFactory {
             worktree: Path::new(&req.task.worktree_path),
             settings_path: &settings,
             task_id: &req.task.id,
+            session_id: &req.session_id,
             resume: req.resume.as_deref(),
             parent_env: parent_env(),
         });
