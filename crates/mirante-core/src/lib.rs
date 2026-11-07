@@ -1,6 +1,7 @@
 //! Mirante core: domain model, SQLite store, status fusion, steer/queue classification,
 //! transcript tailing, git worktrees and the Claude launch config. Pure library: no PTY,
 //! no daemon, no UI.
+pub mod delivery;
 pub mod error;
 pub mod hook;
 pub mod model;
