@@ -1,14 +1,15 @@
 //! JSON-RPC 2.0 client over `codex app-server`'s stdio (one JSON object per line).
 //! - The reader thread reads lines as bytes (`read_until`), routes responses to waiting
-//!   requests by id (0 included), and hands notifications, server→client requests
-//!   (approvals) and lines that are not JSON to a callback. EOF is reported once.
+//!   requests by id (0 included; `"error": null` is a result), and hands notifications,
+//!   server→client requests (approvals), responses nobody waits for and lines that are not
+//!   JSON to a callback. EOF is reported once; after it every request fails at once.
 //! - Writes go through a dedicated writer thread over a bounded queue: `request`,
 //!   `respond` and `notify` never block on the child's stdin (the hub may hold its lock
 //!   while answering an approval). A full queue is an error, never a wait.
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -44,15 +45,18 @@ pub enum CallError {
     Rpc { code: i64, message: String },
     /// No answer in time (the request may still have been applied).
     Timeout(String),
-    /// Not sent, or the connection ended before the answer.
+    /// Not sent (the connection is closed, or the write queue is full).
     Transport(String),
+    /// Sent, then the connection ended before the answer: the request may have been
+    /// applied (treat it like a timeout, never like "not delivered").
+    AfterWrite(String),
 }
 
 impl fmt::Display for CallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CallError::Rpc { code, message } => write!(f, "error {code}: {message}"),
-            CallError::Timeout(m) | CallError::Transport(m) => write!(f, "{m}"),
+            CallError::Timeout(m) | CallError::Transport(m) | CallError::AfterWrite(m) => write!(f, "{m}"),
         }
     }
 }
@@ -64,6 +68,8 @@ pub struct RpcConn {
     queue: Mutex<Option<mpsc::SyncSender<Vec<u8>>>>,
     next_id: AtomicU64,
     pending: Pending,
+    /// The server's output ended: nothing will ever be answered.
+    closed: Arc<AtomicBool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -84,16 +90,20 @@ fn route(line: &[u8], pending: &Pending, on_incoming: &impl Fn(Incoming)) {
         (Some(method), None) => on_incoming(Incoming::Notification { method, params: v["params"].clone() }),
         (None, Some(id)) => {
             let waiter = id.as_u64().and_then(|id| lock(pending).remove(&id));
-            if let Some(tx) = waiter {
-                let r = match v.get("error") {
-                    Some(e) => Err(CallError::Rpc {
-                        code: e["code"].as_i64().unwrap_or(0),
-                        message: e["message"].as_str().unwrap_or("").to_string(),
-                    }),
-                    None => Ok(v["result"].clone()),
-                };
-                let _ = tx.send(r);
-            }
+            let Some(tx) = waiter else {
+                // A late answer to a request that timed out, or an id we never used.
+                let text: String = String::from_utf8_lossy(line).chars().take(INVALID_SHOWN).collect();
+                on_incoming(Incoming::Invalid(format!("unmatched response: {text}")));
+                return;
+            };
+            let r = match v.get("error").filter(|e| !e.is_null()) {
+                Some(e) => Err(CallError::Rpc {
+                    code: e["code"].as_i64().unwrap_or(0),
+                    message: e["message"].as_str().unwrap_or("").to_string(),
+                }),
+                None => Ok(v["result"].clone()),
+            };
+            let _ = tx.send(r);
         }
         (None, None) => {
             on_incoming(Incoming::Invalid(String::from_utf8_lossy(line).chars().take(INVALID_SHOWN).collect()))
@@ -117,8 +127,13 @@ impl RpcConn {
             }
             // Dropping the writer closes the server's stdin (app-server exits on EOF).
         });
-        let conn =
-            Arc::new(RpcConn { queue: Mutex::new(Some(tx)), next_id: AtomicU64::new(0), pending: pending.clone() });
+        let closed = Arc::new(AtomicBool::new(false));
+        let conn = Arc::new(RpcConn {
+            queue: Mutex::new(Some(tx)),
+            next_id: AtomicU64::new(0),
+            pending: pending.clone(),
+            closed: closed.clone(),
+        });
         std::thread::spawn(move || {
             let mut line = Vec::new();
             loop {
@@ -132,7 +147,9 @@ impl RpcConn {
                     route(trimmed, &pending, &on_incoming);
                 }
             }
-            // Every waiter gets a transport error at once (dropping its sender).
+            // Set first: a request registered after the clear below sees it and fails at once.
+            closed.store(true, Ordering::SeqCst);
+            // Every waiter gets an error at once (dropping its sender).
             lock(&pending).clear();
             on_incoming(Incoming::Closed);
         });
@@ -159,6 +176,10 @@ impl RpcConn {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         lock(&self.pending).insert(id, tx);
+        if self.closed() {
+            lock(&self.pending).remove(&id);
+            return Err(CallError::Transport(format!("{method}: the codex app-server connection is closed")));
+        }
         if let Err(e) = self.write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })) {
             lock(&self.pending).remove(&id);
             return Err(CallError::Transport(format!("{method}: {e}")));
@@ -169,10 +190,15 @@ impl RpcConn {
                 lock(&self.pending).remove(&id);
                 Err(CallError::Timeout(format!("{method}: no response within {timeout:?}")))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(CallError::Transport(format!("{method}: the connection ended before the answer")))
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(CallError::AfterWrite(format!(
+                "{method}: the connection ended before the answer (it may have been applied)"
+            ))),
         }
+    }
+
+    /// The server's output ended (requests fail at once from now on).
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// A notification; `Value::Null` params are omitted (as `initialized` expects).
@@ -297,5 +323,44 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             Incoming::Notification { ref method, .. } if method == "item/completed"
         ));
+    }
+
+    #[test]
+    fn a_response_nobody_waits_for_is_reported_and_a_null_error_is_a_result() {
+        let (conn, mut sr, mut sw, rx) = pair();
+        writeln!(sw, "{}", json!({"jsonrpc": "2.0", "id": 99, "result": {}})).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Incoming::Invalid(ref m) if m.contains("unmatched response") && m.contains("99")));
+        let c2 = conn.clone();
+        let h = std::thread::spawn(move || c2.request("x", json!({}), Duration::from_secs(5)));
+        let req = read(&mut sr);
+        writeln!(sw, "{}", json!({"jsonrpc": "2.0", "id": req["id"], "result": {"ok": true}, "error": null})).unwrap();
+        assert_eq!(h.join().unwrap().unwrap(), json!({"ok": true}));
+    }
+
+    #[test]
+    fn requests_after_the_server_closed_fail_at_once() {
+        let (conn, sr, sw, rx) = pair();
+        drop(sw);
+        drop(sr);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Incoming::Closed);
+        let started = Instant::now();
+        let e = conn.request("turn/start", json!({}), Duration::from_secs(10)).unwrap_err();
+        assert!(matches!(e, CallError::Transport(_)), "{e:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "fail fast: {:?}", started.elapsed());
+        assert!(conn.closed());
+    }
+
+    #[test]
+    fn a_request_whose_connection_ends_after_the_write_may_have_landed() {
+        let (conn, mut sr, sw, _rx) = pair();
+        let c2 = conn.clone();
+        let h = std::thread::spawn(move || c2.request("turn/steer", json!({}), Duration::from_secs(10)));
+        read(&mut sr);
+        // The server read it, then went away without an answer.
+        drop(sw);
+        drop(sr);
+        let e = h.join().unwrap().unwrap_err();
+        assert!(matches!(e, CallError::AfterWrite(_)), "{e:?}");
     }
 }

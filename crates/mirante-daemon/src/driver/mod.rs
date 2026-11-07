@@ -113,6 +113,9 @@ pub enum DriverEvent {
     },
     /// Codex: quota / token usage, one line for `mirante ls`.
     Usage(String),
+    /// Codex: the effective sandbox in a few characters (`net:off`, `net:on, +1 root`), for
+    /// `mirante ls`'s MODE column.
+    Sandbox(String),
     /// A step for the feed and audit trail (command finished, agent message, ...).
     Step(Value),
     Exited {

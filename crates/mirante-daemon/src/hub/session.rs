@@ -338,6 +338,15 @@ impl State {
                 }
                 Ok(())
             }
+            DriverEvent::Sandbox(summary) => {
+                let changed =
+                    self.live.get_mut(task_id).map(|l| l.sandbox.replace(summary.clone()) != Some(summary.clone()));
+                if changed == Some(true) {
+                    // Audited: the sandbox the agent really runs with (network, writable roots).
+                    self.event(Some(task_id), "sandbox", json!({ "session_id": session_id, "effective": summary }))?;
+                }
+                Ok(())
+            }
             DriverEvent::NativeId(id) => self.set_native_id(task_id, session_id, &id),
             DriverEvent::Boot(state) => {
                 if let Some(l) = self.live.get_mut(task_id) {

@@ -29,9 +29,9 @@ impl State {
 
 impl State {
     /// An already answered request named by `id` (full id or unique suffix): returned as
-    /// stored when its answer is `answer`, a conflict otherwise. `not_found` is the error
-    /// when nothing matches.
-    fn answered_permission(&self, id: &str, answer: PermissionStatus, not_found: String) -> Result<PermissionRequest> {
+    /// stored when it was answered the same way (`allow`: allowed once or for the session),
+    /// a conflict otherwise. `not_found` is the error when nothing matches.
+    fn answered_permission(&self, id: &str, allow: bool, not_found: String) -> Result<PermissionRequest> {
         let mut found: Vec<PermissionRequest> = self
             .store
             .permissions_matching(id.trim())?
@@ -42,7 +42,7 @@ impl State {
             0 => Err(HubError::NotFound(not_found)),
             1 => {
                 let p = found.remove(0);
-                if p.status == answer {
+                if p.status.allowed() == allow {
                     Ok(p)
                 } else {
                     Err(HubError::Conflict(format!(
@@ -140,13 +140,19 @@ impl Hub {
     /// again (a client retry); a different answer to it is a conflict.
     pub fn answer_permission(&self, a: AnswerPermission) -> Result<PermissionRequest> {
         let mut st = self.lock();
-        let status = if a.allow { PermissionStatus::AllowedOnce } else { PermissionStatus::Denied };
         let p = match st.find_permission(&a.id) {
             Ok(p) => p,
             // Not pending: a retry of an answer that already stands returns the stored row
             // (idempotent); any other answer to an answered card is a conflict.
-            Err(HubError::NotFound(m)) => return st.answered_permission(&a.id, status, m),
+            Err(HubError::NotFound(m)) => return st.answered_permission(&a.id, a.allow, m),
             Err(e) => return Err(e),
+        };
+        // A Codex `grantRoot` allowed lasts for the rest of the session: recorded as such.
+        let grant = p.tool == crate::driver::codex::GRANT_TOOL;
+        let status = match (a.allow, grant) {
+            (false, _) => PermissionStatus::Denied,
+            (true, false) => PermissionStatus::AllowedOnce,
+            (true, true) => PermissionStatus::AllowedSession,
         };
         let l = st
             .live
@@ -182,6 +188,12 @@ impl Hub {
         if let Some(l) = st.live.get_mut(&p.task_id) {
             l.perm_keys.remove(&p.id);
             l.dialogs.remove(&p.id);
+        }
+        if status == PermissionStatus::AllowedSession {
+            let payload = json!({ "permission_id": p.id, "tool": p.tool, "detail": p.detail });
+            if let Err(e) = st.event(Some(&p.task_id), "session_grant", payload) {
+                st.log_error(Some(&p.task_id), "session grant not recorded", &e);
+            }
         }
         if agent == AgentKind::Claude {
             if let Err(e) = st.feed_claude(&p.task_id, &Input::PermissionAnswered { allowed: a.allow }) {
@@ -432,5 +444,49 @@ mod tests {
             k.hub.answer_permission(AnswerPermission { id: newer, allow: true }),
             Err(HubError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn an_allowed_grant_root_is_recorded_as_a_session_grant() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        let grant = crate::driver::codex::GRANT_TOOL;
+        let detail = "write access under /Users/u/data for the rest of the session";
+        k.emit(DriverEvent::PermissionRequested { key: "n:3".into(), tool: grant.into(), detail: detail.into() });
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        let a = k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }).unwrap();
+        assert_eq!(a.status, PermissionStatus::AllowedSession);
+        let grants: Vec<serde_json::Value> = k
+            .hub
+            .lock()
+            .store
+            .task_events(&t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "session_grant")
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(grants, vec![json!({"permission_id": id, "tool": grant, "detail": detail})]);
+        // A retry of the same answer is the stored row; a deny of it is a conflict.
+        assert_eq!(k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }).unwrap(), a);
+        assert!(matches!(k.hub.answer_permission(AnswerPermission { id, allow: false }), Err(HubError::Conflict(_))));
+        // Denying a grant is a plain deny; other cards stay one-time.
+        k.emit(DriverEvent::PermissionRequested { key: "n:4".into(), tool: grant.into(), detail: detail.into() });
+        k.emit(DriverEvent::PermissionRequested { key: "n:5".into(), tool: "command".into(), detail: "ls".into() });
+        let p = k.hub.permissions().unwrap();
+        let d = k.hub.answer_permission(AnswerPermission { id: p[0].request.id.clone(), allow: false }).unwrap();
+        assert_eq!(d.status, PermissionStatus::Denied);
+        let o = k.hub.answer_permission(AnswerPermission { id: p[1].request.id.clone(), allow: true }).unwrap();
+        assert_eq!(o.status, PermissionStatus::AllowedOnce);
+        assert_eq!(k.kinds(&t.id).iter().filter(|e| *e == "session_grant").count(), 1);
+    }
+
+    #[test]
+    fn the_effective_sandbox_shows_in_the_task_view() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        assert_eq!(k.hub.get_task(&t.id).unwrap().sandbox, None);
+        k.emit(DriverEvent::Sandbox("net:off".into()));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().sandbox.as_deref(), Some("net:off"));
     }
 }

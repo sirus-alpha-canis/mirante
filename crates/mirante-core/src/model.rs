@@ -100,9 +100,23 @@ text_enum!(AgentKind, "agent", { Claude => "claude", Codex => "codex" });
 pub enum PermissionStatus {
     Pending,
     AllowedOnce,
+    /// Allowed, and what it grants lasts for the rest of the session (Codex `grantRoot`).
+    AllowedSession,
     Denied,
 }
-text_enum!(PermissionStatus, "permission_status", { Pending => "pending", AllowedOnce => "allowed_once", Denied => "denied" });
+text_enum!(PermissionStatus, "permission_status", {
+    Pending => "pending",
+    AllowedOnce => "allowed_once",
+    AllowedSession => "allowed_session",
+    Denied => "denied",
+});
+
+impl PermissionStatus {
+    /// The user said yes (once or for the session).
+    pub fn allowed(self) -> bool {
+        matches!(self, PermissionStatus::AllowedOnce | PermissionStatus::AllowedSession)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
@@ -233,6 +247,9 @@ mod tests {
             assert_eq!(Status::parse(s.as_str()).unwrap(), s);
         }
         assert_eq!(PermissionStatus::parse("allowed_once").unwrap(), PermissionStatus::AllowedOnce);
+        assert_eq!(PermissionStatus::parse("allowed_session").unwrap(), PermissionStatus::AllowedSession);
+        assert!(PermissionStatus::AllowedSession.allowed() && PermissionStatus::AllowedOnce.allowed());
+        assert!(!PermissionStatus::Denied.allowed() && !PermissionStatus::Pending.allowed());
         assert_eq!(AgentKind::parse("codex").unwrap(), AgentKind::Codex);
         assert_eq!(Lifecycle::parse("archived").unwrap(), Lifecycle::Archived);
         assert!(matches!(Status::parse("busy"), Err(CoreError::BadEnum { kind: "status", .. })));

@@ -126,6 +126,8 @@ pub(crate) struct Live {
     pub(crate) hold: Arc<AtomicBool>,
     /// Codex quota / token usage, as the driver last reported it.
     pub(crate) usage: Option<String>,
+    /// Codex: the effective sandbox, as the driver last reported it (`net:off`).
+    pub(crate) sandbox: Option<String>,
     /// Since when the status is `Idle` (the memory guard's idle hibernation and leak check).
     pub(crate) idle_since: Option<Instant>,
     /// This session's `SessionStart` hook was seen (told to the driver once it is attached,
@@ -195,6 +197,7 @@ impl Live {
             transcript: Vec::new(),
             hold: Arc::default(),
             usage: None,
+            sandbox: None,
             idle_since: Some(Instant::now()),
             saw_session_start: false,
         }
@@ -286,6 +289,7 @@ impl State {
             queued: live.map_or(0, |l| l.queue.len()),
             detail: live.and_then(|l| l.detail.clone()),
             usage: live.and_then(|l| l.usage.clone()),
+            sandbox: live.and_then(|l| l.sandbox.clone()),
             memory: live.and(self.mem.sessions.get(&task.id)).map(memory::mem_view),
             hibernated: self.mem.hibernated.contains(&task.id),
             task,

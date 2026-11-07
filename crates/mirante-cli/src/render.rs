@@ -34,6 +34,15 @@ pub fn mode_label(agent: AgentKind) -> &'static str {
     }
 }
 
+/// The MODE cell: the mode plus, for Codex, the effective sandbox the agent reported
+/// (`auto-edits(net:off)`), so a widened sandbox is visible at a glance.
+pub fn mode_cell(v: &TaskView) -> String {
+    match &v.sandbox {
+        Some(s) => format!("{}({s})", mode_label(v.task.agent)),
+        None => mode_label(v.task.agent).to_string(),
+    }
+}
+
 /// What the mode means, for `mirante show`.
 pub fn mode_help(agent: AgentKind) -> &'static str {
     match agent {
@@ -74,12 +83,13 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
     if tasks.is_empty() {
         return "no tasks (mirante new <repo> --agent claude|codex --branch <name> <goal>)\n".into();
     }
+    let mode_w = tasks.iter().map(|v| mode_cell(v).chars().count()).max().unwrap_or(0).max(10);
     let mut out = format!(
         "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
         fit("ID", 8),
         fit("BRANCH", 22),
         fit("AGENT", 6),
-        fit("MODE", 10),
+        fit("MODE", mode_w),
         fit("STATUS", 9),
         fit("MEM", 11),
         fit("NEEDS", 5),
@@ -96,7 +106,7 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
             fit(short(&v.task.id), 8),
             fit(&v.task.branch, 22),
             fit(v.task.agent.as_str(), 6),
-            fit(mode_label(v.task.agent), 10),
+            fit(&mode_cell(v), mode_w),
             paint(v.task.status, &fit(status_label(v.task.status), 9), color),
             fit(&v.memory.as_ref().map(mem_cell).unwrap_or_default(), 11),
             fit(&needs, 5),
@@ -202,6 +212,9 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
         t.goal.lines().next().unwrap_or("")
     );
     out.push_str(&format!("  mode:      {} ({})\n", mode_label(t.agent), mode_help(t.agent)));
+    if let Some(sb) = &v.sandbox {
+        out.push_str(&format!("  sandbox:   {sb} (effective, as the agent reported it)\n"));
+    }
     out.push_str(&format!("  live:      {}  queued: {}\n", v.live, v.queued));
     for p in perms {
         out.push_str(&format!("  needs you: {} {} {}\n", short(&p.id), p.tool, p.detail));
@@ -236,6 +249,7 @@ mod tests {
             queued: 0,
             detail: detail.map(String::from),
             usage: None,
+            sandbox: None,
             memory: None,
             hibernated: false,
         }
@@ -279,6 +293,21 @@ mod tests {
         assert!(task_detail(&v, &[]).contains("mode:      auto-edits (edits and commands inside the worktree"));
         v.task.lifecycle = Lifecycle::Archiving;
         assert!(tasks_table(&[v], false).contains("[archiving · 5h 42% · 31k tokens]"));
+    }
+
+    #[test]
+    fn codex_rows_show_the_effective_sandbox_in_the_mode() {
+        let mut v = view(Status::Idle, 0, None);
+        v.task.agent = AgentKind::Codex;
+        v.sandbox = Some("net:off".into());
+        let t = tasks_table(&[v.clone()], false);
+        assert!(t.lines().nth(1).unwrap().contains("auto-edits(net:off)"), "{t}");
+        v.sandbox = Some("net:on, +1 granted root".into());
+        assert!(task_detail(&v, &[]).contains("sandbox:   net:on, +1 granted root"), "{}", task_detail(&v, &[]));
+        // Columns stay aligned whatever the mode text.
+        let rows = tasks_table(&[v, view(Status::Idle, 0, None)], false);
+        let starts: Vec<usize> = rows.lines().map(|l| l.find("idle").unwrap_or(0)).skip(1).collect();
+        assert_eq!(starts[0], starts[1], "{rows}");
     }
 
     #[test]

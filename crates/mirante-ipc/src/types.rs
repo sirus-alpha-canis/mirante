@@ -72,6 +72,9 @@ pub struct TaskView {
     /// Codex quota / token usage while live, e.g. "5h 42% · week 9% · 31k tokens".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<String>,
+    /// Codex: the effective sandbox while live, e.g. "net:off" or "net:on, +1 root".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     /// Memory of the live session's process tree, once sampled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemView>,
@@ -327,6 +330,7 @@ mod tests {
             queued: 0,
             detail: None,
             usage: None,
+            sandbox: Some("net:off".into()),
             memory: Some(MemView { bytes: 1, peak: 2, budget: 3, state: "ok".into() }),
             hibernated: false,
         };

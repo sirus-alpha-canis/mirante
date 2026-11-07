@@ -15,6 +15,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/0001_init.sql")),
     (2, include_str!("migrations/0002_permission_answered_once.sql")),
     (3, include_str!("migrations/0003_lifecycle_archiving.sql")),
+    (4, include_str!("migrations/0004_permission_allowed_session.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -165,10 +166,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.schema_version().unwrap(), 4);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -1143,7 +1144,7 @@ mod hardening_tests {
             assert!(conn.execute("UPDATE tasks SET lifecycle = 'archiving'", []).is_err());
         }
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
         let t = s.get_task("t").unwrap();
         assert_eq!((t.goal.as_str(), t.notes.as_str(), t.created_at, t.updated_at), ("g", "n", 5, 6));
         assert_eq!(s.transition_lifecycle("t", Lifecycle::Archiving).unwrap().lifecycle, Lifecycle::Archiving);
@@ -1154,6 +1155,53 @@ mod hardening_tests {
         let broken: Option<String> = s.conn.query_row("PRAGMA foreign_key_check", [], |r| r.get(0)).optional().unwrap();
         assert_eq!(broken, None);
         assert!(s.conn.execute("UPDATE tasks SET lifecycle = 'bogus'", []).is_err());
+    }
+
+    /// A v3 database (permission status CHECK without 'allowed_session') is rebuilt by
+    /// 0004: rows survive, the answered-once trigger and the index are back, and a
+    /// session-wide grant can be recorded.
+    #[test]
+    fn v3_database_upgrades_to_accept_session_grants() {
+        let dir = crate::test_support::TempDir::new("store-v3");
+        let path = dir.path().join("m.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (_, sql) in &MIGRATIONS[..3] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks VALUES ('t', 'x', '/r', '/w', 'b', 'codex', '', '', 'active', 'idle', 0, 0);
+                 INSERT INTO conversations VALUES ('c', 't', NULL, 0);
+                 INSERT INTO sessions VALUES ('s', 't', 'c', 0, NULL, NULL, 0);
+                 INSERT INTO permission_requests VALUES ('old', 't', 's', 'command', 'ls', 'denied', 5, 6);
+                 INSERT INTO permission_requests VALUES ('p', 't', 's', 'file_change', 'grant', 'pending', 7, NULL);",
+            )
+            .unwrap();
+            assert!(conn
+                .execute("UPDATE permission_requests SET status = 'allowed_session' WHERE id = 'p'", [])
+                .is_err());
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 4);
+        let old = s.permissions_matching("old").unwrap();
+        assert_eq!((old[0].status, old[0].created_at, old[0].answered_at), (PermissionStatus::Denied, 5, Some(6)));
+        assert_eq!(
+            s.answer_permission("p", PermissionStatus::AllowedSession).unwrap().status,
+            PermissionStatus::AllowedSession
+        );
+        assert!(
+            s.conn.execute("UPDATE permission_requests SET status = 'denied' WHERE id = 'p'", []).is_err(),
+            "answered once"
+        );
+        let idx: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'permission_requests_task'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert!(s.conn.execute("UPDATE permission_requests SET status = 'bogus' WHERE id = 'old'", []).is_err());
+        let broken: Option<String> = s.conn.query_row("PRAGMA foreign_key_check", [], |r| r.get(0)).optional().unwrap();
+        assert_eq!(broken, None);
     }
 
     #[test]

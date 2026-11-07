@@ -12,10 +12,13 @@
 //!   `interrupted` / `failed` turn abandons its open commands at once. Item events never
 //!   reopen a turn.
 //! - Approval requests mean `NeedsYou` until answered, resolved by the server
-//!   (`serverRequest/resolved`) or voided by the end of the turn that raised them; the keys
-//!   voided here are handed to the driver ([`CodexEngine::take_resolved`]).
+//!   (`serverRequest/resolved`) or voided by the end of the turn that raised them; a request
+//!   that names no turn (the legacy `execCommandApproval` / `applyPatchApproval`) is voided
+//!   only by a thread `systemError` or the process ending. The keys voided here are handed
+//!   to the driver ([`CodexEngine::take_resolved`]). Keys are typed (`n:` number, `s:`
+//!   string), so request `1` and request `"1"` never collide.
 //! - Errors (`error` notifications, a failed turn's `turn.error`, a thread `systemError`)
-//!   become the status detail.
+//!   become the status detail; a "retrying" one is cleared when the turn completes.
 //!
 //! Time is passed in (`now`), so the settle timeout is tested without sleeping.
 use std::collections::{HashMap, HashSet};
@@ -51,11 +54,14 @@ pub enum CodexInput<'a> {
     Closed,
 }
 
-/// A request key as Mirante stores it: a string id verbatim, a number in decimal.
+/// A request key as Mirante stores it, typed: `n:<number>`, `s:<string>` (anything else,
+/// which JSON-RPC does not allow, `j:<json>`). Used for every request id, including the one
+/// in `serverRequest/resolved`.
 pub fn request_key(id: &Value) -> String {
     match id {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::Number(n) => format!("n:{n}"),
+        Value::String(s) => format!("s:{s}"),
+        other => format!("j:{other}"),
     }
 }
 
@@ -182,11 +188,13 @@ impl CodexEngine {
         }
     }
 
+    /// `Some(turn)`: the requests that turn raised (a request without a turn is kept);
+    /// `None`: every request (the thread failed or the process ended).
     fn void_approvals(&mut self, turn: Option<&str>) {
         let gone: Vec<String> = self
             .approvals
             .iter()
-            .filter(|(_, t)| turn.is_none() || t.is_none() || t.as_deref() == turn)
+            .filter(|(_, t)| turn.is_none() || (t.is_some() && t.as_deref() == turn))
             .map(|(k, _)| k.clone())
             .collect();
         for k in gone {
@@ -224,7 +232,13 @@ impl CodexEngine {
                     "turn/completed" => {
                         let turn = &params["turn"];
                         let id = turn["id"].as_str().map(str::to_string).or_else(|| self.turn.clone());
-                        self.void_approvals(id.as_deref());
+                        if let Some(id) = id.as_deref() {
+                            self.void_approvals(Some(id));
+                        }
+                        if self.error.as_deref().is_some_and(|e| e.starts_with("retrying:")) {
+                            // The retry got through (a failed turn sets its own error below).
+                            self.error = None;
+                        }
                         self.last_completed = id;
                         self.turn = None;
                         match turn["status"].as_str() {
@@ -426,7 +440,7 @@ mod tests {
         assert_eq!(e.apply(&ask("5"), t0).unwrap().to, Status::NeedsYou);
         assert_eq!(e.apply(&CodexInput::ApprovalAnswered("5".into()), t0).unwrap().to, Status::Working);
         // Request id 0 is a real id.
-        e.apply(&ask("0"), t0);
+        e.apply(&ask("n:0"), t0);
         let resolved = json!({"threadId": "th1", "requestId": 0});
         let t = e.apply(&n("serverRequest/resolved", &resolved), t0).unwrap();
         assert_eq!((t.to, t.cause.as_str()), (Status::Working, "codex:request_resolved"));
@@ -482,8 +496,49 @@ mod tests {
     }
 
     #[test]
-    fn request_keys_keep_strings_verbatim() {
-        assert_eq!(request_key(&json!(0)), "0");
-        assert_eq!(request_key(&json!("e1")), "e1");
+    fn request_keys_are_typed_so_a_string_and_a_number_never_collide() {
+        assert_eq!(request_key(&json!(0)), "n:0");
+        assert_eq!(request_key(&json!("e1")), "s:e1");
+        assert_ne!(request_key(&json!("1")), request_key(&json!(1)));
+        // The resolved notification uses the same keys.
+        let (mut e, t0) = engine();
+        e.apply(&CodexInput::ApprovalRequested { key: request_key(&json!("7")), turn: None }, t0);
+        let other = json!({"threadId": "th1", "requestId": 7});
+        assert_eq!(e.apply(&n("serverRequest/resolved", &other), t0), None, "number 7 is not string \"7\"");
+        let same = json!({"threadId": "th1", "requestId": "7"});
+        assert_eq!(e.apply(&n("serverRequest/resolved", &same), t0).unwrap().to, Status::Idle);
+    }
+
+    #[test]
+    fn legacy_requests_without_a_turn_are_voided_only_when_the_thread_or_process_ends() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        // A legacy `execCommandApproval` names no turn.
+        e.apply(&CodexInput::ApprovalRequested { key: "n:3".into(), turn: None }, t0);
+        e.apply(&n("turn/completed", &json!({"threadId": "th1", "turn": {"id": "tu1", "status": "completed"}})), t0);
+        assert!(e.take_resolved().is_empty(), "a turn ending does not void a turnless request");
+        assert_eq!(e.status(), Status::NeedsYou);
+        let sys = json!({"threadId": "th1", "status": {"type": "systemError"}});
+        e.apply(&n("thread/status/changed", &sys), t0);
+        assert_eq!(e.take_resolved(), vec!["n:3".to_string()]);
+        e.apply(&CodexInput::ApprovalRequested { key: "n:4".into(), turn: None }, t0);
+        e.apply(&CodexInput::Closed, t0);
+        assert_eq!(e.take_resolved(), vec!["n:4".to_string()]);
+    }
+
+    #[test]
+    fn a_retry_error_is_cleared_when_the_turn_completes() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        let retry = json!({"threadId": "th1", "willRetry": true, "error": {"message": "stream dropped"}});
+        e.apply(&n("error", &retry), t0);
+        assert_eq!(e.detail().as_deref(), Some("retrying: stream dropped"));
+        e.apply(&n("turn/completed", &json!({"threadId": "th1", "turn": {"id": "tu1", "status": "completed"}})), t0);
+        assert_eq!(e.detail(), None, "the retry worked: nothing to show");
+        // A fatal error stays until the next turn.
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu2"}})), t0);
+        e.apply(&n("error", &json!({"threadId": "th1", "willRetry": false, "error": {"message": "limit"}})), t0);
+        e.apply(&n("turn/completed", &json!({"threadId": "th1", "turn": {"id": "tu2", "status": "completed"}})), t0);
+        assert_eq!(e.detail().as_deref(), Some("error: limit"));
     }
 }

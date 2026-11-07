@@ -59,6 +59,25 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     f.write_all(contents.as_bytes())
 }
 
+/// Most bytes `codex-stderr.log` keeps before it is moved to `codex-stderr.log.1`.
+pub const STDERR_LOG_CAP: u64 = 1 << 20;
+
+/// Makes `path` ready to be appended to (mode 0600 in a 0700 directory), keeping what
+/// earlier sessions wrote; past `cap` bytes it is moved to `<path>.1` (replacing the older
+/// one) and a fresh file is started.
+pub fn prepare_append_log(path: &Path, cap: u64) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > cap) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        std::fs::rename(path, &old)?;
+    }
+    let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
 /// A random (version 4) UUID, lowercase `8-4-4-4-12`, from `/dev/urandom`.
 pub fn new_uuid_v4() -> std::io::Result<String> {
     let mut b = [0u8; 16];
@@ -136,7 +155,8 @@ impl RealFactory {
         let over = std::env::var("MIRANTE_CODEX_BIN").ok();
         let bin = resolve_codex_bin(over.as_deref(), std::env::var("PATH").ok().as_deref())?;
         let log = req.paths.session_dir(&req.task.id).join("codex-stderr.log");
-        write_private(&log, "")?;
+        // Appended, never truncated: the last session's stderr explains its crash.
+        prepare_append_log(&log, STDERR_LOG_CAP)?;
         let env_remove = codex_env_to_scrub(parent_env());
         let d = CodexDriver::spawn(
             &bin,
@@ -176,6 +196,25 @@ mod tests {
         assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         write_private(&p, "{\"x\":1}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"x\":1}");
+    }
+
+    #[test]
+    fn the_codex_stderr_log_is_appended_and_rotated_past_its_cap() {
+        let d = TestDir::new();
+        let log = d.path().join("sessions/t1/codex-stderr.log");
+        prepare_append_log(&log, 100).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(log.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(b"first session\n").unwrap();
+        // The next session keeps what the last one wrote (its crash is still readable).
+        prepare_append_log(&log, 100).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "first session\n");
+        std::fs::write(&log, "x".repeat(150)).unwrap();
+        prepare_append_log(&log, 100).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+        let old = log.with_file_name("codex-stderr.log.1");
+        assert_eq!(std::fs::read_to_string(&old).unwrap().len(), 150);
+        assert_eq!(std::fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

@@ -24,14 +24,23 @@
 //!   "stop now" is `turn/interrupt`.
 //! - Approvals arrive as server→client requests and are answered once, one-time only.
 //!   `serverRequest/resolved`, the end of their turn, or the process exiting withdraws them
-//!   (`DriverEvent::PermissionResolved`).
+//!   (`DriverEvent::PermissionResolved`). The one exception is honest about itself: a
+//!   `grantRoot` file-change request asks for write access under a directory for the rest
+//!   of the session; its card says so, and allowing it prints "[allowed: write access under
+//!   <root> for the rest of the session]" and is recorded as `allowed_session`.
+//! - The effective sandbox (network access, extra writable roots, granted roots) is shown
+//!   at the top of every attach stream and reported to the hub (`DriverEvent::Sandbox`,
+//!   e.g. `net:off`) for `mirante ls`.
+//! - `turn/interrupt` goes out from its own short-lived thread, naming the turn running
+//!   when it is sent: a message send waiting on a stuck request never delays it.
+//! - Once app-server's output ended, `send` and `interrupt` fail at once.
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use mirante_core::claude_launch::{env_to_scrub, KNOWN_SHIM_DIRS};
@@ -57,6 +66,8 @@ pub const SANDBOX: &str = "workspace-write";
 /// How the effective sandbox policy names [`SANDBOX`] in responses.
 pub const SANDBOX_POLICY_TYPE: &str = "workspaceWrite";
 pub const REVIEWER: &str = "user";
+/// The card tool of a `grantRoot` request (allowing it is recorded as `allowed_session`).
+pub const GRANT_TOOL: &str = "file_change (session-wide grant)";
 
 /// First line of every attach stream.
 pub const MODE_BANNER: &str = "[mirante] codex, auto-edits mode: edits and commands inside the worktree run without \
@@ -218,7 +229,7 @@ pub fn approval_card(method: &str, params: &Value, file_items: &HashMap<String, 
         "item/commandExecution/requestApproval" | "execCommandApproval" => ("command", text_of(&params["command"])),
         "item/fileChange/requestApproval" | "applyPatchApproval" if params["grantRoot"].is_string() => {
             let root = params["grantRoot"].as_str().unwrap_or("");
-            ("file_change (session-wide grant)", Some(format!("write access under {root} for the rest of the session")))
+            (GRANT_TOOL, Some(format!("write access under {root} for the rest of the session")))
         }
         "item/fileChange/requestApproval" => {
             let item = params["itemId"].as_str().and_then(|id| file_items.get(id));
@@ -236,6 +247,51 @@ pub fn approval_card(method: &str, params: &Value, file_items: &HashMap<String, 
         (None, None) => "(no detail given)".into(),
     };
     (tool.to_string(), detail)
+}
+
+/// `thread/resume` failed because the thread's conversation is gone. Matched on the text
+/// Codex 0.167's schema implies ("no rollout found"), or on an internal error (-32603)
+/// saying "not found" or naming the rollout. The exact text must be confirmed in the Task
+/// 21 real run (resume a thread whose rollout file was deleted).
+pub fn is_native_gone(code: i64, message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("no rollout found") || (code == -32603 && (m.contains("not found") || m.contains("rollout")))
+}
+
+/// The effective sandbox in a few characters, for `mirante ls`: `net:off`, `net:on, +1
+/// root`, `net:off, +1 granted root` (`net:?` when the response does not say).
+pub fn sandbox_summary(sandbox: &Value, granted: &[String]) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut parts = vec![match sandbox["networkAccess"].as_bool() {
+        Some(true) => "net:on".to_string(),
+        Some(false) => "net:off".to_string(),
+        None => "net:?".to_string(),
+    }];
+    let roots = sandbox["writableRoots"].as_array().map_or(0, Vec::len);
+    if roots > 0 {
+        parts.push(format!("+{roots} root{}", plural(roots)));
+    }
+    if !granted.is_empty() {
+        parts.push(format!("+{} granted root{}", granted.len(), plural(granted.len())));
+    }
+    parts.join(", ")
+}
+
+/// The effective sandbox in words, for the attach stream.
+pub fn sandbox_banner(sandbox: &Value, granted: &[String]) -> String {
+    let net = match sandbox["networkAccess"].as_bool() {
+        Some(true) => "network ON",
+        Some(false) => "network off",
+        None => "network not reported",
+    };
+    let mut extra: Vec<String> = sandbox["writableRoots"]
+        .as_array()
+        .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    extra.extend(granted.iter().map(|g| format!("{g} (granted)")));
+    let writable =
+        if extra.is_empty() { "the worktree only".to_string() } else { format!("the worktree + {}", extra.join(", ")) };
+    format!("[mirante] effective sandbox: {SANDBOX}, {net}, writable: {writable}")
 }
 
 fn window_label(mins: Option<i64>) -> String {
@@ -392,30 +448,43 @@ fn tail_lines(text: &str, n: usize) -> String {
 }
 
 /// The spawned app-server: reaped once, by whoever gets there first (the reader at EOF or
-/// `stop`).
+/// `stop`); a concurrent caller waits for that reap and gets the same exit code.
 struct Process {
+    /// Taken out by the reaper: the lock is never held while it waits.
     child: Mutex<Option<Child>>,
     root: Option<Proc>,
     stderr_log: Option<PathBuf>,
-    code: Mutex<Option<i32>>,
+    /// `Some(exit code)` once reaped.
+    outcome: Mutex<Option<Option<i32>>>,
+    reaped: Condvar,
 }
 
 impl Process {
+    fn new(child: Child, root: Option<Proc>, stderr_log: Option<PathBuf>) -> Process {
+        Process { child: Mutex::new(Some(child)), root, stderr_log, outcome: Mutex::default(), reaped: Condvar::new() }
+    }
+
     /// Waits up to `wait` for the exit, then ends what is left of the tree; records the code.
     fn reap(&self, wait: Duration) -> Option<i32> {
-        if let Some(mut child) = lock(&self.child).take() {
-            let deadline = Instant::now() + wait;
-            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if let Some(root) = self.root {
-                proctree::kill_tree(root, Duration::from_millis(500), &Kill);
-            }
-            if let Ok(status) = child.wait() {
-                *lock(&self.code) = status.code();
-            }
+        let taken = lock(&self.child).take();
+        let Some(mut child) = taken else {
+            // Another caller is reaping (or did): wait for its outcome.
+            let g = lock(&self.outcome);
+            let limit = wait + Duration::from_secs(5);
+            let (g, _) = self.reaped.wait_timeout_while(g, limit, |o| o.is_none()).unwrap_or_else(|p| p.into_inner());
+            return (*g).flatten();
+        };
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(20));
         }
-        *lock(&self.code)
+        if let Some(root) = self.root {
+            proctree::kill_tree(root, Duration::from_millis(500), &Kill);
+        }
+        let code = child.wait().ok().and_then(|s| s.code());
+        *lock(&self.outcome) = Some(code);
+        self.reaped.notify_all();
+        code
     }
 
     fn stderr_tail(&self) -> String {
@@ -437,6 +506,8 @@ struct Shared {
     reported: (Status, bool, Option<String>),
     /// The effective sandbox policy from the thread response (sent again on each turn).
     sandbox_policy: Value,
+    /// Roots the user granted write access to for the rest of the session (`grantRoot`).
+    granted_roots: Vec<String>,
     /// clientUserMessageId -> text, until its `userMessage` item shows up.
     unconfirmed: HashMap<String, String>,
     rate_limits: Option<Value>,
@@ -495,7 +566,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 enum Work {
     Send(String),
-    Interrupt(String),
 }
 
 pub struct CodexDriver {
@@ -574,11 +644,19 @@ fn on_incoming(ctx: &Ctx, incoming: Incoming) {
             out.push(DriverEvent::PermissionRequested { key, tool, detail });
             s.settle(t.map_or_else(|| "codex:approval_requested".into(), |t| t.cause), &mut out);
         }
-        Incoming::Request { id, method, .. } => {
+        Incoming::Request { id, method, params } => {
+            let elicitation = method == "mcpServer/elicitation/request";
+            if elicitation {
+                let server = params["serverName"].as_str().unwrap_or("an MCP server");
+                let what = text_of(&params["message"]).map(|m| format!(": {}", bounded(m, 200))).unwrap_or_default();
+                lock(&ctx.shared).output(&format!(
+                    "[mcp elicitation from {server} declined automatically (Mirante never answers one for you){what}]\r\n"
+                ));
+            }
             if let Some(conn) = ctx.conn.get() {
                 // MCP elicitations are declined (never accepted on the user's behalf); other
                 // server requests (user input, tool calls, auth refresh) are not supported.
-                let _ = if method == "mcpServer/elicitation/request" {
+                let _ = if elicitation {
                     conn.respond(&id, json!({ "action": "decline" }))
                 } else {
                     conn.respond_error(&id, -32601, "not supported by Mirante")
@@ -661,7 +739,8 @@ fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, tim
     };
     match r {
         Ok(()) => {}
-        Err(CallError::Timeout(e)) => {
+        // It may have landed: reported, never handed back (it would be sent twice).
+        Err(CallError::Timeout(e) | CallError::AfterWrite(e)) => {
             sink.emit(DriverEvent::Step(json!({ "type": "send_unconfirmed", "text": text, "error": e })));
         }
         Err(e) => {
@@ -702,12 +781,7 @@ impl CodexDriver {
         let root = proctree::proc_of(child.id() as i32);
         let stdin = child.stdin.take().ok_or_else(|| DriverError::Failed("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| DriverError::Failed("no stdout".into()))?;
-        let process = Process {
-            child: Mutex::new(Some(child)),
-            root,
-            stderr_log: Some(stderr_log.to_path_buf()),
-            code: Mutex::default(),
-        };
+        let process = Process::new(child, root, Some(stderr_log.to_path_buf()));
         CodexDriver::connect_process(BufReader::new(stdout), stdin, Some(Arc::new(process)), cwd, resume, sink, timing)
     }
 
@@ -744,6 +818,7 @@ impl CodexDriver {
             scrollback: Vec::new(),
             reported: (Status::Idle, false, None),
             sandbox_policy: Value::Null,
+            granted_roots: Vec::new(),
             unconfirmed: HashMap::new(),
             rate_limits: None,
             token_usage: None,
@@ -777,7 +852,7 @@ impl CodexDriver {
         let method = if resume.is_some() { "thread/resume" } else { "thread/start" };
         let result = match conn.request(method, thread_params(cwd, resume), timing.request) {
             Ok(r) => r,
-            Err(CallError::Rpc { message, .. }) if resume.is_some() && message.contains("no rollout found") => {
+            Err(CallError::Rpc { code, message }) if resume.is_some() && is_native_gone(code, &message) => {
                 return Err(DriverError::NativeGone(format!("codex thread {}: {message}", resume.unwrap_or_default())));
             }
             Err(e) => return Err(fail(e)),
@@ -795,19 +870,12 @@ impl CodexDriver {
         }
         sink.emit(DriverEvent::NativeId(thread_id));
         sink.emit(DriverEvent::Boot(BootState::Ready));
+        sink.emit(DriverEvent::Sandbox(sandbox_summary(&result["sandbox"], &[])));
         let (wsh, wsink, wconn) = (shared.clone(), sink.clone(), conn.clone());
         std::thread::spawn(move || {
             for w in rx {
                 match w {
                     Work::Send(text) => send_now(&wconn, &wsh, &wsink, &text, timing.request),
-                    Work::Interrupt(turn) => {
-                        let thread = lock(&wsh).thread_id.clone();
-                        let p = json!({ "threadId": thread, "turnId": turn });
-                        if let Err(e) = wconn.request("turn/interrupt", p, timing.request) {
-                            wsink
-                                .emit(DriverEvent::Step(json!({ "type": "interrupt_failed", "error": e.to_string() })));
-                        }
-                    }
                 }
             }
         });
@@ -831,6 +899,14 @@ impl CodexDriver {
             }
         });
         Ok(driver)
+    }
+
+    /// Fails at once when app-server's output ended (nothing would ever answer).
+    fn ensure_open(&self) -> Result<(), DriverError> {
+        if lock(&self.shared).closed || self.conn.closed() {
+            return Err(DriverError::Failed("codex app-server has exited (mirante resume starts it again)".into()));
+        }
+        Ok(())
     }
 
     fn queue(&self, w: Work) -> Result<(), DriverError> {
@@ -866,13 +942,39 @@ impl Drop for CodexDriver {
 
 impl Driver for CodexDriver {
     fn send(&self, text: &str) -> Result<(), DriverError> {
+        self.ensure_open()?;
         self.queue(Work::Send(text.to_string()))
     }
 
     fn interrupt(&self) -> Result<(), DriverError> {
-        let turn = lock(&self.shared).engine.turn_id().map(str::to_string);
-        let turn = turn.ok_or_else(|| DriverError::NotNow("no running turn to interrupt".into()))?;
-        self.queue(Work::Interrupt(turn))
+        self.ensure_open()?;
+        if lock(&self.shared).engine.turn_id().is_none() {
+            return Err(DriverError::NotNow("no running turn to interrupt".into()));
+        }
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(DriverError::Failed("driver stopped".into()));
+        }
+        // Its own thread: a send waiting on a stuck request must not delay "stop now".
+        let (conn, shared, sink, timeout) =
+            (self.conn.clone(), self.shared.clone(), self.sink.clone(), self.timing.request);
+        std::thread::spawn(move || {
+            // The turn running now, when the request goes out.
+            let (thread, turn) = {
+                let s = lock(&shared);
+                (s.thread_id.clone(), s.engine.turn_id().map(str::to_string))
+            };
+            let Some(turn) = turn else {
+                sink.emit(DriverEvent::Step(
+                    json!({ "type": "interrupt_skipped", "reason": "the turn already ended" }),
+                ));
+                return;
+            };
+            let p = json!({ "threadId": thread, "turnId": turn });
+            if let Err(e) = conn.request("turn/interrupt", p, timeout) {
+                sink.emit(DriverEvent::Step(json!({ "type": "interrupt_failed", "error": e.to_string() })));
+            }
+        });
+        Ok(())
     }
 
     fn answer_permission(&self, key: &str, _tool: &str, allow: bool) -> Result<(), DriverError> {
@@ -884,9 +986,17 @@ impl Driver for CodexDriver {
             s.approvals.insert(key.to_string(), (id, method, params));
             return Err(DriverError::Failed(format!("answer not sent: {e}")));
         }
-        s.output(&format!("[{}]\r\n", if allow { "allowed once" } else { "denied" }));
-        let t = s.engine.apply(&CodexInput::ApprovalAnswered(key.to_string()), Instant::now());
         let mut out = Vec::new();
+        match params["grantRoot"].as_str().filter(|_| allow) {
+            Some(root) => {
+                // Honest about what it grants: this lasts for the rest of the session.
+                s.output(&format!("[allowed: write access under {root} for the rest of the session]\r\n"));
+                s.granted_roots.push(root.to_string());
+                out.push(DriverEvent::Sandbox(sandbox_summary(&s.sandbox_policy, &s.granted_roots)));
+            }
+            None => s.output(&format!("[{}]\r\n", if allow { "allowed once" } else { "denied" })),
+        }
+        let t = s.engine.apply(&CodexInput::ApprovalAnswered(key.to_string()), Instant::now());
         s.settle(t.map_or_else(|| "mirante:approval_answered".into(), |t| t.cause), &mut out);
         drop(s);
         for e in out {
@@ -908,7 +1018,8 @@ impl Driver for CodexDriver {
     fn attach(&self, _rows: u16, _cols: u16) -> Result<Attachment, DriverError> {
         let mut s = lock(&self.shared);
         let (id, output) = s.fanout.subscribe();
-        let mut initial = format!("{MODE_BANNER}\r\n").into_bytes();
+        let mut initial =
+            format!("{MODE_BANNER}\r\n{}\r\n", sandbox_banner(&s.sandbox_policy, &s.granted_roots)).into_bytes();
         initial.extend_from_slice(&s.scrollback);
         Ok(Attachment { id, initial, output, input: false })
     }
@@ -1146,28 +1257,28 @@ mod tests {
         assert_eq!(
             card,
             DriverEvent::PermissionRequested {
-                key: "41".into(),
+                key: "n:41".into(),
                 tool: "command".into(),
                 detail: "rm -rf build".into()
             }
         );
         let ev = next_event(&rx, status_to(Status::NeedsYou));
         assert!(matches!(ev, DriverEvent::Status { turn_open: true, .. }));
-        d.answer_permission("41", "command", true).unwrap();
+        d.answer_permission("n:41", "command", true).unwrap();
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 41, "result": {"decision": "accept"}}));
-        assert!(matches!(d.answer_permission("41", "command", true), Err(DriverError::NoDialog(_))));
+        assert!(matches!(d.answer_permission("n:41", "command", true), Err(DriverError::NoDialog(_))));
         next_event(&rx, status_to(Status::Working));
         // Request id 0, then resolved by the server (e.g. answered elsewhere).
         fake.send(json!({"jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "i2", "startedAtMs": 1, "command": "ls"}}));
-        next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { key, .. } if key == "0"));
+        next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { key, .. } if key == "n:0"));
         fake.notify("serverRequest/resolved", json!({"threadId": "th-1", "requestId": 0}));
         assert_eq!(
             next_event(&rx, |e| matches!(e, DriverEvent::PermissionResolved { .. })),
-            DriverEvent::PermissionResolved { key: "0".into() }
+            DriverEvent::PermissionResolved { key: "n:0".into() }
         );
         next_event(&rx, status_to(Status::Working));
-        assert!(matches!(d.answer_permission("0", "command", false), Err(DriverError::NoDialog(_))));
+        assert!(matches!(d.answer_permission("n:0", "command", false), Err(DriverError::NoDialog(_))));
         // A request still open when its turn ends is withdrawn too.
         fake.send(json!({"jsonrpc": "2.0", "id": "r7", "method": "item/fileChange/requestApproval",
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f1", "startedAtMs": 1}}));
@@ -1175,7 +1286,7 @@ mod tests {
         fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "completed"}}));
         assert_eq!(
             next_event(&rx, |e| matches!(e, DriverEvent::PermissionResolved { .. })),
-            DriverEvent::PermissionResolved { key: "r7".into() }
+            DriverEvent::PermissionResolved { key: "s:r7".into() }
         );
         next_event(&rx, status_to(Status::Idle));
     }
@@ -1197,7 +1308,7 @@ mod tests {
         assert_eq!(
             card,
             DriverEvent::PermissionRequested {
-                key: "2".into(),
+                key: "n:2".into(),
                 tool: "file_change".into(),
                 detail: "update src/a.rs (+2 -1) — outside".into()
             }
@@ -1206,7 +1317,7 @@ mod tests {
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f2", "startedAtMs": 1, "grantRoot": "/Users/u"}}));
         let card = next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
         assert!(matches!(card, DriverEvent::PermissionRequested { ref tool, ref detail, .. }
-            if tool == "file_change (session-wide grant)" && detail.contains("/Users/u for the rest of the session")));
+            if tool == GRANT_TOOL && detail.contains("/Users/u for the rest of the session")));
     }
 
     #[test]
@@ -1354,7 +1465,7 @@ mod tests {
         drop(fake);
         assert_eq!(
             next_event(&rx, |e| matches!(e, DriverEvent::PermissionResolved { .. })),
-            DriverEvent::PermissionResolved { key: "0".into() }
+            DriverEvent::PermissionResolved { key: "n:0".into() }
         );
         assert_eq!(next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { code: None });
     }
@@ -1447,5 +1558,152 @@ mod tests {
             codex_env_to_scrub(vec!["CMUX_SOCKET".into(), "OPENAI_API_KEY".into(), "CODEX_HOME".into(), "PATH".into()]);
         assert!(keys.contains(&"CMUX_SOCKET".to_string()) && keys.contains(&"CLAUDECODE".to_string()));
         assert!(!keys.iter().any(|k| k.starts_with("OPENAI_") || k.starts_with("CODEX_") || k == "PATH"));
+    }
+
+    fn stream(a: &Attachment, until: &str) -> String {
+        let mut seen = String::new();
+        while !seen.contains(until) {
+            let chunk =
+                a.output.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("{until:?} not in {seen:?}"));
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        seen
+    }
+
+    #[test]
+    fn an_allowed_grant_root_says_it_lasts_for_the_session() {
+        let (d, mut fake, rx, _) = setup(None);
+        let a = d.attach(24, 80).unwrap();
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        fake.send(json!({"jsonrpc": "2.0", "id": 3, "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f2", "startedAtMs": 1, "grantRoot": "/Users/u/data"}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { tool, .. } if tool == GRANT_TOOL));
+        d.answer_permission("n:3", GRANT_TOOL, true).unwrap();
+        assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 3, "result": {"decision": "accept"}}));
+        stream(&a, "[allowed: write access under /Users/u/data for the rest of the session]");
+        // The effective sandbox shown everywhere now includes the granted root.
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Sandbox(s) if s.contains("granted")));
+        assert_eq!(ev, DriverEvent::Sandbox("net:off, +1 granted root".into()));
+    }
+
+    #[test]
+    fn native_gone_is_recognised_by_its_text_or_by_code_and_wording() {
+        assert!(is_native_gone(-32600, "no rollout found for thread id x"));
+        assert!(is_native_gone(-32603, "thread x not found"));
+        assert!(is_native_gone(-32603, "failed to load rollout"));
+        assert!(!is_native_gone(-32603, "internal error"));
+        assert!(!is_native_gone(-32600, "thread not found"), "not-found wording counts only with -32603");
+        let (d, _fake, _rx, _) = connect_with(Some("th-gone"), |f, t| {
+            f.send(json!({"jsonrpc": "2.0", "id": t["id"], "error": {"code": -32603, "message": "thread th-gone not found"}}))
+        });
+        assert!(matches!(d, Err(DriverError::NativeGone(_))), "{:?}", d.err());
+    }
+
+    #[test]
+    fn interrupt_is_not_delayed_by_a_hung_send() {
+        let (d, mut fake, rx, _) = setup(None);
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
+        d.send("more").unwrap();
+        fake.expect("turn/steer"); // never answered: the send waits for its timeout
+        let asked = Instant::now();
+        d.interrupt().unwrap();
+        let int = fake.expect("turn/interrupt");
+        assert!(asked.elapsed() < Duration::from_secs(1), "the interrupt waited {:?}", asked.elapsed());
+        assert_eq!(int["params"], json!({"threadId": "th-1", "turnId": "tu-1"}));
+    }
+
+    #[test]
+    fn a_closed_server_fails_sends_and_interrupts_at_once() {
+        let (d, fake, rx, _) = setup(None);
+        drop(fake);
+        next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. }));
+        assert!(matches!(d.send("x"), Err(DriverError::Failed(ref m)) if m.contains("exited")));
+        assert!(matches!(d.interrupt(), Err(DriverError::Failed(ref m)) if m.contains("exited")));
+    }
+
+    #[test]
+    fn a_send_whose_connection_ended_after_the_write_is_unconfirmed_not_requeued() {
+        let (d, mut fake, rx, _) = setup(None);
+        d.send("did it land?").unwrap();
+        fake.expect("turn/start");
+        drop(fake);
+        // The send's outcome and the exit come from different threads: collect both.
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen.iter().any(|e| matches!(e, DriverEvent::Step(v) if v["type"] == "send_unconfirmed"))
+            || !seen.iter().any(|e| matches!(e, DriverEvent::Exited { .. }))
+        {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok((_, e)) => seen.push(e),
+                Err(_) => break,
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        seen.extend(rx.try_iter().map(|(_, e)| e));
+        assert!(seen.iter().any(|e| matches!(e, DriverEvent::Step(v) if v["type"] == "send_unconfirmed")), "{seen:?}");
+        assert!(!seen.iter().any(|e| matches!(e, DriverEvent::DeliveryAborted { .. })), "{seen:?}");
+    }
+
+    #[test]
+    fn reap_does_not_hold_the_child_lock_while_waiting() {
+        let child = Command::new("/bin/sh").args(["-c", "sleep 0.5; exit 4"]).process_group(0).spawn().unwrap();
+        let root = proctree::proc_of(child.id() as i32);
+        let p = Arc::new(Process::new(child, root, None));
+        let (p2, p3) = (p.clone(), p.clone());
+        let first = std::thread::spawn(move || p2.reap(Duration::from_secs(3)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(p.child.try_lock().is_ok(), "the child mutex is free while the reap waits");
+        let second = std::thread::spawn(move || p3.reap(Duration::from_secs(3)));
+        assert_eq!(first.join().unwrap(), Some(4));
+        assert_eq!(second.join().unwrap(), Some(4), "a concurrent reap gets the same exit code");
+    }
+
+    #[test]
+    fn a_child_turn_started_keeps_our_turn_and_the_steer_uses_it() {
+        let (d, mut fake, rx, _) = setup(None);
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
+        fake.notify("turn/started", json!({"threadId": "th-child", "turn": {"id": "tc-9"}}));
+        std::thread::sleep(Duration::from_millis(100));
+        d.send("go on").unwrap();
+        let steer = fake.expect("turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "tu-1");
+    }
+
+    #[test]
+    fn the_effective_sandbox_is_in_the_banner_and_reported() {
+        let (d, _fake, rx, _) = setup(None);
+        assert_eq!(next_event(&rx, |e| matches!(e, DriverEvent::Sandbox(_))), DriverEvent::Sandbox("net:off".into()));
+        let a = d.attach(24, 80).unwrap();
+        let banner = String::from_utf8_lossy(&a.initial).into_owned();
+        assert!(
+            banner.contains("effective sandbox: workspace-write, network off, writable: the worktree only"),
+            "{banner}"
+        );
+        let (d, _fake, rx, _) = connect_with(None, |f, t| {
+            let mut r = thread_ok("th-1");
+            r["sandbox"] = json!({"type": "workspaceWrite", "writableRoots": ["/opt/cache"], "networkAccess": true});
+            f.reply(t, r)
+        });
+        let d = d.unwrap();
+        assert_eq!(
+            next_event(&rx, |e| matches!(e, DriverEvent::Sandbox(_))),
+            DriverEvent::Sandbox("net:on, +1 root".into())
+        );
+        let banner = String::from_utf8_lossy(&d.attach(24, 80).unwrap().initial).into_owned();
+        assert!(banner.contains("network ON") && banner.contains("writable: the worktree + /opt/cache"), "{banner}");
+        assert_eq!(sandbox_summary(&json!({"type": "workspaceWrite"}), &[]), "net:?");
+    }
+
+    #[test]
+    fn elicitations_are_declined_and_the_stream_says_so() {
+        let (d, mut fake, _rx, _) = setup(None);
+        let a = d.attach(24, 80).unwrap();
+        fake.send(json!({"jsonrpc": "2.0", "id": "e1", "method": "mcpServer/elicitation/request",
+            "params": {"serverName": "github", "message": "Paste a token"}}));
+        assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": "e1", "result": {"action": "decline"}}));
+        let seen = stream(&a, "declined");
+        assert!(seen.contains("[mcp elicitation from github declined automatically"), "{seen}");
     }
 }
