@@ -255,12 +255,18 @@ fn trust_key(grid: &str) -> Result<screen::TrustKey, DriverError> {
         .ok_or_else(|| DriverError::NoDialog(format!("no trust dialog with a \"{}\" option", screen::TRUST_YES)))
 }
 
+/// How long the cursor may stay on "No, exit" after a Down before Down is typed again
+/// (right after the trust dialog shows, Claude may not take keys yet: Task 21 live run).
+const TRUST_DOWN_RETRY: Duration = Duration::from_millis(400);
+
 /// Accepts the trust dialog, each key checked on the screen right before it: a numbered
 /// dialog gets its digit; the real 2.1.285 dialog (no digits, cursor on "No, exit") gets
-/// one Down, then Enter only once the screen shows the cursor on "Yes, I trust this
-/// folder". Down is typed at most once; nothing is typed after `deadline`.
+/// Down (again while the cursor still sits on "No, exit" after [`TRUST_DOWN_RETRY`]), then
+/// Enter only once the screen shows the cursor on "Yes, I trust this folder" and the last
+/// Down is at least [`TRUST_DOWN_RETRY`] old (a late Down never moves the cursor between
+/// that check and Enter). Nothing is typed after `deadline`.
 fn type_trust(pty: &PtyProcess, sink: &Sink, deadline: Instant, tick: Duration) -> Result<(), DriverError> {
-    let mut moved = false;
+    let mut last_down: Option<Instant> = None;
     let r = loop {
         if Instant::now() >= deadline {
             break Err(DriverError::Failed("the trust answer waited too long to be typed; nothing more was typed".into()));
@@ -268,9 +274,13 @@ fn type_trust(pty: &PtyProcess, sink: &Sink, deadline: Instant, tick: Duration) 
         match trust_key(&pty.grid()) {
             Err(e) => break Err(e),
             Ok(screen::TrustKey::Digit(d)) => break pty.write(&[d as u8]).map_err(DriverError::from),
-            Ok(screen::TrustKey::Enter) => break pty.write(b"\r").map_err(DriverError::from),
-            Ok(screen::TrustKey::Down) if !moved => {
-                moved = true;
+            // Not while a Down typed less than TRUST_DOWN_RETRY ago may still move the cursor.
+            Ok(screen::TrustKey::Enter) if last_down.is_none_or(|t| t.elapsed() >= TRUST_DOWN_RETRY) => {
+                break pty.write(b"\r").map_err(DriverError::from)
+            }
+            Ok(screen::TrustKey::Enter) => {}
+            Ok(screen::TrustKey::Down) if last_down.is_none_or(|t| t.elapsed() >= TRUST_DOWN_RETRY) => {
+                last_down = Some(Instant::now());
                 if let Err(e) = pty.write(b"\x1b[B") {
                     break Err(e.into());
                 }
@@ -760,6 +770,24 @@ mod tests {
         f.d.trust(true).unwrap();
         wait_grid(&f.d, "keys:1b5b42,0d");
         ready(&f);
+    }
+
+    /// Task 21 live run: right after the dialog shows, Claude may not take keys yet and the
+    /// first Down is lost. Down is typed again while the cursor still sits on "No, exit";
+    /// Enter still only once the screen shows it on "Yes".
+    #[test]
+    fn a_lost_down_is_typed_again_and_enter_waits_for_yes() {
+        let f = fake(
+            "printf ' \\342\\235\\257 No, exit\\r\\n   Yes, I trust this folder\\r\\n\\r\\n Enter to confirm \\302\\267 Esc to cancel\\r\\n'; \
+             dd bs=1 count=3 >/dev/null 2>&1; \
+             a=$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+             printf '\\033[2J\\033[H   No, exit\\r\\n \\342\\235\\257 Yes, I trust this folder\\r\\n\\r\\n Enter to confirm \\302\\267 Esc to cancel\\r\\n'; \
+             b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+             printf '\\033[2J\\033[Hkeys:%s,%s\\r\\n> \\r\\n  manual mode on\\r\\n' \"$a\" \"$b\"; sleep 5",
+        );
+        next(&f.rx, |e| *e == DriverEvent::Boot(BootState::TrustPrompt));
+        f.d.trust(true).unwrap();
+        wait_grid(&f.d, "keys:1b5b42,0d");
     }
 
     #[test]
