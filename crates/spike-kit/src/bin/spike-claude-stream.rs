@@ -29,17 +29,38 @@ fn send(stdin: &mut impl Write, out: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Gives claude `grace` to exit on its own (stdin closed), then kills it.
-fn reap(child: &mut Child, grace: Duration) {
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
+/// Owns the child; dropping it reaps claude so an early `?` return cannot orphan it.
+struct ChildGuard {
+    child: Child,
+}
+
+impl ChildGuard {
+    fn wait_for(&mut self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // Close stdin, give claude 5s to exit on its own, then SIGTERM (2s), then kill.
+        drop(self.child.stdin.take());
+        if self.wait_for(Duration::from_secs(5)) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        let _ = Command::new("kill").arg("-TERM").arg(self.child.id().to_string()).status();
+        if self.wait_for(Duration::from_secs(2)) {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// `~/.claude/projects/<cwd-slug>/<session_id>.jsonl`, found by name (no slug guessing).
@@ -84,13 +105,13 @@ fn main() -> Result<()> {
     for k in util::env_to_scrub() {
         cmd.env_remove(k);
     }
-    let mut child = cmd.spawn().context("failed to start claude")?;
-    let mut stdin = child.stdin.take().context("no stdin")?;
-    let stdout = child.stdout.take().context("no stdout")?;
+    let mut guard = ChildGuard { child: cmd.spawn().context("failed to start claude")? };
+    let mut stdin = guard.child.stdin.take().context("no stdin")?;
+    let stdout = guard.child.stdout.take().context("no stdout")?;
 
     let (tx, rx) = mpsc::channel::<()>();
     let out_reader = out.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout)
             .lines()
             .map_while(std::result::Result::ok)
@@ -122,7 +143,8 @@ fn main() -> Result<()> {
         }
     }
     drop(stdin);
-    reap(&mut child, Duration::from_secs(5));
+    drop(guard); // reaps claude (stdin already closed), so the reader sees EOF
+    let _ = reader.join();
 
     let log = util::read_jsonl(&out)?;
     println!("results seen: {results}");

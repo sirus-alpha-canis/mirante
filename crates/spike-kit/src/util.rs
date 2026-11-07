@@ -86,6 +86,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn env_to_scrub_never_names_auth_variables() {
+        let keys = env_to_scrub();
+        for k in &keys {
+            assert!(!k.starts_with("ANTHROPIC_"), "{k}");
+            assert!(!k.starts_with("CLAUDE_CODE_OAUTH"), "{k}");
+        }
+        for k in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CONFIG_DIR"] {
+            assert!(!keys.iter().any(|x| x == k), "{k}");
+        }
+    }
+
+    #[test]
     fn parse_jsonl_skips_blank_and_invalid_lines() {
         let v = parse_jsonl("{\"a\":1}\n\nnot json\n{\"a\":2}\n");
         assert_eq!(v.len(), 2);

@@ -79,8 +79,9 @@ pub fn classify_hooks(events: &[LoggedEvent]) -> Delivery {
 /// initial prompt while idle). None → `Inconclusive`. The first in-turn enqueue is matched
 /// with the first subsequent `remove`/`dequeue` (FIFO). None → `Never`. A `remove` with
 /// `reason == "absorbed_mid_turn"` before the running turn's end (or no end at all) →
-/// `Steered`. Any other remove/dequeue → `Queued` if it comes after the turn's end or a
-/// `promptSource:"queued"` user line follows, else `Never`.
+/// `Steered`. Any other remove/dequeue → `Queued` only if it is a `dequeue` or a `remove` whose
+/// reason does not contain "cancel", AND a `promptSource:"queued"` user line follows it before
+/// the next in-turn enqueue or the next non-queued prompt; otherwise `Never`.
 ///
 /// Subagent/sidechain lines (`isSidechain == true`, or carrying `agentId` /
 /// `parentToolUseID`) are ignored by every predicate.
@@ -124,12 +125,27 @@ pub fn classify_transcript(lines: &[Value]) -> Delivery {
     if before_end && after[taken]["reason"] == "absorbed_mid_turn" {
         return Delivery::Steered;
     }
-    let queued_user_follows = after.iter().any(|v| v["type"] == "user" && v["promptSource"] == "queued");
-    if queued_user_follows || !before_end {
-        Delivery::Queued
-    } else {
-        Delivery::Never
+    let op = after[taken];
+    let is_cancel = op["operation"] == "remove" && op["reason"].as_str().is_some_and(|r| r.contains("cancel"));
+    if is_cancel {
+        return Delivery::Never;
     }
+    // A queued user line must follow before the next in-turn enqueue or the next non-queued prompt.
+    let mut in_turn = before_end;
+    for v in &after[taken + 1..] {
+        if v["type"] == "user" && v["promptSource"] == "queued" {
+            return Delivery::Queued;
+        }
+        if is_prompt(v) {
+            return Delivery::Never;
+        }
+        if is_turn_end(v) {
+            in_turn = false;
+        } else if in_turn && is_op(v, &["enqueue"]) {
+            return Delivery::Never;
+        }
+    }
+    Delivery::Never
 }
 
 /// Headless stream-json log ({ts, dir, line}): did an assistant message containing
@@ -225,6 +241,9 @@ mod tests {
         json!({"type": "assistant", "message": {"stop_reason": "end_turn",
                "content": [{"type": "text", "text": text}]}})
     }
+    fn queued_user() -> Value {
+        json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {}})
+    }
     fn turn_end() -> Vec<Value> {
         vec![
             json!({"type": "system", "subtype": "stop_hook_summary"}),
@@ -290,7 +309,7 @@ mod tests {
     #[test]
     fn transcript_remove_after_next_human_prompt_is_queued() {
         // No system line, but a new typed prompt also ends the turn that was running.
-        let t = vec![prompt("one"), queue("enqueue"), answer("done"), prompt("two"), removed("dequeued")];
+        let t = vec![prompt("one"), queue("enqueue"), answer("done"), prompt("two"), removed("dequeued"), queued_user()];
         assert_eq!(classify_transcript(&t), Delivery::Queued);
     }
 
@@ -368,6 +387,41 @@ mod tests {
     }
 
     #[test]
+    fn transcript_cancelled_enqueue_does_not_borrow_a_later_queued_line() {
+        // Enqueue A cancelled mid-turn; a later turn has a queued user line from enqueue B.
+        let mut t = vec![prompt("one"), tool_use(), queue("enqueue"), removed("cancelled"), answer("done")];
+        t.extend(turn_end());
+        t.extend([
+            prompt("two"),
+            queue("enqueue"),
+            json!({"type": "queue-operation", "operation": "dequeue"}),
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {}}),
+        ]);
+        assert_eq!(classify_transcript(&t), Delivery::Never);
+        // A reason merely containing "cancel" is also a cancel.
+        let t = vec![
+            prompt("one"),
+            queue("enqueue"),
+            removed("user_cancelled"),
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {}}),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Never);
+    }
+
+    #[test]
+    fn transcript_queued_line_after_next_in_turn_enqueue_or_prompt_is_never() {
+        let queued_user =
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {}});
+        let dequeue = json!({"type": "queue-operation", "operation": "dequeue"});
+        // Another enqueue inside the running turn comes first.
+        let t = vec![prompt("one"), tool_use(), queue("enqueue"), dequeue.clone(), queue("enqueue"), queued_user.clone()];
+        assert_eq!(classify_transcript(&t), Delivery::Never);
+        // A non-queued prompt comes first.
+        let t = vec![prompt("one"), queue("enqueue"), dequeue, prompt("two"), queued_user];
+        assert_eq!(classify_transcript(&t), Delivery::Never);
+    }
+
+    #[test]
     fn transcript_multiple_enqueues_pair_first_with_first_remove() {
         // FIFO: first enqueue <-> first remove (absorbed mid-turn); the second stays pending.
         let t = vec![prompt("one"), tool_use(), queue("enqueue"), queue("enqueue"), removed("absorbed_mid_turn"), answer("x")];
@@ -379,6 +433,7 @@ mod tests {
             queue("enqueue"),
             answer("x"),
             json!({"type": "queue-operation", "operation": "dequeue"}),
+            queued_user(),
         ];
         assert_eq!(classify_transcript(&t), Delivery::Queued);
     }

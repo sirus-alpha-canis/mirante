@@ -179,3 +179,7 @@ What stays open:
 - The limits assume "ordinary, individual usage". Heavy automated orchestration (many parallel `-p` agents) may fall outside that.
 - No page says outright that unattended, programmatic `-p` on a Pro/Max plan is allowed.
 - This needs founder/legal confirmation, or a question to Anthropic sales.
+
+Re-check: the run-1 and run-2 transcripts were re-classified after commit 4d46984 with `spike classify-transcript` and both are Steered.
+
+Auth: ANTHROPIC_API_KEY was not set during the runs (`env | grep -c ANTHROPIC_API_KEY` in the current shell returns 0, and the env scrub never passes it), and the `rate_limit_event` with `unifiedWindows` indicates subscription auth.
