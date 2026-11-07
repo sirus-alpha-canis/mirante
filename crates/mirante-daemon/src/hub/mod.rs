@@ -175,6 +175,16 @@ pub(crate) struct Live {
 /// Events queued per subscriber. One that falls this far behind is dropped (its stream
 /// ends after the queued events) and resumes with `events.subscribe { since_seq }`.
 pub const SUB_QUEUE: usize = 1024;
+/// Most bytes one `task.events` response carries (its events serialized).
+pub const TASK_EVENTS_BYTES: usize = 1024 * 1024;
+
+/// One `task.events` page and whether the byte budget cut older events from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventsPage {
+    pub events: Vec<Event>,
+    pub truncated: bool,
+}
+
 /// Largest gap `events.subscribe { since_seq }` replays; beyond it a full snapshot is sent.
 pub const REPLAY_MAX: u64 = 10_000;
 
@@ -534,16 +544,35 @@ impl Hub {
     }
 
     /// A page of the task's audit trail, oldest first (see [`TaskEventsParams`]). Clients
-    /// rebuild a task's step feed from it after a restart.
+    /// rebuild a task's step feed from it after a restart. The wire result stays a plain
+    /// list: a page cut by the byte budget is just a shorter page, and paging on with its
+    /// first `seq` as `before_seq` reaches the rest.
     pub fn task_events(&self, p: TaskEventsParams) -> Result<Vec<Event>> {
+        Ok(self.task_events_page(p)?.events)
+    }
+
+    /// [`Hub::task_events`] with the budget's verdict: only the requested page is read from
+    /// the store, then the oldest events are dropped until the page serializes within
+    /// [`TASK_EVENTS_BYTES`] (`truncated`). The newest event always stays, so paging moves.
+    pub fn task_events_page(&self, p: TaskEventsParams) -> Result<EventsPage> {
         let st = self.lock();
         let t = st.resolve(&p.task)?;
         let limit = p.limit.unwrap_or(200).clamp(1, TASK_EVENTS_MAX);
-        let mut events: Vec<Event> =
-            st.store.task_events(&t.id)?.into_iter().filter(|e| p.before_seq.is_none_or(|b| e.seq < b)).collect();
-        let excess = events.len().saturating_sub(limit);
-        events.drain(..excess);
-        Ok(events)
+        let mut events = st.store.task_events_page(&t.id, p.before_seq, limit)?;
+        drop(st);
+        let mut used = 0usize;
+        let mut keep = 0;
+        for e in events.iter().rev() {
+            let size = serde_json::to_vec(e).map_or(usize::MAX, |b| b.len() + 1);
+            if keep > 0 && used.saturating_add(size) > TASK_EVENTS_BYTES {
+                break;
+            }
+            used = used.saturating_add(size);
+            keep += 1;
+        }
+        let truncated = keep < events.len();
+        events.drain(..events.len() - keep);
+        Ok(EventsPage { events, truncated })
     }
 
     /// Removes the worktree (git refuses a dirty one) and archives the task. The branch is
@@ -810,17 +839,34 @@ mod tests {
         git_disarmed(wt, &["add", "."]);
         git_disarmed(wt, &["commit", "-q", "-m", "attrs"]);
         std::fs::write(wt.join("README"), "hey\n").unwrap();
-        std::fs::write(wt.join("notes.txt"), "new\n").unwrap();
+        std::fs::write(wt.join("caf\u{e9}.txt"), "new\n").unwrap();
         let d = k.hub.task_diff(&t.id).unwrap();
         assert!(d.patch.contains("+hey") && d.patch.contains("diff --git a/README b/README"), "{}", d.patch);
-        assert_eq!(d.untracked, vec!["notes.txt".to_string()]);
+        assert_eq!(d.untracked, vec!["caf\u{e9}.txt".to_string()]);
         assert!(d.files.iter().any(|f| f.path == ".gitattributes"));
         let refused = k.hub.archive(&t.id);
         assert!(refused.is_err(), "dirty worktree");
         std::fs::write(wt.join("README"), "hi\n").unwrap();
-        std::fs::remove_file(wt.join("notes.txt")).unwrap();
+        std::fs::remove_file(wt.join("caf\u{e9}.txt")).unwrap();
         k.hub.archive(&t.id).unwrap();
         assert_eq!(sprung(&marks), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pushed_means_origin_has_every_commit_and_ahead_counts_the_rest() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "feat/p").task;
+        let wt = Path::new(&t.worktree_path);
+        let d = k.hub.task_diff(&t.id).unwrap();
+        assert_eq!((d.pushed, d.ahead), (false, None));
+        git_disarmed(wt, &["update-ref", "refs/remotes/origin/feat/p", "HEAD"]);
+        let d = k.hub.task_diff(&t.id).unwrap();
+        assert_eq!((d.pushed, d.ahead), (true, Some(0)));
+        std::fs::write(wt.join("x"), "x\n").unwrap();
+        git_disarmed(wt, &["add", "x"]);
+        git_disarmed(wt, &["commit", "-q", "-m", "x"]);
+        let d = k.hub.task_diff(&t.id).unwrap();
+        assert_eq!((d.pushed, d.ahead, d.files_truncated), (false, Some(1), false));
     }
 
     #[test]
@@ -840,6 +886,30 @@ mod tests {
         assert_eq!(before.unwrap(), all[..2].to_vec());
         let none = k.hub.task_events(TaskEventsParams { task: "nope-nope".into(), ..Default::default() });
         assert!(matches!(none, Err(HubError::NotFound(_))), "{none:?}");
+    }
+
+    #[test]
+    fn a_task_events_page_stays_within_the_byte_budget_and_pages_on() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "big").task;
+        let big = "x".repeat(400 * 1024);
+        for n in 0..3 {
+            k.hub.lock().store.append_event(Some(&t.id), "step", &json!({ "n": n, "blob": big })).unwrap();
+        }
+        let p = |before_seq| TaskEventsParams { task: t.id.clone(), before_seq, limit: Some(10) };
+        let page = k.hub.task_events_page(p(None)).unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.events.iter().map(|e| e.payload["n"].as_u64()).collect::<Vec<_>>(), [Some(1), Some(2)]);
+        let size: usize = page.events.iter().map(|e| serde_json::to_vec(e).unwrap().len()).sum();
+        assert!(size <= TASK_EVENTS_BYTES, "{size}");
+        let older = k.hub.task_events_page(p(Some(page.events[0].seq))).unwrap();
+        assert_eq!(older.events.iter().map(|e| e.payload["n"].as_u64()).collect::<Vec<_>>(), [None, Some(0)]);
+        assert!(!older.truncated);
+        // One event over the budget still comes alone, so paging always moves.
+        k.hub.lock().store.append_event(Some(&t.id), "step", &json!({ "blob": "y".repeat(TASK_EVENTS_BYTES) })).unwrap();
+        let huge = k.hub.task_events_page(p(None)).unwrap();
+        assert_eq!((huge.events.len(), huge.truncated), (1, true));
+        assert_eq!(k.hub.task_events(p(None)).unwrap(), huge.events);
     }
 
     #[test]

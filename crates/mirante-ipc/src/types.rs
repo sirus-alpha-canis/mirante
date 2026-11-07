@@ -310,16 +310,25 @@ pub struct TaskDiff {
     /// The base branch (the repo checkout's current branch), or a commit when detached.
     pub base: String,
     pub merge_base: String,
+    /// At most 2000 (`files_truncated` when cut).
     pub files: Vec<DiffFile>,
-    /// Untracked files (not in `patch`).
+    /// Untracked files (not in `patch`); at most 2000 (`files_truncated` when cut).
     pub untracked: Vec<String>,
+    /// `files` or `untracked` was cut.
+    #[serde(default)]
+    pub files_truncated: bool,
     /// Unified diff, cut at 512 KiB.
     pub patch: String,
     pub truncated: bool,
     /// GitHub's "open a pull request" page, when `origin` is on GitHub.
     pub compare_url: Option<String>,
-    /// `origin/<branch>` exists locally (the branch was pushed at least once).
+    /// `origin/<branch>` exists locally and has every commit of the task branch
+    /// (`ahead == Some(0)`).
     pub pushed: bool,
+    /// Commits on the task branch that `origin/<branch>` lacks; `None` when that ref does
+    /// not exist locally (never pushed, or not fetched).
+    #[serde(default)]
+    pub ahead: Option<u64>,
 }
 
 /// Most events one `task.events` call returns.

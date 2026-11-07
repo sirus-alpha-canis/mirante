@@ -10,6 +10,10 @@ use crate::model::{
     Status, Task, Turn,
 };
 
+/// A page of one task's events, newest first (see [`Store::task_events_page`]).
+const TASK_EVENTS_PAGE: &str = "SELECT seq, boot_id, task_id, kind, payload, ts_ms FROM events \
+     WHERE task_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3";
+
 /// Embedded, ordered schema migrations. `PRAGMA user_version` records the last applied one.
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/0001_init.sql")),
@@ -392,6 +396,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The last `limit` events of `task_id` with `seq < before_seq` (when given), oldest
+    /// first. Reads only that page, through the `events_task (task_id, seq)` index.
+    pub fn task_events_page(&self, task_id: &str, before_seq: Option<u64>, limit: usize) -> Result<Vec<Event>> {
+        let before = before_seq.map_or(i64::MAX, |b| i64::try_from(b).unwrap_or(i64::MAX));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(TASK_EVENTS_PAGE)?;
+        let rows = stmt.query_map(params![task_id, before, limit], event_from_row)?;
+        let mut page = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        page.reverse();
+        Ok(page)
+    }
+
     pub fn task_events(&self, task_id: &str) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, boot_id, task_id, kind, payload, ts_ms FROM events WHERE task_id = ?1 ORDER BY seq",
@@ -417,6 +433,34 @@ fn sample_task(title: &str) -> NewTask {
 mod task_tests {
     use super::*;
     use crate::test_support::TempDir;
+
+    #[test]
+    fn task_events_page_reads_the_newest_page_before_a_seq_from_the_index() {
+        let mut s = Store::open_in_memory().unwrap();
+        let a = s.create_task(sample_task("pa")).unwrap();
+        let b = s.create_task(sample_task("pb")).unwrap();
+        for n in 0..5 {
+            s.append_event(Some(&a.id), "step", &json!({ "n": n })).unwrap();
+            s.append_event(Some(&b.id), "step", &json!({ "n": n })).unwrap();
+        }
+        let all = s.task_events(&a.id).unwrap();
+        assert_eq!(s.task_events_page(&a.id, None, 100).unwrap(), all);
+        assert_eq!(s.task_events_page(&a.id, None, 2).unwrap(), all[all.len() - 2..].to_vec());
+        let before = all[3].seq;
+        assert_eq!(s.task_events_page(&a.id, Some(before), 2).unwrap(), all[1..3].to_vec());
+        assert!(s.task_events_page(&a.id, Some(all[0].seq), 10).unwrap().is_empty());
+        assert!(s.task_events_page("nope", None, 10).unwrap().is_empty());
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {TASK_EVENTS_PAGE}"))
+            .unwrap()
+            .query_map(params!["x", 1i64, 1i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(plan.iter().any(|p| p.contains("events_task")), "{plan:?}");
+        assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{plan:?}");
+    }
 
     #[test]
     fn create_get_and_list_tasks() {
