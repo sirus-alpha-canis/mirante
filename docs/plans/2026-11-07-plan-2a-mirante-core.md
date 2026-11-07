@@ -484,6 +484,8 @@ EOF
 
 ### Task 3: Hook payload with agent identity
 
+> **Superseded in part:** commit "fix(core): status engine handles resume/clear, dialog clearing, late Stop, slash commands" supersedes this task's code for the hook fields (`cwd`, `prompt`, `permission_mode`, `tool_use_id`) and for `is_side_agent` (`agent_id` or `SubagentStart`/`SubagentStop`; `agent_type` alone is the `--agent` main thread). `src/hook.rs` is the source of truth.
+
 **Files:**
 - Create: `crates/mirante-core/src/hook.rs`
 - Modify: `crates/mirante-core/src/lib.rs`
@@ -1818,6 +1820,8 @@ EOF
 
 ### Task 8: Status engine — hook rules
 
+> **Superseded in part:** commit "fix(core): status engine handles resume/clear, dialog clearing, late Stop, slash commands" supersedes this task's code for `SessionStart` by `source`, permission-dialog clearing (`PreToolUse` never clears; `PostToolUse` by `tool_use_id`; `Input::PermissionAnswered`) and slash-command prompts. `src/status.rs` is the source of truth.
+
 **Files:**
 - Create: `crates/mirante-core/src/status.rs`
 - Modify: `crates/mirante-core/src/lib.rs`
@@ -2164,6 +2168,8 @@ EOF
 ---
 
 ### Task 9: Status engine — transcript fusion (both S3 failure classes)
+
+> **Superseded in part:** commit "fix(core): status engine handles resume/clear, dialog clearing, late Stop, slash commands" supersedes this task's code for late hook `Stop`s (paired with `stop_hook_summary` lines) and adds fixtures from the real Task 8 steer run and queued probe. `src/status.rs` is the source of truth.
 
 **Files:**
 - Modify: `crates/mirante-core/src/status.rs`
@@ -2555,6 +2561,8 @@ EOF
 ---
 
 ### Task 10: Steer vs queue classification
+
+> **Superseded in part:** commit "fix(core): status engine handles resume/clear, dialog clearing, late Stop, slash commands" supersedes this task's code for the prompt predicate (shared `status::is_prompt`) and `remove` pairing by content; it documents the global-FIFO orphan risk. `src/delivery.rs` is the source of truth.
 
 **Files:**
 - Create: `crates/mirante-core/src/delivery.rs`

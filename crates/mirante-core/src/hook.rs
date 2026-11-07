@@ -4,7 +4,18 @@ use serde_json::Value;
 use crate::error::Result;
 
 /// Subset of the JSON Claude Code writes to a hook's stdin. Unknown fields are ignored.
-/// `agent_id` / `agent_type` are present when a subagent or side agent emitted the event.
+///
+/// Field names follow the hooks reference (<https://code.claude.com/docs/en/hooks>):
+/// - common to every event: `session_id`, `transcript_path`, `cwd`, `permission_mode`,
+///   `hook_event_name` (plus `prompt_id`, `effort`, ... that Mirante does not read);
+/// - `UserPromptSubmit`: `prompt`; `Notification`: `message`; `SessionStart`: `source`
+///   (`startup` | `resume` | `clear` | `compact` | `fork`);
+/// - tool events (`PreToolUse`, `PostToolUse`, `PermissionRequest`, ...): `tool_name`,
+///   `tool_input`, `tool_use_id` (the docs list `tool_use_id` for Pre/PostToolUse; it is
+///   optional everywhere here);
+/// - agent identity: `agent_id` (the subagent / in-process teammate the hook fired in) and
+///   `agent_type` (agent name). `agent_type` is ALSO present on the main thread when the
+///   session runs with `--agent`, so only `agent_id` marks a side agent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HookEvent {
     pub hook_event_name: String,
@@ -13,13 +24,21 @@ pub struct HookEvent {
     #[serde(default)]
     pub transcript_path: Option<String>,
     #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: Option<Value>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -36,9 +55,11 @@ impl HookEvent {
         HookEvent { hook_event_name: name.to_string(), ..HookEvent::default() }
     }
 
-    /// True when a subagent / side agent emitted the event (the payload names an agent id).
+    /// True when a subagent / side agent emitted the event: the payload names an `agent_id`,
+    /// or the event is `SubagentStart` / `SubagentStop` (a side agent's lifecycle, never the
+    /// main turn's). `agent_type` alone is the main thread of an `--agent` session.
     pub fn is_side_agent(&self) -> bool {
-        self.agent_id.is_some()
+        self.agent_id.is_some() || matches!(self.hook_event_name.as_str(), "SubagentStart" | "SubagentStop")
     }
 
     /// Human-readable detail for a permission card: the Bash command, the file path,
@@ -77,6 +98,34 @@ mod tests {
         let e = HookEvent::parse(r#"{"hook_event_name":"Stop","session_id":"s1"}"#).unwrap();
         assert!(!e.is_side_agent());
         assert_eq!(e, HookEvent { session_id: Some("s1".into()), ..HookEvent::named("Stop") });
+    }
+
+    /// Field names from https://code.claude.com/docs/en/hooks (common fields `cwd`,
+    /// `permission_mode`; `prompt` on UserPromptSubmit; `tool_use_id` on tool events).
+    #[test]
+    fn parses_documented_common_and_per_event_fields() {
+        let raw = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","transcript_path":"/t.jsonl",
+            "cwd":"/repo","permission_mode":"default","prompt":"/review","prompt_id":"p-1"}"#;
+        let e = HookEvent::parse(raw).unwrap();
+        assert_eq!(e.cwd.as_deref(), Some("/repo"));
+        assert_eq!(e.permission_mode.as_deref(), Some("default"));
+        assert_eq!(e.prompt.as_deref(), Some("/review"));
+        let raw = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{},"tool_use_id":"toolu_01"}"#;
+        assert_eq!(HookEvent::parse(raw).unwrap().tool_use_id.as_deref(), Some("toolu_01"));
+    }
+
+    /// With `--agent`, the main thread carries `agent_type` but no `agent_id`: not a side agent.
+    #[test]
+    fn agent_type_alone_is_the_main_thread() {
+        let e = HookEvent::parse(r#"{"hook_event_name":"PreToolUse","agent_type":"reviewer"}"#).unwrap();
+        assert!(!e.is_side_agent());
+    }
+
+    #[test]
+    fn subagent_lifecycle_events_are_side_agent_events() {
+        assert!(HookEvent::named("SubagentStop").is_side_agent());
+        assert!(HookEvent::named("SubagentStart").is_side_agent());
+        assert!(!HookEvent::named("Stop").is_side_agent());
     }
 
     #[test]

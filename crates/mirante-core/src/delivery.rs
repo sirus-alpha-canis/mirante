@@ -7,21 +7,31 @@
 //! - Steered: a `remove` with `reason: "absorbed_mid_turn"` before that turn ends.
 //! - Queued: a `dequeue` (or a non-cancel `remove`), then a `user` line with
 //!   `promptSource: "queued"` before the next in-turn enqueue or the next non-queued prompt.
-//! - Enqueues pair with remove/dequeue operations first-in, first-out.
-//! - A turn starts at a typed prompt (`origin.kind == "human"`) or a headless prompt
-//!   (`promptSource == "sdk"`), and ends at the final assistant line
+//! - Enqueues pair with remove/dequeue operations first-in, first-out, except that a
+//!   `remove` naming its `content` pairs with the oldest untaken enqueue of that text (the
+//!   user may delete a message that is not at the head).
+//! - A turn starts at a prompt line as the status engine sees it ([`crate::status::is_prompt`]:
+//!   typed `origin.kind == "human"`, headless `promptSource == "sdk"`, or a delivered
+//!   `promptSource == "queued"`), and ends at the final assistant line
 //!   (`stop_reason == "end_turn"`) or a `system` `stop_hook_summary` / `turn_duration` line.
 //! - Sidechain lines (`isSidechain`, `agentId`, `parentToolUseID`) are ignored.
 //!
 //! Change from the spike: when the outcome is not decided yet (no remove/dequeue yet, or a
 //! dequeue whose queued prompt line has not been written yet) the result is `Pending`, not
 //! `Never`. The UI calls this on a live, growing transcript.
+//!
+//! Known limitation, global FIFO orphans: the queue is modelled as one FIFO over the whole
+//! transcript. A queue operation this module does not know (anything but `enqueue`,
+//! `remove`, `dequeue`) takes nothing, so if Claude Code ever adds one that consumes a
+//! message, that enqueue stays at the head as an orphan and every later content-less
+//! `dequeue` pairs with the wrong message (shifted by one). Pinned by
+//! `unknown_queue_op_leaves_an_orphan_that_shifts_fifo_pairing`.
 use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::status::is_sidechain;
+use crate::status::{is_prompt, is_sidechain};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,10 +46,6 @@ pub enum Delivery {
     Never,
     /// No matching mid-turn message in the transcript.
     Inconclusive,
-}
-
-fn is_prompt(v: &Value) -> bool {
-    v["type"] == "user" && (v["origin"]["kind"] == "human" || v["promptSource"] == "sdk")
 }
 
 fn is_turn_end(v: &Value) -> bool {
@@ -74,7 +80,10 @@ fn analyze(all: &[Value]) -> Analysis<'_> {
             enqueues.push((i, in_turn));
             fifo.push_back(i);
         } else if is_op(v, &["remove", "dequeue"]) {
-            if let Some(e) = fifo.pop_front() {
+            let by_content = v["content"].as_str().map(str::trim).and_then(|c| {
+                fifo.iter().position(|&e: &usize| lines[e]["content"].as_str().is_some_and(|ec| ec.trim() == c))
+            });
+            if let Some(e) = fifo.remove(by_content.unwrap_or(0)) {
                 taken_by.insert(e, i);
             }
         }
@@ -366,5 +375,64 @@ mod tests {
         assert_eq!(classify_message(&live, "A"), Delivery::Pending);
         let idle = vec![enqueue("A"), dequeue(), prompt("A")];
         assert_eq!(classify_message(&idle, "A"), Delivery::Inconclusive);
+    }
+
+    /// A queued prompt opens a running turn (shared `status::is_prompt`): a message typed
+    /// during that turn is mid-run and can be steered. 2.1.285 queued lines also carry
+    /// `origin.kind: "human"`; this one does not, so the test pins the `promptSource` rule.
+    #[test]
+    fn enqueue_during_a_turn_opened_by_a_queued_prompt_is_mid_run() {
+        let t = vec![
+            prompt("one"),
+            enqueue("A"),
+            answer("done"),
+            dequeue(),
+            json!({"type": "system", "subtype": "turn_duration"}),
+            json!({"type": "user", "promptSource": "queued", "message": {"content": "A"}}),
+            tool_use(),
+            enqueue("B"),
+            json!({"type": "queue-operation", "operation": "remove", "content": "B", "reason": "absorbed_mid_turn"}),
+            answer("B done"),
+        ];
+        assert_eq!(classify_message(&t, "A"), Delivery::Queued);
+        assert_eq!(classify_message(&t, "B"), Delivery::Steered);
+    }
+
+    /// A `remove` that names its content pairs with that enqueue even when it is not the
+    /// FIFO head (the user deleted the second of two queued messages).
+    #[test]
+    fn non_head_remove_pairs_by_content() {
+        let t = vec![
+            prompt("one"),
+            tool_use(),
+            enqueue("A"),
+            enqueue("B"),
+            json!({"type": "queue-operation", "operation": "remove", "content": "B", "reason": "cancelled"}),
+            json!({"type": "queue-operation", "operation": "remove", "content": "A", "reason": "absorbed_mid_turn"}),
+            answer("A done"),
+        ];
+        assert_eq!(classify_message(&t, "A"), Delivery::Steered);
+        assert_eq!(classify_message(&t, "B"), Delivery::Never);
+    }
+
+    /// Known limitation (global FIFO): an operation this module does not know (here a made-up
+    /// `clear`) takes nothing, so its enqueue stays at the head as an orphan and the next
+    /// content-less `dequeue` pairs with it instead of with the message it really took.
+    /// Pinned so a new Claude Code queue operation shows up as a test to revisit.
+    #[test]
+    fn unknown_queue_op_leaves_an_orphan_that_shifts_fifo_pairing() {
+        let t = vec![
+            prompt("one"),
+            tool_use(),
+            enqueue("A"),
+            json!({"type": "queue-operation", "operation": "clear"}),
+            enqueue("B"),
+            answer("done"),
+            dequeue(),
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {"content": "B"}}),
+        ];
+        // Reality: A was cleared (Never), B was queued. FIFO credits the dequeue to A.
+        assert_eq!(classify_message(&t, "A"), Delivery::Queued);
+        assert_eq!(classify_message(&t, "B"), Delivery::Pending);
     }
 }
