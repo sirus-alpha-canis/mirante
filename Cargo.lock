@@ -219,6 +219,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante-bridge"
+version = "0.1.0"
+dependencies = [
+ "mirante-cli",
+ "mirante-core",
+ "mirante-ipc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mirante-cli"
 version = "0.1.0"
 dependencies = [

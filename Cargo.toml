@@ -6,5 +6,6 @@ members = [
     "crates/mirante-hook",
     "crates/mirante-daemon",
     "crates/mirante-cli",
+    "crates/mirante-bridge",
 ]
 resolver = "2"

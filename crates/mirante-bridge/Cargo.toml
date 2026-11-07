@@ -1,0 +1,23 @@
+[package]
+name = "mirante-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Daemon client for the Mirante desktop cockpit: allowlisted RPC, resumable event stream, attach."
+
+[features]
+# The scripted fake daemon (`mirante-fake-daemon`), for UI development and the app smoke test.
+fake = []
+
+[dependencies]
+mirante-core = { path = "../mirante-core" }
+mirante-ipc = { path = "../mirante-ipc" }
+mirante-cli = { path = "../mirante-cli" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "mirante-fake-daemon"
+path = "src/bin/mirante-fake-daemon.rs"
+required-features = ["fake"]

@@ -44,10 +44,16 @@ fn env_names() -> Vec<String> {
 /// `~/.mirante/daemon.log` (rotated to `daemon.log.1` past 10 MiB), and waits up to 5 s for
 /// its socket.
 pub fn start_daemon(paths: &Paths) -> io::Result<Client> {
+    start_daemon_with(paths, &daemon_bin()?)
+}
+
+/// [`start_daemon`] with an explicit daemon binary (the desktop app is not installed next to
+/// `mirante-daemon`, so it finds the binary itself).
+pub fn start_daemon_with(paths: &Paths, bin: &Path) -> io::Result<Client> {
     paths.ensure_home()?;
     let _ = logfile::rotate_if_over(&paths.log(), logfile::LOG_CAP);
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(paths.log())?;
-    let mut cmd = daemon_command(&daemon_bin()?, paths, env_names());
+    let mut cmd = daemon_command(bin, paths, env_names());
     cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: setsid is async-signal-safe and touches no Rust state.
     unsafe {
