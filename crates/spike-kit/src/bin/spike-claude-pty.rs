@@ -131,19 +131,36 @@ impl Session {
         Ok(())
     }
 
+    /// Sends `/exit`, gives claude up to 3s to quit on its own, kills it only on timeout.
     fn finish(mut self) -> String {
         let _ = self.type_line("/exit");
-        std::thread::sleep(Duration::from_secs(3));
-        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Drop kills + reaps if it is still running.
+        let screen = self.screen.lock().unwrap().clone();
+        screen
+    }
+}
+
+impl Drop for Session {
+    /// Never leave a claude process behind, also when the driver bails with an error.
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
-        let screen = self.screen.lock().unwrap();
-        screen.clone()
     }
 }
 
 fn wait_until(
     hooks_log: &Path,
     task: &str,
+    what: &str,
     timeout: Duration,
     done: impl Fn(&[hook::LoggedEvent]) -> bool,
 ) -> Result<Vec<hook::LoggedEvent>> {
@@ -154,7 +171,11 @@ fn wait_until(
         } else {
             Vec::new()
         };
-        if done(&events) || start.elapsed() > timeout {
+        if done(&events) {
+            return Ok(events);
+        }
+        if start.elapsed() > timeout {
+            eprintln!("TIMEOUT waiting for {what}");
             return Ok(events);
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -162,7 +183,7 @@ fn wait_until(
 }
 
 fn wait_for(hooks_log: &Path, task: &str, event: &str, count: usize, timeout: Duration) -> Result<Vec<hook::LoggedEvent>> {
-    wait_until(hooks_log, task, timeout, |events| {
+    wait_until(hooks_log, task, &format!("{count}x {event}"), timeout, |events| {
         events.iter().filter(|e| e.event.hook_event_name == event).count() >= count
     })
 }
@@ -196,7 +217,7 @@ fn steer(cwd: &str, settings: &str, hooks_log: &Path, delay: u64) -> Result<()> 
     s.type_line(FIRST)?;
     std::thread::sleep(Duration::from_secs(delay));
     s.type_line(SECOND)?;
-    let events = wait_until(hooks_log, &task, Duration::from_secs(240), second_prompt_handled)?;
+    let events = wait_until(hooks_log, &task, "Stop after the 2nd prompt", Duration::from_secs(240), second_prompt_handled)?;
     let screen = s.finish();
     let out = screen_path(hooks_log, &task);
     std::fs::write(&out, &screen)?;

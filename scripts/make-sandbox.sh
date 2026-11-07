@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Creates a throwaway git repo for spikes. Prints its path.
-# Guarded: only ever deletes a target under $HOME/.mirante-spike/ or a temp dir.
+# Guarded: only ever deletes a target under $HOME/.mirante-spike/ or a temp dir,
+# and only if it carries the .mirante-sandbox marker (or is the legacy default sandbox).
 set -euo pipefail
 dir="${1:-$HOME/.mirante-spike/sandbox}"
 
@@ -31,6 +32,15 @@ case "$resolved" in
   "$spike_root"/?* | /tmp/?* | /private/tmp/?* | /var/folders/?* | /private/var/folders/?*) ;;
   *) refuse "resolved path '$resolved' is not under $spike_root/ or a temp dir" ;;
 esac
+
+# Only ever wipe a directory this script created (it carries the marker file).
+# Exception: the default sandbox predates the marker (Task 8) and is ours.
+if [ -e "$resolved" ] && [ ! -f "$resolved/.mirante-sandbox" ]; then
+  if [ "$resolved" != "$spike_root/sandbox" ]; then
+    refuse "'$resolved' exists but has no .mirante-sandbox marker (not created by this script)"
+  fi
+  echo "make-sandbox: legacy default sandbox without marker, recreating it" >&2
+fi
 
 rm -rf "$resolved"
 mkdir -p "$resolved"
