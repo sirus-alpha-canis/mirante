@@ -319,7 +319,7 @@ EOF
 Codex steps come from its driver (`step` events: `command`, `agent_message`). Claude has none: the hub sees every `PostToolUse` / `PostToolUseFailure` hook but only uses it for status. This task records each as a `step` event `{type: "tool", tool, summary, ok, agent}` so the cards and the Steps tab show what Claude did. Side agents are tagged, not dropped (the user may want to see them).
 
 **Files:**
-- Modify: `crates/mirante-daemon/src/hub/session.rs` (`tool_step`, call in `apply_hook_envelope`, test)
+- Modify: `crates/mirante-daemon/src/hub/session.rs` (`tool_step`, call in `State::apply_hook_locked` (behind `Hub::apply_hook_envelope`), test)
 
 - [ ] **Step 1: Add the failing test after the `status` helper in `mod tests` — `crates/mirante-daemon/src/hub/session.rs`**
 
@@ -401,7 +401,7 @@ impl State {
     /// Delivers the next queued message
 ```
 
-- [ ] **Step 4: In `Hub::apply_hook_envelope`, after `settle_tool_ran` — `crates/mirante-daemon/src/hub/session.rs`**
+- [ ] **Step 4: In `State::apply_hook_locked` (the body of `Hub::apply_hook_envelope` since the hook-loss rework), after `settle_tool_ran` — `crates/mirante-daemon/src/hub/session.rs`**
 
 Replace:
 

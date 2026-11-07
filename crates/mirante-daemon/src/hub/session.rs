@@ -78,6 +78,25 @@ pub(crate) fn compact(line: &Value) -> Option<Value> {
     }
 }
 
+/// A Claude tool call that ran (`PostToolUse` / `PostToolUseFailure`) as a feed step:
+/// `{type: "tool", tool, summary, ok, agent}`. `summary` is what the tool worked on (command,
+/// path, pattern, URL, ...; at most 200 chars); `agent` is a side agent's type, else null.
+/// Claude has no other step source: Codex steps come from its driver.
+pub(crate) fn tool_step(ev: &HookEvent) -> Option<Value> {
+    let ok = match ev.hook_event_name.as_str() {
+        "PostToolUse" => true,
+        "PostToolUseFailure" => false,
+        _ => return None,
+    };
+    let tool = ev.tool_name.as_deref()?;
+    let summary = ["command", "file_path", "path", "pattern", "url", "description", "prompt"]
+        .iter()
+        .find_map(|k| ev.tool_input.as_ref().and_then(|i| i[*k].as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    let summary: String = summary.chars().take(200).collect();
+    Some(json!({ "type": "tool", "tool": tool, "summary": summary, "ok": ok, "agent": ev.agent_type }))
+}
+
 impl State {
     /// Delivers the next queued message when the session is ready and idle.
     pub(crate) fn kick(&mut self, task_id: &str) -> Result<()> {
@@ -737,6 +756,9 @@ impl State {
         if tool_ran {
             st.settle_tool_ran(&p.task, &session_id, &ev)?;
         }
+        if let Some(step) = tool_step(&ev) {
+            st.event(Some(&p.task), "step", step)?;
+        }
         st.publish();
         Ok(())
     }
@@ -963,6 +985,30 @@ mod tests {
 
     fn status(k: &Kit, task: &str) -> Status {
         k.hub.get_task(task).unwrap().task.status
+    }
+
+    #[test]
+    fn a_claude_tool_that_ran_becomes_a_feed_step() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "steps").task;
+        let bash = json!({"command": "cargo test"});
+        k.hook(&t.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": bash}));
+        let edit = json!({"file_path": "/w/src/lib.rs"});
+        let failed = json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Edit", "tool_input": edit, "agent_type": "Explore"});
+        k.hook(&t.id, failed);
+        k.hook(
+            &t.id,
+            json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "/w/a"}}),
+        );
+        let events = k.hub.lock().store.task_events(&t.id).unwrap();
+        let steps: Vec<Value> = events.into_iter().filter(|e| e.kind == "step").map(|e| e.payload).collect();
+        assert_eq!(
+            steps,
+            vec![
+                json!({"type": "tool", "tool": "Bash", "summary": "cargo test", "ok": true, "agent": null}),
+                json!({"type": "tool", "tool": "Edit", "summary": "/w/src/lib.rs", "ok": false, "agent": "Explore"}),
+            ]
+        );
     }
 
     /// The process's exit is applied while `stop` runs (the pump thread can get there
