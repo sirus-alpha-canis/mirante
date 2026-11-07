@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
 use crate::model::{
-    new_id, now_ms, AgentKind, Conversation, Event, Lifecycle, NewTask, PermissionStatus, Session, Status, Task, Turn,
+    new_id, now_ms, AgentKind, Conversation, Event, Lifecycle, NewTask, PermissionRequest, PermissionStatus, Session,
+    Status, Task, Turn,
 };
 
 /// Embedded, ordered schema migrations. `PRAGMA user_version` records the last applied one.
@@ -743,5 +744,146 @@ mod session_tests {
         assert_eq!(got.transcript_path.as_deref(), Some("/home/u/.claude/projects/x/s.jsonl"));
         assert_eq!(got.transcript_offset, 4096);
         assert!(matches!(s.set_transcript("nope", "/x", 0), Err(CoreError::NotFound { .. })));
+    }
+}
+
+const PERMISSION_COLUMNS: &str = "id, task_id, session_id, tool, detail, status, created_at, answered_at";
+
+fn permission_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionRequest> {
+    Ok(PermissionRequest {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        session_id: r.get(2)?,
+        tool: r.get(3)?,
+        detail: r.get(4)?,
+        status: r.get(5)?,
+        created_at: r.get(6)?,
+        answered_at: r.get(7)?,
+    })
+}
+
+impl Store {
+    pub fn create_permission_request(
+        &mut self,
+        session_id: &str,
+        tool: &str,
+        detail: &str,
+    ) -> Result<PermissionRequest> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let s = load_session(&tx, session_id)?;
+        let p = PermissionRequest {
+            id: new_id(),
+            task_id: s.task_id.clone(),
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            detail: detail.to_string(),
+            status: PermissionStatus::Pending,
+            created_at: now_ms(),
+            answered_at: None,
+        };
+        tx.execute(
+            &format!(
+                "INSERT INTO permission_requests ({PERMISSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)"
+            ),
+            params![p.id, p.task_id, p.session_id, p.tool, p.detail, p.status, p.created_at],
+        )?;
+        insert_event(
+            &tx,
+            &self.boot_id,
+            Some(&p.task_id),
+            "permission_requested",
+            &json!({ "permission_id": p.id, "tool": tool, "detail": detail }),
+        )?;
+        tx.commit()?;
+        Ok(p)
+    }
+
+    /// Answers a pending request exactly once. `answer` must be `AllowedOnce` or `Denied`;
+    /// there is no "always allow".
+    pub fn answer_permission(&mut self, id: &str, answer: PermissionStatus) -> Result<PermissionRequest> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let p = tx
+            .query_row(
+                &format!("SELECT {PERMISSION_COLUMNS} FROM permission_requests WHERE id = ?1"),
+                [id],
+                permission_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound { kind: "permission_request", id: id.to_string() })?;
+        if p.status != PermissionStatus::Pending || answer == PermissionStatus::Pending {
+            return Err(CoreError::InvalidTransition {
+                kind: "permission",
+                from: p.status.as_str().into(),
+                to: answer.as_str().into(),
+            });
+        }
+        tx.execute(
+            "UPDATE permission_requests SET status = ?2, answered_at = ?3 WHERE id = ?1",
+            params![id, answer, now_ms()],
+        )?;
+        insert_event(
+            &tx,
+            &self.boot_id,
+            Some(&p.task_id),
+            "permission_answered",
+            &json!({ "permission_id": id, "answer": answer }),
+        )?;
+        let p = tx.query_row(
+            &format!("SELECT {PERMISSION_COLUMNS} FROM permission_requests WHERE id = ?1"),
+            [id],
+            permission_from_row,
+        )?;
+        tx.commit()?;
+        Ok(p)
+    }
+
+    pub fn pending_permissions(&self, task_id: &str) -> Result<Vec<PermissionRequest>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PERMISSION_COLUMNS} FROM permission_requests WHERE task_id = ?1 AND status = 'pending' ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map([task_id], permission_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn pending_request_survives_restart_and_is_answered_once() {
+        let dir = TempDir::new("store-perm");
+        let path = dir.path().join("m.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let t = s.create_task(sample_task("feat-a")).unwrap();
+        let c = s.create_conversation(&t.id).unwrap();
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        let p = s.create_permission_request(&sess.id, "Bash", "touch a.txt").unwrap();
+        drop(s);
+
+        let mut s = Store::open(&path).unwrap();
+        let pending = s.pending_permissions(&t.id).unwrap();
+        assert_eq!(pending, vec![p.clone()]);
+        let answered = s.answer_permission(&p.id, PermissionStatus::Denied).unwrap();
+        assert_eq!(answered.status, PermissionStatus::Denied);
+        assert!(answered.answered_at.is_some());
+        assert!(s.pending_permissions(&t.id).unwrap().is_empty());
+        let again = s.answer_permission(&p.id, PermissionStatus::AllowedOnce).unwrap_err();
+        assert!(matches!(again, CoreError::InvalidTransition { kind: "permission", .. }), "{again}");
+    }
+
+    #[test]
+    fn pending_is_not_an_answer() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = s.create_task(sample_task("feat-a")).unwrap();
+        let c = s.create_conversation(&t.id).unwrap();
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        let p = s.create_permission_request(&sess.id, "Edit", "src/a.rs").unwrap();
+        assert!(s.answer_permission(&p.id, PermissionStatus::Pending).is_err());
+        assert_eq!(
+            s.answer_permission(&p.id, PermissionStatus::AllowedOnce).unwrap().status,
+            PermissionStatus::AllowedOnce
+        );
     }
 }
