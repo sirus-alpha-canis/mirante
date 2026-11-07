@@ -18,8 +18,8 @@
 //!   no pending permission for the session: a dialog can appear between `send` and the
 //!   keystrokes, and typed text would answer it. A message stopped that way is handed back
 //!   (`DeliveryAborted`). Stopped after the paste, nothing more is typed then (a dialog may
-//!   be taking keys); the pasted text is left in the input box and cleared (Ctrl-E Ctrl-U,
-//!   one more Ctrl-U per pasted line) right before the next paste, once nothing blocks
+//!   be taking keys); the pasted text is left in the input box and cleared (Ctrl-E, two
+//!   Ctrl-U per pasted line) right before the next paste, once nothing blocks
 //!   typing, so the requeued message is never sent twice. Never Enter, Esc or a digit.
 //!   While the hub holds the session (a permission is pending) the typist hands queued
 //!   messages back at once, and cuts the pauses of the one it is typing short, so an answer
@@ -179,12 +179,14 @@ fn pause(sink: &Sink, d: Duration) -> bool {
     }
 }
 
-/// Clears what an aborted paste of `lines` lines left in the input box: Ctrl-E, Ctrl-U,
-/// then one more Ctrl-U per line. The exact sequence Claude Code needs for a multi-line
-/// input is to be confirmed in the Task 21 real run.
+/// Clears what an aborted paste of `lines` lines left in the input box: Ctrl-E, then two
+/// Ctrl-U per line. Confirmed on 2.1.285 (Task 21): each Ctrl-U either clears the text of
+/// the cursor's line or joins that (empty) line to the one above, so `n` lines need
+/// `2n - 1`; the spare one on an empty box does nothing. A large paste collapsed to
+/// "[Pasted text #1 +N lines]" is one line and goes with the first.
 pub fn clear_input(lines: usize) -> Vec<u8> {
-    let mut out = vec![END_OF_LINE, CLEAR_LINE];
-    out.extend(std::iter::repeat_n(CLEAR_LINE, lines.max(1)));
+    let mut out = vec![END_OF_LINE];
+    out.extend(std::iter::repeat_n(CLEAR_LINE, 2 * lines.max(1)));
     out
 }
 
@@ -852,12 +854,23 @@ mod tests {
         wait_grid(&f.d, "got:[]");
     }
 
+    /// Task 21 live run (2.1.285): with a 3-line paste in the input box, Ctrl-E then each
+    /// Ctrl-U either clears a line's text or joins it to the line above, so 3 lines need 5
+    /// Ctrl-U (2n - 1); one more on the empty box is harmless. A large paste shown as
+    /// "[Pasted text #1 +39 lines]" goes with one Ctrl-U.
+    #[test]
+    fn clearing_an_aborted_paste_sends_two_ctrl_u_per_line() {
+        assert_eq!(clear_input(1), b"\x05\x15\x15".to_vec());
+        assert_eq!(clear_input(3), b"\x05\x15\x15\x15\x15\x15\x15".to_vec());
+        assert!(clear_input(3).iter().all(|b| *b == 0x05 || *b == 0x15), "never Enter, Esc or a digit");
+    }
+
     #[test]
     fn a_requeued_message_is_not_duplicated_the_line_is_cleared_before_the_next_paste() {
         let dir = TestDir::new();
         let out = dir.path().join("typed");
         let pasted = paste::bracketed("go on");
-        // Ctrl-E Ctrl-U, then one more Ctrl-U per line of the aborted paste; then the paste again.
+        // Ctrl-E, then two Ctrl-U per line of the aborted paste; then the paste again.
         let want = [b"\x05\x15\x15".to_vec(), pasted.clone(), b"\r".to_vec()].concat();
         let f = fake_with(
             &format!(
