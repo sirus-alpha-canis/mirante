@@ -201,15 +201,17 @@ pub fn has_manual_mode_footer(grid: &str) -> bool {
 }
 
 /// The titles Claude Code (2.1.285) puts on the tool box of a permission dialog, per tool.
-/// "Bash command" and "Edit file" are from real grids; the others are to be confirmed in
-/// the Task 21 real run. A tool not listed here is never matched (answer it in attach).
+/// "Bash command", "Edit file", and Write's "Create file" (new file) / "Overwrite file"
+/// (existing file) are from real grids (Task 21 live run); the others are unconfirmed. A
+/// tool not listed here is never matched (answer it in attach). A side agent's dialog
+/// adds " · from the <type> agent" to the title, so it is never matched either.
 /// Each title belongs to one tool only: `Write` never gets "Edit file" (a Write card must
 /// not answer an Edit dialog of the same path).
 fn titles(tool: &str) -> &'static [&'static str] {
     match tool {
         "Bash" => &["Bash command"],
         "Edit" | "MultiEdit" => &["Edit file"],
-        "Write" => &["Create file", "Write file"],
+        "Write" => &["Create file", "Overwrite file"],
         "NotebookEdit" => &["Edit notebook"],
         "Read" => &["Read file"],
         "WebFetch" => &["Fetch"],
@@ -218,7 +220,7 @@ fn titles(tool: &str) -> &'static [&'static str] {
 }
 
 const ALL_TITLES: [&str; 7] =
-    ["Bash command", "Edit file", "Create file", "Write file", "Edit notebook", "Read file", "Fetch"];
+    ["Bash command", "Edit file", "Create file", "Overwrite file", "Edit notebook", "Read file", "Fetch"];
 
 /// Glyphs that start conversation lines (Claude's messages, tool results, the turn summary)
 /// or a prompt / option: never a line of a dialog's tool box.
@@ -549,6 +551,33 @@ mod tests {
         assert_eq!(option_key(PLAN, "Yes"), None);
         assert!(!has_permission_prompt(PLAN));
         assert!(has_any_dialog(PLAN) && dialog_open(PLAN));
+    }
+
+    /// Real Write dialog (Task 21 live run, 2.1.285): the path sits at the title's
+    /// indentation and a dashed preview box follows, so the box rule never matches it
+    /// (safe: Write and Edit cards are answered in `mirante attach`).
+    const REAL_WRITE: &str = "\
+⏺ Write(novo.txt)
+────────────────────────────────────────────────────────────────────────────────
+ Create file
+ novo.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 x
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create novo.txt?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend";
+
+    #[test]
+    fn write_titles_are_the_real_ones_and_the_real_write_box_is_never_matched() {
+        assert_eq!(titles("Write"), &["Create file", "Overwrite file"]);
+        assert!(!titles("Write").contains(&"Edit file") && !titles("Edit").contains(&"Overwrite file"));
+        assert!(has_permission_prompt(REAL_WRITE));
+        assert_eq!(option_key(REAL_WRITE, "No"), Some('3'));
+        assert!(!dialog_matches(REAL_WRITE, "Write", "/w/novo.txt", None, Some(Path::new("/w"))));
     }
 
     #[test]
