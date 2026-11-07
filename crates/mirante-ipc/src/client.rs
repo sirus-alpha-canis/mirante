@@ -52,6 +52,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(socket: &Path) -> io::Result<Client> {
+        crate::paths::validate_socket_path(socket)?;
         let stream = UnixStream::connect(socket)?;
         Ok(Client { reader: BufReader::new(stream.try_clone()?), writer: stream, next_id: 1 })
     }
@@ -75,11 +76,20 @@ impl Client {
                 continue;
             }
             let resp: Response = serde_json::from_value(v)?;
+            match resp.id {
+                Some(rid) if rid == id => {}
+                // The daemon could not parse our request (or answered without an id): the
+                // error is not about some other call, so surface it instead of waiting.
+                None => {
+                    return Err(match resp.error {
+                        Some(e) => ClientError::Rpc(e),
+                        None => ClientError::Protocol("response without an id".into()),
+                    })
+                }
+                Some(_) => continue,
+            }
             if let Some(e) = resp.error {
                 return Err(ClientError::Rpc(e));
-            }
-            if resp.id != Some(id) {
-                continue;
             }
             return Ok(serde_json::from_value(resp.result.unwrap_or(Value::Null))?);
         }
@@ -100,7 +110,12 @@ impl Client {
 
     /// The raw connection, for `attach` after its response. Keep reading from the returned
     /// reader: it may already hold bytes that arrived with the response.
+    ///
+    /// Read and write timeouts are reset to `None`: an attached stream is long-lived and
+    /// idle for long stretches, so a leftover `set_timeout` would kill it.
     pub fn into_raw(self) -> (BufReader<UnixStream>, UnixStream) {
+        let _ = self.writer.set_read_timeout(None);
+        let _ = self.writer.set_write_timeout(None);
         (self.reader, self.writer)
     }
 }
@@ -173,5 +188,56 @@ mod tests {
         let mut c = Client::connect(&sock).unwrap();
         h.join().unwrap();
         assert!(matches!(c.call::<Value>("x", json!({})), Err(ClientError::Protocol(_)) | Err(ClientError::Io(_))));
+    }
+
+    #[test]
+    fn a_response_without_an_id_is_the_parse_error_for_our_request() {
+        let d = TestDir::new();
+        let sock = d.path().join("s.sock");
+        let h = serve_once(&sock, |_| {
+            vec![serde_json::to_string(&Response::err(None, RpcError::new(code::PARSE, "bad json"))).unwrap()]
+        });
+        let mut c = Client::connect(&sock).unwrap();
+        match c.call::<Value>("x", json!({})) {
+            Err(ClientError::Rpc(e)) => assert_eq!(e.code, code::PARSE),
+            other => panic!("{other:?}"),
+        }
+        drop(c);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn an_error_for_another_id_is_not_ours() {
+        let d = TestDir::new();
+        let sock = d.path().join("s.sock");
+        let h = serve_once(&sock, |req| {
+            vec![
+                serde_json::to_string(&Response::err(Some(req.id + 99), RpcError::new(code::NOT_FOUND, "other"))).unwrap(),
+                serde_json::to_string(&Response::ok(req.id, json!(7))).unwrap(),
+            ]
+        });
+        let mut c = Client::connect(&sock).unwrap();
+        assert_eq!(c.call::<i64>("x", json!({})).unwrap(), 7);
+        drop(c);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn into_raw_clears_timeouts() {
+        let d = TestDir::new();
+        let sock = d.path().join("s.sock");
+        let _l = UnixListener::bind(&sock).unwrap();
+        let c = Client::connect(&sock).unwrap();
+        c.set_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (_r, w) = c.into_raw();
+        assert_eq!(w.read_timeout().unwrap(), None);
+        assert_eq!(w.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn connect_rejects_an_overlong_socket_path() {
+        let long = Path::new("/").join("a".repeat(200));
+        let e = Client::connect(&long).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     }
 }

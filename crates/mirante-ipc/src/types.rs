@@ -160,6 +160,29 @@ pub struct HookParams {
     pub ts_ms: i64,
 }
 
+/// What `mirante-hook` actually puts on the wire and in the spool: [`HookParams`] plus
+/// optional fields (flattened, so a plain `HookParams` reader ignores them and old spool
+/// lines without them still parse).
+///
+/// The daemon's `hook.event` handling and spool ingest MUST dedupe by `event_id`: a hook
+/// that timed out waiting for the ack also spools the event, so the daemon may see it
+/// twice. Spool replays can also be older than live events already applied (the spool is
+/// ingested at daemon start); order by `received_ts_ms`/`ts_ms`, not by arrival.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookEnvelope {
+    #[serde(flatten)]
+    pub params: HookParams,
+    /// `<ts_ms>-<pid>-<counter>`, unique per hook invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// When the hook process received the payload (same clock as `ts_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_ts_ms: Option<i64>,
+    /// The hook's stdin was cut at the size cap; `payload` is a stub, not Claude's JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+}
+
 /// First response of `events.subscribe`; `event` notifications with `seq > seq` follow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {

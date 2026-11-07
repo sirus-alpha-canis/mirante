@@ -265,6 +265,7 @@ dependencies = [
 name = "mirante-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mirante-core",
  "serde",
  "serde_json",

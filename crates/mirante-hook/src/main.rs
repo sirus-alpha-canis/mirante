@@ -1,15 +1,19 @@
-//! `mirante-hook`: see the library docs. Always exits 0 and prints nothing.
-use std::io::Read;
-
+//! `mirante-hook`: see the library docs. Always exits 0 and prints nothing on stdout.
 use mirante_core::claude_launch::TASK_ENV;
 use mirante_core::model::now_ms;
 use mirante_ipc::Paths;
 
-fn main() {
-    let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
+fn run() {
+    let received = now_ms();
+    let (raw, truncated) = mirante_hook::read_stdin(mirante_hook::STDIN_TIMEOUT, mirante_hook::STDIN_CAP);
     let task = std::env::var(TASK_ENV).ok();
     if let Ok(paths) = Paths::from_env() {
-        let _ = mirante_hook::deliver(&paths, task.as_deref(), &raw, now_ms());
+        let _ = mirante_hook::deliver_with(&paths, task.as_deref(), &raw, received, truncated);
     }
+}
+
+fn main() {
+    // A panic must never change Claude's behavior: swallow it and exit 0.
+    let _ = std::panic::catch_unwind(run);
+    std::process::exit(0);
 }
