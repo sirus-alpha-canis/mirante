@@ -7,6 +7,7 @@ pub mod hook;
 pub mod model;
 pub mod status;
 pub mod store;
+pub mod transcript_tail;
 
 pub use error::{CoreError, Result};
 
