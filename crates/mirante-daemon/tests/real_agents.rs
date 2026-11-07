@@ -117,15 +117,20 @@ impl Rig {
     }
 
     /// Answers the dialog in the agent's terminal, as the user does in `mirante attach`:
-    /// only when the screen shows this command's dialog.
+    /// only once the screen shows this command's dialog (the card can come before the
+    /// dialog is drawn).
     fn answer_in_terminal(&self, task: &str, command: &str, key: &[u8]) {
-        let (driver, a) = self.hub.attach(AttachParams { task: task.into(), rows: 40, cols: 120 }).unwrap();
-        let screen = String::from_utf8_lossy(&a.initial).replace("\x1b[C", " ");
-        assert!(
-            screen.contains(command) && screen.contains("Do you want to proceed?"),
-            "not this command's dialog:\n{screen}"
-        );
-        driver.input(a.id, key).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (driver, a) = self.hub.attach(AttachParams { task: task.into(), rows: 40, cols: 120 }).unwrap();
+            let screen = String::from_utf8_lossy(&a.initial).replace("\x1b[C", " ");
+            if screen.contains(command) && screen.contains("Do you want to proceed?") {
+                driver.input(a.id, key).unwrap();
+                return;
+            }
+            assert!(Instant::now() < deadline, "this command's dialog never showed:\n{screen}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
     }
 
     /// Last assistant text in the live session's transcript (read through a second store
@@ -177,7 +182,15 @@ fn claude_turn_permission_stop_and_resume() {
     assert!(r.start(&t, None, true), "resume must reuse the native session id");
     r.say(&t, "Qual é a palavra secreta? Responda só a palavra.");
     r.wait_event(&t, "turn_ended", 120, |_| true);
-    assert!(r.last_answer(&t).contains("JABUTICABA"));
+    // The Stop hook can arrive before the answer's transcript line is written (Task 21
+    // live run): give the line a moment.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut answer = r.last_answer(&t);
+    while !answer.contains("JABUTICABA") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        answer = r.last_answer(&t);
+    }
+    assert!(answer.contains("JABUTICABA"), "{answer:?}");
     r.hub.stop(&t).unwrap();
 }
 
