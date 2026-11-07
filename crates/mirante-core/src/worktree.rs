@@ -31,7 +31,7 @@ fn invalid(name: &str, reason: &str) -> CoreError {
 }
 
 /// Accepts any name git accepts as a branch (`git check-ref-format --branch`), except
-/// names that are not literal branch names: leading `-`, `HEAD`, and `@{...}` shorthands.
+/// names that are not literal branch names: leading `-`, `HEAD`, `@`, and `@{...}` shorthands.
 pub fn validate_branch_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         return Err(invalid(name, "empty"));
@@ -39,7 +39,7 @@ pub fn validate_branch_name(name: &str) -> Result<()> {
     if name.starts_with('-') {
         return Err(invalid(name, "starts with '-'"));
     }
-    if name == "HEAD" || name.contains("@{") {
+    if name == "HEAD" || name == "@" || name.contains("@{") {
         return Err(invalid(name, "not a literal branch name"));
     }
     let ok = Command::new("git").args(["check-ref-format", "--branch", name]).output()?.status.success();
@@ -49,9 +49,23 @@ pub fn validate_branch_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A base ref given by the user: non-empty and never option-like (leading `-`).
+fn validate_base(base: &str) -> Result<()> {
+    if base.trim().is_empty() {
+        return Err(invalid(base, "empty base"));
+    }
+    if base.starts_with('-') {
+        return Err(invalid(base, "base starts with '-'"));
+    }
+    Ok(())
+}
+
 /// The branch checked out in `repo` (fails on a detached HEAD).
 pub fn current_branch(repo: &Path) -> Result<String> {
-    git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| CoreError::Git {
+        args: "symbolic-ref HEAD".into(),
+        stderr: "repository is on a detached HEAD; choose a base branch".into(),
+    })
 }
 
 /// Directory name of the repository's main worktree (works from any of its worktrees).
@@ -73,7 +87,7 @@ fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .args(["show-ref", "--verify", "--quiet", "--end-of-options", &format!("refs/heads/{branch}")])
         .output()?;
     Ok(out.status.success())
 }
@@ -100,6 +114,16 @@ pub fn parse_porcelain(text: &str) -> Vec<Worktree> {
     out
 }
 
+fn root_from_home(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    match home.filter(|h| !h.is_empty()) {
+        Some(home) => Ok(PathBuf::from(home).join(".mirante/worktrees")),
+        None => Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME is not set; cannot locate ~/.mirante/worktrees",
+        ))),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeManager {
     root: PathBuf,
@@ -111,8 +135,9 @@ impl WorktreeManager {
     }
 
     /// `~/.mirante/worktrees`.
-    pub fn default_root() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".mirante/worktrees")
+    /// Fails when `HOME` is unset or empty rather than falling back to the current directory.
+    pub fn default_root() -> Result<PathBuf> {
+        root_from_home(std::env::var_os("HOME"))
     }
 
     pub fn path_for(&self, repo: &Path, branch: &str) -> Result<PathBuf> {
@@ -123,6 +148,9 @@ impl WorktreeManager {
     /// starts from `base`, or from the repo's current branch when `base` is `None`.
     pub fn create(&self, repo: &Path, branch: &str, base: Option<&str>) -> Result<Worktree> {
         validate_branch_name(branch)?;
+        if let Some(b) = base {
+            validate_base(b)?;
+        }
         let path = self.path_for(repo, branch)?;
         if path.exists() {
             return Err(CoreError::Git {
@@ -130,19 +158,24 @@ impl WorktreeManager {
                 stderr: format!("{} already exists", path.display()),
             });
         }
+        let exists = branch_exists(repo, branch)?;
+        if exists && base.is_some() {
+            return Err(invalid(branch, "branch already exists; a base only applies to a new branch"));
+        }
+        // Resolve the base before touching the filesystem so a detached HEAD leaves nothing behind.
+        let base = match (exists, base) {
+            (true, _) => None,
+            (false, Some(b)) => Some(b.to_string()),
+            (false, None) => Some(current_branch(repo)?),
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let path_str = path.to_string_lossy().into_owned();
-        if branch_exists(repo, branch)? {
-            git(repo, &["worktree", "add", &path_str, branch])?;
-        } else {
-            let base = match base {
-                Some(b) => b.to_string(),
-                None => current_branch(repo)?,
-            };
-            git(repo, &["worktree", "add", "-b", branch, &path_str, &base])?;
-        }
+        match base {
+            None => git(repo, &["worktree", "add", "--end-of-options", &path_str, branch])?,
+            Some(base) => git(repo, &["worktree", "add", "-b", branch, "--end-of-options", &path_str, &base])?,
+        };
         let head = git(&path, &["rev-parse", "HEAD"])?;
         Ok(Worktree { path, branch: Some(branch.to_string()), head })
     }
@@ -150,7 +183,12 @@ impl WorktreeManager {
     /// Removes the worktree directory and its git metadata. The branch is kept. Refuses a
     /// dirty worktree (git's own check) so uncommitted work is never discarded silently.
     pub fn remove(&self, repo: &Path, path: &Path) -> Result<()> {
-        git(repo, &["worktree", "remove", &path.to_string_lossy()])?;
+        let root = std::fs::canonicalize(&self.root)?;
+        let path = std::fs::canonicalize(path)?;
+        if path == root || !path.starts_with(&root) {
+            return Err(CoreError::OutsideRoot { path: path.display().to_string(), root: root.display().to_string() });
+        }
+        git(repo, &["worktree", "remove", "--end-of-options", &path.to_string_lossy()])?;
         Ok(())
     }
 
@@ -268,6 +306,52 @@ mod tests {
         std::fs::write(a.path.join("new.txt"), "work\n").unwrap();
         assert!(matches!(mgr.remove(&repo, &a.path), Err(CoreError::Git { .. })));
         assert!(a.path.exists());
+    }
+
+    #[test]
+    fn rejects_option_like_base_and_base_for_existing_branch() {
+        let dir = TempDir::new("wt-base-guard");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        for bad in ["--orphan", "-x", ""] {
+            assert!(matches!(mgr.create(&repo, "n", Some(bad)), Err(CoreError::InvalidBranch { .. })), "{bad:?}");
+        }
+        assert!(matches!(validate_branch_name("@"), Err(CoreError::InvalidBranch { .. })));
+        git(&repo, &["branch", "release"]).unwrap();
+        assert!(matches!(mgr.create(&repo, "release", Some("trunk")), Err(CoreError::InvalidBranch { .. })));
+        assert!(!dir.path().join("wt").exists());
+    }
+
+    #[test]
+    fn detached_head_without_base_is_a_clear_error() {
+        let dir = TempDir::new("wt-detached");
+        let repo = repo(&dir);
+        git(&repo, &["checkout", "-q", "--detach"]).unwrap();
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let err = mgr.create(&repo, "n", None).unwrap_err();
+        assert!(err.to_string().contains("detached HEAD; choose a base branch"), "{err}");
+        mgr.create(&repo, "n", Some("trunk")).unwrap();
+    }
+
+    #[test]
+    fn remove_refuses_paths_outside_the_root() {
+        let dir = TempDir::new("wt-outside");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let elsewhere = WorktreeManager::new(&dir.path().join("other"));
+        let a = elsewhere.create(&repo, "a", None).unwrap();
+        std::fs::create_dir_all(dir.path().join("wt")).unwrap();
+        let err = mgr.remove(&repo, &a.path).unwrap_err();
+        assert!(matches!(err, CoreError::OutsideRoot { .. }), "{err}");
+        assert!(a.path.exists());
+        assert!(matches!(mgr.remove(&repo, &dir.path().join("wt")), Err(CoreError::OutsideRoot { .. })));
+    }
+
+    #[test]
+    fn missing_home_is_an_error_not_a_dot_fallback() {
+        assert!(root_from_home(None).is_err());
+        assert!(root_from_home(Some("".into())).is_err());
+        assert_eq!(root_from_home(Some("/h".into())).unwrap(), PathBuf::from("/h/.mirante/worktrees"));
     }
 
     #[test]

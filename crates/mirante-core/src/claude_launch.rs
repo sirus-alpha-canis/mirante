@@ -14,6 +14,12 @@ pub const KNOWN_SHIM_DIRS: [&str; 1] = [".cmuxterm/cmux-cli-shims"];
 
 /// Inherited variables that make a child `claude` believe it is nested inside another
 /// Claude Code session (or a terminal wrapper's integration). Auth variables are kept.
+///
+/// Beyond the obvious session ids/sockets, a few look harmless but are scrubbed on purpose:
+/// `CLAUDE_EFFORT` and `AI_AGENT` are set by a parent agent and would silently change the
+/// child's reasoning effort / agent-detection behaviour instead of using the user's own
+/// configuration, `CLAUDE_PID`/`CMUX_CLAUDE_PID` point at the parent process, and
+/// `CLAUDE_CODE_EXECPATH` would make the child re-exec the parent's binary (possibly a shim).
 pub const NESTED_SESSION_ENV: [&str; 13] = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -50,6 +56,20 @@ fn is_shim_dir(dir: &Path) -> bool {
     KNOWN_SHIM_DIRS.iter().any(|shim| s.contains(shim))
 }
 
+/// True when `bin`, after following symlinks, lives in a shim directory (a symlink in a
+/// clean PATH entry can still point at a wrapper). Unresolvable paths count as shims.
+fn resolves_into_shim_dir(bin: &Path) -> bool {
+    match std::fs::canonicalize(bin) {
+        Ok(real) => real.parent().is_none_or(is_shim_dir),
+        Err(_) => true,
+    }
+}
+
+/// POSIX single-quote escaping: the result is one literal shell word.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// The real `claude`: `override_bin` (from `MIRANTE_CLAUDE_BIN`) when set, else the first
 /// executable `claude` in `path_var` outside known shim directories.
 pub fn resolve_claude_bin(override_bin: Option<&str>, path_var: Option<&str>) -> Result<PathBuf> {
@@ -65,7 +85,7 @@ pub fn resolve_claude_bin(override_bin: Option<&str>, path_var: Option<&str>) ->
     std::env::split_paths(path_var)
         .filter(|dir| !dir.as_os_str().is_empty() && !is_shim_dir(dir))
         .map(|dir| dir.join("claude"))
-        .find(|p| is_executable(p))
+        .find(|p| is_executable(p) && !resolves_into_shim_dir(p))
         .ok_or_else(|| CoreError::ClaudeNotFound(format!("no claude outside shim dirs in PATH={path_var}")))
 }
 
@@ -88,10 +108,11 @@ pub fn env_to_scrub<I: IntoIterator<Item = String>>(present: I) -> Vec<String> {
     keys
 }
 
-/// Settings passed with `claude --settings <file>`: `hook_cmd` for every event and the
-/// given allowlist. Additive: the user's ~/.claude hooks, skills and MCP servers still load.
+/// Settings passed with `claude --settings <file>`: the hook program at `hook_cmd` (a path,
+/// shell-quoted here because Claude runs hook commands through a shell) for every event and
+/// the given allowlist. Additive: the user's ~/.claude hooks, skills and MCP servers still load.
 pub fn settings_json(hook_cmd: &str, allow: &[String]) -> Value {
-    let handler = json!([{ "type": "command", "command": hook_cmd }]);
+    let handler = json!([{ "type": "command", "command": shell_quote(hook_cmd) }]);
     let mut hooks = serde_json::Map::new();
     for name in PLAIN_EVENTS {
         hooks.insert(name.to_string(), json!([{ "hooks": handler.clone() }]));
@@ -211,12 +232,38 @@ mod tests {
     fn settings_register_every_event_with_the_hook_command() {
         let s = settings_json("/opt/mirante/bin/mirante-hook", &["Bash(cargo test:*)".to_string()]);
         for name in PLAIN_EVENTS.iter().chain(TOOL_EVENTS.iter()) {
-            assert_eq!(s["hooks"][*name][0]["hooks"][0]["command"], "/opt/mirante/bin/mirante-hook", "{name}");
+            assert_eq!(s["hooks"][*name][0]["hooks"][0]["command"], "'/opt/mirante/bin/mirante-hook'", "{name}");
         }
         assert_eq!(s["hooks"]["PermissionRequest"][0]["matcher"], "*");
         assert!(s["hooks"]["Stop"][0].get("matcher").is_none());
         assert_eq!(s["permissions"]["allow"], json!(["Bash(cargo test:*)"]));
         assert!(s["permissions"].get("defaultMode").is_none());
+    }
+
+    #[test]
+    fn hook_command_is_shell_quoted() {
+        let path = "/Users/o'brien/My Apps/mirante-hook";
+        let s = settings_json(path, &[]);
+        let cmd = s["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(cmd, r#"'/Users/o'\''brien/My Apps/mirante-hook'"#);
+        // A real shell must read it back as exactly one word equal to the path.
+        let out = std::process::Command::new("sh").args(["-c", &format!("printf '%s' {cmd}")]).output().unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+        assert_eq!(shell_quote("$(x) `y`"), "'$(x) `y`'");
+    }
+
+    #[test]
+    fn symlink_into_a_shim_dir_is_skipped() {
+        let d = TempDir::new("launch-symlink");
+        let shim = d.path().join("home/.cmuxterm/cmux-cli-shims");
+        let clean = d.path().join("clean");
+        let real = d.path().join("real");
+        let shim_bin = fake_bin(&shim, "claude", 0o755);
+        std::fs::create_dir_all(&clean).unwrap();
+        std::os::unix::fs::symlink(&shim_bin, clean.join("claude")).unwrap();
+        let want = fake_bin(&real, "claude", 0o755);
+        let path = std::env::join_paths([&clean, &real]).unwrap();
+        assert_eq!(resolve_claude_bin(None, path.to_str()).unwrap(), want);
     }
 
     #[test]

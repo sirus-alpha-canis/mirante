@@ -640,6 +640,9 @@ EOF
 
 ### Task 4: Store — open, WAL and versioned migrations
 
+> **Superseded in part:** the commit titled `fix(core): harden store constraints, worktree argv, launch quoting, tailer memory` supersedes the code below for store hardening (WAL check, migration 0002 trigger, UNIQUE mapping, Immediate transactions, conversation/session ownership checks). Prefer the code in `crates/mirante-core` over the snippets here.
+
+
 **Files:**
 - Create: `crates/mirante-core/src/migrations/0001_init.sql`, `crates/mirante-core/src/store.rs`
 - Modify: `crates/mirante-core/src/lib.rs`
@@ -888,6 +891,9 @@ EOF
 ---
 
 ### Task 5: Store — tasks, validated transitions and the audit trail
+
+> **Superseded in part:** see the note at Task 4; the `fix(core): harden store constraints...` commit changes store behavior here (answered-once UPDATE guard, session/conversation checks, Immediate transactions).
+
 
 **Files:**
 - Modify: `crates/mirante-core/src/store.rs`
@@ -1232,6 +1238,9 @@ EOF
 ---
 
 ### Task 6: Store — conversations, sessions with the per-task lock, turns
+
+> **Superseded in part:** see the note at Task 4; the `fix(core): harden store constraints...` commit changes store behavior here (answered-once UPDATE guard, session/conversation checks, Immediate transactions).
+
 
 **Files:**
 - Modify: `crates/mirante-core/src/store.rs`
@@ -1616,6 +1625,9 @@ EOF
 ---
 
 ### Task 7: Store — permission requests
+
+> **Superseded in part:** see the note at Task 4; the `fix(core): harden store constraints...` commit changes store behavior here (answered-once UPDATE guard, session/conversation checks, Immediate transactions).
+
 
 **Files:**
 - Modify: `crates/mirante-core/src/store.rs`
@@ -2978,6 +2990,9 @@ EOF
 
 ### Task 11: Incremental transcript tailer
 
+> **Superseded in part:** the commit titled `fix(core): harden store constraints, worktree argv, launch quoting, tailer memory` supersedes the code below for the tailer (1 MiB chunked reads, 64 MiB cap on unterminated lines, byte-level JSON parsing). Prefer the code in `crates/mirante-core` over the snippets here.
+
+
 **Files:**
 - Create: `crates/mirante-core/src/transcript_tail.rs`
 - Modify: `crates/mirante-core/src/lib.rs`
@@ -3209,6 +3224,9 @@ EOF
 ---
 
 ### Task 12: Worktree manager
+
+> **Superseded in part:** the commit titled `fix(core): harden store constraints, worktree argv, launch quoting, tailer memory` supersedes the code below for the worktree manager (`--end-of-options`, base validation, root-confined remove, detached-HEAD and HOME errors). Prefer the code in `crates/mirante-core` over the snippets here.
+
 
 **Files:**
 - Create: `crates/mirante-core/src/worktree.rs`
@@ -3553,6 +3571,9 @@ EOF
 ---
 
 ### Task 13: Claude launch config, then full verification
+
+> **Superseded in part:** the commit titled `fix(core): harden store constraints, worktree argv, launch quoting, tailer memory` supersedes the code below for launch config (shell-quoted hook command, canonicalized shim check, documented env scrubbing). Prefer the code in `crates/mirante-core` over the snippets here.
+
 
 **Files:**
 - Create: `crates/mirante-core/src/claude_launch.rs`

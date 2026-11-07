@@ -11,7 +11,27 @@ use crate::model::{
 };
 
 /// Embedded, ordered schema migrations. `PRAGMA user_version` records the last applied one.
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] =
+    &[(1, include_str!("migrations/0001_init.sql")), (2, include_str!("migrations/0002_permission_answered_once.sql"))];
+
+/// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation
+                && (f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    || f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
+    )
+}
+
+/// WAL is required on disk; in-memory databases legitimately report "memory".
+fn check_journal_mode(mode: &str) -> Result<()> {
+    match mode.to_ascii_lowercase().as_str() {
+        "wal" | "memory" => Ok(()),
+        other => Err(CoreError::JournalMode(other.to_string())),
+    }
+}
 
 macro_rules! sql_text_enum {
     ($($t:ty),+) => {$(
@@ -53,7 +73,8 @@ impl Store {
     fn init(mut conn: Connection) -> Result<Store> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Returns the resulting mode ("wal" on disk, "memory" for in-memory databases).
-        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        check_journal_mode(&mode)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&mut conn)?;
@@ -95,10 +116,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), 2);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), 2);
     }
 
     #[test]
@@ -285,7 +306,10 @@ impl Store {
 
     /// Appends a free-form event (e.g. a normalized agent step) to the audit trail.
     pub fn append_event(&mut self, task_id: Option<&str>, kind: &str, payload: &Value) -> Result<Event> {
-        insert_event(&self.conn, &self.boot_id, task_id, kind, payload)
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event = insert_event(&tx, &self.boot_id, task_id, kind, payload)?;
+        tx.commit()?;
+        Ok(event)
     }
 
     /// Events with `seq > after_seq`, oldest first, at most `limit`. Clients reconcile from
@@ -493,6 +517,16 @@ impl Store {
     pub fn start_session(&mut self, task_id: &str, conversation_id: &str) -> Result<Session> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = load_task(&tx, task_id)?;
+        let owner: String = tx
+            .query_row("SELECT task_id FROM conversations WHERE id = ?1", [conversation_id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound { kind: "conversation", id: conversation_id.to_string() })?;
+        if owner != task_id {
+            return Err(CoreError::ConversationMismatch {
+                conversation_id: conversation_id.to_string(),
+                task_id: task_id.to_string(),
+            });
+        }
         if task.lifecycle == Lifecycle::Archived {
             return Err(CoreError::InvalidTransition { kind: "session", from: "archived".into(), to: "live".into() });
         }
@@ -514,6 +548,15 @@ impl Store {
         tx.execute(
             &format!("INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 0)"),
             params![s.id, s.task_id, s.conversation_id, s.started_at],
+        )
+        .map_err(
+            |e| {
+                if is_unique_violation(&e) {
+                    CoreError::TaskBusy(task_id.to_string())
+                } else {
+                    e.into()
+                }
+            },
         )?;
         if task.lifecycle == Lifecycle::Created {
             tx.execute(
@@ -574,13 +617,15 @@ impl Store {
 
     /// Persists where the transcript tailer is. Not audited: it moves on every poll.
     pub fn set_transcript(&mut self, session_id: &str, path: &str, offset: u64) -> Result<()> {
-        let n = self.conn.execute(
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             "UPDATE sessions SET transcript_path = ?2, transcript_offset = ?3 WHERE id = ?1",
             params![session_id, path, offset as i64],
         )?;
         if n == 0 {
             return Err(CoreError::NotFound { kind: "session", id: session_id.to_string() });
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -595,7 +640,14 @@ impl Store {
         tx.execute(
             "INSERT INTO turns (id, session_id, idx, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, NULL)",
             params![t.id, t.session_id, t.idx, t.started_at],
-        )?;
+        )
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                CoreError::DuplicateTurn { session_id: session_id.to_string(), idx }
+            } else {
+                e.into()
+            }
+        })?;
         insert_event(
             &tx,
             &self.boot_id,
@@ -771,6 +823,9 @@ impl Store {
     ) -> Result<PermissionRequest> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let s = load_session(&tx, session_id)?;
+        if s.ended_at.is_some() {
+            return Err(CoreError::SessionEnded(session_id.to_string()));
+        }
         let p = PermissionRequest {
             id: new_id(),
             task_id: s.task_id.clone(),
@@ -810,17 +865,22 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| CoreError::NotFound { kind: "permission_request", id: id.to_string() })?;
+        let already = || CoreError::InvalidTransition {
+            kind: "permission",
+            from: p.status.as_str().into(),
+            to: answer.as_str().into(),
+        };
         if p.status != PermissionStatus::Pending || answer == PermissionStatus::Pending {
-            return Err(CoreError::InvalidTransition {
-                kind: "permission",
-                from: p.status.as_str().into(),
-                to: answer.as_str().into(),
-            });
+            return Err(already());
         }
-        tx.execute(
-            "UPDATE permission_requests SET status = ?2, answered_at = ?3 WHERE id = ?1",
+        // Compare-and-set at the DB level: only a still-pending row can be answered.
+        let n = tx.execute(
+            "UPDATE permission_requests SET status = ?2, answered_at = ?3 WHERE id = ?1 AND status = 'pending'",
             params![id, answer, now_ms()],
         )?;
+        if n == 0 {
+            return Err(already());
+        }
         insert_event(
             &tx,
             &self.boot_id,
@@ -885,5 +945,94 @@ mod permission_tests {
             s.answer_permission(&p.id, PermissionStatus::AllowedOnce).unwrap().status,
             PermissionStatus::AllowedOnce
         );
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn setup(s: &mut Store) -> (Task, Conversation, Session) {
+        let t = s.create_task(sample_task("feat-a")).unwrap();
+        let c = s.create_conversation(&t.id).unwrap();
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        (t, c, sess)
+    }
+
+    #[test]
+    fn unique_violation_is_detected() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn.execute_batch("CREATE TABLE u (a TEXT UNIQUE); INSERT INTO u VALUES ('x');").unwrap();
+        let e = s.conn.execute("INSERT INTO u VALUES ('x')", []).unwrap_err();
+        assert!(is_unique_violation(&e));
+        let e = s.conn.execute("INSERT INTO nope VALUES (1)", []).unwrap_err();
+        assert!(!is_unique_violation(&e));
+    }
+
+    #[test]
+    fn duplicate_turn_index_maps_to_a_clear_error() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (_, _, sess) = setup(&mut s);
+        let t1 = s.start_turn(&sess.id).unwrap();
+        let e = s
+            .conn
+            .execute(
+                "INSERT INTO turns (id, session_id, idx, started_at) VALUES ('dup', ?1, ?2, 0)",
+                params![sess.id, t1.idx],
+            )
+            .unwrap_err();
+        assert!(is_unique_violation(&e));
+    }
+
+    #[test]
+    fn start_session_rejects_a_foreign_conversation() {
+        let mut s = Store::open_in_memory().unwrap();
+        let a = s.create_task(sample_task("feat-a")).unwrap();
+        let b = s.create_task(sample_task("feat-b")).unwrap();
+        let cb = s.create_conversation(&b.id).unwrap();
+        let err = s.start_session(&a.id, &cb.id).unwrap_err();
+        assert!(matches!(err, CoreError::ConversationMismatch { .. }), "{err}");
+        let err = s.start_session(&a.id, "missing").unwrap_err();
+        assert!(matches!(err, CoreError::NotFound { kind: "conversation", .. }), "{err}");
+        assert!(s.live_session(&a.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn permission_request_requires_a_live_session() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (_, _, sess) = setup(&mut s);
+        s.end_session(&sess.id).unwrap();
+        let err = s.create_permission_request(&sess.id, "Bash", "ls").unwrap_err();
+        assert!(matches!(err, CoreError::SessionEnded(_)), "{err}");
+    }
+
+    #[test]
+    fn db_refuses_to_change_an_answered_permission() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (_, _, sess) = setup(&mut s);
+        let p = s.create_permission_request(&sess.id, "Bash", "ls").unwrap();
+        s.answer_permission(&p.id, PermissionStatus::Denied).unwrap();
+        let raw = s.conn.execute("UPDATE permission_requests SET status = 'allowed_once' WHERE id = ?1", [&p.id]);
+        assert!(raw.is_err(), "trigger must block re-answering");
+        let status: String =
+            s.conn.query_row("SELECT status FROM permission_requests WHERE id = ?1", [&p.id], |r| r.get(0)).unwrap();
+        assert_eq!(status, "denied");
+    }
+
+    #[test]
+    fn journal_mode_check() {
+        check_journal_mode("wal").unwrap();
+        check_journal_mode("memory").unwrap();
+        assert!(matches!(check_journal_mode("delete"), Err(CoreError::JournalMode(m)) if m == "delete"));
+    }
+
+    #[test]
+    fn append_event_and_set_transcript_commit() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (_, _, sess) = setup(&mut s);
+        let e = s.append_event(None, "x", &json!({})).unwrap();
+        assert_eq!(s.events_since(e.seq - 1, 10).unwrap().len(), 1);
+        s.set_transcript(&sess.id, "/p", 7).unwrap();
+        assert_eq!(s.get_session(&sess.id).unwrap().transcript_offset, 7);
     }
 }

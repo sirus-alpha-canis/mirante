@@ -2,6 +2,10 @@
 //! lines appended since the last one; a partial last line stays buffered until its newline
 //! arrives. `offset()` is the byte position after the last complete line: persist it and
 //! pass it back to `TranscriptTail::new` to resume after a restart.
+//!
+//! Memory is bounded: a poll reads at most `DEFAULT_CHUNK` (1 MiB) bytes, and a single line
+//! longer than `DEFAULT_MAX_PARTIAL` (64 MiB) is discarded (counted in `skipped`) instead of
+//! buffered. Call `poll` again while `offset()` is behind the file length to catch up.
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -9,6 +13,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::error::Result;
+
+/// Most bytes read from the file per `poll`.
+pub const DEFAULT_CHUNK: usize = 1 << 20;
+/// Longest unterminated line kept in memory before it is discarded.
+pub const DEFAULT_MAX_PARTIAL: usize = 64 << 20;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct TailBatch {
@@ -24,11 +33,27 @@ pub struct TranscriptTail {
     path: PathBuf,
     offset: u64,
     partial: Vec<u8>,
+    chunk: usize,
+    max_partial: usize,
+    /// Inside an oversized line: bytes are dropped until its newline arrives.
+    discarding: bool,
 }
 
 impl TranscriptTail {
     pub fn new(path: &Path, offset: u64) -> Self {
-        TranscriptTail { path: path.to_path_buf(), offset, partial: Vec::new() }
+        TranscriptTail::with_limits(path, offset, DEFAULT_CHUNK, DEFAULT_MAX_PARTIAL)
+    }
+
+    /// Like `new` with explicit per-poll read size and unterminated-line cap (both in bytes).
+    pub fn with_limits(path: &Path, offset: u64, chunk: usize, max_partial: usize) -> Self {
+        TranscriptTail {
+            path: path.to_path_buf(),
+            offset,
+            partial: Vec::new(),
+            chunk: chunk.max(1),
+            max_partial,
+            discarding: false,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -53,27 +78,46 @@ impl TranscriptTail {
         if len < read_from {
             self.offset = 0;
             self.partial.clear();
+            self.discarding = false;
             batch.reset = true;
         }
         file.seek(SeekFrom::Start(self.offset + self.partial.len() as u64))?;
         let mut fresh = Vec::new();
-        file.read_to_end(&mut fresh)?;
+        file.take(self.chunk as u64).read_to_end(&mut fresh)?;
+
+        if self.discarding {
+            match fresh.iter().position(|b| *b == b'\n') {
+                None => {
+                    self.offset += fresh.len() as u64;
+                    return Ok(batch);
+                }
+                Some(i) => {
+                    self.offset += i as u64 + 1;
+                    fresh.drain(..=i);
+                    self.discarding = false;
+                }
+            }
+        }
         self.partial.extend_from_slice(&fresh);
 
-        let Some(last_newline) = self.partial.iter().rposition(|b| *b == b'\n') else {
-            return Ok(batch);
-        };
-        let complete: Vec<u8> = self.partial.drain(..=last_newline).collect();
-        self.offset += complete.len() as u64;
-        for line in complete.split(|b| *b == b'\n') {
-            let text = String::from_utf8_lossy(line);
-            if text.trim().is_empty() {
-                continue;
+        if let Some(last_newline) = self.partial.iter().rposition(|b| *b == b'\n') {
+            let complete: Vec<u8> = self.partial.drain(..=last_newline).collect();
+            self.offset += complete.len() as u64;
+            for line in complete.split(|b| *b == b'\n') {
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                match serde_json::from_slice::<Value>(line) {
+                    Ok(v) => batch.lines.push(v),
+                    Err(_) => batch.skipped += 1,
+                }
             }
-            match serde_json::from_str::<Value>(&text) {
-                Ok(v) => batch.lines.push(v),
-                Err(_) => batch.skipped += 1,
-            }
+        }
+        if self.partial.len() > self.max_partial {
+            self.offset += self.partial.len() as u64;
+            self.partial.clear();
+            self.discarding = true;
+            batch.skipped += 1;
         }
         Ok(batch)
     }
@@ -153,6 +197,64 @@ mod tests {
         let b = TranscriptTail::new(&path, 0).poll().unwrap();
         assert_eq!(b.lines.len(), 2);
         assert_eq!(b.skipped, 1);
+    }
+
+    fn drain(t: &mut TranscriptTail, path: &Path) -> (Vec<Value>, usize) {
+        let len = std::fs::metadata(path).unwrap().len();
+        let (mut lines, mut skipped) = (Vec::new(), 0);
+        for _ in 0..10_000 {
+            let b = t.poll().unwrap();
+            lines.extend(b.lines);
+            skipped += b.skipped;
+            if t.offset() == len {
+                break;
+            }
+        }
+        (lines, skipped)
+    }
+
+    #[test]
+    fn reads_in_bounded_chunks_without_losing_lines() {
+        let dir = TempDir::new("tail-chunks");
+        let path = dir.path().join("t.jsonl");
+        let text: String = (0..50).map(|n| format!("{{\"n\":{n},\"s\":\"ã\"}}\n")).collect();
+        append(&path, &text);
+        let mut t = TranscriptTail::with_limits(&path, 0, 16, 1 << 20);
+        let first = t.poll().unwrap();
+        assert!(t.offset() <= 16, "one poll reads at most one chunk");
+        assert!(first.lines.len() <= 1);
+        let (rest, skipped) = drain(&mut t, &path);
+        assert_eq!(first.lines.len() + rest.len(), 50);
+        assert_eq!(skipped, 0);
+        assert_eq!(rest.last().unwrap()["n"], 49);
+    }
+
+    #[test]
+    fn oversized_line_is_discarded_and_counted_then_tailing_resumes() {
+        let dir = TempDir::new("tail-cap");
+        let path = dir.path().join("t.jsonl");
+        let big = format!("{{\"x\":\"{}\"}}\n", "a".repeat(200));
+        append(&path, &format!("{{\"n\":1}}\n{big}{{\"n\":2}}\n"));
+        let mut t = TranscriptTail::with_limits(&path, 0, 16, 32);
+        let (lines, skipped) = drain(&mut t, &path);
+        assert_eq!(lines.iter().map(|v| v["n"].as_i64().unwrap()).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(skipped, 1);
+        assert_eq!(t.offset(), std::fs::metadata(&path).unwrap().len());
+        assert!(t.partial.len() <= 32 + 16);
+        append(&path, "{\"n\":3}\n");
+        assert_eq!(t.poll().unwrap().lines[0]["n"], 3);
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_skipped_not_lossily_decoded() {
+        let dir = TempDir::new("tail-utf8");
+        let path = dir.path().join("t.jsonl");
+        let mut bytes = b"{\"s\":\"".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        bytes.extend_from_slice(b"\"}\n{\"n\":1}\n");
+        std::fs::write(&path, bytes).unwrap();
+        let b = TranscriptTail::new(&path, 0).poll().unwrap();
+        assert_eq!((b.lines.len(), b.skipped), (1, 1));
     }
 
     #[test]

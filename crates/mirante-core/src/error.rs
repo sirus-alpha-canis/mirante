@@ -18,6 +18,16 @@ pub enum CoreError {
     InvalidBranch { name: String, reason: String },
     #[error("git {args}: {stderr}")]
     Git { args: String, stderr: String },
+    #[error("turn index {idx} already exists in session {session_id}")]
+    DuplicateTurn { session_id: String, idx: i64 },
+    #[error("conversation {conversation_id} does not belong to task {task_id}")]
+    ConversationMismatch { conversation_id: String, task_id: String },
+    #[error("session {0} has ended")]
+    SessionEnded(String),
+    #[error("database journal mode is {0:?}, expected \"wal\"")]
+    JournalMode(String),
+    #[error("worktree path {path} is outside the managed root {root}")]
+    OutsideRoot { path: String, root: String },
     #[error("claude binary not found: {0}")]
     ClaudeNotFound(String),
     #[error(transparent)]
