@@ -5,7 +5,15 @@
 //!
 //! Memory is bounded: a poll reads at most `DEFAULT_CHUNK` (1 MiB) bytes, and a single line
 //! longer than `DEFAULT_MAX_PARTIAL` (64 MiB) is discarded (counted in `skipped`) instead of
-//! buffered. Call `poll` again while `offset()` is behind the file length to catch up.
+//! buffered. Call `poll` again while the batch's `more` is set to catch up. Do not loop on
+//! `offset() < file length`: a partial last line keeps the offset behind the length until
+//! its newline arrives, so that loop would spin.
+//!
+//! Restart in the middle of a discarded oversized line: the persisted offset then points
+//! inside that line (discarded bytes advance it). A new tail from that offset does not know
+//! it was discarding, so it reads the line's remainder as one line, which is not valid JSON
+//! and is counted once in `skipped` (or discarded again if the remainder is itself over the
+//! cap). No valid line is lost or duplicated.
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -26,6 +34,8 @@ pub struct TailBatch {
     pub skipped: usize,
     /// True when the file shrank below the saved offset and was re-read from the start.
     pub reset: bool,
+    /// True when this poll read a full chunk: more bytes may be waiting, poll again.
+    pub more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +94,7 @@ impl TranscriptTail {
         file.seek(SeekFrom::Start(self.offset + self.partial.len() as u64))?;
         let mut fresh = Vec::new();
         file.take(self.chunk as u64).read_to_end(&mut fresh)?;
+        batch.more = fresh.len() >= self.chunk;
 
         if self.discarding {
             match fresh.iter().position(|b| *b == b'\n') {
@@ -199,6 +210,7 @@ mod tests {
         assert_eq!(b.skipped, 1);
     }
 
+    /// Polls while `more`, as the module docs prescribe.
     fn drain(t: &mut TranscriptTail, path: &Path) -> (Vec<Value>, usize) {
         let len = std::fs::metadata(path).unwrap().len();
         let (mut lines, mut skipped) = (Vec::new(), 0);
@@ -206,10 +218,11 @@ mod tests {
             let b = t.poll().unwrap();
             lines.extend(b.lines);
             skipped += b.skipped;
-            if t.offset() == len {
+            if !b.more {
                 break;
             }
         }
+        assert_eq!(t.offset(), len, "caught up once `more` clears");
         (lines, skipped)
     }
 
@@ -268,5 +281,66 @@ mod tests {
         let b = t.poll().unwrap();
         assert!(b.reset);
         assert_eq!(b.lines[0]["n"], 9);
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn append(path: &Path, text: &str) {
+        let mut f = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// Loop while `more`: it is set when a poll hit the chunk limit, and clear once the
+    /// reader is caught up, even with a partial last line (offset stays behind len then).
+    #[test]
+    fn more_flags_a_full_chunk_and_clears_when_caught_up() {
+        let dir = TempDir::new("tail-more");
+        let path = dir.path().join("t.jsonl");
+        let text: String = (0..20).map(|n| format!("{{\"n\":{n}}}\n")).collect();
+        append(&path, &text);
+        append(&path, "{\"n\":");
+        let mut t = TranscriptTail::with_limits(&path, 0, 16, 1 << 20);
+        let mut lines = Vec::new();
+        let mut polls = 0;
+        loop {
+            let b = t.poll().unwrap();
+            polls += 1;
+            lines.extend(b.lines);
+            if !b.more {
+                break;
+            }
+            assert!(polls < 1000);
+        }
+        assert!(polls > 1);
+        assert_eq!(lines.len(), 20);
+        assert!(t.offset() < std::fs::metadata(&path).unwrap().len(), "partial line stays unread");
+        assert!(!t.poll().unwrap().more);
+        let small = TranscriptTail::new(&path, 0).poll().unwrap();
+        assert!(!small.more);
+    }
+
+    /// Restart mid-discard: the saved offset points inside the oversized line. The new tail
+    /// reads the line's remainder as one invalid line (counted in `skipped`), then resumes.
+    #[test]
+    fn restart_inside_a_discarded_line_skips_its_remainder_once() {
+        let dir = TempDir::new("tail-restart-discard");
+        let path = dir.path().join("t.jsonl");
+        append(&path, &format!("{{\"n\":1}}\n{{\"x\":\"{}", "a".repeat(100)));
+        let mut t = TranscriptTail::with_limits(&path, 0, 1 << 20, 32);
+        let b = t.poll().unwrap();
+        assert_eq!((b.lines.len(), b.skipped), (1, 1));
+        let saved = t.offset();
+        append(&path, "aaaa\"}\n{\"n\":2}\n");
+        let mut t2 = TranscriptTail::with_limits(&path, saved, 1 << 20, 32);
+        let b = t2.poll().unwrap();
+        assert_eq!(b.lines.iter().map(|v| v["n"].as_i64().unwrap()).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(b.skipped, 1);
     }
 }

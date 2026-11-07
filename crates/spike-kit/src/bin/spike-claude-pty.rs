@@ -3,7 +3,8 @@
 //! resume: sets a secret, exits, resumes by session id and asks for the secret (S4).
 //! status: scripted session(s) in a fresh sandbox; compares hook-derived status with the
 //!         status read off the emulated screen at checkpoints (S3 accuracy).
-//! prompts: types prompts one by one (default: the three S2 prompts), waiting for each Stop,
+//! prompts: types prompts one by one (default: the three S2 prompts), waiting for each Stop
+//!         (a prompt starting with `/` gets a fixed 8s instead: local commands fire no Stop),
 //!         then /exit; prints session id + transcript for `spike usage` (S2 interactive).
 //!
 //! `MIRANTE_CLAUDE_BIN` overrides the binary (default `claude` on PATH), e.g. to skip a
@@ -309,10 +310,17 @@ fn prompts(cwd: &str, settings: &str, hooks_log: &Path, list: &[String]) -> Resu
     let task = format!("prompts-{}", util::now_ms());
     let mut s = Session::start(cwd, settings, hooks_log, &task, &[])?;
     s.boot()?;
+    let mut stops = 0;
     for (i, p) in list.iter().enumerate() {
         s.type_line(p)?;
-        let events = wait_for(hooks_log, &task, "Stop", i + 1, Duration::from_secs(180))?;
-        if events.iter().filter(|e| e.event.hook_event_name == "Stop").count() <= i {
+        // A slash command may never run the model (no Stop): give it time, then move on.
+        if p.starts_with('/') {
+            std::thread::sleep(Duration::from_secs(8));
+            continue;
+        }
+        stops += 1;
+        let events = wait_for(hooks_log, &task, "Stop", stops, Duration::from_secs(180))?;
+        if events.iter().filter(|e| e.event.hook_event_name == "Stop").count() < stops {
             bail!("prompt {} did not finish (no Stop); not typing the rest", i + 1);
         }
     }

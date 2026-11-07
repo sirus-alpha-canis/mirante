@@ -2,7 +2,7 @@
 //! `root` = `~/.mirante/worktrees` by default. The branch name is the user's choice (no
 //! forced prefix), and the base is the repo's current branch unless one is given: never
 //! an assumed `main`. Removing a worktree keeps its branch.
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{CoreError, Result};
@@ -114,6 +114,40 @@ pub fn parse_porcelain(text: &str) -> Vec<Worktree> {
     out
 }
 
+/// Canonical form of `path`, also when it (or its tail) does not exist: `.` and `..` are
+/// resolved lexically, then the deepest existing ancestor is canonicalized (symlinks such
+/// as macOS `/var` -> `/private/var`) and the missing components are appended.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return Ok(p);
+    }
+    let abs = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let mut lexical = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let mut missing = Vec::new();
+    let mut base = lexical.as_path();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(base) {
+            return Ok(missing.iter().rev().fold(canon, |acc: PathBuf, part| acc.join(part)));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                base = parent;
+            }
+            _ => return Ok(lexical),
+        }
+    }
+}
+
 fn root_from_home(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
     match home.filter(|h| !h.is_empty()) {
         Some(home) => Ok(PathBuf::from(home).join(".mirante/worktrees")),
@@ -182,13 +216,19 @@ impl WorktreeManager {
 
     /// Removes the worktree directory and its git metadata. The branch is kept. Refuses a
     /// dirty worktree (git's own check) so uncommitted work is never discarded silently.
+    /// If the directory is already gone (deleted by hand), the path is checked against the
+    /// root lexically and `git worktree prune` drops the stale metadata.
     pub fn remove(&self, repo: &Path, path: &Path) -> Result<()> {
-        let root = std::fs::canonicalize(&self.root)?;
-        let path = std::fs::canonicalize(path)?;
+        let root = resolve(&self.root)?;
+        let path = resolve(path)?;
         if path == root || !path.starts_with(&root) {
             return Err(CoreError::OutsideRoot { path: path.display().to_string(), root: root.display().to_string() });
         }
-        git(repo, &["worktree", "remove", "--end-of-options", &path.to_string_lossy()])?;
+        if path.exists() {
+            git(repo, &["worktree", "remove", "--end-of-options", &path.to_string_lossy()])?;
+        } else {
+            git(repo, &["worktree", "prune"])?;
+        }
         Ok(())
     }
 
@@ -345,6 +385,25 @@ mod tests {
         assert!(matches!(err, CoreError::OutsideRoot { .. }), "{err}");
         assert!(a.path.exists());
         assert!(matches!(mgr.remove(&repo, &dir.path().join("wt")), Err(CoreError::OutsideRoot { .. })));
+    }
+
+    #[test]
+    fn remove_of_a_deleted_directory_prunes_its_metadata() {
+        let dir = TempDir::new("wt-gone");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let a = mgr.create(&repo, "a", None).unwrap();
+        mgr.create(&repo, "b", None).unwrap();
+        std::fs::remove_dir_all(&a.path).unwrap();
+        mgr.remove(&repo, &a.path).unwrap();
+        let listed: Vec<Option<String>> = mgr.list(&repo).unwrap().into_iter().map(|w| w.branch).collect();
+        assert_eq!(listed, vec![Some("b".to_string())]);
+        assert!(!git(&repo, &["worktree", "list", "--porcelain"]).unwrap().contains("/wt/my-app/a\n"));
+        assert!(branch_exists(&repo, "a").unwrap());
+        // A missing path is still checked against the root, lexically (`..` cannot escape).
+        let escape = dir.path().join("wt/my-app/../../elsewhere/x");
+        assert!(matches!(mgr.remove(&repo, &escape), Err(CoreError::OutsideRoot { .. })));
+        assert!(matches!(mgr.remove(&repo, &dir.path().join("nowhere/x")), Err(CoreError::OutsideRoot { .. })));
     }
 
     #[test]

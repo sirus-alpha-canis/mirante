@@ -25,6 +25,16 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Maps a UNIQUE violation to the domain error `on_unique` builds; any other error is
+/// passed through as `CoreError::Sqlite`.
+fn map_unique(e: rusqlite::Error, on_unique: impl FnOnce() -> CoreError) -> CoreError {
+    if is_unique_violation(&e) {
+        on_unique()
+    } else {
+        e.into()
+    }
+}
+
 /// WAL is required on disk; in-memory databases legitimately report "memory".
 fn check_journal_mode(mode: &str) -> Result<()> {
     match mode.to_ascii_lowercase().as_str() {
@@ -549,15 +559,7 @@ impl Store {
             &format!("INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 0)"),
             params![s.id, s.task_id, s.conversation_id, s.started_at],
         )
-        .map_err(
-            |e| {
-                if is_unique_violation(&e) {
-                    CoreError::TaskBusy(task_id.to_string())
-                } else {
-                    e.into()
-                }
-            },
-        )?;
+        .map_err(|e| map_unique(e, || CoreError::TaskBusy(task_id.to_string())))?;
         if task.lifecycle == Lifecycle::Created {
             tx.execute(
                 "UPDATE tasks SET lifecycle = 'active', updated_at = ?2 WHERE id = ?1",
@@ -629,9 +631,13 @@ impl Store {
         Ok(())
     }
 
+    /// Opens the next turn of a live session; an ended session is `SessionEnded`.
     pub fn start_turn(&mut self, session_id: &str) -> Result<Turn> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let s = load_session(&tx, session_id)?;
+        if s.ended_at.is_some() {
+            return Err(CoreError::SessionEnded(session_id.to_string()));
+        }
         let idx: i64 =
             tx.query_row("SELECT COALESCE(MAX(idx), 0) + 1 FROM turns WHERE session_id = ?1", [session_id], |r| {
                 r.get(0)
@@ -641,13 +647,7 @@ impl Store {
             "INSERT INTO turns (id, session_id, idx, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, NULL)",
             params![t.id, t.session_id, t.idx, t.started_at],
         )
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                CoreError::DuplicateTurn { session_id: session_id.to_string(), idx }
-            } else {
-                e.into()
-            }
-        })?;
+        .map_err(|e| map_unique(e, || CoreError::DuplicateTurn { session_id: session_id.to_string(), idx }))?;
         insert_event(
             &tx,
             &self.boot_id,
@@ -974,6 +974,7 @@ mod hardening_tests {
         let mut s = Store::open_in_memory().unwrap();
         let (_, _, sess) = setup(&mut s);
         let t1 = s.start_turn(&sess.id).unwrap();
+        let dup = || CoreError::DuplicateTurn { session_id: sess.id.clone(), idx: t1.idx };
         let e = s
             .conn
             .execute(
@@ -981,7 +982,49 @@ mod hardening_tests {
                 params![sess.id, t1.idx],
             )
             .unwrap_err();
-        assert!(is_unique_violation(&e));
+        let mapped = map_unique(e, dup);
+        assert!(matches!(mapped, CoreError::DuplicateTurn { idx, .. } if idx == t1.idx), "{mapped}");
+        // Any other error passes through unchanged.
+        let other = s.conn.execute("INSERT INTO nope VALUES (1)", []).unwrap_err();
+        assert!(matches!(map_unique(other, dup), CoreError::Sqlite(_)));
+    }
+
+    #[test]
+    fn start_turn_rejects_an_ended_session() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (_, _, sess) = setup(&mut s);
+        s.end_session(&sess.id).unwrap();
+        let err = s.start_turn(&sess.id).unwrap_err();
+        assert!(matches!(err, CoreError::SessionEnded(ref id) if *id == sess.id), "{err}");
+        assert!(s.turns(&sess.id).unwrap().is_empty());
+    }
+
+    /// A database created before migration 0002 (user_version 1) gets the answered-once
+    /// trigger on open, and it guards rows answered before the upgrade too.
+    #[test]
+    fn v1_database_upgrades_and_the_trigger_guards_old_answers() {
+        let dir = crate::test_support::TempDir::new("store-v1");
+        let path = dir.path().join("m.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0].1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks VALUES ('t', 'x', '/r', '/w', 'b', 'claude', '', '', 'active', 'idle', 0, 0);
+                 INSERT INTO conversations VALUES ('c', 't', NULL, 0);
+                 INSERT INTO sessions VALUES ('s', 't', 'c', 0, NULL, NULL, 0);
+                 INSERT INTO permission_requests VALUES ('p', 't', 's', 'Bash', 'ls', 'denied', 0, 1);",
+            )
+            .unwrap();
+            // Before the upgrade nothing stops a re-answer.
+            conn.execute("UPDATE permission_requests SET answered_at = 2 WHERE id = 'p'", []).unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
+        let raw = s.conn.execute("UPDATE permission_requests SET status = 'allowed_once' WHERE id = 'p'", []);
+        assert!(raw.is_err(), "trigger must block re-answering a pre-upgrade row");
+        let err = s.answer_permission("p", PermissionStatus::AllowedOnce).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidTransition { kind: "permission", .. }), "{err}");
     }
 
     #[test]
