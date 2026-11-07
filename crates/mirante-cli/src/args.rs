@@ -20,8 +20,9 @@ usage: mirante <command>
                          answer one request, once (never \"always\")
   interrupt <task>       stop the current step (Esc / turn/interrupt)
   stop <task>            end the agent process (resumable)
-  resume <task> [--trust]
-                         restart the agent on its native session (context kept)
+  resume <task> [--trust] [--fresh]
+                         restart the agent on its native session (context kept);
+                         --fresh starts a new conversation instead (your explicit choice)
   archive <task>         remove the worktree (branch kept) and hide the task
   daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade
@@ -77,6 +78,7 @@ pub enum Cmd {
     Resume {
         task: String,
         trust: bool,
+        fresh: bool,
     },
     Archive {
         task: String,
@@ -190,8 +192,9 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         "interrupt" => Ok(Cmd::Interrupt { task: one(&split(rest, none, none)?, "task")? }),
         "stop" => Ok(Cmd::Stop { task: one(&split(rest, none, none)?, "task")? }),
         "resume" => {
-            let p = split(rest, none, &["--trust"])?;
-            Ok(Cmd::Resume { task: one(&p, "task")?, trust: !p.bools.is_empty() })
+            let p = split(rest, none, &["--trust", "--fresh"])?;
+            let has = |f: &str| p.bools.iter().any(|b| b == f);
+            Ok(Cmd::Resume { task: one(&p, "task")?, trust: has("--trust"), fresh: has("--fresh") })
         }
         "archive" => Ok(Cmd::Archive { task: one(&split(rest, none, none)?, "task")? }),
         "daemon" => match one(&split(rest, none, none)?, "start|stop|restart|status")?.as_str() {
@@ -259,7 +262,8 @@ mod tests {
         assert_eq!(p("ls --all").unwrap(), Cmd::Ls { all: true });
         assert_eq!(p("allow ab12").unwrap(), Cmd::Answer { id: "ab12".into(), allow: true });
         assert_eq!(p("deny ab12").unwrap(), Cmd::Answer { id: "ab12".into(), allow: false });
-        assert_eq!(p("resume feat --trust").unwrap(), Cmd::Resume { task: "feat".into(), trust: true });
+        assert_eq!(p("resume feat --trust").unwrap(), Cmd::Resume { task: "feat".into(), trust: true, fresh: false });
+        assert_eq!(p("resume --fresh feat").unwrap(), Cmd::Resume { task: "feat".into(), trust: false, fresh: true });
         assert_eq!(p("daemon status").unwrap(), Cmd::Daemon(DaemonCmd::Status));
         assert_eq!(p("daemon restart").unwrap(), Cmd::Daemon(DaemonCmd::Restart));
         assert_eq!(p("watch").unwrap(), Cmd::Watch);

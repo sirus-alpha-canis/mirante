@@ -61,6 +61,9 @@ pub struct TaskView {
     pub queued: usize,
     /// Extra status detail, e.g. "turn done, 1 command still finishing".
     pub detail: Option<String>,
+    /// Codex quota / token usage while live, e.g. "5h 42% · week 9% · 31k tokens".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,7 +253,15 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        let v = TaskView { task, live: true, boot: Some(BootState::Ready), needs_you: 1, queued: 0, detail: None };
+        let v = TaskView {
+            task,
+            live: true,
+            boot: Some(BootState::Ready),
+            needs_you: 1,
+            queued: 0,
+            detail: None,
+            usage: None,
+        };
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["id"], "t1");
         assert_eq!(j["status"], "needs_you");

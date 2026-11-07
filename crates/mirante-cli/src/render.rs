@@ -1,5 +1,5 @@
 //! Plain-text tables. Colors only on a terminal (`color` = stdout is a tty).
-use mirante_core::model::{PermissionRequest, Status};
+use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
 use mirante_ipc::types::{BootState, PermissionView, TaskView};
 
 /// Last 8 characters of an id (UUID v7 prefixes are time-based and collide; suffixes do not).
@@ -26,6 +26,25 @@ pub fn status_label(s: Status) -> &'static str {
     s.as_str()
 }
 
+/// The approval mode Mirante runs each agent in (fixed per agent; never a bypass mode).
+pub fn mode_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "manual",
+        AgentKind::Codex => "auto-edits",
+    }
+}
+
+/// What the mode means, for `mirante show`.
+pub fn mode_help(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "Claude asks before every tool that needs permission (--permission-mode manual)",
+        AgentKind::Codex => {
+            "edits and commands inside the worktree run without asking (sandbox workspace-write); \
+             anything beyond it asks you (approvalPolicy on-request, approvalsReviewer user)"
+        }
+    }
+}
+
 fn paint(s: Status, text: &str, color: bool) -> String {
     if !color {
         return text.to_string();
@@ -40,12 +59,14 @@ fn paint(s: Status, text: &str, color: bool) -> String {
 }
 
 fn note(v: &TaskView) -> String {
-    match (v.boot, &v.detail) {
-        (Some(BootState::TrustPrompt), _) => "trust prompt: mirante resume / attach".into(),
-        (Some(BootState::Booting), _) => "starting".into(),
-        (_, Some(d)) => d.clone(),
-        _ => String::new(),
-    }
+    let state = match (v.boot, &v.detail) {
+        _ if v.task.lifecycle == Lifecycle::Archiving => Some("archiving".to_string()),
+        (Some(BootState::TrustPrompt), _) => Some("trust prompt: mirante resume / attach".to_string()),
+        (Some(BootState::Booting), _) => Some("starting".to_string()),
+        (_, Some(d)) => Some(d.clone()),
+        _ => None,
+    };
+    state.into_iter().chain(v.usage.clone()).collect::<Vec<_>>().join(" · ")
 }
 
 pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
@@ -53,10 +74,11 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         return "no tasks (mirante new <repo> --agent claude|codex --branch <name> <goal>)\n".into();
     }
     let mut out = format!(
-        "{}  {}  {}  {}  {}  {}  {}\n",
+        "{}  {}  {}  {}  {}  {}  {}  {}\n",
         fit("ID", 8),
         fit("BRANCH", 22),
         fit("AGENT", 6),
+        fit("MODE", 10),
         fit("STATUS", 9),
         fit("NEEDS", 5),
         fit("Q", 2),
@@ -68,10 +90,11 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         let note = note(v);
         let title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
         out.push_str(&format!(
-            "{}  {}  {}  {}  {}  {}  {}\n",
+            "{}  {}  {}  {}  {}  {}  {}  {}\n",
             fit(short(&v.task.id), 8),
             fit(&v.task.branch, 22),
             fit(v.task.agent.as_str(), 6),
+            fit(mode_label(v.task.agent), 10),
             paint(v.task.status, &fit(status_label(v.task.status), 9), color),
             fit(&needs, 5),
             fit(&queued, 2),
@@ -115,6 +138,7 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
         t.repo_path,
         t.goal.lines().next().unwrap_or("")
     );
+    out.push_str(&format!("  mode:      {} ({})\n", mode_label(t.agent), mode_help(t.agent)));
     out.push_str(&format!("  live:      {}  queued: {}\n", v.live, v.queued));
     for p in perms {
         out.push_str(&format!("  needs you: {} {} {}\n", short(&p.id), p.tool, p.detail));
@@ -125,7 +149,7 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mirante_core::model::{AgentKind, Lifecycle, PermissionStatus, Task};
+    use mirante_core::model::{PermissionStatus, Task};
 
     fn view(status: Status, needs: usize, detail: Option<&str>) -> TaskView {
         TaskView {
@@ -148,6 +172,7 @@ mod tests {
             needs_you: needs,
             queued: 0,
             detail: detail.map(String::from),
+            usage: None,
         }
     }
 
@@ -173,8 +198,22 @@ mod tests {
         assert!(lines[0].starts_with("ID"));
         assert!(lines[1].contains("12345678") && lines[1].contains("needs_you") && lines[1].contains(" 2 "));
         assert!(lines[2].contains("[turn done, 1 command still finishing]"));
+        assert!(lines[0].contains("MODE") && lines[1].contains("manual"));
         assert!(!t.contains('\x1b'));
         assert!(tasks_table(&[view(Status::Idle, 0, None)], true).contains("\x1b[32m"));
+    }
+
+    #[test]
+    fn codex_rows_show_the_auto_edits_mode_and_usage() {
+        let mut v = view(Status::Working, 0, Some("turn done, 1 command still finishing"));
+        v.task.agent = AgentKind::Codex;
+        v.usage = Some("5h 42% · 31k tokens".into());
+        let t = tasks_table(&[v.clone()], false);
+        assert!(t.contains("auto-edits"), "{t}");
+        assert!(t.contains("[turn done, 1 command still finishing · 5h 42% · 31k tokens]"), "{t}");
+        assert!(task_detail(&v, &[]).contains("mode:      auto-edits (edits and commands inside the worktree"));
+        v.task.lifecycle = Lifecycle::Archiving;
+        assert!(tasks_table(&[v], false).contains("[archiving · 5h 42% · 31k tokens]"));
     }
 
     #[test]

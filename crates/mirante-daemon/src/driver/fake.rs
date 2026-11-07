@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use super::proctree::Proc;
 use super::{Attachment, Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
 #[derive(Default)]
@@ -12,6 +13,8 @@ pub struct FakeDriver {
     pub fail_answers: AtomicBool,
     /// The attached client's output channel, kept open until `detach` (like a live agent).
     pub attached: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// What `root()` reports (memory sampling tests set it).
+    pub root: Mutex<Option<Proc>>,
 }
 
 impl FakeDriver {
@@ -75,6 +78,12 @@ impl Driver for FakeDriver {
     fn stop(&self) {
         self.record("stop".into());
     }
+    fn session_started(&self) {
+        self.record("session_started".into());
+    }
+    fn root(&self) -> Option<Proc> {
+        *self.root.lock().unwrap()
+    }
 }
 
 /// Hands out one shared `FakeDriver` and keeps every sink and spawn request.
@@ -84,6 +93,8 @@ pub struct FakeFactory {
     pub sinks: Mutex<Vec<Sink>>,
     pub resumes: Mutex<Vec<Option<String>>>,
     pub fail: AtomicBool,
+    /// When set, `spawn` fails with this error (e.g. `NativeGone`).
+    pub fail_with: Mutex<Option<DriverError>>,
     /// When set, the next `spawn` reports on the first channel that it started, then blocks
     /// until the second one yields (or closes).
     pub spawn_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
@@ -105,10 +116,13 @@ impl DriverFactory for Arc<FakeFactory> {
             let _ = entered.send(());
             let _ = release.recv();
         }
+        self.resumes.lock().unwrap().push(req.resume.clone());
         if self.fail.load(Ordering::SeqCst) {
             return Err(DriverError::Failed("spawn refused".into()));
         }
-        self.resumes.lock().unwrap().push(req.resume);
+        if let Some(e) = self.fail_with.lock().unwrap().clone() {
+            return Err(e);
+        }
         self.sinks.lock().unwrap().push(sink);
         Ok(self.driver.clone())
     }

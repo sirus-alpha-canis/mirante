@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -77,7 +78,9 @@ impl From<HubError> for RpcError {
                 | CoreError::OutsideRoot { .. },
             )
             | HubError::Conflict(_)
-            | HubError::Driver(DriverError::NoDialog(_)) => code::CONFLICT,
+            | HubError::Driver(DriverError::NoDialog(_) | DriverError::NotNow(_) | DriverError::NativeGone(_)) => {
+                code::CONFLICT
+            }
             HubError::Driver(DriverError::Unsupported(_)) => code::UNSUPPORTED,
             HubError::Driver(DriverError::Failed(_)) | HubError::Core(CoreError::ClaudeNotFound(_)) => code::DRIVER,
             HubError::NeedsYou(_) => code::NEEDS_YOU,
@@ -117,6 +120,11 @@ pub(crate) struct Live {
     pub(crate) steers: Vec<String>,
     /// Recent compacted main-chain transcript lines (for steer/queue classification).
     pub(crate) transcript: Vec<Value>,
+    /// The driver's hold flag ([`crate::driver::Sink::held`]): set while this session has a
+    /// pending permission request, so the driver types nothing.
+    pub(crate) hold: Arc<AtomicBool>,
+    /// Codex quota / token usage, as the driver last reported it.
+    pub(crate) usage: Option<String>,
 }
 
 /// Events queued per subscriber. One that falls this far behind is dropped (its stream
@@ -179,6 +187,8 @@ impl Live {
             delivery_in_flight: None,
             steers: Vec::new(),
             transcript: Vec::new(),
+            hold: Arc::default(),
+            usage: None,
         }
     }
 }
@@ -265,6 +275,7 @@ impl State {
             needs_you: pending + trust,
             queued: live.map_or(0, |l| l.queue.len()),
             detail: live.and_then(|l| l.detail.clone()),
+            usage: live.and_then(|l| l.usage.clone()),
             task,
         })
     }
@@ -301,8 +312,23 @@ impl State {
         Ok(())
     }
 
+    /// Sets each live session's hold flag: held while it has a pending permission request
+    /// (typed text could answer that dialog).
+    pub(crate) fn sync_holds(&mut self) {
+        let State { store, live, .. } = self;
+        for (task_id, l) in live.iter() {
+            let held = store
+                .pending_permissions(task_id)
+                .map(|p| p.iter().any(|p| p.session_id == l.session_id))
+                .unwrap_or(true);
+            l.hold.store(held, Ordering::SeqCst);
+        }
+    }
+
     /// Sends every event newer than `last_seq` to the subscribers, dropping closed ones.
+    /// Every hub mutation ends here, so the hold flags are brought up to date first.
     pub(crate) fn publish(&mut self) {
+        self.sync_holds();
         loop {
             let Ok(events) = self.store.events_since(self.last_seq, 1000) else {
                 return;
@@ -744,5 +770,10 @@ mod tests {
         assert_eq!(e.code, code::NEEDS_YOU);
         let e: RpcError = HubError::Core(CoreError::NotFound { kind: "task", id: "x".into() }).into();
         assert_eq!(e.code, code::NOT_FOUND);
+        let e: RpcError = HubError::Driver(DriverError::NotNow("no running turn".into())).into();
+        assert_eq!((e.code, e.message.as_str()), (code::CONFLICT, "no running turn"));
+        let e: RpcError = HubError::Driver(DriverError::NativeGone("no rollout".into())).into();
+        assert_eq!(e.code, code::CONFLICT);
+        assert!(e.message.contains("conversation is gone"), "{}", e.message);
     }
 }

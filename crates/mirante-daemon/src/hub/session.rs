@@ -16,7 +16,7 @@ use mirante_ipc::types::{
 use serde_json::{json, Value};
 
 use super::{DialogKey, EventRx, Hub, HubError, Live, Result, State};
-use crate::driver::{Attachment, Driver, DriverEvent, Sink, SpawnRequest};
+use crate::driver::{Attachment, Driver, DriverError, DriverEvent, Sink, SpawnRequest};
 
 /// How many hook `event_id`s the hub remembers for dedupe.
 pub(crate) const HOOK_DEDUPE_WINDOW: usize = 1024;
@@ -291,6 +291,47 @@ impl State {
                 }
                 Ok(())
             }
+            DriverEvent::PermissionResolved { key } => {
+                let Some(l) = self.live.get(task_id) else {
+                    return Ok(());
+                };
+                let card = l.perm_keys.iter().find(|(_, k)| **k == key).map(|(id, _)| id.clone());
+                let Some(id) = card else {
+                    // Already answered through Mirante (its key was removed then).
+                    return Ok(());
+                };
+                let pending = self.store.pending_permissions(task_id)?.iter().any(|p| p.id == id);
+                if pending {
+                    self.settle_card(task_id, &id, PermissionStatus::Denied, "codex:request_resolved")?;
+                } else if let Some(l) = self.live.get_mut(task_id) {
+                    l.perm_keys.remove(&id);
+                }
+                Ok(())
+            }
+            DriverEvent::DeliveryAborted { text, reason } => {
+                if let Some(l) = self.live.get_mut(task_id) {
+                    if let Some(i) = l.steers.iter().rposition(|s| *s == text) {
+                        l.steers.remove(i);
+                    }
+                    l.queue.push_front(text.clone());
+                    l.delivery_in_flight = None;
+                }
+                self.event(Some(task_id), "message_requeued", json!({ "text": text, "reason": reason }))
+            }
+            DriverEvent::ResumeFailed { reason } => {
+                let payload = json!({
+                    "session_id": session_id,
+                    "reason": reason,
+                    "hint": "`mirante resume <task> --fresh` starts a new conversation",
+                });
+                self.event(Some(task_id), "resume_failed", payload)
+            }
+            DriverEvent::Usage(summary) => {
+                if let Some(l) = self.live.get_mut(task_id) {
+                    l.usage = Some(summary);
+                }
+                Ok(())
+            }
             DriverEvent::NativeId(id) => self.set_native_id(task_id, session_id, &id),
             DriverEvent::Boot(state) => {
                 if let Some(l) = self.live.get_mut(task_id) {
@@ -324,7 +365,7 @@ impl Hub {
     /// Starts (or, with `resume`, resumes) the task's agent. Fails with a conflict while a
     /// session is live (the per-task lock). Waits until the agent leaves `Booting`.
     pub fn start_session(&self, req: StartSession, resume: bool) -> Result<StartResult> {
-        let (task, session_id, native) = {
+        let (task, session_id, native, sink) = {
             let mut st = self.lock();
             let task = st.resolve(&req.task)?;
             if task.lifecycle == Lifecycle::Archived {
@@ -362,15 +403,16 @@ impl Hub {
                 st.publish();
                 return Err(e);
             }
+            let sink = Sink::new(&session.id, self.events.clone());
             let mut live = Live::new(&session.id, task.agent, native.clone());
+            live.hold = sink.hold_flag();
             if let Some(p) = req.prompt.filter(|p| !p.trim().is_empty()) {
                 live.queue.push_back(p);
             }
             st.live.insert(task.id.clone(), live);
             st.publish();
-            (task, session.id, native)
+            (task, session.id, native, sink)
         };
-        let sink = Sink::new(&session_id, self.events.clone());
         let req = SpawnRequest {
             task: task.clone(),
             session_id: session_id.clone(),
@@ -398,6 +440,14 @@ impl Hub {
             }
             Err(e) => {
                 let mut st = self.lock();
+                if let DriverError::NativeGone(reason) = &e {
+                    let payload = json!({
+                        "session_id": session_id,
+                        "reason": reason,
+                        "hint": "`mirante resume <task> --fresh` starts a new conversation",
+                    });
+                    st.event(Some(&task.id), "resume_failed", payload)?;
+                }
                 st.finish_session(&task.id, &session_id, "mirante:spawn_failed")?;
                 st.publish();
                 return Err(e.into());
@@ -566,13 +616,24 @@ impl Hub {
         // Generation fence: a hook stamped with an earlier Mirante session of this task (its
         // Claude process outlived the session, or the hook was slow) must not touch the new
         // one. Unstamped hooks (an older hook binary) are still applied.
-        if let Some(stale) = stamped.filter(|s| *s != session_id) {
+        if let Some(stale) = stamped.as_ref().filter(|s| **s != session_id) {
             let payload = json!({ "hook": ev.hook_event_name, "session": stale, "live_session": session_id });
             st.event(Some(&p.task), "hook_stale", payload)?;
             st.publish();
             return Ok(());
         }
-        if ev.hook_event_name != "SessionStart" {
+        if ev.hook_event_name == "SessionStart" {
+            if let Some(d) = live.driver.clone() {
+                d.session_started();
+            }
+        }
+        // Stamped with this very Mirante session: Claude's own session id may change under
+        // it (`/clear`, a resume that forks), so the hook's id is adopted, never dropped.
+        if stamped.is_some() {
+            if let Some(sid) = &ev.session_id {
+                st.set_native_id(&p.task, &session_id, sid)?;
+            }
+        } else if ev.hook_event_name != "SessionStart" {
             if let (Some(known), Some(sid)) = (native.as_deref(), ev.session_id.as_deref()) {
                 if known != sid {
                     let payload = json!({ "hook": ev.hook_event_name, "session_id": sid, "native_id": known });
@@ -778,6 +839,7 @@ mod tests {
     use super::super::testkit::Kit;
     use super::*;
     use mirante_core::model::PermissionStatus;
+    use mirante_ipc::types::SendMessage;
     use serde_json::json;
 
     fn status(k: &Kit, task: &str) -> Status {
@@ -1273,6 +1335,133 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!pump.is_finished());
+    }
+
+    fn kinds_payloads(k: &Kit, task: &str, kind: &str) -> Vec<Value> {
+        let st = k.hub.lock();
+        st.store.task_events(task).unwrap().into_iter().filter(|e| e.kind == kind).map(|e| e.payload).collect()
+    }
+
+    #[test]
+    fn a_resolved_codex_request_settles_only_its_own_card() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::PermissionRequested { key: "0".into(), tool: "command".into(), detail: "ls".into() });
+        k.emit(DriverEvent::PermissionRequested { key: "7".into(), tool: "command".into(), detail: "pwd".into() });
+        k.emit(DriverEvent::PermissionResolved { key: "0".into() });
+        let left: Vec<String> = k.pending(&t.id).into_iter().map(|p| p.detail).collect();
+        assert_eq!(left, vec!["pwd".to_string()]);
+        let settled = kinds_payloads(&k, &t.id, "permission_settled");
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            (settled[0]["answer"].as_str(), settled[0]["cause"].as_str()),
+            (Some("denied"), Some("codex:request_resolved"))
+        );
+        // Unknown or repeated keys change nothing.
+        k.emit(DriverEvent::PermissionResolved { key: "0".into() });
+        k.emit(DriverEvent::PermissionResolved { key: "99".into() });
+        assert_eq!(k.pending(&t.id).len(), 1);
+        assert_eq!(k.hub.lock().live[&t.id].perm_keys.len(), 1);
+    }
+
+    #[test]
+    fn an_aborted_delivery_goes_back_to_the_front_of_the_queue() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        k.hub.send(SendMessage { task: t.id.clone(), text: "steer me".into(), mode: SendMode::Steer }).unwrap();
+        k.hub.send(SendMessage { task: t.id.clone(), text: "later".into(), mode: SendMode::Queue }).unwrap();
+        k.emit(DriverEvent::DeliveryAborted { text: "steer me".into(), reason: "a dialog appeared".into() });
+        {
+            let st = k.hub.lock();
+            let l = &st.live[&t.id];
+            assert_eq!(l.queue.iter().cloned().collect::<Vec<_>>(), vec!["steer me".to_string(), "later".to_string()]);
+            assert!(l.steers.is_empty());
+        }
+        let ev = kinds_payloads(&k, &t.id, "message_requeued");
+        assert_eq!(ev, vec![json!({"text": "steer me", "reason": "a dialog appeared"})]);
+        // At the turn end the requeued message goes out first.
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        assert_eq!(k.calls().last().map(String::as_str), Some("send:steer me"));
+    }
+
+    #[test]
+    fn a_failed_resume_is_recorded_and_fresh_start_stays_the_users_call() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.emit(DriverEvent::ResumeFailed { reason: "exited after 0.4 s".into() });
+        k.emit(DriverEvent::Exited { code: Some(1) });
+        let ev = kinds_payloads(&k, &t.id, "resume_failed");
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0]["hint"].as_str().unwrap().contains("--fresh"));
+        // Nothing was started on its own.
+        assert_eq!(k.hub.status().live_sessions, 0);
+        assert_eq!(k.factory.resumes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_vanished_native_conversation_fails_the_resume_with_a_typed_error() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::NativeId("thr-gone".into()));
+        k.hub.stop(&t.id).unwrap();
+        *k.factory.fail_with.lock().unwrap() = Some(DriverError::NativeGone("no rollout found for thr-gone".into()));
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true);
+        assert!(matches!(r, Err(HubError::Driver(DriverError::NativeGone(_)))), "{r:?}");
+        assert_eq!(kinds_payloads(&k, &t.id, "resume_failed").len(), 1);
+        assert_eq!(k.hub.status().live_sessions, 0);
+        // The user chooses a fresh start explicitly.
+        *k.factory.fail_with.lock().unwrap() = None;
+        let fresh = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        assert!(!fresh.resumed);
+        assert_eq!(k.factory.resumes.lock().unwrap().last().cloned(), Some(None));
+    }
+
+    #[test]
+    fn usage_reports_show_in_the_task_view() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        assert_eq!(k.hub.get_task(&t.id).unwrap().usage, None);
+        k.emit(DriverEvent::Usage("5h 42% · 31k tokens".into()));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().usage.as_deref(), Some("5h 42% · 31k tokens"));
+        assert!(kinds_payloads(&k, &t.id, "usage").is_empty(), "usage is not written to the audit trail");
+    }
+
+    #[test]
+    fn a_pending_permission_holds_the_drivers_typing() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        let sink = k.factory.last_sink();
+        assert!(!sink.held());
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "ls"));
+        assert!(sink.held());
+        let id = k.pending(&t.id)[0].id.clone();
+        k.hub.answer_permission(mirante_ipc::types::AnswerPermission { id, allow: true }).unwrap();
+        assert!(!sink.held());
+    }
+
+    #[test]
+    fn session_start_reaches_the_driver_and_fenced_hooks_update_the_native_id() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        let session = k.hub.lock().live[&t.id].session_id.clone();
+        k.hook_session(
+            &t.id,
+            json!({"hook_event_name": "SessionStart", "session_id": "nat-1", "source": "startup"}),
+            &session,
+        );
+        assert!(k.calls().contains(&"session_started".to_string()));
+        // Claude's own id changed under the same Mirante session: adopted, not dropped.
+        k.hook_session(
+            &t.id,
+            json!({"hook_event_name": "UserPromptSubmit", "session_id": "nat-2", "prompt": "x"}),
+            &session,
+        );
+        assert_eq!(status(&k, &t.id), Status::Working);
+        assert_eq!(k.hub.lock().live[&t.id].native_id.as_deref(), Some("nat-2"));
+        let st = k.hub.lock();
+        assert_eq!(st.store.latest_conversation(&t.id).unwrap().unwrap().native_session_id.as_deref(), Some("nat-2"));
     }
 
     #[test]

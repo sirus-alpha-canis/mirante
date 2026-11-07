@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use mirante_core::model::{Status, Task};
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 pub mod fake;
+pub mod proctree;
 pub mod real;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,11 @@ pub enum DriverError {
     Unsupported(&'static str),
     /// The dialog the operation targets is not on screen / not pending.
     NoDialog(String),
+    /// The operation does not apply now (e.g. an interrupt with no running turn).
+    NotNow(String),
+    /// The native conversation to resume is gone (Codex: no rollout for the thread). The
+    /// user may start a fresh conversation; Mirante never does so on its own.
+    NativeGone(String),
     Failed(String),
 }
 
@@ -33,6 +40,10 @@ impl fmt::Display for DriverError {
         match self {
             DriverError::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
             DriverError::NoDialog(m) => write!(f, "no matching dialog: {m}"),
+            DriverError::NotNow(m) => write!(f, "{m}"),
+            DriverError::NativeGone(m) => {
+                write!(f, "the agent's conversation is gone ({m}); `mirante resume <task> --fresh` starts a new one")
+            }
             DriverError::Failed(m) => write!(f, "agent driver failed: {m}"),
         }
     }
@@ -70,9 +81,27 @@ pub enum DriverEvent {
         tool: String,
         detail: String,
     },
+    /// Codex: request `key` no longer waits for an answer (the server resolved it, its turn
+    /// ended, or the process exited). The hub settles its card if it is still pending.
+    PermissionResolved {
+        key: String,
+    },
     /// Codex: the thread id, used for `thread/resume`.
     NativeId(String),
     Boot(BootState),
+    /// A message handed to `send` was not typed after all (a dialog appeared, a permission
+    /// became pending): the hub puts it back at the front of the queue.
+    DeliveryAborted {
+        text: String,
+        reason: String,
+    },
+    /// Resuming the native conversation failed (Claude exited right away). The hub records
+    /// `resume_failed`; a fresh start is the user's call (`mirante resume --fresh`).
+    ResumeFailed {
+        reason: String,
+    },
+    /// Codex: quota / token usage, one line for `mirante ls`.
+    Usage(String),
     /// A step for the feed and audit trail (command finished, agent message, ...).
     Step(Value),
     Exited {
@@ -81,20 +110,33 @@ pub enum DriverEvent {
 }
 
 /// Channel end a driver emits into. Every event is tagged with the driver's session id so
-/// late events from an ended session are ignored.
+/// late events from an ended session are ignored. The sink also carries the hub's hold flag
+/// for the session (see [`Sink::held`]).
 #[derive(Clone)]
 pub struct Sink {
     session_id: String,
     tx: mpsc::Sender<(String, DriverEvent)>,
+    hold: Arc<AtomicBool>,
 }
 
 impl Sink {
     pub fn new(session_id: &str, tx: mpsc::Sender<(String, DriverEvent)>) -> Sink {
-        Sink { session_id: session_id.to_string(), tx }
+        Sink { session_id: session_id.to_string(), tx, hold: Arc::default() }
     }
 
     pub fn emit(&self, event: DriverEvent) {
         let _ = self.tx.send((self.session_id.clone(), event));
+    }
+
+    /// True while the hub has a pending permission request for this session: typed text
+    /// could answer that dialog, so nothing may be typed.
+    pub fn held(&self) -> bool {
+        self.hold.load(Ordering::SeqCst)
+    }
+
+    /// The flag behind [`Sink::held`]; the hub keeps a clone and sets it.
+    pub fn hold_flag(&self) -> Arc<AtomicBool> {
+        self.hold.clone()
     }
 }
 
@@ -221,9 +263,17 @@ pub trait Driver: Send + Sync {
     }
     /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
     fn screen_tail(&self) -> String;
-    /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
-    /// driver still emits `Exited`.
+    /// Ends the agent and every process below it (SIGTERM to the tree, SIGKILL after a
+    /// grace period; see [`proctree::kill_tree`]). Blocks until they are gone; the driver
+    /// still emits `Exited`.
     fn stop(&self);
+    /// Claude: the hub saw this session's `SessionStart` hook (one of the readiness
+    /// conditions). Must not block.
+    fn session_started(&self) {}
+    /// The agent's root process (memory sampling, orphan checks), when there is one.
+    fn root(&self) -> Option<proctree::Proc> {
+        None
+    }
 }
 
 pub struct SpawnRequest {
@@ -279,5 +329,15 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         Sink::new("s1", tx).emit(DriverEvent::Boot(BootState::Ready));
         assert_eq!(rx.recv().unwrap(), ("s1".to_string(), DriverEvent::Boot(BootState::Ready)));
+    }
+
+    #[test]
+    fn the_hold_flag_is_shared_between_clones() {
+        let (tx, _rx) = mpsc::channel();
+        let sink = Sink::new("s1", tx);
+        let driver_side = sink.clone();
+        assert!(!driver_side.held());
+        sink.hold_flag().store(true, Ordering::SeqCst);
+        assert!(driver_side.held());
     }
 }

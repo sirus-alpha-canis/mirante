@@ -66,6 +66,14 @@ fn boot_flow(c: &mut Client, mut r: StartResult, trust: bool) -> Res {
                 println!("{id} is still starting; check `mirante ls`");
                 return Ok(());
             }
+            BootState::Exited if r.resumed => {
+                return Err(format!(
+                    "the agent exited right after resuming (its conversation may be gone):\n{}\n\
+                     `mirante resume {id} --fresh` starts a new conversation",
+                    r.screen
+                )
+                .into())
+            }
             BootState::Exited => return Err(format!("the agent exited during startup:\n{}", r.screen).into()),
             BootState::TrustPrompt => {
                 println!("Claude asks whether to trust the worktree folder:\n\n{}\n", r.screen);
@@ -328,7 +336,13 @@ fn run(cmd: Cmd) -> Res {
             let v: TaskView = client(&paths)?.call(method::SESSION_STOP, TaskRef { task })?;
             println!("{} {}", render::short(&v.task.id), v.task.status.as_str());
         }
-        Cmd::Resume { task, trust } => {
+        Cmd::Resume { task, trust, fresh: true } => {
+            let mut c = client(&paths)?;
+            let r: StartResult = c.call(method::SESSION_START, StartSession { task, prompt: None })?;
+            println!("starting a fresh conversation (the earlier one is not resumed)");
+            boot_flow(&mut c, r, trust)?;
+        }
+        Cmd::Resume { task, trust, fresh: false } => {
             let mut c = client(&paths)?;
             let r: StartResult = c.call(method::SESSION_RESUME, StartSession { task, prompt: None })?;
             if !r.resumed {
