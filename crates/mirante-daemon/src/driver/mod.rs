@@ -17,6 +17,7 @@ use mirante_ipc::Paths;
 use serde_json::Value;
 
 pub mod claude;
+pub mod codex;
 pub mod codex_rpc;
 pub mod codex_status;
 #[cfg(test)]

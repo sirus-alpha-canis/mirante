@@ -1,6 +1,7 @@
 //! The production driver factory: the real `claude` in a PTY with Mirante's scoped hook
-//! settings (the real `codex app-server` is wired in by Task 17). Binaries:
-//! `MIRANTE_CLAUDE_BIN`, else PATH without wrapper shims. The hook command:
+//! settings, or the real `codex app-server` in auto-edits mode (its stderr in a private log
+//! under `~/.mirante/sessions/<task>/`). Binaries: `MIRANTE_CLAUDE_BIN` /
+//! `MIRANTE_CODEX_BIN`, else PATH without wrapper shims. The hook command:
 //! `MIRANTE_HOOK_BIN`, else `mirante-hook` next to the daemon executable.
 //!
 //! Claude's launch comes from Plan 2a's `claude_launch::launch_spec` (real binary, env
@@ -19,6 +20,7 @@ use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
 
 use super::claude::{ClaudeDriver, ClaudeTiming};
+use super::codex::{codex_env_to_scrub, resolve_codex_bin, CodexDriver, CodexTiming};
 use super::pty::PtySpec;
 use super::{Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
@@ -127,13 +129,31 @@ impl RealFactory {
         }
         Ok(ClaudeDriver::spawn(pty, sink, ClaudeTiming::default(), req.resume.is_some())?)
     }
+
+    fn codex(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
+        let over = std::env::var("MIRANTE_CODEX_BIN").ok();
+        let bin = resolve_codex_bin(over.as_deref(), std::env::var("PATH").ok().as_deref())?;
+        let log = req.paths.session_dir(&req.task.id).join("codex-stderr.log");
+        write_private(&log, "")?;
+        let env_remove = codex_env_to_scrub(parent_env());
+        let d = CodexDriver::spawn(
+            &bin,
+            &req.task.worktree_path,
+            req.resume.as_deref(),
+            &env_remove,
+            &log,
+            sink,
+            CodexTiming::default(),
+        )?;
+        Ok(d)
+    }
 }
 
 impl DriverFactory for RealFactory {
     fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
         match req.task.agent {
             AgentKind::Claude => self.claude(&req, sink),
-            AgentKind::Codex => Err(DriverError::Unsupported("the Codex driver is not built yet")),
+            AgentKind::Codex => self.codex(&req, sink),
         }
     }
 }
