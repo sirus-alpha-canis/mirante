@@ -4,6 +4,7 @@
 pub mod error;
 pub mod hook;
 pub mod model;
+pub mod status;
 pub mod store;
 
 pub use error::{CoreError, Result};
