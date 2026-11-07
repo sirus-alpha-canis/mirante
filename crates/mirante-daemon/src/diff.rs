@@ -131,9 +131,8 @@ fn text_within(bytes: Vec<u8>, cap: usize) -> String {
 fn github_path(remote: &str) -> Option<&str> {
     let host_ok = |h: &str| {
         h == "github.com"
-            || h.strip_prefix("github.com-").is_some_and(|a| {
-                !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-            })
+            || h.strip_prefix("github.com-")
+                .is_some_and(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
     };
     if let Some(rest) = remote.strip_prefix("https://github.com/") {
         return Some(rest);
@@ -155,9 +154,8 @@ pub fn github_compare_url(remote: &str, base: &str, branch: &str) -> Option<Stri
     let path = path.strip_suffix(".git").unwrap_or(path);
     let mut parts = path.split('/');
     let (owner, repo) = (parts.next()?, parts.next()?);
-    let safe = |s: &str| {
-        !matches!(s, "" | "." | "..") && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-    };
+    let safe =
+        |s: &str| !matches!(s, "" | "." | "..") && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
     if parts.next().is_some() || !safe(owner) || !safe(repo) {
         return None;
     }
@@ -232,7 +230,8 @@ mod tests {
 
     #[test]
     fn numstat_records_parse_with_binary_files_uncounted_renames_and_unicode() {
-        let numstat = ["3\t1\tsrc/a.rs", "-\t-\tlogo.png", "2\t0\t", "old name.rs", "caf\u{e9} \u{fc}.rs", ""].join("\0");
+        let numstat =
+            ["3\t1\tsrc/a.rs", "-\t-\tlogo.png", "2\t0\t", "old name.rs", "caf\u{e9} \u{fc}.rs", ""].join("\0");
         let files = parse_numstat(&recs(&numstat));
         assert_eq!(
             files,

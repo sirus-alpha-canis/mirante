@@ -906,7 +906,11 @@ mod tests {
         assert_eq!(older.events.iter().map(|e| e.payload["n"].as_u64()).collect::<Vec<_>>(), [None, Some(0)]);
         assert!(!older.truncated);
         // One event over the budget still comes alone, so paging always moves.
-        k.hub.lock().store.append_event(Some(&t.id), "step", &json!({ "blob": "y".repeat(TASK_EVENTS_BYTES) })).unwrap();
+        k.hub
+            .lock()
+            .store
+            .append_event(Some(&t.id), "step", &json!({ "blob": "y".repeat(TASK_EVENTS_BYTES) }))
+            .unwrap();
         let huge = k.hub.task_events_page(p(None)).unwrap();
         assert_eq!((huge.events.len(), huge.truncated), (1, true));
         assert_eq!(k.hub.task_events(p(None)).unwrap(), huge.events);

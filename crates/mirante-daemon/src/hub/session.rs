@@ -1136,7 +1136,10 @@ mod tests {
             ("PASSWORD=hunter2 psql", "PASSWORD=«redacted» psql"),
             ("db_password=hunter2 psql", "db_password=«redacted» psql"),
             ("git clone https://user:pa55@github.com/a/b", "git clone https://«redacted»@github.com/a/b"),
-            ("curl 'https://api.x/v1?token=abc&q=1&api_key=k#f'", "curl 'https://api.x/v1?token=«redacted»&q=1&api_key=«redacted»#f'"),
+            (
+                "curl 'https://api.x/v1?token=abc&q=1&api_key=k#f'",
+                "curl 'https://api.x/v1?token=«redacted»&q=1&api_key=«redacted»#f'",
+            ),
             ("curl https://x/y?sig=zz", "curl https://x/y?sig=«redacted»"),
             ("cargo test --workspace", "cargo test --workspace"),
             ("KEYBOARD=us MONKEY=1 a=b", "KEYBOARD=us MONKEY=1 a=b"),
