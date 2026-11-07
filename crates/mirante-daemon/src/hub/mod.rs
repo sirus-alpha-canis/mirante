@@ -720,6 +720,7 @@ mod tests {
     use super::testkit::Kit;
     use super::*;
     use mirante_ipc::types::CreateTask;
+    use std::process::Command;
 
     #[test]
     fn task_diff_reports_committed_uncommitted_and_untracked_changes() {
@@ -748,6 +749,78 @@ mod tests {
         git(&k.repo, &["remote", "add", "origin", "git@github.com:acme/app.git"]);
         let url = k.hub.task_diff(&t.id).unwrap().compare_url;
         assert_eq!(url.as_deref(), Some("https://github.com/acme/app/compare/trunk...feat/d?expand=1"));
+    }
+
+    /// Repo config a prompt-injected agent could plant: each entry touches
+    /// `<marks>/PWNED-<name>` if git ever runs it.
+    fn plant_git_traps(repo: &Path, marks: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(marks.join("hooks")).unwrap();
+        let script = |name: &str| {
+            let path = marks.join(format!("trap-{name}.sh"));
+            std::fs::write(&path, format!("#!/bin/sh\ntouch '{}/PWNED-{name}'\ncat\n", marks.display())).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        for hook in ["post-checkout", "reference-transaction", "post-index-change"] {
+            std::fs::copy(script(hook), marks.join("hooks").join(hook)).unwrap();
+        }
+        let hooks = marks.join("hooks").display().to_string();
+        for (key, value) in [
+            ("core.hooksPath", hooks),
+            ("core.fsmonitor", script("fsmonitor")),
+            ("core.pager", script("pager")),
+            ("diff.external", script("external")),
+            ("filter.evil.clean", script("clean")),
+            ("filter.evil.smudge", script("smudge")),
+            ("diff.evil.textconv", script("textconv")),
+            ("diff.evil.command", script("diffcmd")),
+        ] {
+            assert!(Command::new("git").arg("-C").arg(repo).args(["config", key, &value]).status().unwrap().success());
+        }
+    }
+
+    fn sprung(marks: &Path) -> Vec<String> {
+        let names = std::fs::read_dir(marks).unwrap().filter_map(|e| e.ok()?.file_name().into_string().ok());
+        names.filter(|n| n.starts_with("PWNED")).collect()
+    }
+
+    /// git as the test (never the hardened runner) with every trap disarmed.
+    fn git_disarmed(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "filter.evil.clean=cat"])
+            .args(["-c", "filter.evil.smudge=cat", "-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn diff_and_archive_never_run_code_an_agent_planted_in_the_repo() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "trapped").task;
+        let wt = Path::new(&t.worktree_path);
+        let marks = k.dir.path().join("marks");
+        plant_git_traps(&k.repo, &marks);
+        std::fs::write(wt.join(".gitattributes"), "* filter=evil diff=evil\n").unwrap();
+        std::fs::write(wt.join("lib.rs"), "fn a() {}\n").unwrap();
+        git_disarmed(wt, &["add", "."]);
+        git_disarmed(wt, &["commit", "-q", "-m", "attrs"]);
+        std::fs::write(wt.join("README"), "hey\n").unwrap();
+        std::fs::write(wt.join("notes.txt"), "new\n").unwrap();
+        let d = k.hub.task_diff(&t.id).unwrap();
+        assert!(d.patch.contains("+hey") && d.patch.contains("diff --git a/README b/README"), "{}", d.patch);
+        assert_eq!(d.untracked, vec!["notes.txt".to_string()]);
+        assert!(d.files.iter().any(|f| f.path == ".gitattributes"));
+        let refused = k.hub.archive(&t.id);
+        assert!(refused.is_err(), "dirty worktree");
+        std::fs::write(wt.join("README"), "hi\n").unwrap();
+        std::fs::remove_file(wt.join("notes.txt")).unwrap();
+        k.hub.archive(&t.id).unwrap();
+        assert_eq!(sprung(&marks), Vec::<String>::new());
     }
 
     #[test]

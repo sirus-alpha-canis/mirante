@@ -1,16 +1,19 @@
 //! `task.diff`: what a task branch changed against its base, read with git. Read-only: it
 //! never writes to the repo or the worktree. Uncommitted changes count (the agent may not
 //! have committed yet); untracked files are listed by name.
+//!
+//! The worktree is agent-written: git runs through the hardened runner
+//! ([`mirante_core::git`]) and diffs never run an external diff driver or textconv.
 use std::path::Path;
-use std::process::Command;
 
+use mirante_core::git::Git;
 use mirante_ipc::types::{DiffFile, TaskDiff};
 
 /// Largest patch returned; the rest is cut (`truncated: true`).
 pub const PATCH_CAP: usize = 512 * 1024;
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
+    let out = Git::new(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -63,11 +66,18 @@ pub fn task_diff(repo: &Path, worktree: &Path, branch: &str) -> Result<TaskDiff,
         Ok(b) => b.trim().to_string(),
         Err(_) => git(repo, &["rev-parse", "HEAD"])?.trim().to_string(),
     };
-    let merge_base = git(worktree, &["merge-base", "HEAD", &base])?.trim().to_string();
-    let files = parse_numstat(&git(worktree, &["diff", "--numstat", &merge_base, "--"])?);
+    let merge_base = git(worktree, &["merge-base", "--end-of-options", "HEAD", &base])?.trim().to_string();
+    let diff = |extra: &[&str]| {
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"];
+        args.extend(extra);
+        args.extend(["--end-of-options", &merge_base, "--"]);
+        git(worktree, &args)
+    };
+    let files = parse_numstat(&diff(&["--numstat"])?);
     let untracked =
         git(worktree, &["ls-files", "--others", "--exclude-standard"])?.lines().map(str::to_string).collect();
-    let mut patch = git(worktree, &["diff", &merge_base, "--"])?;
+    // `--default-prefix`: git's `a/` `b/` whatever `diff.noprefix` / `diff.mnemonicPrefix` say.
+    let mut patch = diff(&["--default-prefix"])?;
     let truncated = patch.len() > PATCH_CAP;
     if truncated {
         let mut cut = PATCH_CAP;
@@ -79,7 +89,7 @@ pub fn task_diff(repo: &Path, worktree: &Path, branch: &str) -> Result<TaskDiff,
     let compare_url =
         git(repo, &["remote", "get-url", "origin"]).ok().and_then(|u| github_compare_url(u.trim(), &base, branch));
     let remote_ref = format!("refs/remotes/origin/{branch}");
-    let pushed = git(worktree, &["rev-parse", "--verify", "--quiet", &remote_ref]).is_ok();
+    let pushed = git(worktree, &["rev-parse", "--verify", "--quiet", "--end-of-options", &remote_ref]).is_ok();
     Ok(TaskDiff { base, merge_base, files, untracked, patch, truncated, compare_url, pushed })
 }
 

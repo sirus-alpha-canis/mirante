@@ -4,10 +4,10 @@
 //! an assumed `main`. Removing a worktree keeps its branch.
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{CoreError, Result};
+use crate::git::Git;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -19,8 +19,13 @@ pub struct Worktree {
     pub created_branch: bool,
 }
 
+/// Runs a hardened git in `dir` ([`crate::git`]).
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+    run(Git::new(dir).args(args), args)
+}
+
+fn run(cmd: Git, args: &[&str]) -> Result<String> {
+    let out = cmd.output()?;
     if !out.status.success() {
         return Err(CoreError::Git {
             args: args.join(" "),
@@ -88,7 +93,7 @@ pub fn validate_branch_name(name: &str) -> Result<()> {
     if name == "HEAD" || name == "@" || name.contains("@{") {
         return Err(invalid(name, "not a literal branch name"));
     }
-    let ok = Command::new("git").args(["check-ref-format", "--branch", name]).output()?.status.success();
+    let ok = Git::global().args(["check-ref-format", "--branch", name]).output()?.status.success();
     if !ok {
         return Err(invalid(name, "rejected by git check-ref-format"));
     }
@@ -130,9 +135,7 @@ pub fn repo_name(repo: &Path) -> Result<String> {
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let out = Git::new(repo)
         .args(["show-ref", "--verify", "--quiet", "--end-of-options", &format!("refs/heads/{branch}")])
         .output()?;
     Ok(out.status.success())
@@ -269,9 +272,12 @@ impl WorktreeManager {
             std::fs::create_dir_all(parent)?;
         }
         let path_str = path.to_string_lossy().into_owned();
+        // `worktree add` checks files out: it keeps the repository's filters (Git LFS) but
+        // runs no hook (see `crate::git` for the residual risk).
+        let add = |args: &[&str]| run(Git::checkout(repo).args(args), args);
         match base {
-            None => git(repo, &["worktree", "add", "--end-of-options", &path_str, branch])?,
-            Some(base) => git(repo, &["worktree", "add", "-b", branch, "--end-of-options", &path_str, &base])?,
+            None => add(&["worktree", "add", "--end-of-options", &path_str, branch])?,
+            Some(base) => add(&["worktree", "add", "-b", branch, "--end-of-options", &path_str, &base])?,
         };
         let head = git(&path, &["rev-parse", "HEAD"])?;
         Ok(Worktree { path, branch: Some(branch.to_string()), head, created_branch: !exists })
@@ -330,7 +336,8 @@ impl WorktreeManager {
                 args.push("--force");
             }
             args.extend(["--end-of-options", &target]);
-            git(repo, &args)?;
+            // The worktree may carry its own config (`config.worktree`): its filters too.
+            run(Git::new(repo).neutralize_filters_of(&path).args(&args), &args)?;
         } else {
             git(repo, &["worktree", "prune"])?;
         }
@@ -379,6 +386,7 @@ impl WorktreeManager {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    use std::process::Command;
 
     /// A repo whose only branch is `trunk` (proves nothing assumes `main`).
     fn repo(dir: &TempDir) -> PathBuf {
@@ -694,5 +702,92 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].branch.as_deref(), Some("trunk"));
         assert_eq!(w[1], Worktree { path: "/w/x".into(), branch: None, head: "bbb".into(), created_branch: false });
+    }
+
+    /// Plants code-execution traps a prompt-injected agent could set in a repository: hooks,
+    /// `core.fsmonitor`, a clean/smudge filter, a textconv and external diff driver. Each
+    /// trap touches `<marks>/PWNED-<name>` when git runs it.
+    pub(crate) fn plant_git_traps(repo: &Path, marks: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = |name: &str| {
+            let path = marks.join(format!("trap-{name}.sh"));
+            std::fs::write(&path, format!("#!/bin/sh\ntouch '{}/PWNED-{name}'\ncat\n", marks.display())).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        let hooks = marks.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for hook in ["post-checkout", "reference-transaction", "post-index-change", "pre-auto-gc"] {
+            std::fs::copy(script(hook), hooks.join(hook)).unwrap();
+        }
+        let hooks = hooks.display().to_string();
+        for (key, value) in [
+            ("core.hooksPath", hooks),
+            ("core.fsmonitor", script("fsmonitor")),
+            ("core.pager", script("pager")),
+            ("diff.external", script("external")),
+            ("filter.evil.clean", script("clean")),
+            ("filter.evil.smudge", script("smudge")),
+            ("diff.evil.textconv", script("textconv")),
+            ("diff.evil.command", script("diffcmd")),
+        ] {
+            let ok = Command::new("git").arg("-C").arg(repo).args(["config", key, &value]).status().unwrap();
+            assert!(ok.success(), "git config {key}");
+        }
+    }
+
+    /// The traps [`plant_git_traps`] set off.
+    pub(crate) fn sprung(marks: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(marks)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("PWNED"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Runs git in the test's own name (never through the hardened runner) with every trap
+    /// disarmed, so only the code under test can set one off.
+    pub(crate) fn git_disarmed(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "filter.evil.clean=cat"])
+            .args(["-c", "filter.evil.smudge=cat", "-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+    }
+
+    #[test]
+    fn worktree_lifecycle_never_runs_code_the_repo_configures() {
+        let dir = TempDir::new("wt-traps");
+        let repo = repo(&dir);
+        let marks = dir.path().join("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        plant_git_traps(&repo, &marks);
+        let wt = mgr.create(&repo, "agent", None).unwrap();
+        assert_eq!(sprung(&marks), Vec::<String>::new(), "worktree add");
+        // What the agent leaves behind: attributes routing every file through its filter
+        // and diff driver, committed, and a file rewritten with the same size.
+        std::fs::write(wt.path.join(".gitattributes"), "* filter=evil diff=evil\n").unwrap();
+        git_disarmed(&wt.path, &["add", ".gitattributes"]);
+        git_disarmed(&wt.path, &["commit", "-q", "-m", "attrs"]);
+        std::fs::write(wt.path.join("README.md"), "hi\n").unwrap();
+        std::fs::write(wt.path.join("scratch"), "x\n").unwrap();
+        let dirty = mgr.remove(&repo, &wt.path);
+        assert!(matches!(dirty, Err(CoreError::DirtyWorktree { .. })), "{dirty:?}");
+        std::fs::remove_file(wt.path.join("scratch")).unwrap();
+        mgr.remove(&repo, &wt.path).unwrap();
+        let gone = mgr.create(&repo, "gone", None).unwrap();
+        std::fs::remove_dir_all(&gone.path).unwrap();
+        mgr.remove(&repo, &gone.path).unwrap();
+        mgr.list(&repo).unwrap();
+        let fresh = mgr.create(&repo, "fresh", None).unwrap();
+        mgr.discard(&repo, &fresh).unwrap();
+        assert_eq!(sprung(&marks), Vec::<String>::new());
     }
 }

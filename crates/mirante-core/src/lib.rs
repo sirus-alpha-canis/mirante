@@ -4,6 +4,7 @@
 pub mod claude_launch;
 pub mod delivery;
 pub mod error;
+pub mod git;
 pub mod hook;
 pub mod model;
 pub mod status;
