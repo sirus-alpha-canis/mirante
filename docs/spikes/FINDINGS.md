@@ -54,7 +54,7 @@ Raw evidence: `docs/spikes/raw/task8-outputs.md`, `docs/spikes/raw/s3-status-che
      - `CMUX_CLAUDE_*` / `CMUX_AGENT_*`.
      - Never scrub auth variables.
    - Pass `--permission-mode manual`. The user's global `defaultMode` may be `auto`, and `--settings` is **additive** to `~/.claude`: the user's own hooks, skills and MCP servers still load.
-5. **Trust dialog.** On a new folder the default option is **"No, exit"**. Mirante must show this decision to the user, never auto-accept it silently.
+5. **Trust dialog.** On a new folder the default option is **"No, exit"**. Mirante must show this decision to the user, never auto-accept it silently. (Task 21: the options carry **no digits**; accepting is Down, then Enter; trust is kept per repository. See below.)
 6. **Permission prompts.**
    - Read-only commands such as `date` and `git ls-files` are auto-approved by Claude even in manual mode.
    - For real prompts, the `PermissionRequest` hook fires reliably.
@@ -82,3 +82,55 @@ Raw evidence: `docs/spikes/raw/task8-outputs.md`, `docs/spikes/raw/s3-status-che
   - the founder's decision on interactive vs headless for Claude;
   - quota visibility in interactive mode;
   - legal confirmation that orchestrating the user's own interactive sessions is "ordinary, individual usage".
+
+## Plan 2b Task 21: live facts (2026-11-07, Claude Code 2.1.285, Codex 0.167.0)
+
+Full evidence, screen excerpts and the inline-answers verdict: `docs/dogfood/2026-11-07-plan-2b-results.md`.
+
+### Claude TUI
+
+- **Trust dialog.**
+  - What it shows:
+    - `Accessing workspace:` / the path / `Quick safety check: …` / `Security guide`;
+    - then `❯ No, exit` / `  Yes, I trust this folder`, with **no digits**;
+    - footer `Enter to confirm · Esc to cancel`.
+  - Answering it:
+    - a typed digit does nothing;
+    - Down, then Enter, accepts;
+    - the first Down sent right after the dialog appears can be lost.
+  - `SessionStart` fires only after the answer.
+  - Trust is kept per repository: a later worktree of a trusted repo boots without the dialog.
+- **Permission dialog box.**
+  - Border: a `─` row at column 0 spanning the full width (checked at 70, 120 and 200 columns).
+  - Title and the `Tip: …` line: indent 1.
+  - Bash: the command, then the hook's `tool_input.description`, both at indent 3.
+  - The Tip wraps at narrow widths.
+  - Titles:
+    - `Bash command`; a side agent adds ` · from the general-purpose agent`;
+    - `Edit file`;
+    - Write: `Create file` (new file) and `Overwrite file` (existing file).
+  - Write and Edit put the path at indent 1, followed by a `╌` preview or diff box. Their options are `Yes` / `Yes, and switch to accept edits …` / `No`.
+- **Status line.** There is no "esc to interrupt" text. The running line is the spinner (`✶ Recombobulating… (4s · ↓ 124 tokens)` / `(running PreToolUse hook · 1s)`). The footer is `⏸ manual mode on · ← for agents`. "Esc to" appears only in dialog footers.
+- **Input box.**
+  - Bracketed paste lands as typed lines; 40 lines collapse to `[Pasted text #1 +39 lines]`.
+  - A pasted bare `2` stays in the box.
+  - Ctrl-U clears one line's text or joins an empty line, so n pasted lines need 2n − 1 Ctrl-U after Ctrl-E. A collapsed paste goes with one Ctrl-U.
+  - A dim prompt suggestion can sit in the box after a turn.
+- **Interrupt.** Esc during a streamed answer writes only the user line `[Request interrupted by user]` (with `interruptedMessageId`). No Stop hook and no `turn_duration` follow, so the line itself must end the turn.
+- **Hook and transcript timing for a permission.** `PreToolUse` (carries `tool_use_id`) → dialog drawn (~35 ms) → `PermissionRequest` (**no** `tool_use_id`, ~90 ms) → assistant `tool_use` line in the transcript (~130 ms, i.e. ~95 ms after the dialog). The Stop hook can also come before the turn's last assistant text is in the transcript.
+- **Side agents.**
+  - Their lines go to `~/.claude/projects/<dir>/<session>/subagents/agent-<agentId>.jsonl` (`isSidechain: true`, `agentId`), plus a `.meta.json` file. They are not in the main transcript.
+  - A backgrounded agent's completion starts a new main turn.
+- **`/compact <args>`.** Runs with its arguments (`<command-args>`) and writes no prompt or assistant line, so no turn opens.
+- **User config inside sessions.** The user's statusline, hooks, skills and MCP servers load inside Mirante's sessions. The user's Serena MCP writes `.serena/` into every worktree.
+
+### Codex app-server
+
+- **Approval requests.**
+  - Command approval request: `item/commandExecution/requestApproval`, params `kind, threadId, turnId, itemId, startedAtMs, environmentId, reason, command, cwd, commandActions, proposedExecpolicyAmendment, availableDecisions`.
+  - `availableDecisions` is `["accept", {"acceptWithExecpolicyAmendment":…}, "cancel"]`, yet `{"decision":"decline"}` is accepted (the item completes `"status":"declined"`).
+  - File change outside the worktree: `item/fileChange/requestApproval` with `reason: null, grantRoot: null`. The paths are in the earlier `item/started` `fileChange` item (`changes[].{path, kind.type, diff}`; for `add`, `diff` is the raw content).
+- **Missing thread.** `thread/resume` of an unknown id fails with error `-32600` `"no rollout found for thread id <id>"`.
+- **Interrupt.** `turn/interrupt` ends the turn, but the command already running keeps running under app-server until it finishes.
+- **Background jobs.** A command's background job (`nohup … &`) is reaped when the command returns.
+- **Sandbox.** The effective sandbox reported matches auto-edits: workspace-write, network off, worktree-only writes. Violations are logged by seatbelt (`operation_not_permitted`).
