@@ -133,6 +133,13 @@ impl State {
         Ok(())
     }
 
+    /// Records why Mirante is about to stop this live session (see `Live::ending`).
+    pub(crate) fn mark_ending(&mut self, task_id: &str, session_id: &str, cause: &'static str) {
+        if let Some(l) = self.live.get_mut(task_id).filter(|l| l.session_id == session_id) {
+            l.ending = Some(cause);
+        }
+    }
+
     /// Ends the live session `session_id` of `task_id` (no-op if it is not the live one):
     /// closes its turn and DB session, expires its pending permission requests (the dialog
     /// died with the process), reports undelivered queued messages, and sets `Ended`.
@@ -367,7 +374,8 @@ impl State {
             DriverEvent::Step(v) => self.event(Some(task_id), "step", v),
             DriverEvent::Exited { code } => {
                 self.event(Some(task_id), "process_exited", json!({ "session_id": session_id, "code": code }))?;
-                self.finish_session(task_id, session_id, "mirante:process_exited")
+                let cause = self.live.get(task_id).and_then(|l| l.ending).unwrap_or("mirante:process_exited");
+                self.finish_session(task_id, session_id, cause)
             }
         }
     }
@@ -541,6 +549,7 @@ impl Hub {
     /// Ends the live session (graceful, then kill). The conversation stays resumable.
     pub fn stop(&self, reference: &str) -> Result<TaskView> {
         let (task_id, session_id, driver) = self.live_driver(reference)?;
+        self.lock().mark_ending(&task_id, &session_id, "mirante:stopped");
         if let Some(d) = driver {
             d.stop();
         }
@@ -599,7 +608,10 @@ impl Hub {
     /// Stops every live session (daemon shutdown).
     pub fn shutdown(&self) {
         let live: Vec<LiveRef> = {
-            let st = self.lock();
+            let mut st = self.lock();
+            for l in st.live.values_mut() {
+                l.ending = Some("mirante:daemon_shutdown");
+            }
             st.live.iter().map(|(t, l)| (t.clone(), l.session_id.clone(), l.driver.clone())).collect()
         };
         for (_, _, d) in &live {
@@ -949,6 +961,44 @@ mod tests {
 
     fn status(k: &Kit, task: &str) -> Status {
         k.hub.get_task(task).unwrap().task.status
+    }
+
+    /// The process's exit is applied while `stop` runs (the pump thread can get there
+    /// before the caller re-takes the lock): the end cause must still be the caller's.
+    fn exit_during_stop(k: &Kit, task: &str) {
+        let hub = std::sync::Arc::clone(&k.hub);
+        let session = hub.lock().live.get(task).unwrap().session_id.clone();
+        *k.factory.driver.on_stop.lock().unwrap() =
+            Some(Box::new(move || hub.handle_driver_event_guarded(&session, DriverEvent::Exited { code: Some(0) })));
+    }
+
+    fn end_cause(k: &Kit, task: &str) -> String {
+        let events = k.hub.lock().store.task_events(task).unwrap();
+        let ended = events.iter().rev().find(|e| e.kind == "status" && e.payload["to"] == json!("ended")).unwrap();
+        ended.payload["cause"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn an_exit_racing_stop_shutdown_or_hibernate_keeps_mirantes_cause() {
+        let k = Kit::new();
+        let a = k.started(AgentKind::Claude, "a").task.id;
+        exit_during_stop(&k, &a);
+        k.hub.stop(&a).unwrap();
+        assert_eq!(end_cause(&k, &a), "mirante:stopped");
+        let b = k.started(AgentKind::Codex, "b").task.id;
+        exit_during_stop(&k, &b);
+        k.hub.hibernate(&b).unwrap();
+        assert_eq!(end_cause(&k, &b), "mirante:hibernated");
+        assert!(k.hub.get_task(&b).unwrap().hibernated);
+        let c = k.started(AgentKind::Claude, "c").task.id;
+        exit_during_stop(&k, &c);
+        k.hub.shutdown();
+        assert_eq!(end_cause(&k, &c), "mirante:daemon_shutdown");
+        // An exit nobody asked for is still the process's.
+        *k.factory.driver.on_stop.lock().unwrap() = None;
+        let d = k.started(AgentKind::Claude, "d").task.id;
+        k.emit(DriverEvent::Exited { code: Some(1) });
+        assert_eq!(end_cause(&k, &d), "mirante:process_exited");
     }
 
     #[test]

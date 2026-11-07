@@ -248,6 +248,7 @@ impl Hub {
             let out = (task.id.clone(), l.session_id.clone(), l.driver.clone());
             let kind = if auto.is_some() { "memory.auto_hibernated" } else { "memory.hibernated" };
             st.event(Some(&task.id), kind, payload)?;
+            st.mark_ending(&task.id, &out.1, "mirante:hibernated");
             st.publish();
             out
         };
@@ -256,6 +257,7 @@ impl Hub {
         }
         let mut st = self.lock();
         st.finish_session(&task_id, &session_id, "mirante:hibernated")?;
+        // Also when the process's exit already ended it (with this cause).
         st.mem.hibernated.insert(task_id.clone());
         st.mem.sessions.remove(&task_id);
         st.publish();

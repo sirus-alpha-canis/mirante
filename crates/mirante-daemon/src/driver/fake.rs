@@ -25,6 +25,10 @@ pub struct FakeDriver {
     /// checks and the typist's last check).
     #[allow(clippy::type_complexity)]
     pub guard_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    /// Runs inside `stop` (a test applies the process's exit before `stop` returns, the
+    /// way the pump thread can when the agent dies quickly).
+    #[allow(clippy::type_complexity)]
+    pub on_stop: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeDriver {
@@ -114,6 +118,9 @@ impl Driver for FakeDriver {
     }
     fn stop(&self) {
         self.record("stop".into());
+        if let Some(f) = self.on_stop.lock().unwrap().as_ref() {
+            f();
+        }
     }
     fn session_started(&self) {
         self.record("session_started".into());

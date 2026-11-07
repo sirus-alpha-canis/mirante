@@ -162,6 +162,11 @@ pub(crate) struct Live {
     /// This session's `SessionStart` hook was seen (told to the driver once it is attached,
     /// when the hook beat the spawn).
     pub(crate) saw_session_start: bool,
+    /// Why Mirante is ending this session (`mirante:stopped`, `mirante:hibernated`,
+    /// `mirante:daemon_shutdown`), set before the driver is told to stop: the process's
+    /// exit, which the pump thread may apply before the caller ends the session itself,
+    /// then records this cause instead of `mirante:process_exited`.
+    pub(crate) ending: Option<&'static str>,
 }
 
 /// Events queued per subscriber. One that falls this far behind is dropped (its stream
@@ -246,6 +251,7 @@ impl Live {
             sandbox: None,
             idle_since: Some(Instant::now()),
             saw_session_start: false,
+            ending: None,
         }
     }
 }
