@@ -45,15 +45,20 @@ crates/mirante-daemon/                         # bin `mirante-daemon`
   src/driver/mod.rs                            # Driver trait, DriverEvent, Sink, Attachment, Fanout, factory trait
   src/driver/fake.rs                           # #[cfg(test)] FakeDriver / FakeFactory
   src/driver/real.rs                           # RealFactory: launches real claude / codex
-  src/driver/screen.rs                         # Claude TUI dialog matching (UI actions only, never status)
-  src/driver/pty.rs                            # PtyProcess: PTY + vt100 mirror + CPR answers + fan-out
-  src/driver/claude.rs                         # ClaudeDriver: boot/trust, typist, Esc, answers, transcript tail
-  src/driver/codex_status.rs                   # CodexEngine: status from app-server traffic (rule 8)
-  src/driver/codex_rpc.rs                      # RpcConn: JSON-RPC over stdio
-  src/driver/codex.rs                          # CodexDriver: handshake, steer/start, approvals, read-only stream
+  src/driver/proctree.rs                       # Proc (pid + start time), descendants, kill_tree (Task 13)
+  src/driver/screen.rs                         # Claude TUI: live dialog / trust / input prompt (UI actions only, never status)
+  src/driver/termq.rs                          # terminal queries (CPR, DA1, DSR, OSC 10/11) answered by the daemon
+  src/driver/paste.rs                          # sanitize_for_pty, bracketed paste, `/` and `!` rules
+  src/driver/pty.rs                            # PtyProcess: PTY + vt100 mirror + query answers + fan-out + tree kill
+  src/driver/claude.rs                         # ClaudeDriver: ready/trust, re-checking typist, answers, transcript tail
+  src/driver/codex_status.rs                   # CodexEngine: our thread's status from app-server traffic (rule 8)
+  src/driver/codex_rpc.rs                      # RpcConn: JSON-RPC over stdio, bytes in, writer thread out
+  src/driver/codex.rs                          # CodexDriver: auto-edits handshake, steer/start, approvals, read-only stream
+  src/memguard/{mod,sampler,policy,orphans}.rs # memory sampling, the pressure ladder, orphan sweep (Task 18)
   src/hub/mod.rs                               # Hub, State, Live, HubError, task CRUD, publish/subscribe, testkit
   src/hub/session.rs                           # start/resume/trust/stop, hooks, driver events, queue pump, verdicts
   src/hub/messages.rs                          # steer/queue send, permission list/answer
+  src/hub/memory.rs                            # memory guard thread, hibernate/wake, doctor (Task 19)
   src/recover.rs                               # daemon start: end stale sessions, ingest hook spool
   src/server.rs                                # socket (0600, peer uid), dispatch, subscribe, attach upgrade
   tests/real_agents.rs                         # #[ignore] real Claude / Codex through the daemon
@@ -62,7 +67,8 @@ crates/mirante-cli/                            # bin `mirante` + lib `mirante_cl
   src/term.rs, src/daemon_ctl.rs               # raw mode / window size, auto-start
   src/main.rs                                  # commands
   tests/fake-claude.sh, tests/e2e.rs           # end to end through the real binaries with a fake claude
-docs/dogfood/2026-11-07-plan-2b-dogfood.md     # Task 18: the founder's acceptance checklist and 2-week log
+docs/dogfood/2026-11-07-plan-2b-dogfood.md     # Task 21: the founder's acceptance checklist and 2-week log
+docs/dogfood/memory-stress.md                  # Task 18: manual memory stress procedure (close apps first)
 ```
 
 Dependency order: `mirante-ipc` → `mirante-hook` → daemon `driver` trait → `hub` (core → `session` → `messages`) → `recover` → `server` + binary → CLI → `screen` + `pty` → `claude` → `codex_status` + `codex_rpc` → `codex` → end to end.
@@ -116,12 +122,17 @@ Error codes: JSON-RPC reserved (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`
 | 9 | mirante-daemon | 35 |
 | 10 | mirante-daemon | 41 |
 | 11–12 | mirante-cli | 8 |
-| 13 | mirante-daemon | 50 |
-| 14 | mirante-daemon | 58 |
-| 15 | mirante-daemon | 66 |
-| 16 | mirante-daemon | 76 |
-| 17 | e2e 2; real_agents 2 ignored | — |
-| 18 | workspace | 303 passed, 2 ignored (8 cli + 2 e2e + 141 core + 76 daemon + 3 hook + 12 ipc + 61 spike-kit) |
+| 13 | mirante-daemon / mirante-cli / mirante-ipc | 92 / 13 / 22 |
+| 14 | mirante-daemon | 114 |
+| 15 | mirante-daemon | 133 |
+| 16 | mirante-daemon | 147 |
+| 17 | mirante-daemon | 163 |
+| 18 | mirante-daemon | 178 |
+| 19 | mirante-daemon / mirante-cli / mirante-ipc | 185 / 14 / 22 |
+| 20 | e2e 7; real_agents 2 ignored | — |
+| 21 | workspace | 464 passed, 2 ignored (14 cli + 7 e2e + 157 core + 185 daemon + 2 daemon_signals + 14 hook + 2 hook binary + 22 ipc + 61 spike-kit) |
+
+Tasks 13–21 (rows above) were replayed on top of `2b8030d` (the robustness round: core 157, daemon lib 80, workspace 350 before Task 13).
 
 ---
 
@@ -6693,22 +6704,135 @@ EOF
 
 ---
 
-## Phase 2b-ii — Claude driver
+## Phase 2b-ii — Driver interface v2 and the Claude driver
 
-### Task 13: Screen reading and the PTY process
+Tasks 13–21 were revised on 2026-11-07 (OSS-comparison findings for both drivers, a memory guard, more end-to-end cases) and replayed in order in a scratch clone on top of `2b8030d`: each "fails" step failed with the quoted first error, each "passes" step passed with the quoted counts (the daemon suite three times or more per task, clippy clean at every commit), and every code block below was compared byte for byte with the replayed commit by script.
+
+### Task 13: Driver interface v2, process trees, hub plumbing
 
 **Files:**
-- Modify: `crates/mirante-daemon/src/driver/mod.rs`
-- Create: `crates/mirante-daemon/src/driver/screen.rs`
-- Create: `crates/mirante-daemon/src/driver/pty.rs`
+- Create: `crates/mirante-daemon/src/driver/proctree.rs`
+- Modify: `crates/mirante-daemon/src/driver/mod.rs`, `crates/mirante-daemon/src/driver/fake.rs`
+- Modify: `crates/mirante-daemon/src/hub/mod.rs`, `crates/mirante-daemon/src/hub/session.rs`
+- Modify: `crates/mirante-ipc/src/types.rs`
+- Modify: `crates/mirante-cli/src/render.rs`, `crates/mirante-cli/src/args.rs`, `crates/mirante-cli/src/main.rs`
 
-`screen.rs` ports the proven dialog matching from `spike_kit::screen` (fixtures are real Claude Code 2.1.285 grids) and adds the trust-dialog, ready (`manual mode on` footer: Mirante always launches with `--permission-mode manual`) and request-matching checks. FINDINGS rule 6: only the exact labels "Yes" / "No" match, only below the live dialog header; "Yes, and always allow …" and "Yes, and switch to auto mode …" can never be chosen. The screen is used only to act on dialogs; status never comes from it (spec §2.2).
+Everything the two drivers (Tasks 14–17) and the memory guard (Tasks 18–19) plug into, landed once so those tasks touch only their own files.
 
-`pty.rs` runs a process in a PTY mirrored into a `vt100` grid. Proven in the spikes: the TUI stalls unless cursor-position queries (`ESC[6n`) are answered; the PTY answers them with the real cursor position while no client is attached (an attached terminal answers on its own; answering twice would inject junk input). Output fans out to attached clients; when output ends every attached stream is closed. Dropping the `PtyProcess` kills and reaps the process.
+- **Process trees (`proctree`).** A process is its pid *and* its start time (`Proc`): a pid is reused as soon as its process is reaped, so nothing is signaled unless the start time still matches. Agents run as the leader of their own process group (the PTY child calls `setsid`; Task 17 spawns `codex app-server` with `process_group(0)`), so one `killpg` reaches every child that stayed in the group; children that left it (`setsid`, `setpgrp`) are found by walking parent links (macOS `proc_listchildpids` + `proc_pidinfo(PROC_PIDTBSDINFO)`; Linux `/proc/<pid>/stat`). `kill_tree` sends SIGTERM to the group and every descendant, re-walks the tree on every poll during the grace period (a process forked while dying is caught), sends SIGKILL to what is left, and verifies. A dead root's pid is never walked (it may name another process now). Every driver's `stop` is a `kill_tree`: no more Esc + `/exit`.
+- **Interface v2.** `DriverError::NotNow` (e.g. interrupt with no running turn) and `DriverError::NativeGone` (Codex: the thread to resume has no rollout) both map to RPC `CONFLICT`; `NativeGone`'s message says `mirante resume <task> --fresh` starts a new conversation. New events: `PermissionResolved { key }` (Codex withdrew a request: the hub settles that card, and only that card, as denied with cause `codex:request_resolved`), `DeliveryAborted { text, reason }` (the typist did not type a message after all: it goes back to the front of the queue, event `message_requeued`), `ResumeFailed { reason }` (event `resume_failed` with the `--fresh` hint; Mirante never starts a fresh conversation on its own), `Usage(String)` (Codex quota/tokens, kept in memory and shown in `mirante ls`; not written to the audit trail). `Driver::session_started` (the hub forwards this session's `SessionStart` hook; Claude readiness needs it) and `Driver::root` (the agent's root `Proc`, for memory sampling) have no-op defaults.
+- **Hold flag.** Each `Sink` carries a flag the hub sets while the session has a pending permission request (`State::sync_holds`, run at the start of every `publish`, so every mutation refreshes it). The Claude typist re-checks it right before typing (Task 15): text typed while a dialog waits could answer it.
+- **Native id from any fenced hook.** A hook stamped with the live Mirante session (`MIRANTE_SESSION_ID`, the fence from the robustness round) carries Claude's real session id; it is adopted even when it changed (`/clear`, a resume that forks), never dropped as `hook_orphan`. Unstamped hooks keep the old rule.
+- **CLI.** `mirante ls` gets a `MODE` column (`manual` for Claude, `auto-edits` for Codex; `mirante show` explains it), Codex usage after the status note, `archiving` for a task whose worktree is being removed, and `mirante resume <task> --fresh` (an explicit fresh conversation; `session.start`). A resume whose agent exits at once tells the user about `--fresh`.
 
 - [ ] **Step 1: Write the failing tests**
 
-`crates/mirante-daemon/src/driver/mod.rs`:
+`crates/mirante-daemon/src/driver/proctree.rs` (only the test module for now):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Child, Command};
+    use std::sync::Mutex;
+
+    /// Records every signal, then sends it.
+    struct Recorder {
+        calls: Mutex<Vec<(i32, i32, bool)>>,
+    }
+
+    impl Signaler for Recorder {
+        fn signal(&self, pid: i32, sig: i32) -> bool {
+            self.calls.lock().unwrap().push((pid, sig, false));
+            Kill.signal(pid, sig)
+        }
+        fn signal_group(&self, pgid: i32, sig: i32) -> bool {
+            self.calls.lock().unwrap().push((pgid, sig, true));
+            Kill.signal_group(pgid, sig)
+        }
+    }
+
+    /// A shell in its own process group (like an agent), reaped by a background thread so
+    /// it never lingers as a zombie.
+    fn spawn_group(script: &str) -> (Proc, std::thread::JoinHandle<()>) {
+        use std::os::unix::process::CommandExt;
+        let mut child: Child = Command::new("/bin/sh").args(["-c", script]).process_group(0).spawn().unwrap();
+        let pid = child.id() as i32;
+        let p = proc_of(pid).expect("just started");
+        (p, std::thread::spawn(move || drop(child.wait())))
+    }
+
+    fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ok() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_process_is_its_pid_and_start_time() {
+        let me = proc_of(std::process::id() as i32).unwrap();
+        assert!(alive(me));
+        assert!(!alive(Proc { pid: me.pid, start: me.start + 1 }), "another start time is another process");
+        assert_eq!(proc_of(-5), None);
+        assert_eq!(proc_of(0), None);
+    }
+
+    #[test]
+    fn descendants_include_children_that_left_the_group() {
+        // The grandchild calls setpgrp: out of the agent's process group, still below it.
+        let (root, reaper) = spawn_group("perl -e 'setpgrp(0,0); sleep 30' & sleep 30 & wait");
+        wait_until("one descendant in the group and one outside it", || {
+            let groups: Vec<Option<i32>> = descendants(root).iter().map(|p| pgid(p.pid)).collect();
+            groups.contains(&Some(root.pid)) && groups.iter().any(|g| g.is_some_and(|g| g != root.pid))
+        });
+        let r = kill_tree(root, Duration::from_secs(2), &Kill);
+        assert!(r.survivors.is_empty(), "{r:?}");
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn kill_tree_ends_a_tree_that_forks_while_dying_and_ignores_sigterm() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pidfile = dir.path().join("forked.pid");
+        let (r1, r2) = (dir.path().join("r1"), dir.path().join("r2"));
+        // Child 1 ignores SIGTERM. Child 2 forks a new sleeper (in its own group) when told
+        // to stop, records its pid, and keeps running. Each says when its trap is set.
+        let script = format!(
+            "sh -c 'trap \"\" TERM; touch {r1}; while :; do sleep 0.1; done' & \
+             sh -c 'trap \"perl -e \\\"setpgrp(0,0); sleep 60\\\" & echo \\$! > {p}\" TERM; touch {r2}; while :; do sleep 0.1; done' & \
+             wait",
+            p = pidfile.display(),
+            r1 = r1.display(),
+            r2 = r2.display()
+        );
+        let (root, reaper) = spawn_group(&script);
+        wait_until("both traps set", || r1.exists() && r2.exists());
+        let rec = Recorder { calls: Mutex::new(Vec::new()) };
+        let r = kill_tree(root, Duration::from_millis(800), &rec);
+        assert!(r.survivors.is_empty(), "{r:?}");
+        assert!(r.killed >= 1, "the TERM-ignoring child needed SIGKILL: {r:?}");
+        let forked: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        assert!(proc_of(forked).is_none(), "the child forked during the kill is gone too");
+        assert!(rec.calls.lock().unwrap().iter().any(|(pid, _, group)| *pid == forked && !group));
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn a_reused_pid_is_never_signaled() {
+        let rec = Recorder { calls: Mutex::new(Vec::new()) };
+        let me = proc_of(std::process::id() as i32).unwrap();
+        // Our own pid with a start time that is not ours: a "reused" pid.
+        let stale = Proc { pid: me.pid, start: me.start.wrapping_sub(1) };
+        let r = kill_tree(stale, Duration::ZERO, &rec);
+        assert!(rec.calls.lock().unwrap().is_empty(), "{:?}", rec.calls.lock().unwrap());
+        assert_eq!((r.terminated, r.killed), (0, 0));
+        assert!(alive(me));
+    }
+}
+```
+
+Replace `crates/mirante-daemon/src/driver/mod.rs` with:
 ```rust
 //! The agent driver interface. Every agent sits behind [`Driver`]; an operation the agent
 //! cannot do is a typed [`DriverError::Unsupported`], never a silent failure. Drivers are
@@ -6720,6 +6844,7 @@ EOF
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use mirante_core::model::{Status, Task};
@@ -6729,9 +6854,8 @@ use serde_json::Value;
 
 #[cfg(test)]
 pub mod fake;
-pub mod pty;
+pub mod proctree;
 pub mod real;
-pub mod screen;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverError {
@@ -6739,6 +6863,11 @@ pub enum DriverError {
     Unsupported(&'static str),
     /// The dialog the operation targets is not on screen / not pending.
     NoDialog(String),
+    /// The operation does not apply now (e.g. an interrupt with no running turn).
+    NotNow(String),
+    /// The native conversation to resume is gone (Codex: no rollout for the thread). The
+    /// user may start a fresh conversation; Mirante never does so on its own.
+    NativeGone(String),
     Failed(String),
 }
 
@@ -6747,6 +6876,10 @@ impl fmt::Display for DriverError {
         match self {
             DriverError::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
             DriverError::NoDialog(m) => write!(f, "no matching dialog: {m}"),
+            DriverError::NotNow(m) => write!(f, "{m}"),
+            DriverError::NativeGone(m) => {
+                write!(f, "the agent's conversation is gone ({m}); `mirante resume <task> --fresh` starts a new one")
+            }
             DriverError::Failed(m) => write!(f, "agent driver failed: {m}"),
         }
     }
@@ -6784,9 +6917,27 @@ pub enum DriverEvent {
         tool: String,
         detail: String,
     },
+    /// Codex: request `key` no longer waits for an answer (the server resolved it, its turn
+    /// ended, or the process exited). The hub settles its card if it is still pending.
+    PermissionResolved {
+        key: String,
+    },
     /// Codex: the thread id, used for `thread/resume`.
     NativeId(String),
     Boot(BootState),
+    /// A message handed to `send` was not typed after all (a dialog appeared, a permission
+    /// became pending): the hub puts it back at the front of the queue.
+    DeliveryAborted {
+        text: String,
+        reason: String,
+    },
+    /// Resuming the native conversation failed (Claude exited right away). The hub records
+    /// `resume_failed`; a fresh start is the user's call (`mirante resume --fresh`).
+    ResumeFailed {
+        reason: String,
+    },
+    /// Codex: quota / token usage, one line for `mirante ls`.
+    Usage(String),
     /// A step for the feed and audit trail (command finished, agent message, ...).
     Step(Value),
     Exited {
@@ -6795,20 +6946,33 @@ pub enum DriverEvent {
 }
 
 /// Channel end a driver emits into. Every event is tagged with the driver's session id so
-/// late events from an ended session are ignored.
+/// late events from an ended session are ignored. The sink also carries the hub's hold flag
+/// for the session (see [`Sink::held`]).
 #[derive(Clone)]
 pub struct Sink {
     session_id: String,
     tx: mpsc::Sender<(String, DriverEvent)>,
+    hold: Arc<AtomicBool>,
 }
 
 impl Sink {
     pub fn new(session_id: &str, tx: mpsc::Sender<(String, DriverEvent)>) -> Sink {
-        Sink { session_id: session_id.to_string(), tx }
+        Sink { session_id: session_id.to_string(), tx, hold: Arc::default() }
     }
 
     pub fn emit(&self, event: DriverEvent) {
         let _ = self.tx.send((self.session_id.clone(), event));
+    }
+
+    /// True while the hub has a pending permission request for this session: typed text
+    /// could answer that dialog, so nothing may be typed.
+    pub fn held(&self) -> bool {
+        self.hold.load(Ordering::SeqCst)
+    }
+
+    /// The flag behind [`Sink::held`]; the hub keeps a clone and sets it.
+    pub fn hold_flag(&self) -> Arc<AtomicBool> {
+        self.hold.clone()
     }
 }
 
@@ -6935,9 +7099,17 @@ pub trait Driver: Send + Sync {
     }
     /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
     fn screen_tail(&self) -> String;
-    /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
-    /// driver still emits `Exited`.
+    /// Ends the agent and every process below it (SIGTERM to the tree, SIGKILL after a
+    /// grace period; see [`proctree::kill_tree`]). Blocks until they are gone; the driver
+    /// still emits `Exited`.
     fn stop(&self);
+    /// Claude: the hub saw this session's `SessionStart` hook (one of the readiness
+    /// conditions). Must not block.
+    fn session_started(&self) {}
+    /// The agent's root process (memory sampling, orphan checks), when there is one.
+    fn root(&self) -> Option<proctree::Proc> {
+        None
+    }
 }
 
 pub struct SpawnRequest {
@@ -6994,6 +7166,1187 @@ mod tests {
         Sink::new("s1", tx).emit(DriverEvent::Boot(BootState::Ready));
         assert_eq!(rx.recv().unwrap(), ("s1".to_string(), DriverEvent::Boot(BootState::Ready)));
     }
+
+    #[test]
+    fn the_hold_flag_is_shared_between_clones() {
+        let (tx, _rx) = mpsc::channel();
+        let sink = Sink::new("s1", tx);
+        let driver_side = sink.clone();
+        assert!(!driver_side.held());
+        sink.hold_flag().store(true, Ordering::SeqCst);
+        assert!(driver_side.held());
+    }
+}
+```
+
+In `crates/mirante-daemon/src/hub/session.rs`, add `use mirante_ipc::types::SendMessage;` to the imports of the test module, and add these tests at the end of it (before `compact_keeps_what_classification_reads`):
+```rust
+    fn kinds_payloads(k: &Kit, task: &str, kind: &str) -> Vec<Value> {
+        let st = k.hub.lock();
+        st.store.task_events(task).unwrap().into_iter().filter(|e| e.kind == kind).map(|e| e.payload).collect()
+    }
+
+    #[test]
+    fn a_resolved_codex_request_settles_only_its_own_card() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::PermissionRequested { key: "0".into(), tool: "command".into(), detail: "ls".into() });
+        k.emit(DriverEvent::PermissionRequested { key: "7".into(), tool: "command".into(), detail: "pwd".into() });
+        k.emit(DriverEvent::PermissionResolved { key: "0".into() });
+        let left: Vec<String> = k.pending(&t.id).into_iter().map(|p| p.detail).collect();
+        assert_eq!(left, vec!["pwd".to_string()]);
+        let settled = kinds_payloads(&k, &t.id, "permission_settled");
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            (settled[0]["answer"].as_str(), settled[0]["cause"].as_str()),
+            (Some("denied"), Some("codex:request_resolved"))
+        );
+        // Unknown or repeated keys change nothing.
+        k.emit(DriverEvent::PermissionResolved { key: "0".into() });
+        k.emit(DriverEvent::PermissionResolved { key: "99".into() });
+        assert_eq!(k.pending(&t.id).len(), 1);
+        assert_eq!(k.hub.lock().live[&t.id].perm_keys.len(), 1);
+    }
+
+    #[test]
+    fn an_aborted_delivery_goes_back_to_the_front_of_the_queue() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        k.hub.send(SendMessage { task: t.id.clone(), text: "steer me".into(), mode: SendMode::Steer }).unwrap();
+        k.hub.send(SendMessage { task: t.id.clone(), text: "later".into(), mode: SendMode::Queue }).unwrap();
+        k.emit(DriverEvent::DeliveryAborted { text: "steer me".into(), reason: "a dialog appeared".into() });
+        {
+            let st = k.hub.lock();
+            let l = &st.live[&t.id];
+            assert_eq!(l.queue.iter().cloned().collect::<Vec<_>>(), vec!["steer me".to_string(), "later".to_string()]);
+            assert!(l.steers.is_empty());
+        }
+        let ev = kinds_payloads(&k, &t.id, "message_requeued");
+        assert_eq!(ev, vec![json!({"text": "steer me", "reason": "a dialog appeared"})]);
+        // At the turn end the requeued message goes out first.
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        assert_eq!(k.calls().last().map(String::as_str), Some("send:steer me"));
+    }
+
+    #[test]
+    fn a_failed_resume_is_recorded_and_fresh_start_stays_the_users_call() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.emit(DriverEvent::ResumeFailed { reason: "exited after 0.4 s".into() });
+        k.emit(DriverEvent::Exited { code: Some(1) });
+        let ev = kinds_payloads(&k, &t.id, "resume_failed");
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0]["hint"].as_str().unwrap().contains("--fresh"));
+        // Nothing was started on its own.
+        assert_eq!(k.hub.status().live_sessions, 0);
+        assert_eq!(k.factory.resumes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_vanished_native_conversation_fails_the_resume_with_a_typed_error() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::NativeId("thr-gone".into()));
+        k.hub.stop(&t.id).unwrap();
+        *k.factory.fail_with.lock().unwrap() = Some(DriverError::NativeGone("no rollout found for thr-gone".into()));
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true);
+        assert!(matches!(r, Err(HubError::Driver(DriverError::NativeGone(_)))), "{r:?}");
+        assert_eq!(kinds_payloads(&k, &t.id, "resume_failed").len(), 1);
+        assert_eq!(k.hub.status().live_sessions, 0);
+        // The user chooses a fresh start explicitly.
+        *k.factory.fail_with.lock().unwrap() = None;
+        let fresh = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        assert!(!fresh.resumed);
+        assert_eq!(k.factory.resumes.lock().unwrap().last().cloned(), Some(None));
+    }
+
+    #[test]
+    fn usage_reports_show_in_the_task_view() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        assert_eq!(k.hub.get_task(&t.id).unwrap().usage, None);
+        k.emit(DriverEvent::Usage("5h 42% · 31k tokens".into()));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().usage.as_deref(), Some("5h 42% · 31k tokens"));
+        assert!(kinds_payloads(&k, &t.id, "usage").is_empty(), "usage is not written to the audit trail");
+    }
+
+    #[test]
+    fn a_pending_permission_holds_the_drivers_typing() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        let sink = k.factory.last_sink();
+        assert!(!sink.held());
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "ls"));
+        assert!(sink.held());
+        let id = k.pending(&t.id)[0].id.clone();
+        k.hub.answer_permission(mirante_ipc::types::AnswerPermission { id, allow: true }).unwrap();
+        assert!(!sink.held());
+    }
+
+    #[test]
+    fn session_start_reaches_the_driver_and_fenced_hooks_update_the_native_id() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        let session = k.hub.lock().live[&t.id].session_id.clone();
+        k.hook_session(
+            &t.id,
+            json!({"hook_event_name": "SessionStart", "session_id": "nat-1", "source": "startup"}),
+            &session,
+        );
+        assert!(k.calls().contains(&"session_started".to_string()));
+        // Claude's own id changed under the same Mirante session: adopted, not dropped.
+        k.hook_session(
+            &t.id,
+            json!({"hook_event_name": "UserPromptSubmit", "session_id": "nat-2", "prompt": "x"}),
+            &session,
+        );
+        assert_eq!(status(&k, &t.id), Status::Working);
+        assert_eq!(k.hub.lock().live[&t.id].native_id.as_deref(), Some("nat-2"));
+        let st = k.hub.lock();
+        assert_eq!(st.store.latest_conversation(&t.id).unwrap().unwrap().native_session_id.as_deref(), Some("nat-2"));
+    }
+```
+
+In `crates/mirante-daemon/src/hub/mod.rs`, extend `errors_map_to_typed_rpc_codes` (after the `NOT_FOUND` assertion):
+```rust
+        let e: RpcError = HubError::Driver(DriverError::NotNow("no running turn".into())).into();
+        assert_eq!((e.code, e.message.as_str()), (code::CONFLICT, "no running turn"));
+        let e: RpcError = HubError::Driver(DriverError::NativeGone("no rollout".into())).into();
+        assert_eq!(e.code, code::CONFLICT);
+        assert!(e.message.contains("conversation is gone"), "{}", e.message);
+```
+
+Replace the test module of `crates/mirante-cli/src/render.rs` with:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mirante_core::model::{PermissionStatus, Task};
+
+    fn view(status: Status, needs: usize, detail: Option<&str>) -> TaskView {
+        TaskView {
+            task: Task {
+                id: "0190aaaa-bbbb-7ccc-8ddd-eeee12345678".into(),
+                title: "Fix the login".into(),
+                repo_path: "/r".into(),
+                worktree_path: "/w".into(),
+                branch: "feat/login".into(),
+                agent: AgentKind::Claude,
+                goal: "fix it".into(),
+                notes: String::new(),
+                lifecycle: Lifecycle::Active,
+                status,
+                created_at: 0,
+                updated_at: 0,
+            },
+            live: true,
+            boot: Some(BootState::Ready),
+            needs_you: needs,
+            queued: 0,
+            detail: detail.map(String::from),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn short_ids_are_the_unique_suffix() {
+        assert_eq!(short("0190aaaa-bbbb-7ccc-8ddd-eeee12345678"), "12345678");
+        assert_eq!(short("abc"), "abc");
+    }
+
+    #[test]
+    fn fit_truncates_and_pads_by_characters() {
+        assert_eq!(fit("ação", 6), "ação  ");
+        assert_eq!(fit("abcdefgh", 5), "abcd…");
+    }
+
+    #[test]
+    fn table_shows_status_needs_and_detail() {
+        let t = tasks_table(
+            &[view(Status::NeedsYou, 2, None), view(Status::Working, 0, Some("turn done, 1 command still finishing"))],
+            false,
+        );
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("ID"));
+        assert!(lines[1].contains("12345678") && lines[1].contains("needs_you") && lines[1].contains(" 2 "));
+        assert!(lines[2].contains("[turn done, 1 command still finishing]"));
+        assert!(lines[0].contains("MODE") && lines[1].contains("manual"));
+        assert!(!t.contains('\x1b'));
+        assert!(tasks_table(&[view(Status::Idle, 0, None)], true).contains("\x1b[32m"));
+    }
+
+    #[test]
+    fn codex_rows_show_the_auto_edits_mode_and_usage() {
+        let mut v = view(Status::Working, 0, Some("turn done, 1 command still finishing"));
+        v.task.agent = AgentKind::Codex;
+        v.usage = Some("5h 42% · 31k tokens".into());
+        let t = tasks_table(&[v.clone()], false);
+        assert!(t.contains("auto-edits"), "{t}");
+        assert!(t.contains("[turn done, 1 command still finishing · 5h 42% · 31k tokens]"), "{t}");
+        assert!(task_detail(&v, &[]).contains("mode:      auto-edits (edits and commands inside the worktree"));
+        v.task.lifecycle = Lifecycle::Archiving;
+        assert!(tasks_table(&[v], false).contains("[archiving · 5h 42% · 31k tokens]"));
+    }
+
+    #[test]
+    fn perms_table_says_how_to_answer() {
+        let p = PermissionView {
+            request: PermissionRequest {
+                id: "p-0000-abcdef12".into(),
+                task_id: "t".into(),
+                session_id: "s".into(),
+                tool: "Bash".into(),
+                detail: "rm -rf build\nsecond line".into(),
+                status: PermissionStatus::Pending,
+                created_at: 0,
+                answered_at: None,
+            },
+            task_title: "T".into(),
+            branch: "feat".into(),
+        };
+        let t = perms_table(&[p]);
+        assert!(t.contains("abcdef12") && t.contains("rm -rf build") && !t.contains("second line"));
+        assert!(t.contains("mirante allow <perm>"));
+        assert_eq!(perms_table(&[]), "no pending permission requests\n");
+    }
+}
+```
+
+In the `simple_commands` test of `crates/mirante-cli/src/args.rs`, replace the `resume` assertion with:
+```rust
+        assert_eq!(p("resume feat --trust").unwrap(), Cmd::Resume { task: "feat".into(), trust: true, fresh: false });
+        assert_eq!(p("resume --fresh feat").unwrap(), Cmd::Resume { task: "feat".into(), trust: false, fresh: true });
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p mirante-daemon`
+
+Expected: FAIL to compile; the first error is
+```
+error[E0425]: cannot find type `Proc` in module `proctree`
+```
+
+- [ ] **Step 3: Implement**
+
+Add above the test module in `crates/mirante-daemon/src/driver/proctree.rs`:
+```rust
+//! Process trees: which processes descend from an agent, and ending all of them.
+//!
+//! A process is named by its pid AND its start time ([`Proc`]): a pid can be reused as soon
+//! as its process is reaped, so nothing is ever signaled unless its start time still
+//! matches. Agents run as the leader of their own process group (the PTY child calls
+//! `setsid`; `codex app-server` is spawned with `process_group(0)`), so one `killpg`
+//! reaches every child that stayed in the group; children that moved to another group
+//! (`setsid`, `setpgrp`) are found by walking parent links (macOS: `proc_listchildpids`;
+//! Linux: `/proc/<pid>/stat`).
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
+/// One process: pid plus start time (µs since the epoch on macOS, clock ticks since boot
+/// on Linux). Two values with the same pid and a different start are different processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Proc {
+    pub pid: i32,
+    pub start: u64,
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+
+    /// `SZOMB` from `<sys/proc.h>`: exited, not yet reaped.
+    const SZOMB: u32 = 5;
+
+    fn bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
+        if pid <= 0 {
+            return None;
+        }
+        // SAFETY: `info` is a plain C struct of the size passed; the kernel fills at most that.
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, size) };
+        (n == size && info.pbi_status != SZOMB).then_some(info)
+    }
+
+    pub fn start_time(pid: i32) -> Option<u64> {
+        bsdinfo(pid).map(|i| i.pbi_start_tvsec * 1_000_000 + i.pbi_start_tvusec)
+    }
+
+    pub fn pgid(pid: i32) -> Option<i32> {
+        bsdinfo(pid).map(|i| i.pbi_pgid as i32)
+    }
+
+    pub fn children(pid: i32) -> Vec<i32> {
+        if pid <= 0 {
+            return Vec::new();
+        }
+        let mut cap = 64usize;
+        loop {
+            let mut buf = vec![0 as libc::pid_t; cap];
+            let bytes = (cap * size_of::<libc::pid_t>()) as libc::c_int;
+            // SAFETY: the buffer holds `cap` pids and its size in bytes is passed.
+            let n = unsafe { libc::proc_listchildpids(pid, buf.as_mut_ptr() as *mut c_void, bytes) };
+            if n < 0 {
+                return Vec::new();
+            }
+            let n = n as usize;
+            if n < cap {
+                buf.truncate(n);
+                buf.retain(|p| *p > 0);
+                return buf;
+            }
+            cap *= 4;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod sys {
+    /// (state, ppid, pgid, start) from `/proc/<pid>/stat` (fields 3, 4, 5 and 22).
+    fn stat(pid: i32) -> Option<(char, i32, i32, u64)> {
+        if pid <= 0 {
+            return None;
+        }
+        let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name may contain spaces and parentheses: fields start after the last ')'.
+        let rest = &s[s.rfind(')')? + 2..];
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let state = f.first()?.chars().next()?;
+        Some((state, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?, f.get(19)?.parse().ok()?))
+    }
+
+    pub fn start_time(pid: i32) -> Option<u64> {
+        stat(pid).filter(|s| s.0 != 'Z' && s.0 != 'X').map(|s| s.3)
+    }
+
+    pub fn pgid(pid: i32) -> Option<i32> {
+        stat(pid).map(|s| s.2)
+    }
+
+    pub fn children(pid: i32) -> Vec<i32> {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|c| stat(*c).is_some_and(|s| s.1 == pid))
+            .collect()
+    }
+}
+
+/// The process `pid` now (`None`: gone or a zombie).
+pub fn proc_of(pid: i32) -> Option<Proc> {
+    sys::start_time(pid).map(|start| Proc { pid, start })
+}
+
+/// Still running, and still the same process (not a reused pid).
+pub fn alive(p: Proc) -> bool {
+    sys::start_time(p.pid) == Some(p.start)
+}
+
+pub fn pgid(pid: i32) -> Option<i32> {
+    sys::pgid(pid)
+}
+
+/// Direct children of `pid` (unverified pids; see [`descendants`]).
+pub fn children(pid: i32) -> Vec<i32> {
+    sys::children(pid)
+}
+
+/// Every live process below `root` (not `root` itself), parents before children. Empty
+/// when `root` itself is gone (its pid may name another process now). A child that started
+/// before its parent is a reused pid, not a descendant, and is skipped.
+pub fn descendants(root: Proc) -> Vec<Proc> {
+    let mut out = Vec::new();
+    if !alive(root) {
+        return out;
+    }
+    let mut seen = HashSet::from([root.pid]);
+    let mut next = vec![root];
+    while let Some(parent) = next.pop() {
+        for pid in children(parent.pid) {
+            let Some(p) = proc_of(pid) else { continue };
+            if p.start >= parent.start && seen.insert(pid) {
+                out.push(p);
+                next.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Where signals go. Tests pass a recorder; production uses [`Kill`].
+pub trait Signaler: Send + Sync {
+    fn signal(&self, pid: i32, sig: i32) -> bool;
+    fn signal_group(&self, pgid: i32, sig: i32) -> bool;
+}
+
+/// `kill(2)` / `killpg(2)`.
+pub struct Kill;
+
+impl Signaler for Kill {
+    fn signal(&self, pid: i32, sig: i32) -> bool {
+        // SAFETY: plain syscall; `pid` > 0 is checked by the caller.
+        pid > 0 && unsafe { libc::kill(pid, sig) } == 0
+    }
+    fn signal_group(&self, pgid: i32, sig: i32) -> bool {
+        // SAFETY: plain syscall; `pgid` > 1 is checked by the caller.
+        pgid > 1 && unsafe { libc::killpg(pgid, sig) } == 0
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KillReport {
+    /// Processes that got SIGTERM.
+    pub terminated: usize,
+    /// Processes that needed SIGKILL.
+    pub killed: usize,
+    /// Still alive after the verify pass (should be empty).
+    pub survivors: Vec<Proc>,
+}
+
+/// Signals `sig` to the root's process group (when the group still provably belongs to
+/// this tree) and to every known process of the tree that is still the same process.
+fn signal_tree(root: Proc, known: &[Proc], sig: i32, s: &dyn Signaler) -> usize {
+    let group_ours = alive(root) || known.iter().any(|p| alive(*p) && pgid(p.pid) == Some(root.pid));
+    if group_ours && root.pid > 1 {
+        s.signal_group(root.pid, sig);
+    }
+    let mut n = 0;
+    for p in std::iter::once(&root).chain(known) {
+        if p.pid > 1 && alive(*p) {
+            s.signal(p.pid, sig);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Ends `root` and everything below it: SIGTERM to the tree, then up to `grace` for it to
+/// exit (the tree is re-walked on every poll, so a process forked meanwhile is caught and
+/// told too), then SIGKILL to whatever is left, then a verify pass. Never signals a
+/// process that is not (by pid AND start time) part of the tree.
+pub fn kill_tree(root: Proc, grace: Duration, s: &dyn Signaler) -> KillReport {
+    let mut known: Vec<Proc> = descendants(root);
+    let mut report = KillReport { terminated: signal_tree(root, &known, libc::SIGTERM, s), ..Default::default() };
+    let deadline = Instant::now() + grace;
+    loop {
+        // Newly forked processes get SIGTERM too.
+        let mut fresh = Vec::new();
+        for p in std::iter::once(root).chain(known.clone()) {
+            if alive(p) {
+                for d in descendants(p) {
+                    if !known.contains(&d) {
+                        fresh.push(d);
+                    }
+                }
+            }
+        }
+        for d in fresh {
+            if !known.contains(&d) {
+                if alive(d) && s.signal(d.pid, libc::SIGTERM) {
+                    report.terminated += 1;
+                }
+                known.push(d);
+            }
+        }
+        let left = !alive(root) && known.iter().all(|p| !alive(*p));
+        if left || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Hard kill, repeated until nothing new shows up (a dying parent may still fork).
+    for _ in 0..5 {
+        for p in std::iter::once(root).chain(known.clone()) {
+            if alive(p) {
+                for d in descendants(p) {
+                    if !known.contains(&d) {
+                        known.push(d);
+                    }
+                }
+            }
+        }
+        let n = signal_tree(root, &known, libc::SIGKILL, s);
+        report.killed += n;
+        if n == 0 {
+            break;
+        }
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until && (alive(root) || known.iter().any(|p| alive(*p))) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    report.survivors = std::iter::once(root).chain(known).filter(|p| alive(*p)).collect();
+    report
+}
+```
+
+Replace `crates/mirante-daemon/src/driver/fake.rs` with:
+```rust
+//! Test double: records every call, lets the test emit events through the captured sink.
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+
+use super::proctree::Proc;
+use super::{Attachment, Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
+
+#[derive(Default)]
+pub struct FakeDriver {
+    pub calls: Mutex<Vec<String>>,
+    pub dialog: AtomicBool,
+    pub fail_answers: AtomicBool,
+    /// The attached client's output channel, kept open until `detach` (like a live agent).
+    pub attached: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// What `root()` reports (memory sampling tests set it).
+    pub root: Mutex<Option<Proc>>,
+}
+
+impl FakeDriver {
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+}
+
+impl Driver for FakeDriver {
+    fn send(&self, text: &str) -> Result<(), DriverError> {
+        self.record(format!("send:{text}"));
+        Ok(())
+    }
+    fn interrupt(&self) -> Result<(), DriverError> {
+        self.record("interrupt".into());
+        Ok(())
+    }
+    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError> {
+        if self.fail_answers.load(Ordering::SeqCst) {
+            return Err(DriverError::NoDialog("fake".into()));
+        }
+        self.record(format!("answer:{key}:{allow}"));
+        Ok(())
+    }
+    fn trust(&self, accept: bool) -> Result<(), DriverError> {
+        self.record(format!("trust:{accept}"));
+        Ok(())
+    }
+    fn dialog_open(&self) -> bool {
+        self.dialog.load(Ordering::SeqCst)
+    }
+    fn tail_transcript(&self, path: &Path, offset: u64) {
+        self.record(format!("tail:{}:{offset}", path.display()));
+    }
+    fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError> {
+        self.record(format!("attach:{rows}x{cols}"));
+        let (tx, rx) = mpsc::channel();
+        tx.send(b"live".to_vec()).unwrap();
+        *self.attached.lock().unwrap() = Some(tx);
+        Ok(Attachment { id: 1, initial: b"screen".to_vec(), output: rx, input: true })
+    }
+    fn input(&self, _attachment: u64, bytes: &[u8]) -> Result<(), DriverError> {
+        self.record(format!("input:{}", String::from_utf8_lossy(bytes)));
+        Ok(())
+    }
+    fn detach(&self, attachment: u64) {
+        self.record(format!("detach:{attachment}"));
+        self.attached.lock().unwrap().take();
+    }
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), DriverError> {
+        self.record(format!("resize:{rows}x{cols}"));
+        Ok(())
+    }
+    fn screen_tail(&self) -> String {
+        "fake screen".into()
+    }
+    fn stop(&self) {
+        self.record("stop".into());
+    }
+    fn session_started(&self) {
+        self.record("session_started".into());
+    }
+    fn root(&self) -> Option<Proc> {
+        *self.root.lock().unwrap()
+    }
+}
+
+/// Hands out one shared `FakeDriver` and keeps every sink and spawn request.
+#[derive(Default)]
+pub struct FakeFactory {
+    pub driver: Arc<FakeDriver>,
+    pub sinks: Mutex<Vec<Sink>>,
+    pub resumes: Mutex<Vec<Option<String>>>,
+    pub fail: AtomicBool,
+    /// When set, `spawn` fails with this error (e.g. `NativeGone`).
+    pub fail_with: Mutex<Option<DriverError>>,
+    /// When set, the next `spawn` reports on the first channel that it started, then blocks
+    /// until the second one yields (or closes).
+    pub spawn_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+}
+
+impl FakeFactory {
+    pub fn last_sink(&self) -> Sink {
+        self.sinks.lock().unwrap().last().cloned().expect("spawned")
+    }
+
+    pub fn emit(&self, event: DriverEvent) {
+        self.last_sink().emit(event);
+    }
+}
+
+impl DriverFactory for Arc<FakeFactory> {
+    fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
+        if let Some((entered, release)) = self.spawn_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+        self.resumes.lock().unwrap().push(req.resume.clone());
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(DriverError::Failed("spawn refused".into()));
+        }
+        if let Some(e) = self.fail_with.lock().unwrap().clone() {
+            return Err(e);
+        }
+        self.sinks.lock().unwrap().push(sink);
+        Ok(self.driver.clone())
+    }
+}
+```
+
+In `crates/mirante-daemon/src/hub/mod.rs`:
+
+1. Add `use std::sync::atomic::{AtomicBool, Ordering};` to the imports.
+2. In `impl From<HubError> for RpcError`, replace the arm `| HubError::Driver(DriverError::NoDialog(_)) => code::CONFLICT,` with:
+```rust
+            | HubError::Driver(DriverError::NoDialog(_) | DriverError::NotNow(_) | DriverError::NativeGone(_)) => {
+                code::CONFLICT
+            }
+```
+3. Add two fields at the end of `struct Live` (and `hold: Arc::default(), usage: None,` at the end of `Live::new`):
+```rust
+    /// The driver's hold flag ([`crate::driver::Sink::held`]): set while this session has a
+    /// pending permission request, so the driver types nothing.
+    pub(crate) hold: Arc<AtomicBool>,
+    /// Codex quota / token usage, as the driver last reported it.
+    pub(crate) usage: Option<String>,
+```
+4. In `State::view`, add `usage: live.and_then(|l| l.usage.clone()),` after the `detail` field.
+5. Add `sync_holds` above `publish`, and call it first thing in `publish`:
+```rust
+    /// Sets each live session's hold flag: held while it has a pending permission request
+    /// (typed text could answer that dialog).
+    pub(crate) fn sync_holds(&mut self) {
+        let State { store, live, .. } = self;
+        for (task_id, l) in live.iter() {
+            let held = store
+                .pending_permissions(task_id)
+                .map(|p| p.iter().any(|p| p.session_id == l.session_id))
+                .unwrap_or(true);
+            l.hold.store(held, Ordering::SeqCst);
+        }
+    }
+
+    /// Sends every event newer than `last_seq` to the subscribers, dropping closed ones.
+    /// Every hub mutation ends here, so the hold flags are brought up to date first.
+    pub(crate) fn publish(&mut self) {
+        self.sync_holds();
+        loop {
+            // … unchanged
+```
+
+In `crates/mirante-daemon/src/hub/session.rs`:
+
+1. Import `DriverError`: `use crate::driver::{Attachment, Driver, DriverError, DriverEvent, Sink, SpawnRequest};`
+2. In `State::handle`, add these arms right after the `DriverEvent::PermissionRequested` arm:
+```rust
+            DriverEvent::PermissionResolved { key } => {
+                let Some(l) = self.live.get(task_id) else {
+                    return Ok(());
+                };
+                let card = l.perm_keys.iter().find(|(_, k)| **k == key).map(|(id, _)| id.clone());
+                let Some(id) = card else {
+                    // Already answered through Mirante (its key was removed then).
+                    return Ok(());
+                };
+                let pending = self.store.pending_permissions(task_id)?.iter().any(|p| p.id == id);
+                if pending {
+                    self.settle_card(task_id, &id, PermissionStatus::Denied, "codex:request_resolved")?;
+                } else if let Some(l) = self.live.get_mut(task_id) {
+                    l.perm_keys.remove(&id);
+                }
+                Ok(())
+            }
+            DriverEvent::DeliveryAborted { text, reason } => {
+                if let Some(l) = self.live.get_mut(task_id) {
+                    if let Some(i) = l.steers.iter().rposition(|s| *s == text) {
+                        l.steers.remove(i);
+                    }
+                    l.queue.push_front(text.clone());
+                    l.delivery_in_flight = None;
+                }
+                self.event(Some(task_id), "message_requeued", json!({ "text": text, "reason": reason }))
+            }
+            DriverEvent::ResumeFailed { reason } => {
+                let payload = json!({
+                    "session_id": session_id,
+                    "reason": reason,
+                    "hint": "`mirante resume <task> --fresh` starts a new conversation",
+                });
+                self.event(Some(task_id), "resume_failed", payload)
+            }
+            DriverEvent::Usage(summary) => {
+                if let Some(l) = self.live.get_mut(task_id) {
+                    l.usage = Some(summary);
+                }
+                Ok(())
+            }
+```
+3. In `Hub::start_session`, create the sink inside the locked block (so `Live` gets its hold flag) and return it with the other values; the block now ends like this, and the old `let sink = Sink::new(&session_id, self.events.clone());` line after it is removed (the destructuring becomes `let (task, session_id, native, sink) = {`):
+```rust
+            let sink = Sink::new(&session.id, self.events.clone());
+            let mut live = Live::new(&session.id, task.agent, native.clone());
+            live.hold = sink.hold_flag();
+            if let Some(p) = req.prompt.filter(|p| !p.trim().is_empty()) {
+                live.queue.push_back(p);
+            }
+            st.live.insert(task.id.clone(), live);
+            st.publish();
+            (task, session.id, native, sink)
+        };
+```
+4. In the `Err(e)` arm of the spawn `match`, record a vanished native conversation before ending the session:
+```rust
+            Err(e) => {
+                let mut st = self.lock();
+                if let DriverError::NativeGone(reason) = &e {
+                    let payload = json!({
+                        "session_id": session_id,
+                        "reason": reason,
+                        "hint": "`mirante resume <task> --fresh` starts a new conversation",
+                    });
+                    st.event(Some(&task.id), "resume_failed", payload)?;
+                }
+                st.finish_session(&task.id, &session_id, "mirante:spawn_failed")?;
+                st.publish();
+                return Err(e.into());
+            }
+```
+5. In `Hub::apply_hook_envelope`, replace the generation fence and the native-id check that follows it with:
+```rust
+        // Generation fence: a hook stamped with an earlier Mirante session of this task (its
+        // Claude process outlived the session, or the hook was slow) must not touch the new
+        // one. Unstamped hooks (an older hook binary) are still applied.
+        if let Some(stale) = stamped.as_ref().filter(|s| **s != session_id) {
+            let payload = json!({ "hook": ev.hook_event_name, "session": stale, "live_session": session_id });
+            st.event(Some(&p.task), "hook_stale", payload)?;
+            st.publish();
+            return Ok(());
+        }
+        if ev.hook_event_name == "SessionStart" {
+            if let Some(d) = live.driver.clone() {
+                d.session_started();
+            }
+        }
+        // Stamped with this very Mirante session: Claude's own session id may change under
+        // it (`/clear`, a resume that forks), so the hook's id is adopted, never dropped.
+        if stamped.is_some() {
+            if let Some(sid) = &ev.session_id {
+                st.set_native_id(&p.task, &session_id, sid)?;
+            }
+        } else if ev.hook_event_name != "SessionStart" {
+            if let (Some(known), Some(sid)) = (native.as_deref(), ev.session_id.as_deref()) {
+                if known != sid {
+                    let payload = json!({ "hook": ev.hook_event_name, "session_id": sid, "native_id": known });
+                    st.event(Some(&p.task), "hook_orphan", payload)?;
+                    st.publish();
+                    return Ok(());
+                }
+            }
+        }
+```
+In `crates/mirante-ipc/src/types.rs`, add the field at the end of `TaskView`, and `usage: None,` to the `TaskView` literal in `task_view_flattens_the_task`:
+```rust
+    /// Codex quota / token usage while live, e.g. "5h 42% · week 9% · 31k tokens".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+```
+
+In `crates/mirante-cli/src/render.rs`, replace everything above the test module with:
+```rust
+//! Plain-text tables. Colors only on a terminal (`color` = stdout is a tty).
+use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
+use mirante_ipc::types::{BootState, PermissionView, TaskView};
+
+/// Last 8 characters of an id (UUID v7 prefixes are time-based and collide; suffixes do not).
+pub fn short(id: &str) -> &str {
+    let mut start = id.len().saturating_sub(8);
+    while !id.is_char_boundary(start) {
+        start += 1;
+    }
+    &id[start..]
+}
+
+/// `s` cut to `width` characters (with `…`) and padded.
+pub fn fit(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n > width {
+        let cut: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        format!("{s}{}", " ".repeat(width - n))
+    }
+}
+
+pub fn status_label(s: Status) -> &'static str {
+    s.as_str()
+}
+
+/// The approval mode Mirante runs each agent in (fixed per agent; never a bypass mode).
+pub fn mode_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "manual",
+        AgentKind::Codex => "auto-edits",
+    }
+}
+
+/// What the mode means, for `mirante show`.
+pub fn mode_help(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "Claude asks before every tool that needs permission (--permission-mode manual)",
+        AgentKind::Codex => {
+            "edits and commands inside the worktree run without asking (sandbox workspace-write); \
+             anything beyond it asks you (approvalPolicy on-request, approvalsReviewer user)"
+        }
+    }
+}
+
+fn paint(s: Status, text: &str, color: bool) -> String {
+    if !color {
+        return text.to_string();
+    }
+    let code = match s {
+        Status::Working => "33",
+        Status::NeedsYou => "1;31",
+        Status::Idle => "32",
+        Status::Ended => "2",
+    };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn note(v: &TaskView) -> String {
+    let state = match (v.boot, &v.detail) {
+        _ if v.task.lifecycle == Lifecycle::Archiving => Some("archiving".to_string()),
+        (Some(BootState::TrustPrompt), _) => Some("trust prompt: mirante resume / attach".to_string()),
+        (Some(BootState::Booting), _) => Some("starting".to_string()),
+        (_, Some(d)) => Some(d.clone()),
+        _ => None,
+    };
+    state.into_iter().chain(v.usage.clone()).collect::<Vec<_>>().join(" · ")
+}
+
+pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
+    if tasks.is_empty() {
+        return "no tasks (mirante new <repo> --agent claude|codex --branch <name> <goal>)\n".into();
+    }
+    let mut out = format!(
+        "{}  {}  {}  {}  {}  {}  {}  {}\n",
+        fit("ID", 8),
+        fit("BRANCH", 22),
+        fit("AGENT", 6),
+        fit("MODE", 10),
+        fit("STATUS", 9),
+        fit("NEEDS", 5),
+        fit("Q", 2),
+        "TITLE"
+    );
+    for v in tasks {
+        let needs = if v.needs_you > 0 { v.needs_you.to_string() } else { String::new() };
+        let queued = if v.queued > 0 { v.queued.to_string() } else { String::new() };
+        let note = note(v);
+        let title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
+        out.push_str(&format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}\n",
+            fit(short(&v.task.id), 8),
+            fit(&v.task.branch, 22),
+            fit(v.task.agent.as_str(), 6),
+            fit(mode_label(v.task.agent), 10),
+            paint(v.task.status, &fit(status_label(v.task.status), 9), color),
+            fit(&needs, 5),
+            fit(&queued, 2),
+            title
+        ));
+    }
+    out
+}
+
+pub fn perms_table(perms: &[PermissionView]) -> String {
+    if perms.is_empty() {
+        return "no pending permission requests\n".into();
+    }
+    let mut out = format!("{}  {}  {}  {}\n", fit("PERM", 8), fit("TASK", 22), fit("TOOL", 10), "DETAIL");
+    for p in perms {
+        out.push_str(&format!(
+            "{}  {}  {}  {}\n",
+            fit(short(&p.request.id), 8),
+            fit(&p.branch, 22),
+            fit(&p.request.tool, 10),
+            p.request.detail.lines().next().unwrap_or("")
+        ));
+    }
+    out.push_str("answer once: mirante allow <perm> | mirante deny <perm>\n");
+    out
+}
+
+pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
+    let t = &v.task;
+    let mut out = format!(
+        "{}  {}\n  id:        {}\n  agent:     {}\n  status:    {}{}\n  lifecycle: {}\n  branch:    {}\n  worktree:  {}\n  repo:      {}\n  goal:      {}\n",
+        short(&t.id),
+        t.title,
+        t.id,
+        t.agent.as_str(),
+        t.status.as_str(),
+        if note(v).is_empty() { String::new() } else { format!(" [{}]", note(v)) },
+        t.lifecycle.as_str(),
+        t.branch,
+        t.worktree_path,
+        t.repo_path,
+        t.goal.lines().next().unwrap_or("")
+    );
+    out.push_str(&format!("  mode:      {} ({})\n", mode_label(t.agent), mode_help(t.agent)));
+    out.push_str(&format!("  live:      {}  queued: {}\n", v.live, v.queued));
+    for p in perms {
+        out.push_str(&format!("  needs you: {} {} {}\n", short(&p.id), p.tool, p.detail));
+    }
+    out
+}
+```
+
+In `crates/mirante-cli/src/args.rs`: in `USAGE`, replace the `resume` entry with
+```
+  resume <task> [--trust] [--fresh]
+                         restart the agent on its native session (context kept);
+                         --fresh starts a new conversation instead (your explicit choice)
+```
+add `fresh: bool,` to `Cmd::Resume`, and parse it:
+```rust
+        "resume" => {
+            let p = split(rest, none, &["--trust", "--fresh"])?;
+            let has = |f: &str| p.bools.iter().any(|b| b == f);
+            Ok(Cmd::Resume { task: one(&p, "task")?, trust: has("--trust"), fresh: has("--fresh") })
+        }
+```
+In `crates/mirante-cli/src/main.rs`, in `boot_flow` add this arm before the plain `BootState::Exited` arm:
+```rust
+            BootState::Exited if r.resumed => {
+                return Err(format!(
+                    "the agent exited right after resuming (its conversation may be gone):\n{}\n\
+                     `mirante resume {id} --fresh` starts a new conversation",
+                    r.screen
+                )
+                .into())
+            }
+```
+and replace the `Cmd::Resume { task, trust }` arm of `run` with the two arms below (the second keeps the old body):
+```rust
+        Cmd::Resume { task, trust, fresh: true } => {
+            let mut c = client(&paths)?;
+            let r: StartResult = c.call(method::SESSION_START, StartSession { task, prompt: None })?;
+            println!("starting a fresh conversation (the earlier one is not resumed)");
+            boot_flow(&mut c, r, trust)?;
+        }
+        Cmd::Resume { task, trust, fresh: false } => {
+            let mut c = client(&paths)?;
+            let r: StartResult = c.call(method::SESSION_RESUME, StartSession { task, prompt: None })?;
+            // … unchanged
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `cargo test -p mirante-daemon -p mirante-ipc -p mirante-cli`
+
+Expected (one line per test target, in this order; each line also ends with `; finished in …`):
+```
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+(mirante-cli lib, `mirante` bin, mirante-daemon lib, daemon bin, `daemon_signals`, mirante-ipc, then the three doc-test targets.) No compiler warnings.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/mirante-daemon crates/mirante-ipc crates/mirante-cli
+git commit -F - <<'EOF'
+feat(daemon): driver interface v2, process-tree kill, hold flag, resolved/aborted/usage events
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+### Task 14: PTY process, terminal queries, screen reading, paste sanitizing
+
+**Files:**
+- Modify: `crates/mirante-daemon/src/driver/mod.rs` (module list)
+- Create: `crates/mirante-daemon/src/driver/termq.rs`
+- Create: `crates/mirante-daemon/src/driver/paste.rs`
+- Create: `crates/mirante-daemon/src/driver/screen.rs`
+- Create: `crates/mirante-daemon/src/driver/pty.rs`
+
+The building blocks of the Claude driver (Task 15). Decisions, stated plainly:
+
+- **Terminal queries are answered by the daemon, always** (`termq.rs`). Claude Code stalls until its cursor-position query (`ESC[6n`) is answered (Week-1 spike); it may also ask for device attributes (`ESC[c`), status (`ESC[5n`) and the foreground/background colors (OSC 10/11 `?`). The daemon answers every one of them, attached or not, and strips them from the bytes attached clients receive, so a client terminal never answers a second time (a second answer would arrive in Claude as typed input). The parser keeps state across reads: a query split between two chunks is held back (only while the held bytes are still a prefix of a known query, so at most 7 bytes) and completed by the next chunk; everything else passes through byte for byte, including bytes that are not UTF-8. Answers are written in stream order, so a CPR answer reports the cursor as it is right after the bytes before the query.
+- **The agent is a process-group leader** (portable-pty calls `setsid` in the child). `PtyProcess::root()` is the child's `Proc` (pid + start time, Task 13) captured at spawn; `kill_tree` ends the group and every descendant through `proctree::kill_tree` (SIGTERM, grace, SIGKILL, verify). Dropping a `PtyProcess` does a short `kill_tree` and reaps the child.
+- **Attach repaints the full terminal state**: vt100 `state_formatted()` (screen contents plus input modes: bracketed paste, application cursor keys, mouse, cursor visibility), so a client attaching mid-session types into the same modes the agent set. `PtyProcess::attach` takes the fan-out lock before reading the mirror (the reader holds the same lock while mirroring and sending a chunk): the repaint and the first live bytes neither overlap nor leave a gap.
+- **Screen reading** (`screen.rs`) is used only for UI actions, never for status (spec §2.2). A live dialog sits in the bottom rows and ends with a key-hint footer, so only the last 20 non-blank rows are searched and a footer is required: a permission dialog is a `Do you want to …?` header, a `1.` option and an `Esc to …` footer below it; the trust dialog is an option labelled exactly "Yes, I trust this folder" with a footer (`Esc to …` / `Enter to confirm`) below it. The same words in the conversation above (quoted dialogs, prose questions) never count. `has_any_dialog` also blocks typing for dialogs Mirante does not know (plan approval, pickers): a `❯ N.` option with a footer. FINDINGS rule 6 is unchanged: only an exact "Yes" / "No" label below the live header is ever chosen; plan approval ("Yes, and auto-accept edits", …) has no plain "Yes" and is never answered by Mirante.
+- **Messages are sanitized and pasted** (`paste.rs`): one bracketed paste (`ESC[200~` … `ESC[201~`), so a newline no longer submits early and multi-line messages work. Before framing, every terminal control is removed: CRLF / CR become LF, CSI / OSC / other escape sequences are dropped whole (a smuggled `ESC[201~` cannot end the paste early), C0 controls except LF and TAB, DEL and C1 controls are dropped, TAB becomes 4 spaces; all other characters (accents, emoji) are kept. Two prefixes are special and this is the rule: a message starting with `/` is a Claude slash command and is typed as plain keystrokes (sanitized, one line only, otherwise refused) so Claude runs it as the command the user wrote; a message starting with `!` would run a shell command in Claude's bash mode with no permission prompt, so Mirante refuses it ("attach and type it yourself").
+
+- [ ] **Step 1: Write the failing tests**
+
+In `crates/mirante-daemon/src/driver/mod.rs`, replace the module list with:
+```rust
+#[cfg(test)]
+pub mod fake;
+pub mod paste;
+pub mod proctree;
+pub mod pty;
+pub mod real;
+pub mod screen;
+pub mod termq;
+```
+
+`crates/mirante-daemon/src/driver/termq.rs` (only the test module for now):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(p: &[Piece]) -> Vec<u8> {
+        p.iter()
+            .flat_map(|p| match p {
+                Piece::Bytes(b) => b.clone(),
+                Piece::Query(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queries_are_split_out_in_stream_order() {
+        let mut t = TermQueries::default();
+        let p = t.feed(b"ab\x1b[6ncd\x1b[c\x1b[0c\x1b[5n");
+        assert_eq!(
+            p,
+            vec![
+                Piece::Bytes(b"ab".to_vec()),
+                Piece::Query(Query::CursorPosition),
+                Piece::Bytes(b"cd".to_vec()),
+                Piece::Query(Query::DeviceAttributes),
+                Piece::Query(Query::DeviceAttributes),
+                Piece::Query(Query::Status),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_split_across_reads_is_completed() {
+        let mut t = TermQueries::default();
+        assert_eq!(t.feed(b"x\x1b["), vec![Piece::Bytes(b"x".to_vec())]);
+        assert_eq!(t.feed(b"6"), vec![]);
+        assert_eq!(t.feed(b"ny"), vec![Piece::Query(Query::CursorPosition), Piece::Bytes(b"y".to_vec())]);
+        assert_eq!(t.feed(b"\x1b]1"), vec![]);
+        assert_eq!(t.feed(b"1;?\x1b"), vec![]);
+        assert_eq!(t.feed(b"\\"), vec![Piece::Query(Query::Background { bel: false })]);
+    }
+
+    #[test]
+    fn osc_color_queries_with_bel_and_st() {
+        let mut t = TermQueries::default();
+        let p = t.feed(b"\x1b]10;?\x07\x1b]11;?\x1b\\");
+        assert_eq!(
+            p,
+            vec![Piece::Query(Query::Foreground { bel: true }), Piece::Query(Query::Background { bel: false })]
+        );
+        assert_eq!(answer(Query::Foreground { bel: true }, (0, 0)), b"\x1b]10;rgb:ffff/ffff/ffff\x07");
+        assert_eq!(answer(Query::Background { bel: false }, (0, 0)), b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+        assert_eq!(answer(Query::CursorPosition, (4, 9)), b"\x1b[5;10R");
+    }
+
+    #[test]
+    fn other_sequences_pass_through_untouched() {
+        let mut t = TermQueries::default();
+        let input = b"\x1b[2J\x1b[1;31mred\x1b[0m\x1b]0;title\x07\x1b[6;5n\x1b[?2004h\x1b]8;;http://x\x1b\\";
+        let p = t.feed(input);
+        assert_eq!(bytes(&p), input.to_vec());
+        assert!(p.iter().all(|p| matches!(p, Piece::Bytes(_))));
+    }
+
+    #[test]
+    fn a_held_prefix_that_is_no_query_passes_through_with_the_next_chunk() {
+        let mut t = TermQueries::default();
+        assert_eq!(t.feed(b"\x1b]1"), vec![]);
+        assert_eq!(bytes(&t.feed(b"2;?\x07")), b"\x1b]12;?\x07".to_vec());
+        // At the end of the stream an unfinished prefix is returned as-is.
+        t.feed(b"\x1b[");
+        assert_eq!(t.flush(), b"\x1b[".to_vec());
+        assert_eq!(t.flush(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn bytes_without_escape_are_unchanged_whatever_they_are() {
+        let mut t = TermQueries::default();
+        let data: Vec<u8> = (0..=255u8).filter(|b| *b != 0x1b).cycle().take(5000).collect();
+        let mut got = Vec::new();
+        for chunk in data.chunks(333) {
+            got.extend(bytes(&t.feed(chunk)));
+        }
+        assert_eq!(got, data);
+    }
+}
+```
+
+`crates/mirante-daemon/src/driver/paste.rs` (only the test module for now):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controls_and_smuggled_paste_end_are_removed_newlines_and_emoji_kept() {
+        let framed = bracketed("a\r\nb\x1b[201~c\td\x00e🙂");
+        assert_eq!(framed, "\x1b[200~a\nbc    de🙂\x1b[201~".as_bytes());
+    }
+
+    #[test]
+    fn every_kind_of_control_is_dropped() {
+        assert_eq!(sanitize_for_pty("x\ry"), "x\ny");
+        assert_eq!(sanitize_for_pty("t\x1b]0;title\x07u\x1b]8;;http://e\x1b\\v"), "tuv");
+        assert_eq!(sanitize_for_pty("p\x1bPq data\x1b\\r"), "pr");
+        assert_eq!(sanitize_for_pty("a\x1bcb\x1b"), "ab");
+        assert_eq!(sanitize_for_pty("1\u{9b}2\u{85}3\x7f4\x085"), "12345");
+        assert_eq!(sanitize_for_pty("ação ✓ 日本"), "ação ✓ 日本");
+    }
+
+    #[test]
+    fn slash_commands_are_keystrokes_and_bang_is_refused() {
+        assert_eq!(typed_message("  /compact keep the plan\n").unwrap(), b"/compact keep the plan".to_vec());
+        assert!(typed_message("/compact\nmore").unwrap_err().contains("one line"));
+        assert!(typed_message("!rm -rf build").unwrap_err().contains("attach and type it yourself"));
+        assert!(typed_message("\x1b[31m\x00").unwrap_err().contains("empty"));
+        assert_eq!(typed_message("use tabs\nthen test").unwrap(), b"\x1b[200~use tabs\nthen test\x1b[201~".to_vec());
+    }
 }
 ```
 
@@ -7031,6 +8384,18 @@ mod tests {
    2. Yes, allow all edits during this session
    3. No
  Esc to cancel";
+    const TRUST: &str = "\
+ Do you trust the files in this folder?
+ /Users/u/.mirante/worktrees/app/feat
+ ❯ 1. No, exit
+   2. Yes, I trust this folder
+ Enter to confirm · Esc to exit";
+    const PLAN: &str = "\
+ Would you like to proceed?
+ ❯ 1. Yes, and auto-accept edits
+   2. Yes, and manually approve edits
+   3. No, keep planning
+ ctrl-g to edit in editor · Esc to cancel";
 
     #[test]
     fn exact_one_time_options_only() {
@@ -7048,13 +8413,42 @@ mod tests {
     }
 
     #[test]
-    fn dialogs_and_readiness() {
+    fn dialogs_need_a_footer_in_the_bottom_rows() {
         assert!(has_permission_prompt(DIALOG) && has_permission_prompt(EDIT_DIALOG));
         assert!(!has_permission_prompt(IDLE));
-        assert!(!has_permission_prompt("Do you want to proceed?\nsure"));
-        assert!(is_ready(IDLE));
-        assert!(!is_ready("Do you trust the files in this folder?\n❯ 1. No, exit\n  2. Yes, I trust this folder"));
-        assert!(is_trust_dialog("  2. Yes, I trust this folder"));
+        // Prose that asks the same question is not a dialog: no footer.
+        assert!(!has_permission_prompt("Do you want to proceed?\n1. Yes\n2. No\n❯ "));
+        // A real dialog scrolled up above the bottom rows is history, not a live dialog.
+        let scrolled = format!("{DIALOG}\n{}❯\n  ⏸ manual mode on", "output line\n".repeat(BOTTOM_ROWS));
+        assert!(!has_permission_prompt(&scrolled) && !dialog_open(&scrolled));
+    }
+
+    #[test]
+    fn the_trust_dialog_is_the_exact_option_with_a_footer() {
+        assert!(is_trust_dialog(TRUST));
+        assert_eq!(trust_key(TRUST), Some('2'));
+        assert!(dialog_open(TRUST));
+        // The question quoted in the conversation is not the dialog.
+        let prose = "❯ Do you trust the files in this folder? asked the README\n  Yes, I trust this folder\n❯ \n  ⏸ manual mode on";
+        assert!(!is_trust_dialog(prose));
+        // Without a footer below the option there is no live dialog.
+        assert!(!is_trust_dialog(" ❯ 1. No, exit\n   2. Yes, I trust this folder"));
+    }
+
+    #[test]
+    fn plan_approval_has_no_plain_yes_but_still_blocks_typing() {
+        assert_eq!(option_key(PLAN, "Yes"), None);
+        assert!(!has_permission_prompt(PLAN));
+        assert!(has_any_dialog(PLAN) && dialog_open(PLAN));
+    }
+
+    #[test]
+    fn the_input_prompt_and_the_ready_fast_path() {
+        assert!(has_input_prompt(IDLE) && has_manual_mode_footer(IDLE));
+        assert!(!dialog_open(IDLE));
+        assert!(has_input_prompt("> \n"));
+        assert!(!has_input_prompt(" ❯ 1. Yes\n Esc to cancel"));
+        assert!(!has_manual_mode_footer(TRUST));
     }
 
     #[test]
@@ -7064,7 +8458,7 @@ mod tests {
         assert!(dialog_matches(EDIT_DIALOG, "/Users/u/.mirante/worktrees/app/feat/src/main.rs"));
         assert!(dialog_matches(DIALOG, ""));
         assert!(!dialog_matches(IDLE, "touch s3-denied.txt"));
-        let wrapped = "Bash command\n  cargo test --workspace --all-\n  features -- --nocapture\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        let wrapped = "Bash command\n  cargo test --workspace --all-\n  features -- --nocapture\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
         assert!(dialog_matches(wrapped, "cargo test --workspace --all-features -- --nocapture"));
     }
 
@@ -7113,14 +8507,24 @@ mod tests {
     }
 
     #[test]
-    fn cursor_position_queries_are_answered_while_detached() {
+    fn queries_are_answered_while_attached_and_never_reach_the_client() {
         // `stty raw -echo` so the reply reaches `dd` byte for byte.
         let p = PtyProcess::spawn(
-            &sh("stty raw -echo; printf 'ab\\033[6n'; r=$(dd bs=1 count=6 2>/dev/null); printf '\\r\\nreply:%s' \"$r\" | tr '\\033' 'E'"),
+            &sh("stty raw -echo; printf 'R\\r\\n'; dd bs=1 count=1 >/dev/null 2>&1; printf 'ab\\033[6n'; \
+                 r=$(dd bs=1 count=6 2>/dev/null); printf '\\r\\nreply:%s' \"$r\" | tr '\\033' 'E'; sleep 5"),
             |_| {},
         )
         .unwrap();
-        wait_for("reply", || p.grid().contains("reply:E[1;3R"));
+        wait_for("raw mode", || p.grid().contains('R'));
+        let (_, _initial, rx) = p.attach();
+        p.write(b"g").unwrap();
+        wait_for("reply", || p.grid().contains("reply:E[2;3R"));
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("reply:") {
+            seen.extend(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert!(!seen.windows(4).any(|w| w == b"\x1b[6n"), "{:?}", String::from_utf8_lossy(&seen));
+        assert!(String::from_utf8_lossy(&seen).contains("ab"));
     }
 
     #[test]
@@ -7136,13 +8540,27 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_process_kills_it_and_resize_reaches_the_grid() {
-        let p = PtyProcess::spawn(&sh("sleep 30"), |_| {}).unwrap();
+    fn the_repaint_restores_input_modes() {
+        let p = PtyProcess::spawn(&sh("printf '\\033[?2004hhello'; sleep 5"), |_| {}).unwrap();
+        wait_for("hello", || p.grid().contains("hello"));
+        let (_, initial, _rx) = p.attach();
+        let text = String::from_utf8_lossy(&initial);
+        assert!(text.contains("hello") && text.contains("\x1b[?2004h"), "{text:?}");
+    }
+
+    #[test]
+    fn dropping_the_process_ends_its_tree_and_resize_reaches_the_grid() {
+        let p = PtyProcess::spawn(&sh("sleep 30 & sleep 30"), |_| {}).unwrap();
+        let root = p.root().expect("root process");
+        wait_for("the background child", || !proctree::descendants(root).is_empty());
+        let kids = proctree::descendants(root);
         p.resize(30, 100).unwrap();
         assert_eq!(p.parser.lock().unwrap().screen().size(), (nz(30), nz(100)));
         let started = Instant::now();
         drop(p);
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!proctree::alive(root));
+        assert!(kids.iter().all(|k| !proctree::alive(*k)), "{kids:?}");
     }
 }
 ```
@@ -7158,52 +8576,348 @@ error[E0425]: cannot find type `PtySpec` in this scope
 
 - [ ] **Step 3: Implement**
 
+Add above the test module in `crates/mirante-daemon/src/driver/termq.rs`:
+```rust
+//! Terminal queries in the agent's output, answered by the daemon. A TUI asks its terminal
+//! for the cursor position (CPR `ESC[6n`), device attributes (DA1 `ESC[c`), status (DSR
+//! `ESC[5n`) and colors (OSC 10/11 `?`); Claude Code stalls until CPR is answered (Week-1
+//! spike). The daemon always answers (attached or not) and strips the queries from what
+//! attached clients get, so a client terminal never answers a second time (a second reply
+//! would arrive as typed input).
+//!
+//! The parser keeps state across reads: a query split between two chunks (`ESC[` then
+//! `6n`) is held back and completed with the next chunk. Only bytes that are still a prefix
+//! of a known query are held (at most 7); everything else passes through byte for byte.
+
+/// A query the agent sent to its terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Query {
+    /// `ESC[6n`: where is the cursor?
+    CursorPosition,
+    /// `ESC[c` / `ESC[0c`: what kind of terminal is this?
+    DeviceAttributes,
+    /// `ESC[5n`: are you OK?
+    Status,
+    /// `ESC]10;?`: the foreground color. `bel`: terminated by BEL (else by ST).
+    Foreground { bel: bool },
+    /// `ESC]11;?`: the background color.
+    Background { bel: bool },
+}
+
+/// Output split into what passes through and the queries, in stream order (a CPR answer
+/// needs the cursor as it is after the bytes before the query).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    Bytes(Vec<u8>),
+    Query(Query),
+}
+
+const QUERIES: [(&[u8], Query); 8] = [
+    (b"\x1b[6n", Query::CursorPosition),
+    (b"\x1b[c", Query::DeviceAttributes),
+    (b"\x1b[0c", Query::DeviceAttributes),
+    (b"\x1b[5n", Query::Status),
+    (b"\x1b]10;?\x07", Query::Foreground { bel: true }),
+    (b"\x1b]10;?\x1b\\", Query::Foreground { bel: false }),
+    (b"\x1b]11;?\x07", Query::Background { bel: true }),
+    (b"\x1b]11;?\x1b\\", Query::Background { bel: false }),
+];
+
+/// What a partial match at the end of the input could still become.
+enum Match {
+    Full(Query, usize),
+    Prefix,
+    No,
+}
+
+fn match_at(buf: &[u8]) -> Match {
+    let mut prefix = false;
+    for (pat, q) in QUERIES {
+        if buf.len() >= pat.len() {
+            if &buf[..pat.len()] == pat {
+                return Match::Full(q, pat.len());
+            }
+        } else if pat.starts_with(buf) {
+            prefix = true;
+        }
+    }
+    if prefix {
+        Match::Prefix
+    } else {
+        Match::No
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TermQueries {
+    held: Vec<u8>,
+}
+
+impl TermQueries {
+    /// Splits one chunk of output (plus whatever was held from the previous one).
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Piece> {
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        let mut plain = Vec::new();
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i] != 0x1b {
+                plain.push(buf[i]);
+                i += 1;
+                continue;
+            }
+            match match_at(&buf[i..]) {
+                Match::Full(q, len) => {
+                    if !plain.is_empty() {
+                        out.push(Piece::Bytes(std::mem::take(&mut plain)));
+                    }
+                    out.push(Piece::Query(q));
+                    i += len;
+                }
+                Match::Prefix => {
+                    // Only reachable at the end of the input: wait for the next chunk.
+                    self.held = buf[i..].to_vec();
+                    break;
+                }
+                Match::No => {
+                    plain.push(0x1b);
+                    i += 1;
+                }
+            }
+        }
+        if !plain.is_empty() {
+            out.push(Piece::Bytes(plain));
+        }
+        out
+    }
+
+    /// Bytes held back at the end of the stream (an unfinished query prefix), as-is.
+    pub fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// The reply a terminal would send. `cursor` is (row, col), 0-based.
+pub fn answer(q: Query, cursor: (u16, u16)) -> Vec<u8> {
+    let st = |bel: bool| if bel { "\x07" } else { "\x1b\\" };
+    match q {
+        Query::CursorPosition => format!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1).into_bytes(),
+        // A VT100 with advanced video: the plainest answer every TUI accepts.
+        Query::DeviceAttributes => b"\x1b[?1;2c".to_vec(),
+        Query::Status => b"\x1b[0n".to_vec(),
+        Query::Foreground { bel } => format!("\x1b]10;rgb:ffff/ffff/ffff{}", st(bel)).into_bytes(),
+        Query::Background { bel } => format!("\x1b]11;rgb:0000/0000/0000{}", st(bel)).into_bytes(),
+    }
+}
+```
+
+Add above the test module in `crates/mirante-daemon/src/driver/paste.rs`:
+```rust
+//! Turning a user's message into the bytes typed into Claude Code's input box.
+//!
+//! A message is sent as one bracketed paste (`ESC[200~` … `ESC[201~`), so newlines stay
+//! inside the message instead of submitting it early, and the text is sanitized first:
+//! nothing in it can act as a terminal control (no escape sequences, so a smuggled
+//! `ESC[201~` cannot end the paste early; no control characters). Two prefixes are special:
+//! - `/…` is a Claude slash command. It is typed as plain keystrokes (no paste) so Claude
+//!   runs it as the command the user wrote. It must be one line.
+//! - `!…` is Claude's bash mode, which runs a shell command with no permission prompt.
+//!   Mirante refuses it: a relayed message must never run a shell command unasked; the user
+//!   attaches and types it.
+
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// The text with every terminal control removed: CRLF and lone CR become LF; CSI, OSC and
+/// other escape sequences are dropped whole; C0 controls except LF and TAB, DEL and C1
+/// controls (U+0080–U+009F) are dropped; TAB becomes 4 spaces. All other characters,
+/// including non-ASCII and emoji, are kept.
+pub fn sanitize_for_pty(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            '\x1b' => match chars.next() {
+                // CSI: parameters and intermediates up to a final byte @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC, DCS, SOS, PM, APC: a string up to BEL or ST (ESC \).
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Any other escape: ESC plus one character.
+                _ => {}
+            },
+            c if (c as u32) < 0x20 || c == '\x7f' => {}
+            c if (0x80..=0x9f).contains(&(c as u32)) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `text` sanitized and framed as one bracketed paste.
+pub fn bracketed(text: &str) -> Vec<u8> {
+    let mut out = PASTE_START.to_vec();
+    out.extend_from_slice(sanitize_for_pty(text).as_bytes());
+    out.extend_from_slice(PASTE_END);
+    out
+}
+
+/// The bytes to type for a message (Enter is sent separately), or why it is refused.
+pub fn typed_message(text: &str) -> Result<Vec<u8>, String> {
+    let clean = sanitize_for_pty(text);
+    let lead = clean.trim_start();
+    if lead.trim().is_empty() {
+        return Err("the message is empty once control characters are removed".into());
+    }
+    if lead.starts_with('!') {
+        return Err("a message starting with `!` would run a shell command in Claude's bash mode without a \
+                    permission prompt; Mirante does not send it (attach and type it yourself)"
+            .into());
+    }
+    if lead.starts_with('/') {
+        let line = lead.trim_end();
+        if line.contains('\n') {
+            return Err("a slash command must be one line".into());
+        }
+        return Ok(line.as_bytes().to_vec());
+    }
+    Ok(bracketed(text))
+}
+```
+
 Add above the test module in `crates/mirante-daemon/src/driver/screen.rs`:
 ```rust
 //! Reading Claude Code's TUI (2.1.285) off the emulated screen. Used ONLY for UI actions
 //! (which key answers this dialog, is a dialog in the way of typed text, is the trust
-//! prompt up, is the input box ready). Status never comes from here: it comes from hooks
+//! prompt up, is the input box there). Status never comes from here: it comes from hooks
 //! and the transcript (`mirante_core::status`). Dialog matching ported from
 //! `spike_kit::screen`, whose fixtures are real 2.1.285 grids.
+//!
+//! Live dialogs sit at the bottom of the screen and end with a key-hint footer ("Esc to
+//! cancel", "Enter to confirm · Esc to exit"). Only the last [`BOTTOM_ROWS`] non-blank
+//! rows are searched and a footer is required, so the same words in the conversation above
+//! (a quoted dialog, prose asking "Do you want to …?") never count as a dialog.
 
-/// Index of the last permission dialog: a `Do you want to …?` line followed later by a
-/// numbered `1.` option line.
+/// How many non-blank rows at the bottom of the screen a live dialog can occupy.
+pub const BOTTOM_ROWS: usize = 20;
+
+/// The last [`BOTTOM_ROWS`] non-blank lines of the screen.
+fn bottom(grid: &str) -> Vec<&str> {
+    let lines: Vec<&str> = grid.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(BOTTOM_ROWS)..].to_vec()
+}
+
+fn is_footer(l: &str) -> bool {
+    l.contains("Esc to")
+}
+
+/// `(digit, label)` of a numbered option line (`❯ 1. Yes`, `  2. No`).
+fn option(l: &str) -> Option<(char, &str)> {
+    let t = l.trim().trim_start_matches('❯').trim();
+    let (num, rest) = t.split_once(". ")?;
+    let digit = num.parse::<u8>().ok().filter(|d| (1..10).contains(d))?;
+    Some((char::from(b'0' + digit), rest.trim()))
+}
+
+/// In the bottom rows: the index of the last permission-dialog header (`Do you want to …?`)
+/// that is followed by a `1.` option and then a footer.
 fn dialog_start(lines: &[&str]) -> Option<usize> {
-    let is_option_one = |l: &str| l.trim_start().trim_start_matches('❯').trim_start().starts_with("1. ");
-    (0..lines.len()).rev().find(|&i| {
+    let footer = lines.iter().rposition(|l| is_footer(l))?;
+    (0..footer).rev().find(|&i| {
         let t = lines[i].trim();
-        t.starts_with("Do you want to") && t.ends_with('?') && lines[i + 1..].iter().any(|l| is_option_one(l))
+        t.starts_with("Do you want to")
+            && t.ends_with('?')
+            && lines[i + 1..footer].iter().any(|l| option(l).is_some_and(|(d, _)| d == '1'))
     })
 }
 
+/// A permission dialog is open at the bottom of the screen.
 pub fn has_permission_prompt(grid: &str) -> bool {
-    let lines: Vec<&str> = grid.lines().collect();
-    dialog_start(&lines).is_some()
+    dialog_start(&bottom(grid)).is_some()
 }
 
-/// The digit of the live dialog's option whose label is exactly `label` ("Yes" / "No").
-/// Only lines below the dialog header count, and only an exact label matches, so
-/// "Yes, and always allow …" and "Yes, and switch to auto mode …" are never chosen.
+/// Any selection dialog at the bottom of the screen: an option list with the cursor on an
+/// option (`❯ N.`) and a footer below it. Covers dialogs Mirante does not know (plan
+/// approval, model pickers): typed text must never land in one.
+pub fn has_any_dialog(grid: &str) -> bool {
+    let lines = bottom(grid);
+    let Some(footer) = lines.iter().rposition(|l| is_footer(l) || l.contains("Enter to confirm")) else {
+        return false;
+    };
+    lines[..footer].iter().any(|l| l.trim_start().starts_with('❯') && option(l).is_some())
+}
+
+/// The digit of the live permission dialog's option whose label is exactly `label`
+/// ("Yes" / "No"). Only options below the dialog header and above its footer count, and
+/// only an exact label matches, so "Yes, and always allow …" and "Yes, and switch to auto
+/// mode …" are never chosen (FINDINGS rule 6).
 pub fn option_key(grid: &str, label: &str) -> Option<char> {
-    let lines: Vec<&str> = grid.lines().collect();
+    let lines = bottom(grid);
     let start = dialog_start(&lines)?;
-    lines[start + 1..].iter().find_map(|l| {
-        let t = l.trim().trim_start_matches('❯').trim();
-        let (num, rest) = t.split_once(". ")?;
-        let digit = num.parse::<u8>().ok().filter(|d| *d < 10)?;
-        (rest.trim() == label).then(|| char::from(b'0' + digit))
+    let footer = lines.iter().rposition(|l| is_footer(l))?;
+    lines[start + 1..footer].iter().find_map(|l| option(l).filter(|(_, t)| *t == label).map(|(d, _)| d))
+}
+
+pub const TRUST_YES: &str = "Yes, I trust this folder";
+
+/// The digit of the trust dialog's exact "Yes, I trust this folder" option, when the
+/// dialog is live: that option and a key-hint footer below it in the bottom rows.
+pub fn trust_key(grid: &str) -> Option<char> {
+    let lines = bottom(grid);
+    let i = lines.iter().position(|l| option(l).is_some_and(|(_, t)| t == TRUST_YES))?;
+    let footer = lines[i + 1..].iter().any(|l| is_footer(l) || l.contains("Enter to confirm"));
+    footer.then(|| option(lines[i]).map(|(d, _)| d)).flatten()
+}
+
+/// Claude's workspace-trust dialog (new folder) is live. Its default option is "No, exit".
+pub fn is_trust_dialog(grid: &str) -> bool {
+    trust_key(grid).is_some()
+}
+
+/// Typed text would land in a dialog (permission, trust, or any other selection).
+pub fn dialog_open(grid: &str) -> bool {
+    has_permission_prompt(grid) || is_trust_dialog(grid) || has_any_dialog(grid)
+}
+
+/// The input box is on screen: a `❯` / `>` prompt line in the bottom rows that is not a
+/// dialog option.
+pub fn has_input_prompt(grid: &str) -> bool {
+    bottom(grid).iter().any(|l| {
+        let t = l.trim_start();
+        (t.starts_with('❯') || t.starts_with('>')) && option(l).is_none()
     })
 }
 
-/// Claude's workspace-trust dialog (new folder). Its default option is "No, exit".
-pub fn is_trust_dialog(grid: &str) -> bool {
-    grid.contains("trust this folder") || grid.contains("Do you trust")
-}
-
-/// The input box is up: Mirante always launches with `--permission-mode manual`, whose
-/// footer reads "manual mode on".
-pub fn is_ready(grid: &str) -> bool {
-    !is_trust_dialog(grid) && grid.contains("manual mode on")
+/// The ready fast path: Mirante launches with `--permission-mode manual`, whose footer
+/// reads "manual mode on".
+pub fn has_manual_mode_footer(grid: &str) -> bool {
+    bottom(grid).iter().any(|l| l.contains("manual mode on"))
 }
 
 /// Does the dialog on screen concern `detail` (a permission request's command or path)?
@@ -7213,14 +8927,14 @@ pub fn is_ready(grid: &str) -> bool {
 pub fn dialog_matches(grid: &str, detail: &str) -> bool {
     let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let detail = detail.lines().next().unwrap_or("").trim();
-    if detail.is_empty() {
-        return true;
-    }
-    let lines: Vec<&str> = grid.lines().collect();
+    let lines = bottom(grid);
     let Some(start) = dialog_start(&lines) else {
         return false;
     };
-    // The tool box sits right above the question: search the last 15 lines before it.
+    if detail.is_empty() {
+        return true;
+    }
+    // The tool box sits right above the question: search up to 15 lines before it.
     let from = start.saturating_sub(15);
     let hay = squash(&lines[from..=start].join("\n"));
     let head: String = squash(detail).chars().take(30).collect();
@@ -7237,10 +8951,17 @@ pub fn tail(grid: &str, n: usize) -> String {
 
 Add above the test module in `crates/mirante-daemon/src/driver/pty.rs`:
 ```rust
-//! An agent process in a pseudo-terminal, mirrored into a vt100 grid. The reader thread
-//! answers cursor-position queries (`ESC[6n`) while no client is attached (the TUI stalls
-//! without an answer; an attached terminal answers on its own), and fans output out to
-//! attached clients. The process is killed when the `PtyProcess` is dropped.
+//! An agent process in a pseudo-terminal, mirrored into a vt100 grid.
+//! - The child is a session and process-group leader (portable-pty calls `setsid`), so
+//!   [`PtyProcess::kill_tree`] ends it with everything it started ([`proctree::kill_tree`]).
+//! - Terminal queries in the output (cursor position, device attributes, status, colors)
+//!   are answered by the daemon, attached or not, and stripped from what attached clients
+//!   get ([`termq`]): one answer, never two.
+//! - Output fans out to attached clients over bounded queues. A client that falls behind
+//!   gets a full repaint; a new client starts from a repaint that also restores the input
+//!   modes (bracketed paste, cursor keys, mouse) the agent switched on.
+//!
+//! The process tree is ended when the `PtyProcess` is dropped.
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7249,9 +8970,9 @@ use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use super::proctree::{self, KillReport, Proc};
+use super::termq::{self, Piece, TermQueries};
 use super::Fanout;
-
-pub const CPR_QUERY: &[u8] = b"\x1b[6n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtySpec {
@@ -7270,7 +8991,10 @@ pub struct PtyProcess {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Writer,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+    root: Option<Proc>,
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Lock order: `fanout`, then `parser` (the reader and `attach` both follow it, so a
+    /// new client's repaint and its first live bytes never overlap or leave a gap).
     fanout: Arc<Mutex<Fanout>>,
     exited: Arc<AtomicBool>,
 }
@@ -7279,7 +9003,7 @@ fn size(rows: u16, cols: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-fn nz(n: u16) -> std::num::NonZeroU16 {
+pub(crate) fn nz(n: u16) -> std::num::NonZeroU16 {
     std::num::NonZeroU16::new(n.max(1)).expect("max(1) is non-zero")
 }
 
@@ -7289,6 +9013,41 @@ fn other(e: impl std::fmt::Display) -> io::Error {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Bytes that redraw `screen` on a fresh terminal, input modes included.
+fn repaint_of(screen: &vt100::Screen) -> Vec<u8> {
+    let mut out = b"\x1b[2J\x1b[H".to_vec();
+    out.extend_from_slice(screen.state_formatted().as_bytes());
+    out
+}
+
+/// One chunk of agent output: mirror it, answer its queries, fan it out.
+fn pump(chunk_pieces: Vec<Piece>, parser: &Mutex<vt100::Parser>, fanout: &Mutex<Fanout>, writer: &Writer) {
+    let mut f = lock(fanout);
+    let mut live = Vec::new();
+    for piece in chunk_pieces {
+        match piece {
+            Piece::Bytes(b) => {
+                lock(parser).process(&b);
+                live.extend_from_slice(&b);
+            }
+            Piece::Query(q) => {
+                let cursor = lock(parser).screen().cursor_position();
+                let mut w = lock(writer);
+                let _ = w.write_all(&termq::answer(q, cursor)).and_then(|()| w.flush());
+            }
+        }
+    }
+    if !live.is_empty() {
+        f.send(&live);
+    }
+    if f.needs_repaint() {
+        // A client fell behind and lost chunks (bounded queue): send it the whole screen,
+        // after which it gets live bytes again.
+        let screen = repaint_of(lock(parser).screen());
+        f.repaint(&screen);
+    }
 }
 
 impl PtyProcess {
@@ -7306,6 +9065,8 @@ impl PtyProcess {
         }
         let child = pair.slave.spawn_command(cmd).map_err(other)?;
         drop(pair.slave);
+        // Captured now, while the pid surely names our child.
+        let root = child.process_id().and_then(|pid| proctree::proc_of(pid as i32));
         let mut reader = pair.master.try_clone_reader().map_err(other)?;
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(other)?));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(nz(spec.rows), nz(spec.cols), 0)));
@@ -7314,36 +9075,24 @@ impl PtyProcess {
             master: Mutex::new(pair.master),
             writer: writer.clone(),
             child: Mutex::new(child),
+            root,
             parser: parser.clone(),
             fanout: fanout.clone(),
             exited: Arc::new(AtomicBool::new(false)),
         });
         std::thread::spawn(move || {
+            let mut queries = TermQueries::default();
             let mut buf = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                let chunk = &buf[..n];
-                let cursor = {
-                    let mut parser = lock(&parser);
-                    parser.process(chunk);
-                    parser.screen().cursor_position()
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
                 };
-                let mut f = lock(&fanout);
-                if f.is_empty() && chunk.windows(CPR_QUERY.len()).any(|w| w == CPR_QUERY) {
-                    let answer = format!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1);
-                    let mut w = lock(&writer);
-                    let _ = w.write_all(answer.as_bytes()).and_then(|()| w.flush());
-                }
-                f.send(chunk);
-                if f.needs_repaint() {
-                    // A client fell behind and lost chunks (bounded queue): send it the
-                    // whole screen, after which it gets live bytes again.
-                    let mut screen = b"\x1b[2J\x1b[H".to_vec();
-                    screen.extend_from_slice(lock(&parser).screen().contents_formatted().as_bytes());
-                    f.repaint(&screen);
-                }
+                pump(queries.feed(&buf[..n]), &parser, &fanout, &writer);
+            }
+            let rest = queries.flush();
+            if !rest.is_empty() {
+                pump(vec![Piece::Bytes(rest)], &parser, &fanout, &writer);
             }
             // End of output: close every attached stream.
             *lock(&fanout) = Fanout::default();
@@ -7359,7 +9108,7 @@ impl PtyProcess {
                 drop(p);
                 match status {
                     Ok(Some(s)) => break Some(s.exit_code() as i32),
-                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                     Err(_) => break None,
                 }
             };
@@ -7380,11 +9129,18 @@ impl PtyProcess {
         lock(&self.parser).screen().contents()
     }
 
-    /// Escape sequences that repaint the current screen on a fresh terminal.
+    /// Escape sequences that repaint the current screen, input modes included, on a
+    /// fresh terminal.
     pub fn repaint(&self) -> Vec<u8> {
-        let mut out = b"\x1b[2J\x1b[H".to_vec();
-        out.extend_from_slice(lock(&self.parser).screen().contents_formatted().as_bytes());
-        out
+        repaint_of(lock(&self.parser).screen())
+    }
+
+    /// A new client: its repaint and a live stream that continues exactly after it.
+    pub fn attach(&self) -> (u64, Vec<u8>, mpsc::Receiver<Vec<u8>>) {
+        let mut f = lock(&self.fanout);
+        let initial = repaint_of(lock(&self.parser).screen());
+        let (id, rx) = f.subscribe();
+        (id, initial, rx)
     }
 
     /// Resizes the PTY (the agent gets SIGWINCH and redraws) and the mirror grid.
@@ -7406,30 +9162,48 @@ impl PtyProcess {
         self.exited.load(Ordering::SeqCst)
     }
 
-    pub fn kill(&self) {
-        let _ = lock(&self.child).kill();
+    /// The agent's root process (the session leader), as it was at spawn.
+    pub fn root(&self) -> Option<Proc> {
+        self.root
     }
 
-    /// Waits up to `timeout` for the process to exit on its own.
+    /// Ends the agent and every process below it: SIGTERM, `grace`, SIGKILL, verify.
+    pub fn kill_tree(&self, grace: Duration) -> KillReport {
+        match self.root {
+            Some(root) => proctree::kill_tree(root, grace, &proctree::Kill),
+            None => {
+                let _ = lock(&self.child).kill();
+                KillReport::default()
+            }
+        }
+    }
+
+    /// Waits up to `timeout` for the process to exit.
     pub fn wait_exit(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            if matches!(lock(&self.child).try_wait(), Ok(Some(_))) {
+            if self.exited() || matches!(lock(&self.child).try_wait(), Ok(Some(_))) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    /// Test only: feeds `bytes` into the mirror as if the agent had printed them.
+    #[cfg(test)]
+    pub fn mirror(&self, bytes: &[u8]) {
+        lock(&self.parser).process(bytes);
     }
 }
 
 impl Drop for PtyProcess {
     fn drop(&mut self) {
-        let mut child = lock(&self.child);
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            let _ = child.kill();
+        let running = !matches!(lock(&self.child).try_wait(), Ok(Some(_)));
+        if running {
+            self.kill_tree(Duration::from_millis(200));
         }
-        let _ = child.wait();
+        let _ = lock(&self.child).wait();
     }
 }
 ```
@@ -7440,8 +9214,9 @@ Run: `cargo test -p mirante-daemon`
 
 Expected (one line per test target, in this order; each line also ends with `; finished in …`):
 ```
-test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
@@ -7452,7 +9227,7 @@ No compiler warnings.
 ```bash
 git add crates/mirante-daemon
 git commit -F - <<'EOF'
-feat(daemon): PTY process with vt100 mirror, CPR answers, fan-out; dialog matching
+feat(daemon): PTY process in its own group, daemon-answered terminal queries, footer-gated dialog reading, sanitized bracketed paste
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -7460,312 +9235,37 @@ EOF
 
 ---
 
-### Task 14: Claude driver and its launch
+### Task 15: Claude driver and its launch
 
 **Files:**
-- Modify: `crates/mirante-daemon/src/driver/mod.rs`
+- Modify: `crates/mirante-daemon/src/driver/mod.rs` (module list)
 - Create: `crates/mirante-daemon/src/driver/claude.rs`
 - Modify: `crates/mirante-daemon/src/driver/real.rs`
+- Modify: `crates/mirante-daemon/src/hub/messages.rs` (refuse what the typist would refuse)
 
-The unmodified interactive `claude` in a PTY (FINDINGS: the mode that fits the terms, steers mid-run and resumes), launched from Plan 2a's `claude_launch::launch_spec`: the real binary (`MIRANTE_CLAUDE_BIN` or PATH without shims), nested-session and cmux variables scrubbed (auth never touched), `--permission-mode manual`, Mirante's hooks added through `--settings` (a 0600 file under `~/.mirante/sessions/<task>/`), `--resume <native id>` on resume, `MIRANTE_TASK_ID` and `MIRANTE_HOME` set so the hook reaches this daemon. Never `--dangerously-skip-permissions`; the allowlist is empty.
+The unmodified interactive `claude` in a PTY (FINDINGS: the mode that fits the terms, steers mid-run and resumes), launched from Plan 2a's `claude_launch::launch_spec`: the real binary (`MIRANTE_CLAUDE_BIN` or PATH without shims), nested-session and terminal variables scrubbed (auth never touched), `--permission-mode manual`, Mirante's hooks added through `--settings` (a 0600 file in a 0700 `~/.mirante/sessions/<task>/`), the agent terminal variables (`TERM=xterm-256color`, `COLORTERM`, `TERM_PROGRAM=mirante`), `MIRANTE_TASK_ID`, and `MIRANTE_SESSION_ID` = the Mirante session id of the spawn request. The hook echoes that id back and the hub drops every hook stamped with another session (`hook_stale`), so this variable must be exactly `SpawnRequest.session_id`; a test asserts it. The factory adds `MIRANTE_HOME` (the hook must reach this daemon). Never `--dangerously-skip-permissions`; the allowlist is empty.
 
-- **Boot.** A watcher reads the grid: the trust dialog → `Boot(TrustPrompt)` (once); the input footer with no dialog → `Boot(Ready)`. There is no time-based "ready" fallback: an unknown startup dialog keeps the session `Booting` (the user attaches) instead of receiving typed text.
-- **Trust.** Accept = Down, pause, Enter (the default option is "No, exit"; Week-1 proven). Decline = kill.
-- **Messages** are typed by a typist thread: one line (newlines collapsed: Enter would submit early), 400 ms pause, Enter. Refused while a dialog is on screen.
+- **Native id up front.** A fresh start passes `--session-id <uuid v4>` (16 bytes from `/dev/urandom`, version and variant bits set) and emits `NativeId(uuid)` before Claude prints anything, so even a crash during boot leaves a resumable id. A resume passes `--resume <id>`. A resumed process that exits within `resume_window` (3 s) reports `ResumeFailed` before `Exited`; the hub records `resume_failed` and starting a fresh conversation stays the user's call (`mirante resume <task> --fresh`, Task 13). The driver never starts fresh on its own.
+- **Ready** needs all of: the hub saw this session's `SessionStart` hook (`Driver::session_started`), no dialog on screen, and either the "manual mode on" footer (fast path) or an input prompt (`❯` / `>`) on a screen unchanged for `ready_stable` (500 ms). There is no time-based fallback: an unknown startup screen keeps the session `Booting` (the user attaches) instead of receiving typed text. The trust dialog is looked for only before the first `Ready`.
+- **Trust.** Reported as `Boot(TrustPrompt)`, answered only by the user. Accept types the digit of the option labelled exactly "Yes, I trust this folder" (never Down+Enter, which depends on the option order); no such option on screen is `NoDialog`. Decline ends the process tree.
+- **Messages** go through one typist thread, one at a time, so two sends never interleave: a pause (`pre_type`), the bracketed paste (or a slash command's keystrokes; `!` is refused, Task 14), a pause (`type_pause`, the TUI drops an Enter that arrives too fast), Enter. Nothing is typed before `Ready` (`NotNow`). Right before the paste AND right before Enter the typist checks again that no dialog is on screen and that the hub holds no pending permission for this session (`Sink::held`, Task 13): a dialog can open between `send` and the keystrokes, and typed text, or an Enter, would answer it. The second check matters because a dialog can open during `type_pause`; Enter would then confirm its default option. A message stopped before the paste is handed back untouched (`DeliveryAborted`, the hub re-queues it at the front); stopped after the paste, the input line is cleared with Ctrl-U, which no dialog takes as an answer (never Enter, Esc or a digit), and the message is handed back the same way.
 - **Interrupt** = Esc. **Permission answers** type the digit of the exact option, only if the dialog on screen matches the request's detail (first 30 non-space characters, or the file name of an absolute path).
 - **Transcript tail.** One thread per transcript path (switches on `/clear`), polling `TranscriptTail` and looping while `more` (never while offset < length), emitting lines then the new offset.
-- **Stop** = Esc, `/exit`, 3 s grace, kill. Dropping the driver kills the process.
+- **Stop** ends the whole process tree (`kill_tree`: SIGTERM to the group and every descendant, `stop_grace`, SIGKILL, verify), not Esc + `/exit`: a hung TUI or a background child (a dev server, a test watcher) must not outlive the session. Dropping the driver does the same with a short grace.
 
 - [ ] **Step 1: Write the failing tests**
 
-`crates/mirante-daemon/src/driver/mod.rs`:
+In `crates/mirante-daemon/src/driver/mod.rs`, replace the module list with:
 ```rust
-//! The agent driver interface. Every agent sits behind [`Driver`]; an operation the agent
-//! cannot do is a typed [`DriverError::Unsupported`], never a silent failure. Drivers are
-//! non-blocking (typing and protocol calls run on the driver's own threads) except
-//! [`Driver::stop`], so the hub may call them while holding its lock.
-//!
-//! Drivers report back through a [`Sink`] (a channel drained by the hub's pump thread),
-//! never by calling the hub directly, so a driver thread can never deadlock on the hub.
-use std::collections::HashMap;
-use std::fmt;
-use std::path::Path;
-use std::sync::{mpsc, Arc};
-
-use mirante_core::model::{Status, Task};
-use mirante_ipc::types::BootState;
-use mirante_ipc::Paths;
-use serde_json::Value;
-
 pub mod claude;
 #[cfg(test)]
 pub mod fake;
+pub mod paste;
+pub mod proctree;
 pub mod pty;
 pub mod real;
 pub mod screen;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverError {
-    /// The agent cannot do this (e.g. a trust prompt on Codex).
-    Unsupported(&'static str),
-    /// The dialog the operation targets is not on screen / not pending.
-    NoDialog(String),
-    Failed(String),
-}
-
-impl fmt::Display for DriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DriverError::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
-            DriverError::NoDialog(m) => write!(f, "no matching dialog: {m}"),
-            DriverError::Failed(m) => write!(f, "agent driver failed: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for DriverError {}
-
-impl From<std::io::Error> for DriverError {
-    fn from(e: std::io::Error) -> Self {
-        DriverError::Failed(e.to_string())
-    }
-}
-
-/// What a driver tells the hub.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DriverEvent {
-    /// Claude: one main-transcript line, for the hub's `StatusEngine`.
-    Transcript(Value),
-    /// Claude: where the transcript tailer is (persisted, not audited).
-    TranscriptOffset {
-        path: String,
-        offset: u64,
-    },
-    /// Codex: a status computed by the driver's own engine. `turn_open` drives the turn
-    /// records; `detail` is shown next to the status.
-    Status {
-        to: Status,
-        cause: String,
-        turn_open: bool,
-        detail: Option<String>,
-    },
-    /// Codex: an approval request. `key` is what `answer_permission` gets back.
-    PermissionRequested {
-        key: String,
-        tool: String,
-        detail: String,
-    },
-    /// Codex: the thread id, used for `thread/resume`.
-    NativeId(String),
-    Boot(BootState),
-    /// A step for the feed and audit trail (command finished, agent message, ...).
-    Step(Value),
-    Exited {
-        code: Option<i32>,
-    },
-}
-
-/// Channel end a driver emits into. Every event is tagged with the driver's session id so
-/// late events from an ended session are ignored.
-#[derive(Clone)]
-pub struct Sink {
-    session_id: String,
-    tx: mpsc::Sender<(String, DriverEvent)>,
-}
-
-impl Sink {
-    pub fn new(session_id: &str, tx: mpsc::Sender<(String, DriverEvent)>) -> Sink {
-        Sink { session_id: session_id.to_string(), tx }
-    }
-
-    pub fn emit(&self, event: DriverEvent) {
-        let _ = self.tx.send((self.session_id.clone(), event));
-    }
-}
-
-/// A live view of the agent's terminal (Claude) or event stream (Codex).
-pub struct Attachment {
-    pub id: u64,
-    /// Bytes that repaint the current screen (or recent stream) before live output.
-    pub initial: Vec<u8>,
-    pub output: mpsc::Receiver<Vec<u8>>,
-    /// Whether typed bytes reach the agent (`Driver::input`).
-    pub input: bool,
-}
-
-/// Output chunks queued per attached client. A client that falls this far behind stops
-/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
-pub const ATTACH_QUEUE: usize = 256;
-
-struct FanoutSub {
-    tx: mpsc::SyncSender<Vec<u8>>,
-    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
-    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
-    needs_repaint: bool,
-}
-
-/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
-/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
-/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
-pub struct Fanout {
-    next: u64,
-    cap: usize,
-    subs: HashMap<u64, FanoutSub>,
-}
-
-impl Default for Fanout {
-    fn default() -> Self {
-        Fanout::with_capacity(ATTACH_QUEUE)
-    }
-}
-
-impl Fanout {
-    /// `cap` chunks queued per client (at least 1).
-    pub fn with_capacity(cap: usize) -> Fanout {
-        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
-    }
-
-    pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
-        self.next += 1;
-        let (tx, rx) = mpsc::sync_channel(self.cap);
-        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
-        (self.next, rx)
-    }
-
-    pub fn remove(&mut self, id: u64) {
-        self.subs.remove(&id);
-    }
-
-    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
-    pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, s| {
-            if s.needs_repaint {
-                return true;
-            }
-            match s.tx.try_send(bytes.to_vec()) {
-                Ok(()) => true,
-                Err(mpsc::TrySendError::Full(_)) => {
-                    s.needs_repaint = true;
-                    true
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-
-    /// Some client dropped chunks and waits for a full screen.
-    pub fn needs_repaint(&self) -> bool {
-        self.subs.values().any(|s| s.needs_repaint)
-    }
-
-    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
-    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
-    pub fn repaint(&mut self, screen: &[u8]) {
-        self.subs.retain(|_, s| {
-            if !s.needs_repaint {
-                return true;
-            }
-            match s.tx.try_send(screen.to_vec()) {
-                Ok(()) => {
-                    s.needs_repaint = false;
-                    true
-                }
-                Err(mpsc::TrySendError::Full(_)) => true,
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.subs.is_empty()
-    }
-}
-
-pub trait Driver: Send + Sync {
-    /// Delivers a message now: types it into the TUI (Claude) or steers / starts a turn
-    /// (Codex). Returns once the message is handed to the driver's worker.
-    fn send(&self, text: &str) -> Result<(), DriverError>;
-    /// Esc (Claude) or `turn/interrupt` (Codex).
-    fn interrupt(&self) -> Result<(), DriverError>;
-    /// Answers the permission dialog / approval request named by `key` (Codex: the request
-    /// id; Claude: the request detail, checked against the dialog on screen). Selects only
-    /// a one-time "Yes" or "No", never an "always" or "auto" option.
-    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError>;
-    /// Answers Claude's workspace-trust dialog. `false` ends the session.
-    fn trust(&self, accept: bool) -> Result<(), DriverError>;
-    /// True while a dialog would capture typed text (a message must not be typed then).
-    fn dialog_open(&self) -> bool;
-    /// Claude: start (or switch) tailing the session transcript at `offset`.
-    fn tail_transcript(&self, path: &Path, offset: u64);
-    fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
-    fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
-    fn detach(&self, attachment: u64);
-    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
-    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
-        Err(DriverError::Unsupported("resize"))
-    }
-    /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
-    fn screen_tail(&self) -> String;
-    /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
-    /// driver still emits `Exited`.
-    fn stop(&self);
-}
-
-pub struct SpawnRequest {
-    pub task: Task,
-    pub session_id: String,
-    /// Native id to resume (Claude session id / Codex thread id).
-    pub resume: Option<String>,
-    pub paths: Paths,
-}
-
-pub trait DriverFactory: Send + Sync {
-    fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fanout_drops_dead_receivers() {
-        let mut f = Fanout::default();
-        let (a, rx_a) = f.subscribe();
-        let (_b, rx_b) = f.subscribe();
-        f.send(b"x");
-        assert_eq!(rx_a.recv().unwrap(), b"x");
-        drop(rx_b);
-        f.send(b"y");
-        assert_eq!(rx_a.recv().unwrap(), b"y");
-        f.remove(a);
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
-        let mut f = Fanout::with_capacity(2);
-        let (_id, rx) = f.subscribe();
-        for b in [b"1", b"2", b"3", b"4"] {
-            f.send(b);
-        }
-        assert!(f.needs_repaint());
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
-        // Room again, but live bytes stay held back until the full screen is sent.
-        f.send(b"5");
-        assert!(rx.try_recv().is_err());
-        f.repaint(b"SCREEN");
-        assert!(!f.needs_repaint());
-        f.send(b"6");
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
-    }
-
-    #[test]
-    fn sink_tags_events_with_the_session() {
-        let (tx, rx) = mpsc::channel();
-        Sink::new("s1", tx).emit(DriverEvent::Boot(BootState::Ready));
-        assert_eq!(rx.recv().unwrap(), ("s1".to_string(), DriverEvent::Boot(BootState::Ready)));
-    }
-}
+pub mod termq;
 ```
 
 `crates/mirante-daemon/src/driver/claude.rs` (only the test module for now):
@@ -7773,19 +9273,32 @@ mod tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::proctree;
+    use mirante_ipc::test_dir::TestDir;
+    use std::sync::atomic::AtomicBool;
 
     fn fast() -> ClaudeTiming {
         ClaudeTiming {
             tick: Duration::from_millis(20),
+            pre_type: Duration::from_millis(150),
             type_pause: Duration::from_millis(50),
             tail_poll: Duration::from_millis(20),
-            stop_grace: Duration::from_secs(2),
+            stop_grace: Duration::from_secs(1),
             boot_limit: Duration::from_secs(10),
+            ready_stable: Duration::from_millis(150),
+            resume_window: Duration::from_secs(3),
         }
     }
 
+    struct Fake {
+        d: Arc<ClaudeDriver>,
+        rx: mpsc::Receiver<(String, DriverEvent)>,
+        /// The hub's side of the hold flag.
+        hold: Arc<AtomicBool>,
+    }
+
     /// A fake `claude`: a shell script in the PTY (raw mode, no echo).
-    fn fake(script: &str) -> (Arc<ClaudeDriver>, mpsc::Receiver<(String, DriverEvent)>) {
+    fn fake_with(script: &str, timing: ClaudeTiming, resuming: bool) -> Fake {
         let (tx, rx) = mpsc::channel();
         let spec = PtySpec {
             program: "/bin/sh".into(),
@@ -7796,7 +9309,13 @@ mod tests {
             rows: 30,
             cols: 100,
         };
-        (ClaudeDriver::spawn(spec, Sink::new("s1", tx), fast()).unwrap(), rx)
+        let sink = Sink::new("s1", tx);
+        let hold = sink.hold_flag();
+        Fake { d: ClaudeDriver::spawn(spec, sink, timing, resuming).unwrap(), rx, hold }
+    }
+
+    fn fake(script: &str) -> Fake {
+        fake_with(script, fast(), false)
     }
 
     fn next(rx: &mpsc::Receiver<(String, DriverEvent)>, want: impl Fn(&DriverEvent) -> bool) -> DriverEvent {
@@ -7818,108 +9337,275 @@ mod tests {
         }
     }
 
+    /// Ready on screen (footer fast path); the test still has to report `SessionStart`.
     const READY: &str = "printf '\\033[2J\\033[H> \\r\\n  manual mode on\\r\\n'";
 
+    fn ready(f: &Fake) {
+        f.d.session_started();
+        assert_eq!(next(&f.rx, |e| matches!(e, DriverEvent::Boot(_))), DriverEvent::Boot(BootState::Ready));
+    }
+
+    const DIALOG: &[u8] = b"\x1b[2J\x1b[H Bash command\r\n   touch x\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n";
+
     #[test]
-    fn trust_prompt_waits_for_the_user_then_down_enter_accepts() {
-        let (d, rx) = fake(
-            "printf 'Do you trust the files in this folder?\\r\\n> 1. No, exit\\r\\n  2. Yes, I trust this folder\\r\\n'; \
-             k=$(dd bs=1 count=4 2>/dev/null | od -An -c | tr -d ' \\n'); \
-             printf '\\033[2J\\033[Hkeys:%s\\r\\n  manual mode on\\r\\n' \"$k\"; sleep 5",
+    fn the_trust_prompt_waits_for_the_user_then_its_exact_option_is_typed() {
+        let f = fake(
+            "printf 'Do you trust the files in this folder?\\r\\n \\342\\235\\257 1. No, exit\\r\\n   2. Yes, I trust this folder\\r\\n Enter to confirm \\302\\267 Esc to exit\\r\\n'; \
+             k=$(dd bs=1 count=1 2>/dev/null); \
+             printf '\\033[2J\\033[Hkeys:%s\\r\\n> \\r\\n  manual mode on\\r\\n' \"$k\"; sleep 5",
         );
-        assert_eq!(next(&rx, |e| matches!(e, DriverEvent::Boot(_))), DriverEvent::Boot(BootState::TrustPrompt));
-        assert!(d.dialog_open());
-        assert!(matches!(d.send("hi"), Err(DriverError::Failed(_))));
-        d.trust(true).unwrap();
-        assert_eq!(next(&rx, |e| matches!(e, DriverEvent::Boot(_))), DriverEvent::Boot(BootState::Ready));
-        wait_grid(&d, "keys:033[B\\r");
-        assert!(matches!(d.trust(true), Err(DriverError::NoDialog(_))));
+        assert_eq!(next(&f.rx, |e| matches!(e, DriverEvent::Boot(_))), DriverEvent::Boot(BootState::TrustPrompt));
+        assert!(f.d.dialog_open());
+        assert!(matches!(f.d.send("hi"), Err(DriverError::NotNow(_))));
+        f.d.trust(true).unwrap();
+        wait_grid(&f.d, "keys:2");
+        ready(&f);
+        assert!(matches!(f.d.trust(true), Err(DriverError::NoDialog(_))));
     }
 
     #[test]
     fn declining_trust_ends_the_process() {
-        let (d, rx) = fake("printf 'Yes, I trust this folder\\r\\n'; sleep 30");
-        next(&rx, |e| *e == DriverEvent::Boot(BootState::TrustPrompt));
-        d.trust(false).unwrap();
-        assert!(matches!(next(&rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { .. }));
+        let f = fake(
+            "printf ' \\342\\235\\257 1. No, exit\\r\\n   2. Yes, I trust this folder\\r\\n Enter to confirm\\r\\n'; sleep 30",
+        );
+        next(&f.rx, |e| *e == DriverEvent::Boot(BootState::TrustPrompt));
+        f.d.trust(false).unwrap();
+        assert!(matches!(next(&f.rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { .. }));
     }
 
     #[test]
-    fn messages_are_typed_as_one_line_then_enter() {
-        let (d, rx) = fake(&format!(
-            "{READY}; l=$(dd bs=1 count=13 2>/dev/null | od -An -c | tr -d ' \\n'); printf 'got:%s' \"$l\"; sleep 5"
+    fn ready_needs_session_start_and_a_settled_input_prompt() {
+        let f = fake("printf '> '; sleep 5");
+        wait_grid(&f.d, ">");
+        // The prompt alone is not enough: no SessionStart yet.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(f.rx.try_iter().all(|(_, e)| !matches!(e, DriverEvent::Boot(_))));
+        ready(&f);
+    }
+
+    #[test]
+    fn nothing_is_typed_before_ready() {
+        let f = fake(&format!(
+            "{READY}; stty min 0 time 10; k=$(dd bs=1 count=10 2>/dev/null); printf 'got:[%s]' \"$k\"; sleep 5"
         ));
-        next(&rx, |e| *e == DriverEvent::Boot(BootState::Ready));
-        d.send("use\ntabs  now").unwrap();
-        wait_grid(&d, "got:usetabsnow\\r");
+        wait_grid(&f.d, "manual mode on");
+        assert!(matches!(f.d.send("hi"), Err(DriverError::NotNow(_))));
+        wait_grid(&f.d, "got:[]");
+    }
+
+    #[test]
+    fn messages_are_one_bracketed_paste_then_enter() {
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let want = [paste::bracketed("use\r\ntabs\x1b[201~ now"), b"\r".to_vec(), b"/compact\r".to_vec()].concat();
+        let f = fake(&format!(
+            "{READY}; dd bs=1 count={} of={} 2>/dev/null; printf 'done'; sleep 5",
+            want.len(),
+            out.display()
+        ));
+        ready(&f);
+        assert!(f.d.send("!rm -rf build").unwrap_err().to_string().contains("attach and type it yourself"));
+        f.d.send("use\r\ntabs\x1b[201~ now").unwrap();
+        f.d.send("/compact").unwrap();
+        wait_grid(&f.d, "done");
+        assert_eq!(std::fs::read(&out).unwrap(), want);
+        assert_eq!(want[..6], *b"\x1b[200~");
+    }
+
+    #[test]
+    fn two_concurrent_sends_never_interleave() {
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let (a, b) = ("first message ".repeat(20), "second message ".repeat(20));
+        let pa = [paste::bracketed(&a), b"\r".to_vec()].concat();
+        let pb = [paste::bracketed(&b), b"\r".to_vec()].concat();
+        let f = fake(&format!(
+            "{READY}; dd bs=1 count={} of={} 2>/dev/null; printf 'done'; sleep 5",
+            pa.len() + pb.len(),
+            out.display()
+        ));
+        ready(&f);
+        let (d1, d2) = (f.d.clone(), f.d.clone());
+        let t1 = std::thread::spawn(move || d1.send(&a).unwrap());
+        let t2 = std::thread::spawn(move || d2.send(&b).unwrap());
+        t1.join().unwrap();
+        t2.join().unwrap();
+        wait_grid(&f.d, "done");
+        let got = std::fs::read(&out).unwrap();
+        assert!(
+            got == [pa.clone(), pb.clone()].concat() || got == [pb, pa].concat(),
+            "{:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn a_dialog_that_appears_before_the_keystrokes_gets_nothing() {
+        let f = fake(&format!(
+            "{READY}; stty min 0 time 15; k=$(dd bs=1 count=10 2>/dev/null); printf 'got:[%s]' \"$k\"; sleep 5"
+        ));
+        ready(&f);
+        f.d.send("1").unwrap();
+        // The dialog opens between `send` and the first keystroke.
+        f.d.pty.mirror(DIALOG);
+        let ev = next(&f.rx, |e| matches!(e, DriverEvent::DeliveryAborted { .. }));
+        assert!(
+            matches!(ev, DriverEvent::DeliveryAborted { ref text, ref reason } if text == "1" && reason.contains("nothing was typed"))
+        );
+        wait_grid(&f.d, "got:[]");
+    }
+
+    #[test]
+    fn a_permission_pending_before_enter_clears_the_line_instead_of_submitting() {
+        let pasted = paste::bracketed("go on");
+        let f = fake_with(
+            &format!(
+                "{READY}; dd bs=1 count={} >/dev/null 2>&1; printf 'pasted'; stty min 0 time 20; \
+                 k=$(dd bs=1 count=1 2>/dev/null | od -An -b | tr -d ' '); printf ' next:[%s]' \"$k\"; sleep 5",
+                pasted.len()
+            ),
+            ClaudeTiming { type_pause: Duration::from_millis(800), ..fast() },
+            false,
+        );
+        ready(&f);
+        f.d.send("go on").unwrap();
+        wait_grid(&f.d, "pasted");
+        f.hold.store(true, Ordering::SeqCst);
+        let ev = next(&f.rx, |e| matches!(e, DriverEvent::DeliveryAborted { .. }));
+        assert!(matches!(ev, DriverEvent::DeliveryAborted { ref reason, .. } if reason.contains("before Enter")));
+        // Ctrl-U (octal 025), never Enter.
+        wait_grid(&f.d, "next:[025]");
+        assert!(matches!(f.d.send("more"), Err(DriverError::Failed(_))));
     }
 
     #[test]
     fn permission_answer_types_the_exact_option_for_the_matching_dialog() {
-        let dialog = "printf '\\033[2J\\033[H Bash command\\r\\n   touch x\\r\\n Do you want to proceed?\\r\\n ❯ 1. Yes\\r\\n   2. Yes, and always allow access to /w\\r\\n   3. No\\r\\n'";
-        let (d, rx) = fake(&format!(
+        let dialog = "printf '\\033[2J\\033[H Bash command\\r\\n   touch x\\r\\n Do you want to proceed?\\r\\n \\342\\235\\257 1. Yes\\r\\n   2. Yes, and always allow access to /w\\r\\n   3. No\\r\\n Esc to cancel\\r\\n'";
+        let f = fake(&format!(
             "{READY}; sleep 1; {dialog}; k=$(dd bs=1 count=1 2>/dev/null); printf '\\r\\npicked:%s' \"$k\"; sleep 5"
         ));
-        next(&rx, |e| *e == DriverEvent::Boot(BootState::Ready));
-        wait_grid(&d, "Do you want to proceed?");
-        assert!(d.dialog_open());
-        assert!(matches!(d.answer_permission("rm -rf /", true), Err(DriverError::NoDialog(_))));
-        d.answer_permission("touch x", false).unwrap();
-        wait_grid(&d, "picked:3");
+        ready(&f);
+        wait_grid(&f.d, "Do you want to proceed?");
+        assert!(f.d.dialog_open());
+        assert!(matches!(f.d.answer_permission("rm -rf /", true), Err(DriverError::NoDialog(_))));
+        f.d.answer_permission("touch x", false).unwrap();
+        wait_grid(&f.d, "picked:3");
     }
 
     #[test]
     fn transcript_lines_and_offsets_are_emitted_from_the_given_offset() {
-        let dir = mirante_ipc::test_dir::TestDir::new();
+        let dir = TestDir::new();
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "{\"old\":true}\n{\"type\":\"user\"}\n").unwrap();
-        let (d, rx) = fake("sleep 5");
-        d.tail_transcript(&path, 13);
+        let f = fake("sleep 5");
+        f.d.tail_transcript(&path, 13);
         assert_eq!(
-            next(&rx, |e| matches!(e, DriverEvent::Transcript(_))),
+            next(&f.rx, |e| matches!(e, DriverEvent::Transcript(_))),
             DriverEvent::Transcript(json!({"type": "user"}))
         );
-        let off = next(&rx, |e| matches!(e, DriverEvent::TranscriptOffset { .. }));
+        let off = next(&f.rx, |e| matches!(e, DriverEvent::TranscriptOffset { .. }));
         assert_eq!(off, DriverEvent::TranscriptOffset { path: path.to_string_lossy().into_owned(), offset: 29 });
-        d.tail_transcript(&path, 0);
+        f.d.tail_transcript(&path, 0);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, b"{\"n\":2}\n"))
             .unwrap();
-        assert_eq!(next(&rx, |e| matches!(e, DriverEvent::Transcript(_))), DriverEvent::Transcript(json!({"n": 2})));
+        assert_eq!(next(&f.rx, |e| matches!(e, DriverEvent::Transcript(_))), DriverEvent::Transcript(json!({"n": 2})));
     }
 
     #[test]
-    fn stop_types_exit_and_the_driver_reports_the_exit() {
-        let (d, rx) = fake("while true; do c=$(dd bs=1 count=1 2>/dev/null); [ \"$c\" = t ] && exit 0; done");
-        d.stop();
-        assert_eq!(next(&rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { code: Some(0) });
-        assert!(d.pty.exited());
+    fn stop_ends_the_whole_tree_even_a_child_forked_during_the_kill() {
+        let dir = TestDir::new();
+        let (pidfile, readyfile, child) =
+            (dir.path().join("forked.pid"), dir.path().join("ready"), dir.path().join("child.sh"));
+        std::fs::write(
+            &child,
+            format!(
+                "trap 'perl -e \"setpgrp(0,0); sleep 60\" & echo $! > {}' TERM HUP\n: > {}\nwhile :; do sleep 0.1; done\n",
+                pidfile.display(),
+                readyfile.display()
+            ),
+        )
+        .unwrap();
+        let f = fake(&format!("sh {} & wait; sleep 60", child.display()));
+        let root = f.d.root().expect("root");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !readyfile.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        f.d.stop();
+        assert!(matches!(next(&f.rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { .. }));
+        assert!(!proctree::alive(root));
+        let forked: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        assert!(proctree::proc_of(forked).is_none(), "the child forked during the kill survived");
     }
 
     #[test]
-    fn attach_repaints_then_streams_and_input_reaches_the_agent() {
-        let (d, _rx) = fake("printf 'hello'; k=$(dd bs=1 count=2 2>/dev/null); printf ' typed:%s' \"$k\"; sleep 5");
-        wait_grid(&d, "hello");
-        let a = d.attach(24, 80).unwrap();
-        assert!(String::from_utf8_lossy(&a.initial).contains("hello"));
-        d.input(a.id, b"ok").unwrap();
+    fn a_resume_that_exits_at_once_is_reported_never_restarted() {
+        let f = fake_with("exit 3", fast(), true);
+        let ev = next(&f.rx, |e| matches!(e, DriverEvent::ResumeFailed { .. } | DriverEvent::Exited { .. }));
+        assert!(matches!(ev, DriverEvent::ResumeFailed { ref reason } if reason.contains("--resume")), "{ev:?}");
+        assert_eq!(next(&f.rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { code: Some(3) });
+        // A fresh start that exits is just an exit.
+        let g = fake("exit 3");
+        let ev = next(&g.rx, |e| matches!(e, DriverEvent::ResumeFailed { .. } | DriverEvent::Exited { .. }));
+        assert_eq!(ev, DriverEvent::Exited { code: Some(3) });
+    }
+
+    #[test]
+    fn attach_repaints_with_input_modes_then_streams_and_input_reaches_the_agent() {
+        let f =
+            fake("printf '\\033[?2004hhello'; k=$(dd bs=1 count=2 2>/dev/null); printf ' typed:%s' \"$k\"; sleep 5");
+        wait_grid(&f.d, "hello");
+        let a = f.d.attach(24, 80).unwrap();
+        let initial = String::from_utf8_lossy(&a.initial);
+        assert!(initial.contains("hello") && initial.contains("\x1b[?2004h"), "{initial:?}");
+        f.d.input(a.id, b"ok").unwrap();
         let mut seen = Vec::new();
         while !String::from_utf8_lossy(&seen).contains("typed:ok") {
             seen.extend(a.output.recv_timeout(Duration::from_secs(5)).unwrap());
         }
-        d.detach(a.id);
+        f.d.detach(a.id);
+    }
+
+    #[test]
+    fn arbitrary_bytes_pass_through_attach_unchanged() {
+        let dir = TestDir::new();
+        let file = dir.path().join("bytes");
+        // Not UTF-8, every value but ESC (the one byte terminal queries start with).
+        let mut x: u32 = 0x1234_5678;
+        let data: Vec<u8> = std::iter::from_fn(|| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            Some((x >> 24) as u8)
+        })
+        .filter(|b| *b != 0x1b)
+        .take(4096)
+        .collect();
+        assert!(std::str::from_utf8(&data).is_err());
+        std::fs::write(&file, &data).unwrap();
+        let f = fake(&format!("printf R; dd bs=1 count=1 >/dev/null 2>&1; cat {}; sleep 5", file.display()));
+        wait_grid(&f.d, "R");
+        let a = f.d.attach(30, 100).unwrap();
+        f.d.input(a.id, b"g").unwrap();
+        let mut seen = Vec::new();
+        while seen.len() < data.len() {
+            seen.extend(a.output.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert_eq!(seen, data);
     }
 }
 ```
 
-`crates/mirante-daemon/src/driver/real.rs` (only the test module for now):
+Append to `crates/mirante-daemon/src/driver/real.rs`:
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mirante_core::model::{Lifecycle, Status, Task};
     use mirante_ipc::test_dir::TestDir;
+    use mirante_ipc::Paths;
 
     #[test]
     fn private_files_are_0600_in_0700_dirs() {
@@ -7931,7 +9617,91 @@ mod tests {
         write_private(&p, "{\"x\":1}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"x\":1}");
     }
+
+    #[test]
+    fn uuids_are_random_version_4() {
+        let (a, b) = (new_uuid_v4().unwrap(), new_uuid_v4().unwrap());
+        assert_ne!(a, b);
+        let parts: Vec<usize> = a.split('-').map(str::len).collect();
+        assert_eq!(parts, vec![8, 4, 4, 4, 12]);
+        assert_eq!(&a[14..15], "4");
+        assert!("89ab".contains(&a[19..20]), "{a}");
+        assert!(a.chars().all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    fn request(resume: Option<&str>) -> SpawnRequest {
+        SpawnRequest {
+            task: Task {
+                id: "task-1".into(),
+                title: "T".into(),
+                repo_path: "/r".into(),
+                worktree_path: "/w/tree".into(),
+                branch: "feat".into(),
+                agent: AgentKind::Claude,
+                goal: "g".into(),
+                notes: String::new(),
+                lifecycle: Lifecycle::Active,
+                status: Status::Idle,
+                created_at: 0,
+                updated_at: 0,
+            },
+            session_id: "sess-42".into(),
+            resume: resume.map(String::from),
+            paths: Paths::new(Path::new("/h")),
+        }
+    }
+
+    fn env<'a>(spec: &'a PtySpec, key: &str) -> Option<&'a str> {
+        spec.env_set.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session() {
+        let parent = vec!["CLAUDECODE".to_string(), "ANTHROPIC_API_KEY".to_string()];
+        let (spec, pinned) =
+            claude_spec(&request(None), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), parent).unwrap();
+        let id = pinned.expect("fresh start pins an id");
+        let args = spec.args.join(" ");
+        assert!(args.contains(&format!("--session-id {id}")), "{args}");
+        assert!(args.contains("--permission-mode manual") && args.contains("--settings /h/s.json"), "{args}");
+        assert!(!args.contains("--resume") && !args.contains("dangerously"), "{args}");
+        assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+        assert_eq!(env(&spec, "MIRANTE_TASK_ID"), Some("task-1"));
+        assert_eq!(env(&spec, "MIRANTE_HOME"), Some("/h"));
+        assert_eq!(env(&spec, "TERM"), Some("xterm-256color"));
+        assert!(spec.env_remove.contains(&"CLAUDECODE".to_string()));
+        assert!(!spec.env_remove.iter().any(|k| k.starts_with("ANTHROPIC_")));
+        assert_eq!((spec.cwd.as_path(), spec.rows, spec.cols), (Path::new("/w/tree"), 40, 120));
+    }
+
+    #[test]
+    fn a_resume_passes_the_native_id_and_pins_nothing() {
+        let (spec, pinned) =
+            claude_spec(&request(Some("nat-1")), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), vec![])
+                .unwrap();
+        assert_eq!(pinned, None);
+        let args = spec.args.join(" ");
+        assert!(args.contains("--resume nat-1") && !args.contains("--session-id"), "{args}");
+        assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+    }
 }
+```
+
+In `crates/mirante-daemon/src/hub/messages.rs`, add to the test module (before `queue_on_an_idle_agent_is_delivered_at_once`):
+```rust
+    #[test]
+    fn claude_messages_the_typist_would_refuse_are_refused_up_front() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        for text in ["!rm -rf build", "/compact\nnow"] {
+            for mode in [SendMode::Steer, SendMode::Queue] {
+                assert!(matches!(send(&k, &t.id, text, mode), Err(HubError::Invalid(_))), "{text:?}");
+            }
+        }
+        assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 0);
+        assert!(send(&k, &t.id, "/compact", SendMode::Queue).is_ok());
+    }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -7950,14 +9720,26 @@ Add above the test module in `crates/mirante-daemon/src/driver/claude.rs`:
 //! Claude Code driver: the unmodified interactive `claude` in a PTY (FINDINGS: the
 //! human-attended mode that fits the terms, steers mid-run and resumes). Status comes from
 //! hooks (via `mirante-hook` → daemon) fused with this driver's transcript tail; the screen
-//! is read only to act on dialogs:
-//! - boot: the workspace-trust dialog (default "No, exit") is reported as `TrustPrompt` and
-//!   answered only by the user (`trust`); `Ready` needs the input box footer.
-//! - messages are typed (text, pause, Enter), never while a dialog is open;
-//! - interrupt is Esc; permission answers type the digit of the exact "Yes" / "No" option
+//! is read only to act on dialogs.
+//! - Boot: the workspace-trust dialog is reported as `TrustPrompt` and answered only by the
+//!   user (`trust`, which types the digit of the exact "Yes, I trust this folder" option).
+//!   `Ready` needs the `SessionStart` hook, the input prompt, no dialog, and a screen that
+//!   stayed unchanged for `ready_stable` (the "manual mode on" footer skips the wait).
+//!   There is no time-based fallback: an unknown startup screen keeps the session booting.
+//! - Messages are typed by one typist thread, one at a time: a bracketed paste, a pause,
+//!   Enter. Right before the paste AND right before Enter the typist checks again that no
+//!   dialog is on screen and that the hub holds no pending permission for the session:
+//!   a dialog can appear between `send` and the keystrokes, and typed text would answer it.
+//!   A message stopped that way is handed back (`DeliveryAborted`); stopped after the
+//!   paste, the input line is cleared with Ctrl-U (never Enter, Esc or a digit, which a
+//!   dialog would take as an answer).
+//! - Interrupt is Esc; permission answers type the digit of the exact "Yes" / "No" option
 //!   of the dialog that matches the request.
+//! - Stop ends the whole process tree (SIGTERM, grace, SIGKILL; see `proctree`).
+//! - A `--resume` whose process exits within `resume_window` reports `ResumeFailed`; a
+//!   fresh start is the user's call.
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7965,41 +9747,55 @@ use mirante_core::transcript_tail::TranscriptTail;
 use mirante_ipc::types::BootState;
 use serde_json::json;
 
+use super::paste;
+use super::proctree::Proc;
 use super::pty::{PtyProcess, PtySpec};
 use super::{screen, Attachment, Driver, DriverError, DriverEvent, Sink};
 
 const ESC: &[u8] = b"\x1b";
-const DOWN: &[u8] = b"\x1b[B";
+/// Ctrl-U: clears the input line. Not an answer to any dialog.
+const CLEAR_LINE: &[u8] = b"\x15";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeTiming {
     /// Screen polling interval during boot.
     pub tick: Duration,
-    /// Pause between typed text and Enter (the TUI drops an Enter that arrives too fast).
+    /// Pause between `send` and the first keystroke (lets a dialog that is about to open
+    /// show up before anything is typed).
+    pub pre_type: Duration,
+    /// Pause between the pasted text and Enter (the TUI drops an Enter that arrives too fast).
     pub type_pause: Duration,
     pub tail_poll: Duration,
-    /// How long `/exit` gets before the process is killed.
+    /// SIGTERM to SIGKILL on stop.
     pub stop_grace: Duration,
     /// The boot watcher gives up after this long (the session stays `Booting`).
     pub boot_limit: Duration,
+    /// How long the input prompt must stay unchanged before `Ready` (no footer fast path).
+    pub ready_stable: Duration,
+    /// A resumed process that exits sooner than this failed to resume.
+    pub resume_window: Duration,
 }
 
 impl Default for ClaudeTiming {
     fn default() -> Self {
         ClaudeTiming {
-            tick: Duration::from_millis(200),
+            tick: Duration::from_millis(100),
+            pre_type: Duration::from_millis(150),
             type_pause: Duration::from_millis(400),
             tail_poll: Duration::from_millis(300),
             stop_grace: Duration::from_secs(3),
             boot_limit: Duration::from_secs(600),
+            ready_stable: Duration::from_millis(500),
+            resume_window: Duration::from_secs(3),
         }
     }
 }
 
 enum Typing {
-    Text(String),
+    /// (the message as given, the bytes to type before Enter)
+    Message(String, Vec<u8>),
+    /// Keys for a dialog or the TUI (answers, Esc): typed as they are.
     Keys(Vec<u8>),
-    Pause(Duration),
 }
 
 pub struct ClaudeDriver {
@@ -8010,38 +9806,85 @@ pub struct ClaudeDriver {
     tail_path: Mutex<Option<PathBuf>>,
     /// Bumped to stop the current tail thread (new path, stop, exit).
     tail_gen: Arc<AtomicU64>,
+    /// The hub saw this session's `SessionStart` hook.
+    started: Arc<AtomicBool>,
+    /// `Ready` was reported: messages may be typed; the trust prompt is no longer looked for.
+    ready: Arc<AtomicBool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Why typing must not happen now, if it must not.
+fn blocked(pty: &PtyProcess, sink: &Sink) -> Option<&'static str> {
+    if sink.held() {
+        Some("a permission request is pending")
+    } else if screen::dialog_open(&pty.grid()) {
+        Some("a dialog is open on the agent's screen")
+    } else {
+        None
+    }
+}
+
+fn type_message(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming, text: String, bytes: &[u8]) {
+    std::thread::sleep(timing.pre_type);
+    if let Some(why) = blocked(pty, sink) {
+        sink.emit(DriverEvent::DeliveryAborted { text, reason: format!("{why}; nothing was typed") });
+        return;
+    }
+    if pty.write(bytes).is_err() {
+        sink.emit(DriverEvent::DeliveryAborted { text, reason: "the agent's terminal is closed".into() });
+        return;
+    }
+    std::thread::sleep(timing.type_pause);
+    if let Some(why) = blocked(pty, sink) {
+        let _ = pty.write(CLEAR_LINE);
+        let reason = format!("{why} before Enter; the typed text was cleared, not sent");
+        sink.emit(DriverEvent::DeliveryAborted { text, reason });
+        return;
+    }
+    let _ = pty.write(b"\r");
+}
+
 impl ClaudeDriver {
-    pub fn spawn(spec: PtySpec, sink: Sink, timing: ClaudeTiming) -> Result<Arc<ClaudeDriver>, DriverError> {
+    /// Spawns `spec`. `resuming`: the launch passes `--resume` (an exit within
+    /// `resume_window` is then reported as `ResumeFailed`).
+    pub fn spawn(
+        spec: PtySpec,
+        sink: Sink,
+        timing: ClaudeTiming,
+        resuming: bool,
+    ) -> Result<Arc<ClaudeDriver>, DriverError> {
         let tail_gen = Arc::new(AtomicU64::new(0));
         let (exit_sink, exit_gen) = (sink.clone(), tail_gen.clone());
+        let born = Instant::now();
         let pty = PtyProcess::spawn(&spec, move |code| {
             exit_gen.fetch_add(1, Ordering::SeqCst);
+            let after = born.elapsed();
+            if resuming && after < timing.resume_window {
+                let reason = format!(
+                    "claude exited {:.1} s after --resume (exit code {code:?}); its conversation may be gone",
+                    after.as_secs_f32()
+                );
+                exit_sink.emit(DriverEvent::ResumeFailed { reason });
+            }
             exit_sink.emit(DriverEvent::Exited { code });
         })?;
         let (tx, rx) = mpsc::channel::<Typing>();
-        let typist_pty = pty.clone();
-        let pause = timing.type_pause;
+        let (typist_pty, typist_sink) = (pty.clone(), sink.clone());
         std::thread::spawn(move || {
             for t in rx {
-                let _ = match t {
-                    Typing::Text(s) => typist_pty
-                        .write(s.as_bytes())
-                        .map(|()| std::thread::sleep(pause))
-                        .and_then(|()| typist_pty.write(b"\r")),
-                    Typing::Keys(k) => typist_pty.write(&k),
-                    Typing::Pause(d) => {
-                        std::thread::sleep(d);
-                        Ok(())
+                match t {
+                    Typing::Message(text, bytes) => type_message(&typist_pty, &typist_sink, timing, text, &bytes),
+                    Typing::Keys(k) => {
+                        let _ = typist_pty.write(&k);
                     }
-                };
+                }
             }
         });
+        let started = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let driver = Arc::new(ClaudeDriver {
             pty: pty.clone(),
             sink: sink.clone(),
@@ -8049,8 +9892,10 @@ impl ClaudeDriver {
             timing,
             tail_path: Mutex::new(None),
             tail_gen,
+            started: started.clone(),
+            ready: ready.clone(),
         });
-        std::thread::spawn(move || watch_boot(&pty, &sink, timing));
+        std::thread::spawn(move || watch_boot(&pty, &sink, timing, &started, &ready));
         Ok(driver)
     }
 
@@ -8059,21 +9904,34 @@ impl ClaudeDriver {
     }
 }
 
-/// Reports `TrustPrompt` when the trust dialog shows (once per appearance) and `Ready` once
-/// the input box is up with no dialog. Never answers anything itself.
-fn watch_boot(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming) {
+/// Reports `TrustPrompt` when the trust dialog shows (once per appearance, only before the
+/// first `Ready`) and `Ready` once: `SessionStart` seen, no dialog, and either the
+/// "manual mode on" footer or an input prompt on a screen unchanged for `ready_stable`.
+/// Never answers anything itself.
+fn watch_boot(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming, started: &AtomicBool, ready: &AtomicBool) {
     let start = Instant::now();
     let mut trust_shown = false;
+    let (mut last, mut since) = (String::new(), Instant::now());
     while !pty.exited() && start.elapsed() < timing.boot_limit {
         let grid = pty.grid();
+        if grid != last {
+            last = grid.clone();
+            since = Instant::now();
+        }
         if screen::is_trust_dialog(&grid) {
             if !trust_shown {
                 trust_shown = true;
                 sink.emit(DriverEvent::Boot(BootState::TrustPrompt));
             }
-        } else if screen::is_ready(&grid) && !screen::has_permission_prompt(&grid) {
-            sink.emit(DriverEvent::Boot(BootState::Ready));
-            return;
+        } else {
+            trust_shown = false;
+            let settled = screen::has_manual_mode_footer(&grid)
+                || (screen::has_input_prompt(&grid) && since.elapsed() >= timing.ready_stable);
+            if started.load(Ordering::SeqCst) && !screen::dialog_open(&grid) && settled {
+                ready.store(true, Ordering::SeqCst);
+                sink.emit(DriverEvent::Boot(BootState::Ready));
+                return;
+            }
         }
         std::thread::sleep(timing.tick);
     }
@@ -8082,18 +9940,22 @@ fn watch_boot(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming) {
 impl Drop for ClaudeDriver {
     fn drop(&mut self) {
         self.tail_gen.fetch_add(1, Ordering::SeqCst);
-        self.pty.kill();
+        if !self.pty.exited() {
+            self.pty.kill_tree(Duration::from_millis(200));
+        }
     }
 }
 
 impl Driver for ClaudeDriver {
     fn send(&self, text: &str) -> Result<(), DriverError> {
-        if self.dialog_open() {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(DriverError::NotNow("Claude is not ready yet (starting, or at the trust prompt)".into()));
+        }
+        if blocked(&self.pty, &self.sink).is_some() {
             return Err(DriverError::Failed("a dialog is open on the agent's screen".into()));
         }
-        // A newline would submit early: one message is one line.
-        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        self.type_(Typing::Text(line))
+        let bytes = paste::typed_message(text).map_err(DriverError::Failed)?;
+        self.type_(Typing::Message(text.to_string(), bytes))
     }
 
     fn interrupt(&self) -> Result<(), DriverError> {
@@ -8117,22 +9979,21 @@ impl Driver for ClaudeDriver {
     }
 
     fn trust(&self, accept: bool) -> Result<(), DriverError> {
-        if !screen::is_trust_dialog(&self.pty.grid()) {
-            return Err(DriverError::NoDialog("no trust dialog on screen".into()));
+        if self.ready.load(Ordering::SeqCst) {
+            return Err(DriverError::NoDialog("the session is past its trust prompt".into()));
         }
+        let key = screen::trust_key(&self.pty.grid())
+            .ok_or_else(|| DriverError::NoDialog(format!("no trust dialog with a \"{}\" option", screen::TRUST_YES)))?;
         if !accept {
-            self.pty.kill();
+            let (pty, grace) = (self.pty.clone(), self.timing.stop_grace);
+            std::thread::spawn(move || pty.kill_tree(grace));
             return Ok(());
         }
-        // The default option is "No, exit": move to "Yes, I trust this folder" first.
-        self.type_(Typing::Keys(DOWN.to_vec()))?;
-        self.type_(Typing::Pause(Duration::from_millis(500)))?;
-        self.type_(Typing::Text(String::new()))
+        self.type_(Typing::Keys(vec![key as u8]))
     }
 
     fn dialog_open(&self) -> bool {
-        let grid = self.pty.grid();
-        screen::has_permission_prompt(&grid) || screen::is_trust_dialog(&grid)
+        screen::dialog_open(&self.pty.grid())
     }
 
     fn tail_transcript(&self, path: &Path, offset: u64) {
@@ -8177,8 +10038,8 @@ impl Driver for ClaudeDriver {
 
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError> {
         self.pty.resize(rows, cols)?;
-        let (id, output) = self.pty.subscribe();
-        Ok(Attachment { id, initial: self.pty.repaint(), output, input: true })
+        let (id, initial, output) = self.pty.attach();
+        Ok(Attachment { id, initial, output, input: true })
     }
 
     fn input(&self, _attachment: u64, bytes: &[u8]) -> Result<(), DriverError> {
@@ -8200,28 +10061,35 @@ impl Driver for ClaudeDriver {
     fn stop(&self) {
         self.tail_gen.fetch_add(1, Ordering::SeqCst);
         if !self.pty.exited() {
-            // Esc closes a dialog or interrupts the turn, then `/exit` quits cleanly.
-            let _ = self.pty.write(ESC);
-            std::thread::sleep(Duration::from_millis(300));
-            let _ = self.pty.write(b"/exit");
-            std::thread::sleep(self.timing.type_pause);
-            let _ = self.pty.write(b"\r");
-            if !self.pty.wait_exit(self.timing.stop_grace) {
-                self.pty.kill();
-                self.pty.wait_exit(Duration::from_secs(2));
-            }
+            self.pty.kill_tree(self.timing.stop_grace);
+            self.pty.wait_exit(Duration::from_secs(2));
         }
+    }
+
+    fn session_started(&self) {
+        self.started.store(true, Ordering::SeqCst);
+    }
+
+    fn root(&self) -> Option<Proc> {
+        self.pty.root()
     }
 }
 ```
 
-Add above the test module in `crates/mirante-daemon/src/driver/real.rs`:
+Replace `crates/mirante-daemon/src/driver/real.rs` with:
 ```rust
 //! The production driver factory: the real `claude` in a PTY with Mirante's scoped hook
-//! settings (the real `codex app-server` is wired in by Task 16). Binaries: `MIRANTE_CLAUDE_BIN` /
-//! `MIRANTE_CODEX_BIN`, else PATH without wrapper shims. The hook command:
+//! settings (the real `codex app-server` is wired in by Task 17). Binaries:
+//! `MIRANTE_CLAUDE_BIN`, else PATH without wrapper shims. The hook command:
 //! `MIRANTE_HOOK_BIN`, else `mirante-hook` next to the daemon executable.
-use std::io::Write;
+//!
+//! Claude's launch comes from Plan 2a's `claude_launch::launch_spec` (real binary, env
+//! scrub that never touches auth, `--permission-mode manual`, additive `--settings`, the
+//! agent terminal variables, `MIRANTE_TASK_ID` and `MIRANTE_SESSION_ID` = this Mirante
+//! session, which the hook echoes back and the hub fences on). Added here: `MIRANTE_HOME`
+//! (the hook must reach this daemon) and, on a fresh start, `--session-id <uuid>`, so the
+//! native id is known before Claude prints anything.
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8232,7 +10100,7 @@ use mirante_ipc::paths::HOME_ENV;
 
 use super::claude::{ClaudeDriver, ClaudeTiming};
 use super::pty::PtySpec;
-use super::{Driver, DriverError, DriverFactory, Sink, SpawnRequest};
+use super::{Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
 #[derive(Debug, Clone)]
 pub struct RealFactory {
@@ -8269,8 +10137,61 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     f.write_all(contents.as_bytes())
 }
 
+/// A random (version 4) UUID, lowercase `8-4-4-4-12`, from `/dev/urandom`.
+pub fn new_uuid_v4() -> std::io::Result<String> {
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+}
+
 fn parent_env() -> Vec<String> {
     std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
+}
+
+/// The PTY launch for `req`, and the native session id pinned for a fresh start
+/// (`None` when resuming: the id to resume is `req.resume`).
+pub fn claude_spec(
+    req: &SpawnRequest,
+    claude: &Path,
+    settings: &Path,
+    size: (u16, u16),
+    parent_env: Vec<String>,
+) -> std::io::Result<(PtySpec, Option<String>)> {
+    let spec = launch_spec(LaunchInput {
+        claude_bin: claude,
+        worktree: Path::new(&req.task.worktree_path),
+        settings_path: settings,
+        task_id: &req.task.id,
+        session_id: &req.session_id,
+        resume: req.resume.as_deref(),
+        parent_env,
+    });
+    let mut args = spec.args;
+    let pinned = match req.resume {
+        Some(_) => None,
+        None => {
+            let id = new_uuid_v4()?;
+            args.push("--session-id".to_string());
+            args.push(id.clone());
+            Some(id)
+        }
+    };
+    let mut env_set = spec.env_set;
+    // The hook (a child of claude) must reach this daemon, not one under another home.
+    env_set.push((HOME_ENV.to_string(), req.paths.home().to_string_lossy().into_owned()));
+    let pty = PtySpec {
+        program: spec.program,
+        args,
+        cwd: spec.cwd,
+        env_remove: spec.env_remove,
+        env_set,
+        rows: size.0,
+        cols: size.1,
+    };
+    Ok((pty, pinned))
 }
 
 impl RealFactory {
@@ -8279,29 +10200,12 @@ impl RealFactory {
         let hook = hook_bin()?;
         let settings = req.paths.session_dir(&req.task.id).join("claude-settings.json");
         write_private(&settings, &settings_json(&hook.to_string_lossy(), &[]).to_string())?;
-        let spec = launch_spec(LaunchInput {
-            claude_bin: &claude,
-            worktree: Path::new(&req.task.worktree_path),
-            settings_path: &settings,
-            task_id: &req.task.id,
-            session_id: &req.session_id,
-            resume: req.resume.as_deref(),
-            parent_env: parent_env(),
-        });
-        let mut env_set = spec.env_set;
-        // The hook (a child of claude) must reach this daemon, not one under another home.
-        env_set.push((HOME_ENV.to_string(), req.paths.home().to_string_lossy().into_owned()));
-        env_set.push(("TERM".to_string(), "xterm-256color".to_string()));
-        let pty = PtySpec {
-            program: spec.program,
-            args: spec.args,
-            cwd: spec.cwd,
-            env_remove: spec.env_remove,
-            env_set,
-            rows: self.rows,
-            cols: self.cols,
-        };
-        Ok(ClaudeDriver::spawn(pty, sink, ClaudeTiming::default())?)
+        let (pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env())?;
+        if let Some(id) = pinned {
+            // Known before Claude starts: a crash during boot can still be resumed.
+            sink.emit(DriverEvent::NativeId(id));
+        }
+        Ok(ClaudeDriver::spawn(pty, sink, ClaudeTiming::default(), req.resume.is_some())?)
     }
 }
 
@@ -8313,6 +10217,101 @@ impl DriverFactory for RealFactory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mirante_core::model::{Lifecycle, Status, Task};
+    use mirante_ipc::test_dir::TestDir;
+    use mirante_ipc::Paths;
+
+    #[test]
+    fn private_files_are_0600_in_0700_dirs() {
+        let d = TestDir::new();
+        let p = d.path().join("sessions/t1/claude-settings.json");
+        write_private(&p, "{}").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        write_private(&p, "{\"x\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"x\":1}");
+    }
+
+    #[test]
+    fn uuids_are_random_version_4() {
+        let (a, b) = (new_uuid_v4().unwrap(), new_uuid_v4().unwrap());
+        assert_ne!(a, b);
+        let parts: Vec<usize> = a.split('-').map(str::len).collect();
+        assert_eq!(parts, vec![8, 4, 4, 4, 12]);
+        assert_eq!(&a[14..15], "4");
+        assert!("89ab".contains(&a[19..20]), "{a}");
+        assert!(a.chars().all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    fn request(resume: Option<&str>) -> SpawnRequest {
+        SpawnRequest {
+            task: Task {
+                id: "task-1".into(),
+                title: "T".into(),
+                repo_path: "/r".into(),
+                worktree_path: "/w/tree".into(),
+                branch: "feat".into(),
+                agent: AgentKind::Claude,
+                goal: "g".into(),
+                notes: String::new(),
+                lifecycle: Lifecycle::Active,
+                status: Status::Idle,
+                created_at: 0,
+                updated_at: 0,
+            },
+            session_id: "sess-42".into(),
+            resume: resume.map(String::from),
+            paths: Paths::new(Path::new("/h")),
+        }
+    }
+
+    fn env<'a>(spec: &'a PtySpec, key: &str) -> Option<&'a str> {
+        spec.env_set.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session() {
+        let parent = vec!["CLAUDECODE".to_string(), "ANTHROPIC_API_KEY".to_string()];
+        let (spec, pinned) =
+            claude_spec(&request(None), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), parent).unwrap();
+        let id = pinned.expect("fresh start pins an id");
+        let args = spec.args.join(" ");
+        assert!(args.contains(&format!("--session-id {id}")), "{args}");
+        assert!(args.contains("--permission-mode manual") && args.contains("--settings /h/s.json"), "{args}");
+        assert!(!args.contains("--resume") && !args.contains("dangerously"), "{args}");
+        assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+        assert_eq!(env(&spec, "MIRANTE_TASK_ID"), Some("task-1"));
+        assert_eq!(env(&spec, "MIRANTE_HOME"), Some("/h"));
+        assert_eq!(env(&spec, "TERM"), Some("xterm-256color"));
+        assert!(spec.env_remove.contains(&"CLAUDECODE".to_string()));
+        assert!(!spec.env_remove.iter().any(|k| k.starts_with("ANTHROPIC_")));
+        assert_eq!((spec.cwd.as_path(), spec.rows, spec.cols), (Path::new("/w/tree"), 40, 120));
+    }
+
+    #[test]
+    fn a_resume_passes_the_native_id_and_pins_nothing() {
+        let (spec, pinned) =
+            claude_spec(&request(Some("nat-1")), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), vec![])
+                .unwrap();
+        assert_eq!(pinned, None);
+        let args = spec.args.join(" ");
+        assert!(args.contains("--resume nat-1") && !args.contains("--session-id"), "{args}");
+        assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+    }
+}
+```
+
+In `crates/mirante-daemon/src/hub/messages.rs` (`Hub::send`), right after `let task = st.resolve(&m.task)?;`, refuse what the typist would refuse instead of queueing it (a queued `!` line would come back at every turn end):
+```rust
+        if task.agent == AgentKind::Claude {
+            // Refused now rather than queued: the typist would refuse it at every turn end
+            // (a `!` bash-mode line, a multi-line slash command).
+            crate::driver::paste::typed_message(&m.text).map_err(HubError::Invalid)?;
+        }
 ```
 
 - [ ] **Step 4: Run to verify it passes**
@@ -8321,8 +10320,9 @@ Run: `cargo test -p mirante-daemon`
 
 Expected (one line per test target, in this order; each line also ends with `; finished in …`):
 ```
-test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
@@ -8333,7 +10333,7 @@ No compiler warnings.
 ```bash
 git add crates/mirante-daemon
 git commit -F - <<'EOF'
-feat(daemon): claude PTY driver with user-answered trust, typed steering, transcript tail
+feat(daemon): claude PTY driver: pinned session id, hook-gated ready, re-checked typing, exact trust option, tree stop
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -8343,309 +10343,36 @@ EOF
 
 ## Phase 2b-iii — Codex driver
 
-### Task 15: Codex status engine and JSON-RPC connection
+### Task 16: Codex status engine and JSON-RPC connection
 
 **Files:**
-- Modify: `crates/mirante-daemon/src/driver/mod.rs`
+- Modify: `crates/mirante-daemon/src/driver/mod.rs` (two `pub mod` lines)
 - Create: `crates/mirante-daemon/src/driver/codex_status.rs`
 - Create: `crates/mirante-daemon/src/driver/codex_rpc.rs`
 
-Codex status comes straight from app-server traffic (FINDINGS: no hook/transcript fusion needed). FINDINGS rule 8: `turn/completed` does not mean every command finished (run 2: `passo-2`'s `item/completed` came 1.3 s after it). The engine tracks open `commandExecution` items by id, keeps `Working` with the detail "turn done, N command(s) still finishing" while any is open after the turn, goes `Idle` only on the last one, and never reopens a turn from an item event. Approval requests mean `NeedsYou` until answered; the turn ending voids them. It reuses Plan 2a's `Transition` and `Status::can_transition_to`.
+Codex status comes straight from app-server traffic (FINDINGS: no hook/transcript fusion needed), and only from **our** thread: every v2 notification carries a `threadId`, and a sub-agent's thread finishing its turn must not end ours. Approval requests are the exception: whoever asks, the user answers, so any pending approval means `NeedsYou`.
 
-`RpcConn` speaks line-delimited JSON-RPC over any stream pair (the real app-server's stdio, or a socket pair in tests): requests wait for their own response with a timeout; notifications and server→client requests (approvals) go to a callback; EOF is reported once.
+FINDINGS rule 8: `turn/completed` does not mean every command finished (run 2: `passo-2`'s `item/completed` came 1.3 s after it). Open `commandExecution` items are tracked by id; while any is open after a **completed** turn, the status stays `Working` with the detail "turn done, N command(s) still finishing". They settle on their own `item/completed`, on `thread/status/changed` → `idle`, or after `settle_after` (30 s): a command whose end Codex never reports must not pin the task at `Working` forever. An `interrupted` or `failed` turn abandons its open commands at once (the driver prints `[command abandoned]`). Item events never reopen a turn, and a late `turn/start` response for a turn that already completed does not reopen it either. Time is an argument (`apply(input, now)`) so the timeout is tested without sleeping.
+
+Approvals are tracked by key with the turn that raised them. They end when Mirante answers, when the server says so (`serverRequest/resolved`, whose `requestId` may be `0`), when their turn completes, or when the process closes; the keys voided by the engine are handed to the driver (`take_resolved`) so it can tell the hub (`DriverEvent::PermissionResolved`). Errors become the status detail: an `error` notification (`willRetry` → "retrying: …", else "error: …", with `codexErrorInfo` such as `usageLimitExceeded`), a failed turn's `turn.error`, a thread `systemError`.
+
+`RpcConn` speaks line-delimited JSON-RPC over any stream pair (the real app-server's stdio, or a socket pair in tests). Lines are read as bytes (`read_until`), so invalid UTF-8 or a log line on stdout is reported as `Incoming::Invalid`, never silently dropped. Responses are routed by id (ids start at 0). Errors are typed (`CallError::{Rpc, Timeout, Transport}`): Task 17 retries a steer only on a JSON-RPC rejection, never on a timeout. Writes go through a dedicated writer thread over a bounded queue (`WRITE_QUEUE` = 256 lines): `request`, `respond` and `notify` never block on the child's stdin, because the hub calls `answer_permission` while holding its lock; a full queue is an error, not a wait.
 
 - [ ] **Step 1: Write the failing tests**
 
-`crates/mirante-daemon/src/driver/mod.rs`:
+In `crates/mirante-daemon/src/driver/mod.rs`, add the two modules so the module list reads:
 ```rust
-//! The agent driver interface. Every agent sits behind [`Driver`]; an operation the agent
-//! cannot do is a typed [`DriverError::Unsupported`], never a silent failure. Drivers are
-//! non-blocking (typing and protocol calls run on the driver's own threads) except
-//! [`Driver::stop`], so the hub may call them while holding its lock.
-//!
-//! Drivers report back through a [`Sink`] (a channel drained by the hub's pump thread),
-//! never by calling the hub directly, so a driver thread can never deadlock on the hub.
-use std::collections::HashMap;
-use std::fmt;
-use std::path::Path;
-use std::sync::{mpsc, Arc};
-
-use mirante_core::model::{Status, Task};
-use mirante_ipc::types::BootState;
-use mirante_ipc::Paths;
-use serde_json::Value;
-
 pub mod claude;
 pub mod codex_rpc;
 pub mod codex_status;
 #[cfg(test)]
 pub mod fake;
+pub mod paste;
+pub mod proctree;
 pub mod pty;
 pub mod real;
 pub mod screen;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverError {
-    /// The agent cannot do this (e.g. a trust prompt on Codex).
-    Unsupported(&'static str),
-    /// The dialog the operation targets is not on screen / not pending.
-    NoDialog(String),
-    Failed(String),
-}
-
-impl fmt::Display for DriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DriverError::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
-            DriverError::NoDialog(m) => write!(f, "no matching dialog: {m}"),
-            DriverError::Failed(m) => write!(f, "agent driver failed: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for DriverError {}
-
-impl From<std::io::Error> for DriverError {
-    fn from(e: std::io::Error) -> Self {
-        DriverError::Failed(e.to_string())
-    }
-}
-
-/// What a driver tells the hub.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DriverEvent {
-    /// Claude: one main-transcript line, for the hub's `StatusEngine`.
-    Transcript(Value),
-    /// Claude: where the transcript tailer is (persisted, not audited).
-    TranscriptOffset {
-        path: String,
-        offset: u64,
-    },
-    /// Codex: a status computed by the driver's own engine. `turn_open` drives the turn
-    /// records; `detail` is shown next to the status.
-    Status {
-        to: Status,
-        cause: String,
-        turn_open: bool,
-        detail: Option<String>,
-    },
-    /// Codex: an approval request. `key` is what `answer_permission` gets back.
-    PermissionRequested {
-        key: String,
-        tool: String,
-        detail: String,
-    },
-    /// Codex: the thread id, used for `thread/resume`.
-    NativeId(String),
-    Boot(BootState),
-    /// A step for the feed and audit trail (command finished, agent message, ...).
-    Step(Value),
-    Exited {
-        code: Option<i32>,
-    },
-}
-
-/// Channel end a driver emits into. Every event is tagged with the driver's session id so
-/// late events from an ended session are ignored.
-#[derive(Clone)]
-pub struct Sink {
-    session_id: String,
-    tx: mpsc::Sender<(String, DriverEvent)>,
-}
-
-impl Sink {
-    pub fn new(session_id: &str, tx: mpsc::Sender<(String, DriverEvent)>) -> Sink {
-        Sink { session_id: session_id.to_string(), tx }
-    }
-
-    pub fn emit(&self, event: DriverEvent) {
-        let _ = self.tx.send((self.session_id.clone(), event));
-    }
-}
-
-/// A live view of the agent's terminal (Claude) or event stream (Codex).
-pub struct Attachment {
-    pub id: u64,
-    /// Bytes that repaint the current screen (or recent stream) before live output.
-    pub initial: Vec<u8>,
-    pub output: mpsc::Receiver<Vec<u8>>,
-    /// Whether typed bytes reach the agent (`Driver::input`).
-    pub input: bool,
-}
-
-/// Output chunks queued per attached client. A client that falls this far behind stops
-/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
-pub const ATTACH_QUEUE: usize = 256;
-
-struct FanoutSub {
-    tx: mpsc::SyncSender<Vec<u8>>,
-    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
-    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
-    needs_repaint: bool,
-}
-
-/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
-/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
-/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
-pub struct Fanout {
-    next: u64,
-    cap: usize,
-    subs: HashMap<u64, FanoutSub>,
-}
-
-impl Default for Fanout {
-    fn default() -> Self {
-        Fanout::with_capacity(ATTACH_QUEUE)
-    }
-}
-
-impl Fanout {
-    /// `cap` chunks queued per client (at least 1).
-    pub fn with_capacity(cap: usize) -> Fanout {
-        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
-    }
-
-    pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
-        self.next += 1;
-        let (tx, rx) = mpsc::sync_channel(self.cap);
-        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
-        (self.next, rx)
-    }
-
-    pub fn remove(&mut self, id: u64) {
-        self.subs.remove(&id);
-    }
-
-    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
-    pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, s| {
-            if s.needs_repaint {
-                return true;
-            }
-            match s.tx.try_send(bytes.to_vec()) {
-                Ok(()) => true,
-                Err(mpsc::TrySendError::Full(_)) => {
-                    s.needs_repaint = true;
-                    true
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-
-    /// Some client dropped chunks and waits for a full screen.
-    pub fn needs_repaint(&self) -> bool {
-        self.subs.values().any(|s| s.needs_repaint)
-    }
-
-    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
-    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
-    pub fn repaint(&mut self, screen: &[u8]) {
-        self.subs.retain(|_, s| {
-            if !s.needs_repaint {
-                return true;
-            }
-            match s.tx.try_send(screen.to_vec()) {
-                Ok(()) => {
-                    s.needs_repaint = false;
-                    true
-                }
-                Err(mpsc::TrySendError::Full(_)) => true,
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.subs.is_empty()
-    }
-}
-
-pub trait Driver: Send + Sync {
-    /// Delivers a message now: types it into the TUI (Claude) or steers / starts a turn
-    /// (Codex). Returns once the message is handed to the driver's worker.
-    fn send(&self, text: &str) -> Result<(), DriverError>;
-    /// Esc (Claude) or `turn/interrupt` (Codex).
-    fn interrupt(&self) -> Result<(), DriverError>;
-    /// Answers the permission dialog / approval request named by `key` (Codex: the request
-    /// id; Claude: the request detail, checked against the dialog on screen). Selects only
-    /// a one-time "Yes" or "No", never an "always" or "auto" option.
-    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError>;
-    /// Answers Claude's workspace-trust dialog. `false` ends the session.
-    fn trust(&self, accept: bool) -> Result<(), DriverError>;
-    /// True while a dialog would capture typed text (a message must not be typed then).
-    fn dialog_open(&self) -> bool;
-    /// Claude: start (or switch) tailing the session transcript at `offset`.
-    fn tail_transcript(&self, path: &Path, offset: u64);
-    fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
-    fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
-    fn detach(&self, attachment: u64);
-    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
-    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
-        Err(DriverError::Unsupported("resize"))
-    }
-    /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
-    fn screen_tail(&self) -> String;
-    /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
-    /// driver still emits `Exited`.
-    fn stop(&self);
-}
-
-pub struct SpawnRequest {
-    pub task: Task,
-    pub session_id: String,
-    /// Native id to resume (Claude session id / Codex thread id).
-    pub resume: Option<String>,
-    pub paths: Paths,
-}
-
-pub trait DriverFactory: Send + Sync {
-    fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fanout_drops_dead_receivers() {
-        let mut f = Fanout::default();
-        let (a, rx_a) = f.subscribe();
-        let (_b, rx_b) = f.subscribe();
-        f.send(b"x");
-        assert_eq!(rx_a.recv().unwrap(), b"x");
-        drop(rx_b);
-        f.send(b"y");
-        assert_eq!(rx_a.recv().unwrap(), b"y");
-        f.remove(a);
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
-        let mut f = Fanout::with_capacity(2);
-        let (_id, rx) = f.subscribe();
-        for b in [b"1", b"2", b"3", b"4"] {
-            f.send(b);
-        }
-        assert!(f.needs_repaint());
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
-        // Room again, but live bytes stay held back until the full screen is sent.
-        f.send(b"5");
-        assert!(rx.try_recv().is_err());
-        f.repaint(b"SCREEN");
-        assert!(!f.needs_repaint());
-        f.send(b"6");
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
-    }
-
-    #[test]
-    fn sink_tags_events_with_the_session() {
-        let (tx, rx) = mpsc::channel();
-        Sink::new("s1", tx).emit(DriverEvent::Boot(BootState::Ready));
-        assert_eq!(rx.recv().unwrap(), ("s1".to_string(), DriverEvent::Boot(BootState::Ready)));
-    }
-}
+pub mod termq;
 ```
 
 `crates/mirante-daemon/src/driver/codex_status.rs` (only the test module for now):
@@ -8659,14 +10386,25 @@ mod tests {
         CodexInput::Notification { method, params }
     }
 
+    fn engine() -> (CodexEngine, Instant) {
+        let mut e = CodexEngine::new(Duration::from_secs(30));
+        e.set_thread("th1");
+        (e, Instant::now())
+    }
+
     #[test]
     fn plain_turn() {
-        let mut e = CodexEngine::new();
-        let started = json!({"turn": {"id": "tu1"}});
-        assert_eq!(e.apply(&n("turn/started", &started)).unwrap().to, Status::Working);
+        let (mut e, t0) = engine();
+        let started = json!({"threadId": "th1", "turn": {"id": "tu1"}});
+        assert_eq!(e.apply(&n("turn/started", &started), t0).unwrap().to, Status::Working);
         assert_eq!(e.turn_id(), Some("tu1"));
-        assert_eq!(e.apply(&n("turn/completed", &json!({"turn": {"id": "tu1"}}))).unwrap().to, Status::Idle);
+        let done = json!({"threadId": "th1", "turn": {"id": "tu1", "status": "completed"}});
+        assert_eq!(e.apply(&n("turn/completed", &done), t0).unwrap().to, Status::Idle);
         assert!(!e.turn_open());
+        // A late `turn/start` response for the finished turn does not reopen it.
+        assert_eq!(e.apply(&CodexInput::TurnAccepted("tu1".into()), t0), None);
+        assert_eq!(e.apply(&CodexInput::TurnAccepted("tu2".into()), t0).unwrap().to, Status::Working);
+        assert_eq!(e.turn_id(), Some("tu2"));
     }
 
     /// FINDINGS rule 8 (S1 Codex run 2): passo-2's item/completed came 1.3 s after
@@ -8674,43 +10412,139 @@ mod tests {
     /// must not reopen the turn.
     #[test]
     fn command_finishing_after_turn_completed_keeps_working_with_detail() {
-        let mut e = CodexEngine::new();
-        e.apply(&n("turn/started", &json!({"turn": {"id": "tu1"}})));
-        e.apply(&n("item/started", &json!({"item": {"type": "commandExecution", "id": "c2", "command": "sleep 3"}})));
-        assert_eq!(e.apply(&n("turn/completed", &json!({}))), None);
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        let cmd = json!({"threadId": "th1", "item": {"type": "commandExecution", "id": "c2", "command": "sleep 3"}});
+        e.apply(&n("item/started", &cmd), t0);
+        let done = json!({"threadId": "th1", "turn": {"id": "tu1", "status": "completed"}});
+        assert_eq!(e.apply(&n("turn/completed", &done), t0), None);
         assert_eq!(e.status(), Status::Working);
         assert_eq!(e.detail().as_deref(), Some("turn done, 1 command(s) still finishing"));
         assert!(!e.turn_open());
-        let t = e.apply(&n("item/completed", &json!({"item": {"type": "commandExecution", "id": "c2"}}))).unwrap();
+        let t = e.apply(&n("item/completed", &cmd), t0).unwrap();
         assert_eq!((t.from, t.to, t.cause.as_str()), (Status::Working, Status::Idle, "codex:item/completed"));
         assert!(!e.turn_open());
         assert_eq!(e.detail(), None);
     }
 
     #[test]
-    fn approvals_need_you_until_answered_and_die_with_the_turn() {
-        let mut e = CodexEngine::new();
-        e.apply(&n("turn/started", &json!({"turn": {"id": "tu1"}})));
-        assert_eq!(e.apply(&CodexInput::ApprovalRequested("5".into())).unwrap().to, Status::NeedsYou);
-        assert_eq!(e.apply(&CodexInput::ApprovalAnswered("5".into())).unwrap().to, Status::Working);
-        e.apply(&CodexInput::ApprovalRequested("6".into()));
-        assert_eq!(e.apply(&n("turn/completed", &json!({}))).unwrap().to, Status::Idle);
+    fn open_commands_settle_on_thread_idle_or_after_the_timeout() {
+        let (mut e, t0) = engine();
+        let cmd = json!({"threadId": "th1", "item": {"type": "commandExecution", "id": "c1"}});
+        let done = json!({"threadId": "th1", "turn": {"id": "tu1", "status": "completed"}});
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        e.apply(&n("item/started", &cmd), t0);
+        e.apply(&n("turn/completed", &done), t0);
+        let idle = json!({"threadId": "th1", "status": {"type": "idle"}});
+        let t = e.apply(&n("thread/status/changed", &idle), t0).unwrap();
+        assert_eq!((t.to, t.cause.as_str()), (Status::Idle, "codex:thread/status/changed"));
+        // Second turn: no idle notification, the timeout settles it.
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu2"}})), t0);
+        e.apply(&n("item/started", &cmd), t0);
+        e.apply(&n("turn/completed", &json!({"threadId": "th1", "turn": {"id": "tu2", "status": "completed"}})), t0);
+        assert_eq!(e.apply(&CodexInput::Tick, t0 + Duration::from_secs(29)), None);
+        assert_eq!(e.status(), Status::Working);
+        let t = e.apply(&CodexInput::Tick, t0 + Duration::from_secs(30)).unwrap();
+        assert_eq!((t.to, t.cause.as_str()), (Status::Idle, "mirante:settle_timeout"));
+        assert_eq!(e.background_commands(), 0);
+    }
+
+    #[test]
+    fn an_interrupted_or_failed_turn_abandons_its_open_commands() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        e.apply(&n("item/started", &json!({"threadId": "th1", "item": {"type": "commandExecution", "id": "c1"}})), t0);
+        let stop = json!({"threadId": "th1", "turn": {"id": "tu1", "status": "interrupted"}});
+        assert_eq!(e.apply(&n("turn/completed", &stop), t0).unwrap().to, Status::Idle);
+        assert_eq!((e.take_abandoned(), e.background_commands(), e.detail()), (1, 0, None));
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu2"}})), t0);
+        let failed = json!({"threadId": "th1", "turn": {"id": "tu2", "status": "failed",
+            "error": {"message": "quota", "codexErrorInfo": "usageLimitExceeded"}}});
+        assert_eq!(e.apply(&n("turn/completed", &failed), t0).unwrap().to, Status::Idle);
+        assert_eq!(e.detail().as_deref(), Some("turn failed: usageLimitExceeded: quota"));
+    }
+
+    #[test]
+    fn another_threads_events_never_move_our_status() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        let child_done = json!({"threadId": "child", "turn": {"id": "tc", "status": "completed"}});
+        assert_eq!(e.apply(&n("turn/completed", &child_done), t0), None);
+        let child_idle = json!({"threadId": "child", "status": {"type": "systemError"}});
+        assert_eq!(e.apply(&n("thread/status/changed", &child_idle), t0), None);
+        assert_eq!((e.status(), e.turn_id()), (Status::Working, Some("tu1")));
+        // A sub-agent's approval still needs the user.
+        let req = CodexInput::ApprovalRequested { key: "3".into(), turn: Some("tc".into()) };
+        assert_eq!(e.apply(&req, t0).unwrap().to, Status::NeedsYou);
+    }
+
+    #[test]
+    fn approvals_need_you_until_answered_resolved_or_voided_by_their_turn() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        let ask = |k: &str| CodexInput::ApprovalRequested { key: k.into(), turn: Some("tu1".into()) };
+        assert_eq!(e.apply(&ask("5"), t0).unwrap().to, Status::NeedsYou);
+        assert_eq!(e.apply(&CodexInput::ApprovalAnswered("5".into()), t0).unwrap().to, Status::Working);
+        // Request id 0 is a real id.
+        e.apply(&ask("0"), t0);
+        let resolved = json!({"threadId": "th1", "requestId": 0});
+        let t = e.apply(&n("serverRequest/resolved", &resolved), t0).unwrap();
+        assert_eq!((t.to, t.cause.as_str()), (Status::Working, "codex:request_resolved"));
+        assert_eq!(e.apply(&n("serverRequest/resolved", &resolved), t0), None);
+        e.apply(&ask("6"), t0);
+        e.apply(&CodexInput::ApprovalRequested { key: "s1".into(), turn: Some("other".into()) }, t0);
+        let done = json!({"threadId": "th1", "turn": {"id": "tu1", "status": "completed"}});
+        e.apply(&n("turn/completed", &done), t0);
+        assert_eq!(e.take_resolved(), vec!["6".to_string()]);
+        assert_eq!(e.status(), Status::NeedsYou, "the sub-agent's request is still open");
+        assert_eq!(e.apply(&CodexInput::ApprovalAnswered("s1".into()), t0).unwrap().to, Status::Idle);
+    }
+
+    #[test]
+    fn errors_become_the_detail() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        let retry = json!({"threadId": "th1", "turnId": "tu1", "willRetry": true,
+            "error": {"message": "stream dropped", "codexErrorInfo": {"responseStreamDisconnected": {}}}});
+        e.apply(&n("error", &retry), t0);
+        assert_eq!(e.detail().as_deref(), Some("retrying: responseStreamDisconnected: stream dropped"));
+        let fatal = json!({"threadId": "th1", "turnId": "tu1", "willRetry": false,
+            "error": {"message": "limit", "codexErrorInfo": "usageLimitExceeded"}});
+        e.apply(&n("error", &fatal), t0);
+        assert_eq!(e.detail().as_deref(), Some("error: usageLimitExceeded: limit"));
+        e.apply(&CodexInput::ApprovalRequested { key: "1".into(), turn: Some("tu1".into()) }, t0);
+        let sys = json!({"threadId": "th1", "status": {"type": "systemError"}});
+        assert_eq!(e.apply(&n("thread/status/changed", &sys), t0).unwrap().to, Status::Idle);
+        assert_eq!(e.take_resolved(), vec!["1".to_string()]);
+        assert!(e.detail().unwrap().contains("system error"));
+        // The next turn clears it.
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu2"}})), t0);
+        assert_eq!(e.detail(), None);
     }
 
     #[test]
     fn other_items_and_unknown_notifications_change_nothing() {
-        let mut e = CodexEngine::new();
-        assert_eq!(e.apply(&n("item/completed", &json!({"item": {"type": "agentMessage", "id": "m"}}))), None);
-        assert_eq!(e.apply(&n("thread/status/changed", &json!({}))), None);
+        let (mut e, t0) = engine();
+        let msg = json!({"threadId": "th1", "item": {"type": "agentMessage", "id": "m"}});
+        assert_eq!(e.apply(&n("item/completed", &msg), t0), None);
+        assert_eq!(e.apply(&n("thread/tokenUsage/updated", &json!({"threadId": "th1"})), t0), None);
         assert_eq!(e.status(), Status::Idle);
     }
 
     #[test]
-    fn closed_is_ended_and_final() {
-        let mut e = CodexEngine::new();
-        e.apply(&n("turn/started", &json!({"turn": {"id": "tu1"}})));
-        assert_eq!(e.apply(&CodexInput::Closed).unwrap().to, Status::Ended);
-        assert_eq!(e.apply(&n("turn/started", &json!({"turn": {"id": "tu2"}}))), None);
+    fn closed_is_ended_final_and_voids_every_request() {
+        let (mut e, t0) = engine();
+        e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu1"}})), t0);
+        e.apply(&CodexInput::ApprovalRequested { key: "0".into(), turn: None }, t0);
+        assert_eq!(e.apply(&CodexInput::Closed, t0).unwrap().to, Status::Ended);
+        assert_eq!(e.take_resolved(), vec!["0".to_string()]);
+        assert_eq!(e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu2"}})), t0), None);
+    }
+
+    #[test]
+    fn request_keys_keep_strings_verbatim() {
+        assert_eq!(request_key(&json!(0)), "0");
+        assert_eq!(request_key(&json!("e1")), "e1");
     }
 }
 ```
@@ -8722,6 +10556,7 @@ mod tests {
     use super::*;
     use std::io::BufReader;
     use std::os::unix::net::UnixStream;
+    use std::time::Instant;
 
     /// (client conn, server reader, server writer, incoming receiver)
     fn pair() -> (Arc<RpcConn>, BufReader<UnixStream>, UnixStream, mpsc::Receiver<Incoming>) {
@@ -8740,50 +10575,80 @@ mod tests {
     }
 
     #[test]
-    fn requests_get_their_own_response_and_errors_are_returned() {
+    fn requests_get_their_own_response_including_id_zero_and_errors_are_typed() {
         let (conn, mut sr, mut sw, _rx) = pair();
         let c2 = conn.clone();
         let h = std::thread::spawn(move || c2.request("thread/start", json!({"cwd": "/w"}), Duration::from_secs(5)));
         let req = read(&mut sr);
+        assert_eq!(req["id"], 0, "the first request id is 0");
         assert_eq!((req["method"].as_str(), req["params"]["cwd"].as_str()), (Some("thread/start"), Some("/w")));
-        writeln!(sw, "{}", json!({"jsonrpc": "2.0", "id": req["id"], "result": {"thread": {"id": "th1"}}})).unwrap();
+        writeln!(sw, "{}", json!({"jsonrpc": "2.0", "id": 0, "result": {"thread": {"id": "th1"}}})).unwrap();
         assert_eq!(h.join().unwrap().unwrap()["thread"]["id"], "th1");
         let c3 = conn.clone();
         let h = std::thread::spawn(move || c3.request("turn/steer", json!({}), Duration::from_secs(5)));
         let req = read(&mut sr);
-        writeln!(
-            sw,
-            "{}",
-            json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32600, "message": "expectedTurnId mismatch"}})
-        )
-        .unwrap();
-        assert!(h.join().unwrap().unwrap_err().contains("expectedTurnId"));
+        let err =
+            json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32600, "message": "expectedTurnId mismatch"}});
+        writeln!(sw, "{err}").unwrap();
+        assert_eq!(
+            h.join().unwrap().unwrap_err(),
+            CallError::Rpc { code: -32600, message: "expectedTurnId mismatch".into() }
+        );
     }
 
     #[test]
-    fn notifications_and_server_requests_reach_the_callback_and_eof_closes() {
+    fn notifications_server_requests_and_bad_lines_reach_the_callback_and_eof_closes() {
         let (conn, mut sr, mut sw, rx) = pair();
         writeln!(sw, "{}", json!({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "t"}}}))
             .unwrap();
-        writeln!(sw, "{}", json!({"jsonrpc": "2.0", "id": 9, "method": "item/commandExecution/requestApproval", "params": {"command": "ls"}})).unwrap();
+        sw.write_all(b"WARN codex: not json \xff\r\n\n").unwrap();
+        let req = json!({"jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval", "params": {}});
+        writeln!(sw, "{req}").unwrap();
         assert_eq!(
             rx.recv().unwrap(),
             Incoming::Notification { method: "turn/started".into(), params: json!({"turn": {"id": "t"}}) }
         );
+        assert_eq!(rx.recv().unwrap(), Incoming::Invalid("WARN codex: not json \u{fffd}".into()));
         let Incoming::Request { id, method, .. } = rx.recv().unwrap() else { panic!() };
-        assert_eq!(method, "item/commandExecution/requestApproval");
+        assert_eq!((method.as_str(), &id), ("item/commandExecution/requestApproval", &json!(0)));
         conn.respond(&id, json!({"decision": "accept"})).unwrap();
-        assert_eq!(read(&mut sr), json!({"jsonrpc": "2.0", "id": 9, "result": {"decision": "accept"}}));
+        assert_eq!(read(&mut sr), json!({"jsonrpc": "2.0", "id": 0, "result": {"decision": "accept"}}));
         drop(sw);
         drop(sr);
         conn.close();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Incoming::Closed);
+        assert!(conn.notify("x", Value::Null).is_err(), "nothing is written after close");
     }
 
     #[test]
     fn a_request_without_response_times_out() {
         let (conn, _sr, _sw, _rx) = pair();
-        assert!(conn.request("initialize", json!({}), Duration::from_millis(50)).unwrap_err().contains("no response"));
+        let e = conn.request("initialize", json!({}), Duration::from_millis(50)).unwrap_err();
+        assert!(matches!(e, CallError::Timeout(ref m) if m.contains("no response")), "{e:?}");
+    }
+
+    /// The server stops reading its stdin (stuck, or busy): our writes queue up to the
+    /// bound and then fail fast, and notifications from it keep arriving meanwhile.
+    #[test]
+    fn a_server_that_stops_reading_never_blocks_writes_or_reads() {
+        let (conn, _sr, mut sw, rx) = pair();
+        let big = "x".repeat(8 * 1024);
+        let started = Instant::now();
+        let mut refused = 0;
+        for _ in 0..(WRITE_QUEUE + 64) {
+            if conn.notify("noise", json!({ "pad": big })).is_err() {
+                refused += 1;
+            }
+        }
+        assert!(refused > 0, "the bounded queue must refuse once full");
+        assert!(started.elapsed() < Duration::from_secs(5), "writes never block: {:?}", started.elapsed());
+        let e = conn.request("turn/steer", json!({}), Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(e, CallError::Transport(ref m) if m.contains("write queue full")), "{e:?}");
+        writeln!(sw, "{}", json!({"jsonrpc": "2.0", "method": "item/completed", "params": {}})).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Incoming::Notification { ref method, .. } if method == "item/completed"
+        ));
     }
 }
 ```
@@ -8802,18 +10667,34 @@ error: cannot find macro `json` in this scope
 Add above the test module in `crates/mirante-daemon/src/driver/codex_status.rs`:
 ```rust
 //! Codex status, straight from app-server traffic (no hooks, no transcript):
-//! - `turn/started` opens the turn (`Working`); `turn/completed` closes it.
-//! - FINDINGS rule 8: `turn/completed` does not mean every command finished. Open
-//!   `commandExecution` items are tracked by id; while any is open after the turn, the
-//!   status stays `Working` with the detail "turn done, N command(s) still finishing", and
-//!   only the last `item/completed` makes it `Idle`. Item events never reopen a turn.
-//! - Approval requests (server→client JSON-RPC requests) mean `NeedsYou` until answered;
-//!   the turn ending voids them.
-use std::collections::HashSet;
+//! - Only OUR thread moves the status: notifications carrying another `threadId` (a
+//!   sub-agent's thread) are ignored here. Approval requests are the exception: whoever
+//!   asks, the user must answer, so any approval means `NeedsYou`.
+//! - `turn/started` (or the `turn/start` response, whichever comes first) opens the turn
+//!   (`Working`); `turn/completed` closes it.
+//! - FINDINGS rule 8: a `completed` turn does not mean every command finished. Open
+//!   `commandExecution` items are tracked by id; while any is open after the turn the status
+//!   stays `Working` with the detail "turn done, N command(s) still finishing". They settle
+//!   on their own `item/completed`, on `thread/status/changed` → idle, or after
+//!   `settle_after` (a command whose end Codex never reports must not pin the task). An
+//!   `interrupted` / `failed` turn abandons its open commands at once. Item events never
+//!   reopen a turn.
+//! - Approval requests mean `NeedsYou` until answered, resolved by the server
+//!   (`serverRequest/resolved`) or voided by the end of the turn that raised them; the keys
+//!   voided here are handed to the driver ([`CodexEngine::take_resolved`]).
+//! - Errors (`error` notifications, a failed turn's `turn.error`, a thread `systemError`)
+//!   become the status detail.
+//!
+//! Time is passed in (`now`), so the settle timeout is tested without sleeping.
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use mirante_core::model::Status;
 use mirante_core::status::Transition;
 use serde_json::Value;
+
+/// How long commands still open after a completed turn may keep the task `Working`.
+pub const SETTLE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexInput<'a> {
@@ -8821,27 +10702,94 @@ pub enum CodexInput<'a> {
         method: &'a str,
         params: &'a Value,
     },
-    ApprovalRequested(String),
+    /// The `turn/start` response named the turn it started.
+    TurnAccepted(String),
+    /// A server→client approval request; `turn` is its `turnId` when it has one.
+    ApprovalRequested {
+        key: String,
+        turn: Option<String>,
+    },
+    /// Mirante answered it.
     ApprovalAnswered(String),
+    /// The server says it no longer waits (`serverRequest/resolved`).
+    ApprovalResolved(String),
+    /// Time passed (the driver ticks about once a second).
+    Tick,
     /// The app-server process or its stdout ended.
     Closed,
 }
 
-#[derive(Debug, Clone, Default)]
+/// A request key as Mirante stores it: a string id verbatim, a number in decimal.
+pub fn request_key(id: &Value) -> String {
+    match id {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CodexEngine {
-    status: Option<Status>,
+    status: Status,
+    thread: Option<String>,
     turn: Option<String>,
+    /// The last turn that completed (a late `turn/start` response must not reopen it).
+    last_completed: Option<String>,
     open_commands: HashSet<String>,
-    approvals: HashSet<String>,
+    /// key -> the turn that raised it.
+    approvals: HashMap<String, Option<String>>,
+    /// When the turn completed while commands were still open.
+    finished_at: Option<Instant>,
+    settle_after: Duration,
+    error: Option<String>,
+    resolved: Vec<String>,
+    abandoned: usize,
+}
+
+impl Default for CodexEngine {
+    fn default() -> Self {
+        CodexEngine::new(SETTLE_AFTER)
+    }
+}
+
+fn error_text(err: &Value) -> Option<String> {
+    let message = err["message"].as_str().filter(|m| !m.is_empty());
+    let info = match &err["codexErrorInfo"] {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => o.keys().next().cloned(),
+        _ => None,
+    };
+    match (info, message) {
+        (Some(i), Some(m)) => Some(format!("{i}: {m}")),
+        (Some(i), None) => Some(i),
+        (None, Some(m)) => Some(m.to_string()),
+        (None, None) => None,
+    }
 }
 
 impl CodexEngine {
-    pub fn new() -> Self {
-        CodexEngine { status: Some(Status::Idle), ..Default::default() }
+    pub fn new(settle_after: Duration) -> Self {
+        CodexEngine {
+            status: Status::Idle,
+            thread: None,
+            turn: None,
+            last_completed: None,
+            open_commands: HashSet::new(),
+            approvals: HashMap::new(),
+            finished_at: None,
+            settle_after,
+            error: None,
+            resolved: Vec::new(),
+            abandoned: 0,
+        }
+    }
+
+    /// Our thread: notifications for any other thread are ignored.
+    pub fn set_thread(&mut self, id: &str) {
+        self.thread = Some(id.to_string());
     }
 
     pub fn status(&self) -> Status {
-        self.status.unwrap_or(Status::Idle)
+        self.status
     }
 
     pub fn turn_id(&self) -> Option<&str> {
@@ -8856,13 +10804,25 @@ impl CodexEngine {
         self.open_commands.len()
     }
 
-    /// Shown next to the status: why a finished turn is still `Working`.
-    pub fn detail(&self) -> Option<String> {
-        let n = self.open_commands.len();
-        (self.turn.is_none() && n > 0).then(|| format!("turn done, {n} command(s) still finishing"))
+    /// Approval keys voided by the last inputs (their turn ended, the process closed).
+    pub fn take_resolved(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.resolved)
     }
 
-    /// Where the status should be now, from the tracked facts.
+    /// Commands abandoned by the last interrupted / failed turn.
+    pub fn take_abandoned(&mut self) -> usize {
+        std::mem::take(&mut self.abandoned)
+    }
+
+    /// Shown next to the status: why a finished turn is still `Working`, else the last error.
+    pub fn detail(&self) -> Option<String> {
+        let n = self.open_commands.len();
+        if self.turn.is_none() && n > 0 {
+            return Some(format!("turn done, {n} command(s) still finishing"));
+        }
+        self.error.clone()
+    }
+
     fn target(&self) -> Status {
         if !self.approvals.is_empty() {
             Status::NeedsYou
@@ -8874,29 +10834,79 @@ impl CodexEngine {
     }
 
     fn settle(&mut self, cause: String) -> Option<Transition> {
-        let from = self.status();
+        let from = self.status;
         let to = self.target();
         if !from.can_transition_to(to) {
             return None;
         }
-        self.status = Some(to);
+        self.status = to;
         Some(Transition { from, to, cause })
     }
 
-    pub fn apply(&mut self, input: &CodexInput<'_>) -> Option<Transition> {
-        if self.status() == Status::Ended {
+    fn ours(&self, params: &Value) -> bool {
+        match (params["threadId"].as_str(), &self.thread) {
+            (Some(t), Some(mine)) => t == mine,
+            _ => true,
+        }
+    }
+
+    fn void_approvals(&mut self, turn: Option<&str>) {
+        let gone: Vec<String> = self
+            .approvals
+            .iter()
+            .filter(|(_, t)| turn.is_none() || t.is_none() || t.as_deref() == turn)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in gone {
+            self.approvals.remove(&k);
+            self.resolved.push(k);
+        }
+    }
+
+    fn close_commands(&mut self) {
+        self.open_commands.clear();
+        self.finished_at = None;
+    }
+
+    pub fn apply(&mut self, input: &CodexInput<'_>, now: Instant) -> Option<Transition> {
+        if self.status == Status::Ended {
             return None;
         }
         match input {
             CodexInput::Notification { method, params } => {
+                if *method == "serverRequest/resolved" {
+                    let key = request_key(&params["requestId"]);
+                    return self.apply(&CodexInput::ApprovalResolved(key), now);
+                }
+                if !self.ours(params) {
+                    return None;
+                }
                 let item = &params["item"];
                 match *method {
                     "turn/started" => {
-                        self.turn = params["turn"]["id"].as_str().map(str::to_string).or(Some(String::new()))
+                        let id = params["turn"]["id"].as_str().unwrap_or_default().to_string();
+                        self.turn = Some(id);
+                        self.error = None;
+                        self.finished_at = None;
                     }
                     "turn/completed" => {
+                        let turn = &params["turn"];
+                        let id = turn["id"].as_str().map(str::to_string).or_else(|| self.turn.clone());
+                        self.void_approvals(id.as_deref());
+                        self.last_completed = id;
                         self.turn = None;
-                        self.approvals.clear();
+                        match turn["status"].as_str() {
+                            Some("interrupted" | "failed") => {
+                                self.abandoned = self.open_commands.len();
+                                self.close_commands();
+                                if turn["status"] == "failed" {
+                                    let why = error_text(&turn["error"]).unwrap_or_else(|| "no reason given".into());
+                                    self.error = Some(format!("turn failed: {why}"));
+                                }
+                            }
+                            _ if !self.open_commands.is_empty() => self.finished_at = Some(now),
+                            _ => {}
+                        }
                     }
                     "item/started" if item["type"] == "commandExecution" => {
                         if let Some(id) = item["id"].as_str() {
@@ -8907,25 +10917,68 @@ impl CodexEngine {
                         if let Some(id) = item["id"].as_str() {
                             self.open_commands.remove(id);
                         }
+                        if self.open_commands.is_empty() {
+                            self.finished_at = None;
+                        }
+                    }
+                    "thread/status/changed" => match params["status"]["type"].as_str() {
+                        // The thread is idle: nothing of it is still running.
+                        Some("idle") if self.turn.is_none() => self.close_commands(),
+                        Some("systemError") => {
+                            self.void_approvals(None);
+                            self.turn = None;
+                            self.close_commands();
+                            self.error = Some("codex reported a system error on this thread".into());
+                        }
+                        _ => return None,
+                    },
+                    "error" => {
+                        let why = error_text(&params["error"]).unwrap_or_else(|| "unknown error".into());
+                        self.error = Some(if params["willRetry"] == true {
+                            format!("retrying: {why}")
+                        } else {
+                            format!("error: {why}")
+                        });
                     }
                     _ => return None,
                 }
                 self.settle(format!("codex:{method}"))
             }
-            CodexInput::ApprovalRequested(key) => {
-                self.approvals.insert(key.clone());
+            CodexInput::TurnAccepted(id) => {
+                if self.turn.is_some() || self.last_completed.as_deref() == Some(id.as_str()) {
+                    return None;
+                }
+                self.turn = Some(id.clone());
+                self.error = None;
+                self.finished_at = None;
+                self.settle("codex:turn/start".into())
+            }
+            CodexInput::ApprovalRequested { key, turn } => {
+                self.approvals.insert(key.clone(), turn.clone());
                 self.settle("codex:approval_requested".into())
             }
             CodexInput::ApprovalAnswered(key) => {
                 self.approvals.remove(key);
                 self.settle("mirante:approval_answered".into())
             }
+            CodexInput::ApprovalResolved(key) => {
+                self.approvals.remove(key)?;
+                self.settle("codex:request_resolved".into())
+            }
+            CodexInput::Tick => {
+                let due = self.finished_at.is_some_and(|t| now.duration_since(t) >= self.settle_after);
+                if !due {
+                    return None;
+                }
+                self.close_commands();
+                self.settle("mirante:settle_timeout".into())
+            }
             CodexInput::Closed => {
+                self.void_approvals(None);
                 self.turn = None;
-                self.open_commands.clear();
-                self.approvals.clear();
-                let from = self.status();
-                self.status = Some(Status::Ended);
+                self.close_commands();
+                let from = self.status;
+                self.status = Status::Ended;
                 Some(Transition { from, to: Status::Ended, cause: "codex:closed".into() })
             }
         }
@@ -8935,16 +10988,26 @@ impl CodexEngine {
 
 Add above the test module in `crates/mirante-daemon/src/driver/codex_rpc.rs`:
 ```rust
-//! JSON-RPC 2.0 client over `codex app-server`'s stdio (one JSON object per line). The
-//! reader thread routes responses to waiting requests and hands notifications and
-//! server→client requests (approvals) to a callback.
+//! JSON-RPC 2.0 client over `codex app-server`'s stdio (one JSON object per line).
+//! - The reader thread reads lines as bytes (`read_until`), routes responses to waiting
+//!   requests by id (0 included), and hands notifications, server→client requests
+//!   (approvals) and lines that are not JSON to a callback. EOF is reported once.
+//! - Writes go through a dedicated writer thread over a bounded queue: `request`,
+//!   `respond` and `notify` never block on the child's stdin (the hub may hold its lock
+//!   while answering an approval). A full queue is an error, never a wait.
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+/// Lines queued for the writer thread.
+pub const WRITE_QUEUE: usize = 256;
+/// A line that is not JSON is reported cut to this many characters.
+const INVALID_SHOWN: usize = 500;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
@@ -8958,14 +11021,37 @@ pub enum Incoming {
         method: String,
         params: Value,
     },
+    /// A line that is not a JSON object (logged, never silently dropped).
+    Invalid(String),
     /// The server's stdout ended.
     Closed,
 }
 
-type Pending = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, Value>>>>>;
+/// Why a request failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallError {
+    /// The server answered with a JSON-RPC error.
+    Rpc { code: i64, message: String },
+    /// No answer in time (the request may still have been applied).
+    Timeout(String),
+    /// Not sent, or the connection ended before the answer.
+    Transport(String),
+}
+
+impl fmt::Display for CallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CallError::Rpc { code, message } => write!(f, "error {code}: {message}"),
+            CallError::Timeout(m) | CallError::Transport(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+type Waiter = mpsc::Sender<Result<Value, CallError>>;
+type Pending = Arc<Mutex<HashMap<u64, Waiter>>>;
 
 pub struct RpcConn {
-    writer: Mutex<Box<dyn Write + Send>>,
+    queue: Mutex<Option<mpsc::SyncSender<Vec<u8>>>>,
     next_id: AtomicU64,
     pending: Pending,
 }
@@ -8974,71 +11060,107 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+fn route(line: &[u8], pending: &Pending, on_incoming: &impl Fn(Incoming)) {
+    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+        let text: String = String::from_utf8_lossy(line).chars().take(INVALID_SHOWN).collect();
+        on_incoming(Incoming::Invalid(text));
+        return;
+    };
+    let method = v["method"].as_str().map(str::to_string);
+    match (method, v.get("id")) {
+        (Some(method), Some(id)) => {
+            on_incoming(Incoming::Request { id: id.clone(), method, params: v["params"].clone() })
+        }
+        (Some(method), None) => on_incoming(Incoming::Notification { method, params: v["params"].clone() }),
+        (None, Some(id)) => {
+            let waiter = id.as_u64().and_then(|id| lock(pending).remove(&id));
+            if let Some(tx) = waiter {
+                let r = match v.get("error") {
+                    Some(e) => Err(CallError::Rpc {
+                        code: e["code"].as_i64().unwrap_or(0),
+                        message: e["message"].as_str().unwrap_or("").to_string(),
+                    }),
+                    None => Ok(v["result"].clone()),
+                };
+                let _ = tx.send(r);
+            }
+        }
+        (None, None) => {
+            on_incoming(Incoming::Invalid(String::from_utf8_lossy(line).chars().take(INVALID_SHOWN).collect()))
+        }
+    }
+}
+
 impl RpcConn {
     pub fn start(
-        reader: impl BufRead + Send + 'static,
-        writer: impl Write + Send + 'static,
+        mut reader: impl BufRead + Send + 'static,
+        mut writer: impl Write + Send + 'static,
         on_incoming: impl Fn(Incoming) + Send + 'static,
     ) -> Arc<RpcConn> {
         let pending: Pending = Arc::default();
-        let conn = Arc::new(RpcConn {
-            writer: Mutex::new(Box::new(writer)),
-            next_id: AtomicU64::new(1),
-            pending: pending.clone(),
-        });
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
         std::thread::spawn(move || {
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                let method = v["method"].as_str().map(str::to_string);
-                match (method, v.get("id")) {
-                    (Some(method), Some(id)) => {
-                        on_incoming(Incoming::Request { id: id.clone(), method, params: v["params"].clone() })
-                    }
-                    (Some(method), None) => on_incoming(Incoming::Notification { method, params: v["params"].clone() }),
-                    (None, Some(id)) => {
-                        let waiter = id.as_u64().and_then(|id| lock(&pending).remove(&id));
-                        if let Some(tx) = waiter {
-                            let r = match v.get("error") {
-                                Some(e) => Err(e.clone()),
-                                None => Ok(v["result"].clone()),
-                            };
-                            let _ = tx.send(r);
-                        }
-                    }
-                    (None, None) => {}
+            for line in rx {
+                if writer.write_all(&line).and_then(|()| writer.flush()).is_err() {
+                    break;
                 }
             }
+            // Dropping the writer closes the server's stdin (app-server exits on EOF).
+        });
+        let conn =
+            Arc::new(RpcConn { queue: Mutex::new(Some(tx)), next_id: AtomicU64::new(0), pending: pending.clone() });
+        std::thread::spawn(move || {
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let trimmed = line.trim_ascii();
+                if !trimmed.is_empty() {
+                    route(trimmed, &pending, &on_incoming);
+                }
+            }
+            // Every waiter gets a transport error at once (dropping its sender).
             lock(&pending).clear();
             on_incoming(Incoming::Closed);
         });
         conn
     }
 
+    /// Queues one line for the writer thread; never blocks.
     fn write(&self, msg: &Value) -> io::Result<()> {
-        let mut w = lock(&self.writer);
         let mut line = serde_json::to_vec(msg)?;
         line.push(b'\n');
-        w.write_all(&line)?;
-        w.flush()
+        let q = lock(&self.queue);
+        let tx = q.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        tx.try_send(line).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "codex app-server is not reading its input (write queue full)",
+            ),
+            mpsc::TrySendError::Disconnected(_) => io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"),
+        })
     }
 
-    /// Sends a request and waits for its result. `Err` holds the JSON-RPC error object or
-    /// a transport message.
-    pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    /// Sends a request and waits up to `timeout` for its result.
+    pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, CallError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         lock(&self.pending).insert(id, tx);
         if let Err(e) = self.write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })) {
             lock(&self.pending).remove(&id);
-            return Err(e.to_string());
+            return Err(CallError::Transport(format!("{method}: {e}")));
         }
         match rx.recv_timeout(timeout) {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&id);
-                Err(format!("{method}: no response within {timeout:?}"))
+                Err(CallError::Timeout(format!("{method}: no response within {timeout:?}")))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(CallError::Transport(format!("{method}: the connection ended before the answer")))
             }
         }
     }
@@ -9060,9 +11182,10 @@ impl RpcConn {
         self.write(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))
     }
 
-    /// Closes the server's stdin (app-server exits on EOF).
+    /// Stops writing: the writer thread drains what is queued, then closes the server's
+    /// stdin (app-server exits on EOF).
     pub fn close(&self) {
-        *lock(&self.writer) = Box::new(io::sink());
+        lock(&self.queue).take();
     }
 }
 ```
@@ -9073,19 +11196,20 @@ Run: `cargo test -p mirante-daemon`
 
 Expected (one line per test target, in this order; each line also ends with `; finished in …`):
 ```
-test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 147 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-No compiler warnings.
+`cargo clippy -p mirante-daemon --all-targets` prints no warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/mirante-daemon
+git add crates/mirante-daemon/src/driver/mod.rs crates/mirante-daemon/src/driver/codex_status.rs crates/mirante-daemon/src/driver/codex_rpc.rs
 git commit -F - <<'EOF'
-feat(daemon): codex status engine (late command items) and JSON-RPC connection
+feat(daemon): codex status engine (our thread only, late and abandoned commands, errors) and non-blocking JSON-RPC
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -9093,314 +11217,41 @@ EOF
 
 ---
 
-### Task 16: Codex driver and its launch
+### Task 17: Codex driver and its launch
 
 **Files:**
-- Modify: `crates/mirante-daemon/src/driver/mod.rs`
+- Modify: `crates/mirante-daemon/src/driver/mod.rs` (one `pub mod` line)
 - Create: `crates/mirante-daemon/src/driver/codex.rs`
 - Modify: `crates/mirante-daemon/src/driver/real.rs`
 
-Method names and payloads are the ones verified in Task 10 of Week 1 plus the generated schema (`codex app-server generate-json-schema`, Codex 0.167): `initialize` (`clientInfo` required) / `initialized`, `thread/start` / `thread/resume` (`threadId`), `turn/start` (`threadId`, `input`), `turn/steer` (`threadId`, `expectedTurnId`, `input`), `turn/interrupt` (`threadId`, `turnId`).
+Method names and payloads are the ones verified in Week 1 plus the generated schema (`codex app-server generate-json-schema`, Codex 0.167): `initialize` (`clientInfo` required) / `initialized`, `thread/start` / `thread/resume` (`threadId`, `excludeTurns`), `turn/start` (`threadId`, `input`, `clientUserMessageId`, `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`), `turn/steer` (`threadId`, `expectedTurnId`, `input`, `clientUserMessageId`), `turn/interrupt` (`threadId`, `turnId`), `serverRequest/resolved` (`threadId`, `requestId`), `error` (`error.codexErrorInfo`, `willRetry`), `account/rateLimits/updated`, `thread/tokenUsage/updated`.
 
-- **Policy.** `approvalPolicy: "on-request"`, `sandbox: "workspace-write"`, `approvalsReviewer: "user"`. Never `"never"` (that was spike-only), never the automatic reviewer: approvals reach the user.
-- **Approvals** (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, legacy `execCommandApproval` / `applyPatchApproval`) become permission cards keyed by the request id and are answered once with a one-time decision: `accept`/`decline`; for permissions, the requested profile with `scope: "turn"` or an empty grant; legacy `approved`/`abort`. Never `acceptForSession`, never policy amendments. MCP elicitations are declined; other server requests get a JSON-RPC "not supported" error.
-- **Messages.** A worker thread sends `turn/steer` with the running turn's id, falling back to `turn/start` when the steer is rejected (the turn ended in between); `turn/start` when idle. Rule 9: a steer lands at the next model step, a running command keeps running; "stop now" is `mirante interrupt` (`turn/interrupt`).
-- **Attach** is a read-only rendered stream (turns, `$ command`, exit codes, agent messages, approval notices) with 64 KiB of scrollback.
-- **Launch hygiene** mirrors Claude: the real binary (`MIRANTE_CODEX_BIN` or PATH without shims), the Claude nested-session set plus every `CMUX_*` variable removed, `OPENAI_*` / `CODEX_*` never touched; stderr goes to `~/.mirante/sessions/<task>/codex-stderr.log`. A failed handshake drops the driver, which kills the process.
+**The approval mode is "auto-edits" (founder's decision), stated plainly:** Mirante starts or resumes every Codex thread with `approvalPolicy: "on-request"`, `sandbox: "workspace-write"` and `approvalsReviewer: "user"`. Codex edits files and runs commands **inside the worktree without asking**; anything beyond the sandbox (network, writes outside the worktree, a command that wants to escape the sandbox) is an approval request that reaches **you**, never an automatic reviewer. This is less strict than Claude's `manual` mode, where every permissioned tool asks. The mode is shown in `mirante ls` (MODE column) and `mirante show` (Task 13) and is the first line of `mirante attach` on a Codex task. Mirante checks that Codex applied it: the `thread/start` / `thread/resume` response reports the effective `approvalPolicy`, `approvalsReviewer` and sandbox policy (`{"type": "workspaceWrite", …}`), and anything else fails the boot with an error naming what came back. Every `turn/start` sends the mode again (the sandbox policy exactly as the thread response reported it, so the user's own writable roots and network setting are kept). Never `"never"`, never `auto_review`.
+
+- **Approvals** (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, legacy `execCommandApproval` / `applyPatchApproval`) become permission cards keyed by the request id (`0` and string ids included) and are answered once, one-time only: `accept` / `decline`; for permissions the requested profile with `scope: "turn"` or an empty grant; legacy `approved` / `{"denied": {"rejection": …}}` (the schema's "deny and continue"; `abort` would stop the whole turn). Never `acceptForSession` / `approved_for_session`, never policy amendments. A file-change card shows the patch: the request's `itemId` names the `fileChange` item seen in `item/started`, summarised as `update src/a.rs (+2 -1)` (bounded). A request with `grantRoot` asks for write access for the rest of the session and its card says "session-wide grant". A request from another thread (a sub-agent) gets a card whose tool reads "(sub-agent)". The answer is queued to the writer thread, so answering never blocks the hub. MCP elicitations are declined; other server requests get a JSON-RPC "not supported" error.
+- **Withdrawn requests.** `serverRequest/resolved`, the end of the request's turn, or the process exiting emits `DriverEvent::PermissionResolved { key }` (Task 13 settles that card).
+- **Messages.** A worker thread sends `turn/steer` with the open turn's id, else `turn/start`, whose **response** names the new turn (the steer that follows does not wait for `turn/started`). A steer rejected by a JSON-RPC error while the engine shows the turn closed is retried once as `turn/start`; rejected while the turn is still open, or not sent at all, the message goes back to the hub's queue (`DeliveryAborted`); a timeout is never retried (it may have landed) and is reported as `send_unconfirmed`. Each message carries a `clientUserMessageId`; the `userMessage` item with that `clientId` confirms it (`message_confirmed` step). Rule 9: a steer lands at the next model step, a running command keeps running; "stop now" is `mirante interrupt` (`turn/interrupt`), which is a clear `NotNow` error when no turn of ours is running.
+- **Resume** sends `thread/resume` with `excludeTurns: true`. A thread Codex no longer has (`-32603 "no rollout found …"`) is `DriverError::NativeGone`: Task 13 records `resume_failed` and the user decides (`mirante resume --fresh`); Mirante never starts a fresh thread on its own.
+- **Status detail and usage.** Errors become the detail plus a `codex_error` / `turn_failed` / `codex_system_error` step. `account/rateLimits/updated` and `thread/tokenUsage/updated` become one `DriverEvent::Usage` line (`5h 42% · week 9% · 31k tokens`) shown in `mirante ls`.
+- **Attach** is a read-only rendered stream (mode banner, turns, `$ command`, exit codes, `[command abandoned]`, agent messages, file changes, errors, approval notices) with 64 KiB of scrollback.
+- **Process.** The real binary (`MIRANTE_CODEX_BIN` or PATH without shims), the Claude nested-session set plus every `CMUX_*` variable removed, `OPENAI_*` / `CODEX_*` never touched, `RUST_LOG=warn` unless set. `codex app-server` leads its own process group (`process_group(0)`); `stop` is `proctree::kill_tree` of that tree (SIGTERM, SIGKILL after 3 s, forks during the kill included). stderr goes to `~/.mirante/sessions/<task>/codex-stderr.log` (0600); when stdout closes the child is reaped and a `codex_exited` step carries the exit code and the last 4 KiB of that log before `Exited { code }`. Lines on stdout that are not JSON become a `codex_non_json` step. A failed handshake drops the driver, which ends the process tree.
 
 - [ ] **Step 1: Write the failing tests**
 
-`crates/mirante-daemon/src/driver/mod.rs`:
+In `crates/mirante-daemon/src/driver/mod.rs`, add `pub mod codex;` so the module list reads:
 ```rust
-//! The agent driver interface. Every agent sits behind [`Driver`]; an operation the agent
-//! cannot do is a typed [`DriverError::Unsupported`], never a silent failure. Drivers are
-//! non-blocking (typing and protocol calls run on the driver's own threads) except
-//! [`Driver::stop`], so the hub may call them while holding its lock.
-//!
-//! Drivers report back through a [`Sink`] (a channel drained by the hub's pump thread),
-//! never by calling the hub directly, so a driver thread can never deadlock on the hub.
-use std::collections::HashMap;
-use std::fmt;
-use std::path::Path;
-use std::sync::{mpsc, Arc};
-
-use mirante_core::model::{Status, Task};
-use mirante_ipc::types::BootState;
-use mirante_ipc::Paths;
-use serde_json::Value;
-
 pub mod claude;
 pub mod codex;
 pub mod codex_rpc;
 pub mod codex_status;
 #[cfg(test)]
 pub mod fake;
+pub mod paste;
+pub mod proctree;
 pub mod pty;
 pub mod real;
 pub mod screen;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverError {
-    /// The agent cannot do this (e.g. a trust prompt on Codex).
-    Unsupported(&'static str),
-    /// The dialog the operation targets is not on screen / not pending.
-    NoDialog(String),
-    Failed(String),
-}
-
-impl fmt::Display for DriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DriverError::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
-            DriverError::NoDialog(m) => write!(f, "no matching dialog: {m}"),
-            DriverError::Failed(m) => write!(f, "agent driver failed: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for DriverError {}
-
-impl From<std::io::Error> for DriverError {
-    fn from(e: std::io::Error) -> Self {
-        DriverError::Failed(e.to_string())
-    }
-}
-
-/// What a driver tells the hub.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DriverEvent {
-    /// Claude: one main-transcript line, for the hub's `StatusEngine`.
-    Transcript(Value),
-    /// Claude: where the transcript tailer is (persisted, not audited).
-    TranscriptOffset {
-        path: String,
-        offset: u64,
-    },
-    /// Codex: a status computed by the driver's own engine. `turn_open` drives the turn
-    /// records; `detail` is shown next to the status.
-    Status {
-        to: Status,
-        cause: String,
-        turn_open: bool,
-        detail: Option<String>,
-    },
-    /// Codex: an approval request. `key` is what `answer_permission` gets back.
-    PermissionRequested {
-        key: String,
-        tool: String,
-        detail: String,
-    },
-    /// Codex: the thread id, used for `thread/resume`.
-    NativeId(String),
-    Boot(BootState),
-    /// A step for the feed and audit trail (command finished, agent message, ...).
-    Step(Value),
-    Exited {
-        code: Option<i32>,
-    },
-}
-
-/// Channel end a driver emits into. Every event is tagged with the driver's session id so
-/// late events from an ended session are ignored.
-#[derive(Clone)]
-pub struct Sink {
-    session_id: String,
-    tx: mpsc::Sender<(String, DriverEvent)>,
-}
-
-impl Sink {
-    pub fn new(session_id: &str, tx: mpsc::Sender<(String, DriverEvent)>) -> Sink {
-        Sink { session_id: session_id.to_string(), tx }
-    }
-
-    pub fn emit(&self, event: DriverEvent) {
-        let _ = self.tx.send((self.session_id.clone(), event));
-    }
-}
-
-/// A live view of the agent's terminal (Claude) or event stream (Codex).
-pub struct Attachment {
-    pub id: u64,
-    /// Bytes that repaint the current screen (or recent stream) before live output.
-    pub initial: Vec<u8>,
-    pub output: mpsc::Receiver<Vec<u8>>,
-    /// Whether typed bytes reach the agent (`Driver::input`).
-    pub input: bool,
-}
-
-/// Output chunks queued per attached client. A client that falls this far behind stops
-/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
-pub const ATTACH_QUEUE: usize = 256;
-
-struct FanoutSub {
-    tx: mpsc::SyncSender<Vec<u8>>,
-    /// Its queue overflowed: chunks were dropped, so live bytes would corrupt its screen.
-    /// Nothing more is sent until [`Fanout::repaint`] delivers a full screen.
-    needs_repaint: bool,
-}
-
-/// Fan-out of output bytes to attached clients over bounded queues; dead receivers are
-/// dropped on send. The owner of the screen calls [`Fanout::repaint`] whenever
-/// [`Fanout::needs_repaint`] is true (e.g. right after `send`).
-pub struct Fanout {
-    next: u64,
-    cap: usize,
-    subs: HashMap<u64, FanoutSub>,
-}
-
-impl Default for Fanout {
-    fn default() -> Self {
-        Fanout::with_capacity(ATTACH_QUEUE)
-    }
-}
-
-impl Fanout {
-    /// `cap` chunks queued per client (at least 1).
-    pub fn with_capacity(cap: usize) -> Fanout {
-        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
-    }
-
-    pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
-        self.next += 1;
-        let (tx, rx) = mpsc::sync_channel(self.cap);
-        self.subs.insert(self.next, FanoutSub { tx, needs_repaint: false });
-        (self.next, rx)
-    }
-
-    pub fn remove(&mut self, id: u64) {
-        self.subs.remove(&id);
-    }
-
-    /// Never blocks: a full queue marks that client for a repaint and drops the chunk.
-    pub fn send(&mut self, bytes: &[u8]) {
-        self.subs.retain(|_, s| {
-            if s.needs_repaint {
-                return true;
-            }
-            match s.tx.try_send(bytes.to_vec()) {
-                Ok(()) => true,
-                Err(mpsc::TrySendError::Full(_)) => {
-                    s.needs_repaint = true;
-                    true
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-
-    /// Some client dropped chunks and waits for a full screen.
-    pub fn needs_repaint(&self) -> bool {
-        self.subs.values().any(|s| s.needs_repaint)
-    }
-
-    /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
-    /// [`Fanout::send`] whose queue has room again, and resumes live bytes for them.
-    pub fn repaint(&mut self, screen: &[u8]) {
-        self.subs.retain(|_, s| {
-            if !s.needs_repaint {
-                return true;
-            }
-            match s.tx.try_send(screen.to_vec()) {
-                Ok(()) => {
-                    s.needs_repaint = false;
-                    true
-                }
-                Err(mpsc::TrySendError::Full(_)) => true,
-                Err(mpsc::TrySendError::Disconnected(_)) => false,
-            }
-        });
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.subs.is_empty()
-    }
-}
-
-pub trait Driver: Send + Sync {
-    /// Delivers a message now: types it into the TUI (Claude) or steers / starts a turn
-    /// (Codex). Returns once the message is handed to the driver's worker.
-    fn send(&self, text: &str) -> Result<(), DriverError>;
-    /// Esc (Claude) or `turn/interrupt` (Codex).
-    fn interrupt(&self) -> Result<(), DriverError>;
-    /// Answers the permission dialog / approval request named by `key` (Codex: the request
-    /// id; Claude: the request detail, checked against the dialog on screen). Selects only
-    /// a one-time "Yes" or "No", never an "always" or "auto" option.
-    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError>;
-    /// Answers Claude's workspace-trust dialog. `false` ends the session.
-    fn trust(&self, accept: bool) -> Result<(), DriverError>;
-    /// True while a dialog would capture typed text (a message must not be typed then).
-    fn dialog_open(&self) -> bool;
-    /// Claude: start (or switch) tailing the session transcript at `offset`.
-    fn tail_transcript(&self, path: &Path, offset: u64);
-    fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
-    fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
-    fn detach(&self, attachment: u64);
-    /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
-    fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
-        Err(DriverError::Unsupported("resize"))
-    }
-    /// Last lines of the screen (Claude) or stream (Codex), for the CLI.
-    fn screen_tail(&self) -> String;
-    /// Ends the agent gracefully, then kills it. Blocks until the process is gone; the
-    /// driver still emits `Exited`.
-    fn stop(&self);
-}
-
-pub struct SpawnRequest {
-    pub task: Task,
-    pub session_id: String,
-    /// Native id to resume (Claude session id / Codex thread id).
-    pub resume: Option<String>,
-    pub paths: Paths,
-}
-
-pub trait DriverFactory: Send + Sync {
-    fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fanout_drops_dead_receivers() {
-        let mut f = Fanout::default();
-        let (a, rx_a) = f.subscribe();
-        let (_b, rx_b) = f.subscribe();
-        f.send(b"x");
-        assert_eq!(rx_a.recv().unwrap(), b"x");
-        drop(rx_b);
-        f.send(b"y");
-        assert_eq!(rx_a.recv().unwrap(), b"y");
-        f.remove(a);
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn a_stalled_client_queue_is_bounded_and_resumes_after_a_repaint() {
-        let mut f = Fanout::with_capacity(2);
-        let (_id, rx) = f.subscribe();
-        for b in [b"1", b"2", b"3", b"4"] {
-            f.send(b);
-        }
-        assert!(f.needs_repaint());
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"1".to_vec(), b"2".to_vec()]);
-        // Room again, but live bytes stay held back until the full screen is sent.
-        f.send(b"5");
-        assert!(rx.try_recv().is_err());
-        f.repaint(b"SCREEN");
-        assert!(!f.needs_repaint());
-        f.send(b"6");
-        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
-    }
-
-    #[test]
-    fn sink_tags_events_with_the_session() {
-        let (tx, rx) = mpsc::channel();
-        Sink::new("s1", tx).emit(DriverEvent::Boot(BootState::Ready));
-        assert_eq!(rx.recv().unwrap(), ("s1".to_string(), DriverEvent::Boot(BootState::Ready)));
-    }
-}
+pub mod termq;
 ```
 
 `crates/mirante-daemon/src/driver/codex.rs` (only the test module for now):
@@ -9437,22 +11288,36 @@ mod tests {
         }
     }
 
-    /// Connects a driver to a fake app-server; returns after the handshake.
-    fn setup(resume: Option<&str>) -> (Arc<CodexDriver>, FakeServer, mpsc::Receiver<(String, DriverEvent)>, Value) {
+    /// What app-server answers to thread/start|resume when it applied the requested mode.
+    fn thread_ok(id: &str) -> Value {
+        json!({"thread": {"id": id}, "approvalPolicy": "on-request", "approvalsReviewer": "user",
+            "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": false},
+            "cwd": "/w/tree", "model": "m", "modelProvider": "p"})
+    }
+
+    fn timing() -> CodexTiming {
+        CodexTiming {
+            request: Duration::from_secs(2),
+            settle_after: Duration::from_millis(300),
+            tick: Duration::from_millis(20),
+            stop_grace: Duration::from_secs(2),
+        }
+    }
+
+    type Rx = mpsc::Receiver<(String, DriverEvent)>;
+
+    /// Connects a driver to a fake app-server; `answer` replies to the thread request.
+    fn connect_with(
+        resume: Option<&str>,
+        answer: impl FnOnce(&mut FakeServer, &Value) + Send + 'static,
+    ) -> (Result<Arc<CodexDriver>, DriverError>, FakeServer, Rx, Value) {
         let (client, server) = UnixStream::pair().unwrap();
         let mut fake = FakeServer { r: BufReader::new(server.try_clone().unwrap()), w: server };
         let (tx, rx) = mpsc::channel();
         let resume = resume.map(str::to_string);
         let h = std::thread::spawn(move || {
-            CodexDriver::connect(
-                BufReader::new(client.try_clone().unwrap()),
-                client,
-                None,
-                "/w/tree",
-                resume.as_deref(),
-                Sink::new("s1", tx),
-                Duration::from_secs(5),
-            )
+            let reader = BufReader::new(client.try_clone().unwrap());
+            CodexDriver::connect(reader, client, "/w/tree", resume.as_deref(), Sink::new("s1", tx), timing())
         });
         let init = fake.expect("initialize");
         assert_eq!(init["params"]["clientInfo"]["name"], "mirante");
@@ -9460,12 +11325,16 @@ mod tests {
         let initialized = fake.expect("initialized");
         assert!(initialized.get("params").is_none());
         let thread = fake.next();
-        fake.reply(&thread, json!({"thread": {"id": "th-1"}}));
-        let d = h.join().unwrap().unwrap();
-        (d, fake, rx, thread)
+        answer(&mut fake, &thread);
+        (h.join().unwrap(), fake, rx, thread)
     }
 
-    fn next_event(rx: &mpsc::Receiver<(String, DriverEvent)>, want: impl Fn(&DriverEvent) -> bool) -> DriverEvent {
+    fn setup(resume: Option<&str>) -> (Arc<CodexDriver>, FakeServer, Rx, Value) {
+        let (d, fake, rx, thread) = connect_with(resume, |f, t| f.reply(t, thread_ok("th-1")));
+        (d.unwrap(), fake, rx, thread)
+    }
+
+    fn next_event(rx: &Rx, want: impl Fn(&DriverEvent) -> bool) -> DriverEvent {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let (_, ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("event");
@@ -9475,8 +11344,12 @@ mod tests {
         }
     }
 
+    fn status_to(to: Status) -> impl Fn(&DriverEvent) -> bool {
+        move |e| matches!(e, DriverEvent::Status { to: t, .. } if *t == to)
+    }
+
     #[test]
-    fn handshake_starts_a_thread_where_the_user_approves() {
+    fn handshake_starts_a_thread_in_auto_edits_mode_and_checks_it_was_applied() {
         let (_d, _fake, rx, thread) = setup(None);
         assert_eq!(thread["method"], "thread/start");
         assert_eq!(
@@ -9488,33 +11361,62 @@ mod tests {
     }
 
     #[test]
-    fn resume_uses_thread_resume_with_the_same_policy() {
-        let (_d, _fake, _rx, thread) = setup(Some("th-old"));
-        assert_eq!(thread["method"], "thread/resume");
-        assert_eq!(thread["params"]["threadId"], "th-old");
-        assert_eq!(thread["params"]["approvalPolicy"], "on-request");
-        assert_ne!(thread["params"]["approvalPolicy"], "never");
+    fn a_thread_whose_effective_mode_differs_fails_the_boot() {
+        let (d, _fake, _rx, _) = connect_with(None, |f, t| {
+            let mut r = thread_ok("th-1");
+            r["approvalPolicy"] = json!("never");
+            f.reply(t, r)
+        });
+        let Err(DriverError::Failed(m)) = d else { panic!("{:?}", d.err()) };
+        assert!(m.contains("auto-edits") && m.contains("\"never\""), "{m}");
+        let (d, _fake, _rx, _) = connect_with(None, |f, t| {
+            let mut r = thread_ok("th-1");
+            r["approvalsReviewer"] = json!("auto_review");
+            f.reply(t, r)
+        });
+        assert!(matches!(d, Err(DriverError::Failed(_))));
     }
 
     #[test]
-    fn send_starts_a_turn_then_steers_the_running_one_with_its_id() {
+    fn resume_uses_thread_resume_without_turns_and_a_vanished_thread_is_typed() {
+        let (_d, _fake, _rx, thread) = setup(Some("th-old"));
+        assert_eq!(thread["method"], "thread/resume");
+        assert_eq!(thread["params"]["threadId"], "th-old");
+        assert_eq!(thread["params"]["excludeTurns"], true);
+        assert_eq!(thread["params"]["approvalPolicy"], "on-request");
+        let (d, _fake, _rx, _) = connect_with(Some("th-gone"), |f, t| {
+            f.send(json!({"jsonrpc": "2.0", "id": t["id"],
+                "error": {"code": -32603, "message": "no rollout found for thread id th-gone"}}))
+        });
+        assert!(matches!(d, Err(DriverError::NativeGone(ref m)) if m.contains("th-gone")), "{:?}", d.err());
+    }
+
+    #[test]
+    fn send_starts_a_turn_with_the_policy_then_steers_the_running_one() {
         let (d, mut fake, rx, _) = setup(None);
         d.send("five steps").unwrap();
         let start = fake.expect("turn/start");
-        assert_eq!(start["params"]["input"][0]["text"], "five steps");
-        assert_eq!(start["params"]["threadId"], "th-1");
-        fake.reply(&start, json!({"turn": {"id": "tu-1"}}));
-        fake.notify("turn/started", json!({"turn": {"id": "tu-1", "status": "inProgress"}}));
+        let p = &start["params"];
+        assert_eq!((p["input"][0]["text"].as_str(), p["threadId"].as_str()), (Some("five steps"), Some("th-1")));
+        assert_eq!((p["approvalPolicy"].as_str(), p["approvalsReviewer"].as_str()), (Some("on-request"), Some("user")));
+        assert_eq!(p["sandboxPolicy"]["type"], "workspaceWrite");
+        let client_id = p["clientUserMessageId"].as_str().unwrap().to_string();
+        // The turn id comes from the response, before any notification.
+        fake.reply(&start, json!({"turn": {"id": "tu-1", "items": [], "status": "inProgress"}}));
         let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { .. }));
         assert_eq!(
             ev,
             DriverEvent::Status {
                 to: Status::Working,
-                cause: "codex:turn/started".into(),
+                cause: "codex:turn/start".into(),
                 turn_open: true,
                 detail: None
             }
         );
+        fake.notify("item/started", json!({"threadId": "th-1", "turnId": "tu-1",
+            "item": {"type": "userMessage", "id": "u1", "clientId": client_id, "content": [{"type": "text", "text": "five steps"}]}}));
+        let ok = next_event(&rx, |e| matches!(e, DriverEvent::Step(_)));
+        assert_eq!(ok, DriverEvent::Step(json!({"type": "message_confirmed", "text": "five steps"})));
         d.send("stop, say BANANA").unwrap();
         let steer = fake.expect("turn/steer");
         assert_eq!(steer["params"]["expectedTurnId"], "tu-1");
@@ -9525,21 +11427,40 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_steer_falls_back_to_a_new_turn() {
-        let (d, mut fake, _rx, _) = setup(None);
-        fake.notify("turn/started", json!({"turn": {"id": "tu-1"}}));
-        std::thread::sleep(Duration::from_millis(100));
+    fn a_steer_rejected_after_its_turn_closed_falls_back_but_a_timeout_never_does() {
+        let (d, mut fake, rx, _) = setup(None);
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
         d.send("more").unwrap();
         let steer = fake.expect("turn/steer");
+        fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "completed"}}));
+        next_event(&rx, status_to(Status::Idle));
         fake.send(json!({"jsonrpc": "2.0", "id": steer["id"], "error": {"code": -32600, "message": "no active turn"}}));
         let start = fake.expect("turn/start");
         assert_eq!(start["params"]["input"][0]["text"], "more");
+        fake.reply(&start, json!({"turn": {"id": "tu-2"}}));
+        next_event(&rx, status_to(Status::Working));
+        // A steer rejected while the turn is still open goes back to the hub's queue.
+        d.send("not now").unwrap();
+        let steer = fake.expect("turn/steer");
+        fake.send(json!({"jsonrpc": "2.0", "id": steer["id"], "error": {"code": -32600, "message": "activeTurnNotSteerable"}}));
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::DeliveryAborted { .. }));
+        assert!(matches!(ev, DriverEvent::DeliveryAborted { ref text, .. } if text == "not now"));
+        // No answer at all: reported, never re-sent as a new turn.
+        d.send("slow").unwrap();
+        fake.expect("turn/steer");
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "send_unconfirmed"));
+        assert!(matches!(ev, DriverEvent::Step(v) if v["text"] == "slow"));
+        fake.w.set_nonblocking(true).unwrap();
+        fake.r.get_ref().set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut line = String::new();
+        assert!(fake.r.read_line(&mut line).is_err() || line.is_empty(), "nothing more was sent: {line}");
     }
 
     #[test]
-    fn approvals_become_permission_cards_answered_once_with_one_time_decisions() {
+    fn approvals_become_cards_answered_once_and_are_withdrawn_when_resolved() {
         let (d, mut fake, rx, _) = setup(None);
-        fake.notify("turn/started", json!({"turn": {"id": "tu-1"}}));
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
         fake.send(json!({"jsonrpc": "2.0", "id": 41, "method": "item/commandExecution/requestApproval",
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "i1", "startedAtMs": 1, "command": "rm -rf build"}}));
         let card = next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
@@ -9551,17 +11472,66 @@ mod tests {
                 detail: "rm -rf build".into()
             }
         );
-        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { to: Status::NeedsYou, .. }));
+        let ev = next_event(&rx, status_to(Status::NeedsYou));
         assert!(matches!(ev, DriverEvent::Status { turn_open: true, .. }));
         d.answer_permission("41", true).unwrap();
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 41, "result": {"decision": "accept"}}));
         assert!(matches!(d.answer_permission("41", true), Err(DriverError::NoDialog(_))));
-        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { .. }));
-        assert!(matches!(ev, DriverEvent::Status { to: Status::Working, .. }));
+        next_event(&rx, status_to(Status::Working));
+        // Request id 0, then resolved by the server (e.g. answered elsewhere).
+        fake.send(json!({"jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "i2", "startedAtMs": 1, "command": "ls"}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { key, .. } if key == "0"));
+        fake.notify("serverRequest/resolved", json!({"threadId": "th-1", "requestId": 0}));
+        assert_eq!(
+            next_event(&rx, |e| matches!(e, DriverEvent::PermissionResolved { .. })),
+            DriverEvent::PermissionResolved { key: "0".into() }
+        );
+        next_event(&rx, status_to(Status::Working));
+        assert!(matches!(d.answer_permission("0", false), Err(DriverError::NoDialog(_))));
+        // A request still open when its turn ends is withdrawn too.
+        fake.send(json!({"jsonrpc": "2.0", "id": "r7", "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f1", "startedAtMs": 1}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
+        fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "completed"}}));
+        assert_eq!(
+            next_event(&rx, |e| matches!(e, DriverEvent::PermissionResolved { .. })),
+            DriverEvent::PermissionResolved { key: "r7".into() }
+        );
+        next_event(&rx, status_to(Status::Idle));
     }
 
     #[test]
-    fn decisions_per_request_kind() {
+    fn sub_agent_and_file_change_cards_say_what_they_are() {
+        let (_d, mut fake, rx, _) = setup(None);
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        fake.send(json!({"jsonrpc": "2.0", "id": 1, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th-child", "turnId": "tc", "itemId": "i", "startedAtMs": 1, "command": "curl x"}}));
+        let card = next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
+        assert!(matches!(card, DriverEvent::PermissionRequested { ref tool, .. } if tool == "command (sub-agent)"));
+        fake.notify("item/started", json!({"threadId": "th-1", "turnId": "tu-1", "startedAtMs": 1, "item": {
+            "type": "fileChange", "id": "f1", "status": "inProgress",
+            "changes": [{"path": "src/a.rs", "kind": {"type": "update"}, "diff": "--- a\n+++ b\n-old\n+new\n+more\n"}]}}));
+        fake.send(json!({"jsonrpc": "2.0", "id": 2, "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f1", "startedAtMs": 1, "reason": "outside"}}));
+        let card = next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
+        assert_eq!(
+            card,
+            DriverEvent::PermissionRequested {
+                key: "2".into(),
+                tool: "file_change".into(),
+                detail: "update src/a.rs (+2 -1) — outside".into()
+            }
+        );
+        fake.send(json!({"jsonrpc": "2.0", "id": 3, "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f2", "startedAtMs": 1, "grantRoot": "/Users/u"}}));
+        let card = next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
+        assert!(matches!(card, DriverEvent::PermissionRequested { ref tool, ref detail, .. }
+            if tool == "file_change (session-wide grant)" && detail.contains("/Users/u for the rest of the session")));
+    }
+
+    #[test]
+    fn decisions_per_request_kind_are_one_time_only() {
         let p = json!({"permissions": {"network": {"enabled": true}}});
         assert_eq!(approval_response("item/fileChange/requestApproval", &p, false), json!({"decision": "decline"}));
         assert_eq!(
@@ -9573,66 +11543,208 @@ mod tests {
             json!({"permissions": {}, "scope": "turn"})
         );
         assert_eq!(approval_response("execCommandApproval", &p, true), json!({"decision": "approved"}));
-        for allow in [true, false] {
-            let d = approval_response("item/commandExecution/requestApproval", &p, allow).to_string();
-            assert!(!d.contains("ForSession") && !d.contains("Amendment"), "{d}");
-        }
-        assert_eq!(approval_card("execCommandApproval", &json!({"command": ["git", "push"]})).1, "git push");
         assert_eq!(
-            approval_card("item/fileChange/requestApproval", &json!({"reason": "write outside"})).1,
-            "write outside"
+            approval_response("applyPatchApproval", &p, false),
+            json!({"decision": {"denied": {"rejection": "denied by the user in Mirante"}}})
         );
+        for m in APPROVAL_METHODS {
+            for allow in [true, false] {
+                let d = approval_response(m, &p, allow).to_string();
+                assert!(
+                    !d.contains("ForSession")
+                        && !d.contains("for_session")
+                        && !d.contains("mendment")
+                        && !d.contains("abort"),
+                    "{d}"
+                );
+            }
+        }
+        let items = HashMap::new();
+        assert_eq!(approval_card("execCommandApproval", &json!({"command": ["git", "push"]}), &items).1, "git push");
+        let legacy = json!({"fileChanges": {"b.rs": {"type": "add", "content": "a\nb\n"}}});
+        assert_eq!(approval_card("applyPatchApproval", &legacy, &items).1, "add b.rs (+2 -0)");
     }
 
     #[test]
-    fn unsupported_server_requests_are_refused_and_elicitations_declined() {
-        let (_d, mut fake, _rx, _) = setup(None);
+    fn usage_errors_and_settling_reach_the_hub() {
+        let (_d, mut fake, rx, _) = setup(None);
+        fake.notify(
+            "account/rateLimits/updated",
+            json!({"rateLimits": {
+            "primary": {"usedPercent": 42, "windowDurationMins": 300},
+            "secondary": {"usedPercent": 9, "windowDurationMins": 10080}}}),
+        );
+        assert_eq!(
+            next_event(&rx, |e| matches!(e, DriverEvent::Usage(_))),
+            DriverEvent::Usage("5h 42% · week 9%".into())
+        );
+        fake.notify(
+            "thread/tokenUsage/updated",
+            json!({"threadId": "th-1", "turnId": "t", "tokenUsage": {
+            "total": {"totalTokens": 31_400}, "last": {"totalTokens": 10}}}),
+        );
+        assert_eq!(
+            next_event(&rx, |e| matches!(e, DriverEvent::Usage(_))),
+            DriverEvent::Usage("5h 42% · week 9% · 31k tokens".into())
+        );
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        fake.notify(
+            "error",
+            json!({"threadId": "th-1", "turnId": "tu-1", "willRetry": false,
+            "error": {"message": "limit", "codexErrorInfo": "usageLimitExceeded"}}),
+        );
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "codex_error"));
+        assert!(matches!(ev, DriverEvent::Step(v) if v["error"] == "usageLimitExceeded: limit"));
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { detail: Some(_), .. }));
+        assert!(
+            matches!(ev, DriverEvent::Status { detail: Some(ref d), .. } if d == "error: usageLimitExceeded: limit")
+        );
+        // A command still open after the turn settles by itself after `settle_after`.
+        fake.notify(
+            "item/started",
+            json!({"threadId": "th-1", "item": {"type": "commandExecution", "id": "c1", "command": "sleep 9"}}),
+        );
+        fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "completed"}}));
+        let ev = next_event(&rx, status_to(Status::Idle));
+        assert!(matches!(ev, DriverEvent::Status { ref cause, .. } if cause == "mirante:settle_timeout"));
+    }
+
+    #[test]
+    fn interrupting_with_no_running_turn_is_a_clear_error() {
+        let (d, mut fake, _rx, _) = setup(None);
+        assert!(matches!(d.interrupt(), Err(DriverError::NotNow(ref m)) if m.contains("no running turn")));
+        fake.notify("turn/started", json!({"threadId": "th-child", "turn": {"id": "tc"}}));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(d.interrupt(), Err(DriverError::NotNow(_))), "a sub-agent's turn is not ours");
+    }
+
+    #[test]
+    fn other_threads_and_unsupported_requests() {
+        let (_d, mut fake, rx, _) = setup(None);
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
+        // A sub-agent finishing does not end our turn.
+        fake.notify("turn/completed", json!({"threadId": "th-child", "turn": {"id": "tc", "status": "completed"}}));
         fake.send(json!({"jsonrpc": "2.0", "id": 5, "method": "item/tool/requestUserInput", "params": {}}));
         let r = fake.next();
         assert_eq!((r["id"].as_i64(), r["error"]["code"].as_i64()), (Some(5), Some(-32601)));
         fake.send(json!({"jsonrpc": "2.0", "id": "e1", "method": "mcpServer/elicitation/request", "params": {}}));
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": "e1", "result": {"action": "decline"}}));
+        fake.w.write_all(b"panic: not json\n").unwrap();
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "codex_non_json"));
+        assert!(matches!(ev, DriverEvent::Step(v) if v["line"] == "panic: not json"));
+        while let Ok((_, e)) = rx.try_recv() {
+            assert!(!matches!(e, DriverEvent::Status { to: Status::Idle, .. }), "{e:?}");
+        }
     }
 
     #[test]
-    fn late_command_completion_is_reported_and_the_stream_is_readable() {
+    fn the_stream_is_readable_starts_with_the_mode_and_reports_abandoned_commands() {
         let (d, mut fake, rx, _) = setup(None);
         let a = d.attach(24, 80).unwrap();
         assert!(!a.input);
-        fake.notify("turn/started", json!({"turn": {"id": "tu-1"}}));
-        fake.notify("item/started", json!({"item": {"type": "commandExecution", "id": "c2", "command": "sleep 3"}}));
-        fake.notify("item/completed", json!({"item": {"type": "agentMessage", "id": "m", "text": "BANANA"}}));
-        fake.notify("turn/completed", json!({"turn": {"id": "tu-1", "status": "completed"}}));
-        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { turn_open: false, .. }));
-        assert_eq!(
-            ev,
-            DriverEvent::Status {
-                to: Status::Working,
-                cause: "codex:turn/completed".into(),
-                turn_open: false,
-                detail: Some("turn done, 1 command(s) still finishing".into())
-            }
+        assert!(String::from_utf8_lossy(&a.initial).starts_with("[mirante] codex, auto-edits mode"));
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        fake.notify(
+            "item/started",
+            json!({"threadId": "th-1", "item": {"type": "commandExecution", "id": "c2", "command": "sleep 3"}}),
         );
         fake.notify(
             "item/completed",
-            json!({"item": {"type": "commandExecution", "id": "c2", "command": "sleep 3", "exitCode": 0}}),
+            json!({"threadId": "th-1", "item": {"type": "agentMessage", "id": "m", "text": "BANANA"}}),
         );
-        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { .. }));
-        assert!(matches!(ev, DriverEvent::Status { to: Status::Idle, .. }));
+        fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "interrupted"}}));
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Status { turn_open: false, .. }));
+        assert!(matches!(ev, DriverEvent::Status { to: Status::Idle, detail: None, .. }), "{ev:?}");
         let mut seen = String::new();
-        while !seen.contains("[exit 0]") {
+        while !seen.contains("[command abandoned]") {
             seen.push_str(&String::from_utf8_lossy(&a.output.recv_timeout(Duration::from_secs(5)).unwrap()));
         }
-        assert!(seen.contains("$ sleep 3") && seen.contains("BANANA") && seen.contains("── turn completed ──"));
+        assert!(seen.contains("$ sleep 3") && seen.contains("BANANA") && seen.contains("── turn interrupted ──"));
+        assert!(d.screen_tail().ends_with("[command abandoned]"));
         assert!(matches!(d.input(a.id, b"x"), Err(DriverError::Unsupported(_))));
         assert!(matches!(d.trust(true), Err(DriverError::Unsupported(_))));
     }
 
     #[test]
-    fn server_eof_is_an_exit() {
-        let (_d, fake, rx, _) = setup(None);
+    fn server_eof_withdraws_requests_and_is_an_exit() {
+        let (_d, mut fake, rx, _) = setup(None);
+        fake.send(json!({"jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "i", "startedAtMs": 1, "command": "ls"}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
         drop(fake);
+        assert_eq!(
+            next_event(&rx, |e| matches!(e, DriverEvent::PermissionResolved { .. })),
+            DriverEvent::PermissionResolved { key: "0".into() }
+        );
         assert_eq!(next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { code: None });
+    }
+
+    /// A fake `codex app-server`: answers the handshake (request ids 0 and 1), then runs
+    /// `rest`. It writes one line to stderr first.
+    fn fake_app_server(dir: &Path, rest: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("codex");
+        let script = format!(
+            "#!/bin/sh\necho 'fake codex: starting' >&2\n\
+             read l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\n\
+             read l\n\
+             read l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"thread\":{{\"id\":\"th-1\"}},\"approvalPolicy\":\"on-request\",\"approvalsReviewer\":\"user\",\"sandbox\":{{\"type\":\"workspaceWrite\"}}}}}}'\n\
+             {rest}\n"
+        );
+        std::fs::write(&p, script).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn spawn_fake(dir: &Path, rest: &str) -> (Arc<CodexDriver>, Rx) {
+        let bin = fake_app_server(dir, rest);
+        let (tx, rx) = mpsc::channel();
+        let log = dir.join("codex-stderr.log");
+        let cwd = dir.to_string_lossy().into_owned();
+        let d = CodexDriver::spawn(&bin, &cwd, None, &[], &log, Sink::new("s1", tx), timing()).unwrap();
+        (d, rx)
+    }
+
+    #[test]
+    fn stop_ends_the_app_server_and_everything_it_started() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        let rest = format!(
+            "sleep 60 & echo $! > {p}\nperl -e 'setpgrp(0,0); sleep 60' & echo $! >> {p}\nwhile :; do sleep 0.1; done",
+            p = pids.display()
+        );
+        let (d, rx) = spawn_fake(dir.path(), &rest);
+        let root = d.root().expect("spawned");
+        assert_eq!(proctree::pgid(root.pid), Some(root.pid), "app-server leads its own process group");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let children: Vec<i32> = loop {
+            let text = std::fs::read_to_string(&pids).unwrap_or_default();
+            let v: Vec<i32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+            if v.len() == 2 && v.iter().all(|p| proctree::proc_of(*p).is_some()) {
+                break v;
+            }
+            assert!(Instant::now() < deadline, "children never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        d.stop();
+        assert!(!proctree::alive(root));
+        for pid in children {
+            assert!(proctree::proc_of(pid).is_none(), "{pid} survived the stop");
+        }
+        next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. }));
+    }
+
+    #[test]
+    fn an_exit_is_reported_with_its_code_and_the_stderr_tail() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let (_d, rx) = spawn_fake(dir.path(), "echo 'fatal: model not available' >&2\nexit 3");
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "codex_exited"));
+        let DriverEvent::Step(v) = ev else { unreachable!() };
+        assert_eq!(v["code"], 3);
+        let tail = v["stderr_tail"].as_str().unwrap();
+        assert!(tail.contains("fake codex: starting") && tail.contains("fatal: model not available"), "{tail}");
+        assert_eq!(next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. })), DriverEvent::Exited { code: Some(3) });
     }
 
     #[test]
@@ -9673,22 +11785,40 @@ error: cannot find macro `json` in this scope
 
 Add above the test module in `crates/mirante-daemon/src/driver/codex.rs`:
 ```rust
-//! Codex driver: `codex app-server` JSON-RPC over stdio (FINDINGS Task 10, verified names).
+//! Codex driver: `codex app-server` JSON-RPC over stdio (FINDINGS Task 10 names, Codex 0.167
+//! schema).
+//!
+//! **Approval mode "auto-edits"** (the founder's decision): every thread is started or
+//! resumed with `approvalPolicy: "on-request"`, `sandbox: "workspace-write"` and
+//! `approvalsReviewer: "user"`. In plain words: Codex edits files and runs commands inside
+//! the worktree without asking (the sandbox allows writes there and nothing else); anything
+//! beyond the sandbox (network, writes outside the worktree, an unsandboxed command) is an
+//! approval request that reaches the user, never an automatic reviewer. The effective
+//! policy in the `thread/start` / `thread/resume` response is checked: if Codex did not
+//! apply exactly this mode the boot fails. Each `turn/start` sends the policy again. Never
+//! `"never"`, never `auto_review`, never a session-wide or policy-amending decision.
+//!
 //! - Launch hygiene: the real binary (`MIRANTE_CODEX_BIN`, else PATH without shim dirs),
-//!   every Claude nested-session and `CMUX_*` variable removed, auth untouched.
-//! - `thread/start` / `thread/resume` with `cwd` = the worktree, `approvalPolicy`
-//!   "on-request", `sandbox` "workspace-write", `approvalsReviewer` "user": the user
-//!   approves; never "never", never an automatic reviewer.
-//! - Messages: `turn/steer` (with `expectedTurnId`) while a turn runs, else `turn/start`.
+//!   every Claude nested-session and `CMUX_*` variable removed, auth untouched,
+//!   `RUST_LOG=warn` unless set; its own process group, so `stop` ends the whole tree.
+//! - Only our thread's notifications move the status and fill the stream; a sub-agent's
+//!   approval requests become cards labelled "(sub-agent)".
+//! - Messages: `turn/steer` (with `expectedTurnId`) while a turn runs, else `turn/start`
+//!   (whose response names the new turn). A steer rejected because the turn just closed is
+//!   retried as `turn/start`; a timeout is never retried (it may have landed). Each message
+//!   carries a `clientUserMessageId` and is confirmed when its `userMessage` item shows up.
 //!   A steer lands at the next model step; a running command keeps running (rule 9), so
 //!   "stop now" is `turn/interrupt`.
-//! - Approvals arrive as server→client requests and are answered once, with a one-time
-//!   decision only ("accept" / "decline"; never "acceptForSession" or policy amendments).
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+//! - Approvals arrive as server→client requests and are answered once, one-time only.
+//!   `serverRequest/resolved`, the end of their turn, or the process exiting withdraws them
+//!   (`DriverEvent::PermissionResolved`).
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use mirante_core::claude_launch::{env_to_scrub, KNOWN_SHIM_DIRS};
@@ -9696,8 +11826,9 @@ use mirante_core::model::Status;
 use mirante_ipc::types::BootState;
 use serde_json::{json, Value};
 
-use super::codex_rpc::{Incoming, RpcConn};
-use super::codex_status::{CodexEngine, CodexInput};
+use super::codex_rpc::{CallError, Incoming, RpcConn};
+use super::codex_status::{request_key, CodexEngine, CodexInput, SETTLE_AFTER};
+use super::proctree::{self, Kill, Proc};
 use super::{Attachment, Driver, DriverError, DriverEvent, Fanout, Sink};
 
 pub const APPROVAL_METHODS: [&str; 5] = [
@@ -9708,28 +11839,101 @@ pub const APPROVAL_METHODS: [&str; 5] = [
     "applyPatchApproval",
 ];
 
-const SCROLLBACK: usize = 64 * 1024;
+pub const APPROVAL_POLICY: &str = "on-request";
+pub const SANDBOX: &str = "workspace-write";
+/// How the effective sandbox policy names [`SANDBOX`] in responses.
+pub const SANDBOX_POLICY_TYPE: &str = "workspaceWrite";
+pub const REVIEWER: &str = "user";
 
-/// `thread/start` (no `resume`) or `thread/resume` parameters.
+/// First line of every attach stream.
+pub const MODE_BANNER: &str = "[mirante] codex, auto-edits mode: edits and commands inside the worktree run without \
+     asking; anything beyond the sandbox asks you (approvalPolicy on-request, sandbox workspace-write, approvalsReviewer user)";
+
+const SCROLLBACK: usize = 64 * 1024;
+/// How much of the stderr log is reported when the process exits.
+pub const STDERR_TAIL: u64 = 4096;
+/// File-change items remembered for approval cards.
+const FILE_ITEMS: usize = 64;
+/// Longest card detail for a patch.
+const PATCH_DETAIL: usize = 400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexTiming {
+    /// How long a JSON-RPC request waits for its answer.
+    pub request: Duration,
+    /// Commands still open after a completed turn settle after this long.
+    pub settle_after: Duration,
+    /// Clock for the settle timeout.
+    pub tick: Duration,
+    /// SIGTERM → SIGKILL grace when stopping.
+    pub stop_grace: Duration,
+}
+
+impl Default for CodexTiming {
+    fn default() -> Self {
+        CodexTiming {
+            request: Duration::from_secs(30),
+            settle_after: SETTLE_AFTER,
+            tick: Duration::from_secs(1),
+            stop_grace: Duration::from_secs(3),
+        }
+    }
+}
+
+/// `thread/start` (no `resume`) or `thread/resume` parameters, in auto-edits mode.
 pub fn thread_params(cwd: &str, resume: Option<&str>) -> Value {
     let mut p = json!({
         "cwd": cwd,
-        "approvalPolicy": "on-request",
-        "sandbox": "workspace-write",
-        "approvalsReviewer": "user",
+        "approvalPolicy": APPROVAL_POLICY,
+        "sandbox": SANDBOX,
+        "approvalsReviewer": REVIEWER,
     });
     if let Some(id) = resume {
         p["threadId"] = json!(id);
+        p["excludeTurns"] = json!(true);
     }
     p
 }
 
-/// The one-time answer to an approval request (schema: Codex 0.167 app-server).
+/// The response must show the mode Mirante asked for; anything else fails the boot.
+pub fn check_mode(response: &Value) -> Result<(), String> {
+    let policy = &response["approvalPolicy"];
+    let reviewer = &response["approvalsReviewer"];
+    let sandbox = &response["sandbox"]["type"];
+    if policy == APPROVAL_POLICY && reviewer == REVIEWER && sandbox == SANDBOX_POLICY_TYPE {
+        return Ok(());
+    }
+    Err(format!(
+        "codex app-server did not apply Mirante's auto-edits mode (wanted approvalPolicy {APPROVAL_POLICY}, \
+         sandbox {SANDBOX_POLICY_TYPE}, approvalsReviewer {REVIEWER}; got approvalPolicy {policy}, sandbox {sandbox}, \
+         approvalsReviewer {reviewer}); refusing to run it"
+    ))
+}
+
+/// `turn/start` parameters: the input plus the mode again (the sandbox policy exactly as
+/// the thread response reported it, so the user's writable roots / network setting stay).
+pub fn turn_start_params(thread: &str, text: &str, client_id: &str, sandbox_policy: &Value) -> Value {
+    json!({
+        "threadId": thread,
+        "input": [{ "type": "text", "text": text }],
+        "clientUserMessageId": client_id,
+        "approvalPolicy": APPROVAL_POLICY,
+        "approvalsReviewer": REVIEWER,
+        "sandboxPolicy": sandbox_policy,
+    })
+}
+
+/// The one-time answer to an approval request (schema: Codex 0.167 app-server). Legacy
+/// requests take a `ReviewDecision`, whose "deny and continue" is `{"denied": …}` (`abort`
+/// would stop the whole turn).
 pub fn approval_response(method: &str, params: &Value, allow: bool) -> Value {
     match method {
         "item/permissions/requestApproval" if allow => json!({ "permissions": params["permissions"], "scope": "turn" }),
         "item/permissions/requestApproval" => json!({ "permissions": {}, "scope": "turn" }),
-        "execCommandApproval" | "applyPatchApproval" => json!({ "decision": if allow { "approved" } else { "abort" } }),
+        "execCommandApproval" | "applyPatchApproval" if allow => json!({ "decision": "approved" }),
+        "execCommandApproval" | "applyPatchApproval" => {
+            json!({ "decision": { "denied": { "rejection": "denied by the user in Mirante" } } })
+        }
         _ => json!({ "decision": if allow { "accept" } else { "decline" } }),
     }
 }
@@ -9745,15 +11949,123 @@ fn text_of(v: &Value) -> Option<String> {
     }
 }
 
-/// (tool, detail) for the permission card.
-pub fn approval_card(method: &str, params: &Value) -> (String, String) {
+/// `+added -removed` of a unified diff (header lines not counted).
+fn diff_counts(diff: &str) -> (usize, usize) {
+    let added = diff.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+    let removed = diff.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+    (added, removed)
+}
+
+fn bounded(mut s: String, max: usize) -> String {
+    if s.chars().count() > max {
+        s = s.chars().take(max.saturating_sub(1)).collect();
+        s.push('…');
+    }
+    s
+}
+
+/// "update src/a.rs (+3 -1), add b.rs (+10 -0)" for a v2 `fileChange` item's `changes`.
+fn changes_summary(changes: &Value) -> Option<String> {
+    let parts: Vec<String> = changes
+        .as_array()?
+        .iter()
+        .map(|c| {
+            let (a, r) = diff_counts(c["diff"].as_str().unwrap_or(""));
+            let kind = c["kind"]["type"].as_str().unwrap_or("change");
+            format!("{kind} {} (+{a} -{r})", c["path"].as_str().unwrap_or("?"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// The same for a legacy `applyPatchApproval`'s `fileChanges` map.
+fn legacy_changes_summary(changes: &Value) -> Option<String> {
+    let parts: Vec<String> = changes
+        .as_object()?
+        .iter()
+        .map(|(path, c)| {
+            let kind = c["type"].as_str().unwrap_or("change");
+            let (a, r) = match kind {
+                "add" => (c["content"].as_str().unwrap_or("").lines().count(), 0),
+                "delete" => (0, c["content"].as_str().unwrap_or("").lines().count()),
+                _ => diff_counts(c["unified_diff"].as_str().unwrap_or("")),
+            };
+            format!("{kind} {path} (+{a} -{r})")
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// (tool, detail) for the permission card. A file change shows its patch (from the
+/// `fileChange` item the request's `itemId` names); a `grantRoot` asks for write access for
+/// the rest of the session and says so.
+pub fn approval_card(method: &str, params: &Value, file_items: &HashMap<String, Value>) -> (String, String) {
     let reason = text_of(&params["reason"]);
     let (tool, detail) = match method {
         "item/commandExecution/requestApproval" | "execCommandApproval" => ("command", text_of(&params["command"])),
-        "item/fileChange/requestApproval" | "applyPatchApproval" => ("file_change", text_of(&params["grantRoot"])),
+        "item/fileChange/requestApproval" | "applyPatchApproval" if params["grantRoot"].is_string() => {
+            let root = params["grantRoot"].as_str().unwrap_or("");
+            ("file_change (session-wide grant)", Some(format!("write access under {root} for the rest of the session")))
+        }
+        "item/fileChange/requestApproval" => {
+            let item = params["itemId"].as_str().and_then(|id| file_items.get(id));
+            ("file_change", item.and_then(|i| changes_summary(&i["changes"])).map(|s| bounded(s, PATCH_DETAIL)))
+        }
+        "applyPatchApproval" => {
+            ("file_change", legacy_changes_summary(&params["fileChanges"]).map(|s| bounded(s, PATCH_DETAIL)))
+        }
         _ => ("permissions", Some(params["permissions"].to_string()).filter(|s| s != "null")),
     };
-    (tool.to_string(), detail.or(reason).unwrap_or_else(|| "(no detail given)".into()))
+    let detail = match (detail, reason) {
+        (Some(d), Some(r)) if tool.starts_with("file_change") => format!("{d} — {r}"),
+        (Some(d), _) => d,
+        (None, Some(r)) => r,
+        (None, None) => "(no detail given)".into(),
+    };
+    (tool.to_string(), detail)
+}
+
+fn window_label(mins: Option<i64>) -> String {
+    match mins {
+        Some(10080) => "week".into(),
+        Some(m) if m >= 1440 && m % 1440 == 0 => format!("{}d", m / 1440),
+        Some(m) if m >= 60 && m % 60 == 0 => format!("{}h", m / 60),
+        Some(m) => format!("{m}m"),
+        None => "limit".into(),
+    }
+}
+
+fn tokens_label(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{}k", (n + 500) / 1_000),
+        n => n.to_string(),
+    }
+}
+
+/// One line for `mirante ls`: "5h 42% · week 9% · 31k tokens".
+pub fn usage_line(rate_limits: Option<&Value>, token_usage: Option<&Value>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(r) = rate_limits {
+        for w in [&r["primary"], &r["secondary"]] {
+            if let Some(p) = w["usedPercent"].as_i64() {
+                parts.push(format!("{} {p}%", window_label(w["windowDurationMins"].as_i64())));
+            }
+        }
+    }
+    if let Some(total) = token_usage.and_then(|t| t["total"]["totalTokens"].as_i64()) {
+        parts.push(format!("{} tokens", tokens_label(total)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn error_text(err: &Value) -> String {
+    let info = match &err["codexErrorInfo"] {
+        Value::String(s) => format!("{s}: "),
+        Value::Object(o) => o.keys().next().map(|k| format!("{k}: ")).unwrap_or_default(),
+        _ => String::new(),
+    };
+    format!("{info}{}", err["message"].as_str().unwrap_or("unknown error"))
 }
 
 /// A human-readable line for `mirante attach` (read-only stream).
@@ -9769,6 +12081,15 @@ pub fn render(method: &str, params: &Value) -> Option<String> {
         ("item/completed", Some("commandExecution")) => Some(format!("  [exit {}]\r\n", item["exitCode"])),
         ("item/completed", Some("agentMessage")) => Some(format!("{}\r\n", crlf(item["text"].as_str()?))),
         ("item/completed", Some("userMessage")) => Some(format!("> {}\r\n", crlf(&text_of(&item["content"])?))),
+        ("item/completed", Some("fileChange")) => Some(format!("  [{}]\r\n", changes_summary(&item["changes"])?)),
+        ("error", _) => Some(format!(
+            "[error] {}{}\r\n",
+            error_text(&params["error"]),
+            if params["willRetry"] == true { " (retrying)" } else { "" }
+        )),
+        ("thread/status/changed", _) if params["status"]["type"] == "systemError" => {
+            Some("[codex reported a system error on this thread]\r\n".into())
+        }
         _ => None,
     }
 }
@@ -9783,6 +12104,17 @@ fn step(method: &str, params: &Value) -> Option<Value> {
         ("item/completed", Some("agentMessage")) => {
             let text: String = item["text"].as_str().unwrap_or("").chars().take(500).collect();
             Some(json!({ "type": "agent_message", "text": text }))
+        }
+        ("error", _) => Some(json!({
+            "type": "codex_error",
+            "error": error_text(&params["error"]),
+            "will_retry": params["willRetry"],
+        })),
+        ("turn/completed", _) if params["turn"]["status"] == "failed" => {
+            Some(json!({ "type": "turn_failed", "error": error_text(&params["turn"]["error"]) }))
+        }
+        ("thread/status/changed", _) if params["status"]["type"] == "systemError" => {
+            Some(json!({ "type": "codex_system_error" }))
         }
         _ => None,
     }
@@ -9828,15 +12160,75 @@ pub fn codex_env_to_scrub(present: Vec<String>) -> Vec<String> {
     keys
 }
 
+/// The last `max` bytes of `path` (lossy UTF-8), empty when unreadable.
+pub fn file_tail(path: &Path, max: u64) -> String {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(max)));
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Last `n` non-blank lines.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The spawned app-server: reaped once, by whoever gets there first (the reader at EOF or
+/// `stop`).
+struct Process {
+    child: Mutex<Option<Child>>,
+    root: Option<Proc>,
+    stderr_log: Option<PathBuf>,
+    code: Mutex<Option<i32>>,
+}
+
+impl Process {
+    /// Waits up to `wait` for the exit, then ends what is left of the tree; records the code.
+    fn reap(&self, wait: Duration) -> Option<i32> {
+        if let Some(mut child) = lock(&self.child).take() {
+            let deadline = Instant::now() + wait;
+            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if let Some(root) = self.root {
+                proctree::kill_tree(root, Duration::from_millis(500), &Kill);
+            }
+            if let Ok(status) = child.wait() {
+                *lock(&self.code) = status.code();
+            }
+        }
+        *lock(&self.code)
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.stderr_log.as_deref().map(|p| file_tail(p, STDERR_TAIL)).unwrap_or_default()
+    }
+}
+
 struct Shared {
     engine: CodexEngine,
     thread_id: Option<String>,
     /// key -> (request id, method, params)
     approvals: HashMap<String, (Value, String, Value)>,
+    /// `fileChange` items by id (bounded), for approval cards.
+    file_items: HashMap<String, Value>,
+    file_order: VecDeque<String>,
     fanout: Fanout,
     scrollback: Vec<u8>,
     /// Last reported (status, turn open, detail), to emit only changes.
     reported: (Status, bool, Option<String>),
+    /// The effective sandbox policy from the thread response (sent again on each turn).
+    sandbox_policy: Value,
+    /// clientUserMessageId -> text, until its `userMessage` item shows up.
+    unconfirmed: HashMap<String, String>,
+    rate_limits: Option<Value>,
+    token_usage: Option<Value>,
+    closed: bool,
 }
 
 impl Shared {
@@ -9853,14 +12245,34 @@ impl Shared {
         }
     }
 
-    /// The status event to emit, if anything the hub shows changed.
-    fn report(&mut self, cause: String) -> Option<DriverEvent> {
-        let now = (self.engine.status(), self.engine.turn_open(), self.engine.detail());
-        if now == self.reported {
-            return None;
+    fn remember_file_item(&mut self, item: &Value) {
+        let Some(id) = item["id"].as_str() else { return };
+        if self.file_items.insert(id.to_string(), item.clone()).is_none() {
+            self.file_order.push_back(id.to_string());
         }
-        self.reported = now.clone();
-        Some(DriverEvent::Status { to: now.0, cause, turn_open: now.1, detail: now.2 })
+        while self.file_order.len() > FILE_ITEMS {
+            if let Some(old) = self.file_order.pop_front() {
+                self.file_items.remove(&old);
+            }
+        }
+    }
+
+    /// After the engine moved: withdrawn requests, abandoned commands, the status change.
+    fn settle(&mut self, cause: String, out: &mut Vec<DriverEvent>) {
+        for key in self.engine.take_resolved() {
+            if self.approvals.remove(&key).is_some() {
+                self.output(&format!("[request {key} withdrawn]\r\n"));
+                out.push(DriverEvent::PermissionResolved { key });
+            }
+        }
+        for _ in 0..self.engine.take_abandoned() {
+            self.output("  [command abandoned]\r\n");
+        }
+        let now = (self.engine.status(), self.engine.turn_open(), self.engine.detail());
+        if now != self.reported {
+            self.reported = now.clone();
+            out.push(DriverEvent::Status { to: now.0, cause, turn_open: now.1, detail: now.2 });
+        }
     }
 }
 
@@ -9870,7 +12282,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 enum Work {
     Send(String),
-    Interrupt,
+    Interrupt(String),
 }
 
 pub struct CodexDriver {
@@ -9878,173 +12290,331 @@ pub struct CodexDriver {
     shared: Arc<Mutex<Shared>>,
     sink: Sink,
     work: Mutex<Option<mpsc::Sender<Work>>>,
-    child: Mutex<Option<Child>>,
+    process: Option<Arc<Process>>,
+    stopped: Arc<AtomicBool>,
+    timing: CodexTiming,
 }
 
-fn on_incoming(shared: &Mutex<Shared>, sink: &Sink, conn: &OnceLock<Arc<RpcConn>>, incoming: Incoming) {
+struct Ctx {
+    shared: Arc<Mutex<Shared>>,
+    sink: Sink,
+    conn: OnceLock<Arc<RpcConn>>,
+    process: Option<Arc<Process>>,
+}
+
+fn on_incoming(ctx: &Ctx, incoming: Incoming) {
+    let mut out = Vec::new();
     match incoming {
         Incoming::Notification { method, params } => {
-            let status = {
-                let mut s = lock(shared);
-                let t = s.engine.apply(&CodexInput::Notification { method: &method, params: &params });
+            let mut s = lock(&ctx.shared);
+            let item = &params["item"];
+            let ours = params["threadId"].as_str().is_none_or(|t| Some(t) == s.thread_id.as_deref());
+            if method == "item/started" && item["type"] == "fileChange" {
+                s.remember_file_item(item);
+            }
+            match method.as_str() {
+                "account/rateLimits/updated" => s.rate_limits = Some(params["rateLimits"].clone()),
+                "thread/tokenUsage/updated" if ours => s.token_usage = Some(params["tokenUsage"].clone()),
+                "serverRequest/resolved" => {
+                    let key = request_key(&params["requestId"]);
+                    if s.approvals.remove(&key).is_some() {
+                        s.output(&format!("[request {key} resolved by codex]\r\n"));
+                        out.push(DriverEvent::PermissionResolved { key });
+                    }
+                }
+                _ => {}
+            }
+            if matches!(method.as_str(), "account/rateLimits/updated" | "thread/tokenUsage/updated") {
+                if let Some(line) = usage_line(s.rate_limits.as_ref(), s.token_usage.as_ref()) {
+                    out.push(DriverEvent::Usage(line));
+                }
+            }
+            if ours && item["type"] == "userMessage" {
+                if let Some(text) = item["clientId"].as_str().and_then(|id| s.unconfirmed.remove(id)) {
+                    out.push(DriverEvent::Step(json!({ "type": "message_confirmed", "text": text })));
+                }
+            }
+            let t = s.engine.apply(&CodexInput::Notification { method: &method, params: &params }, Instant::now());
+            if ours {
                 if let Some(text) = render(&method, &params) {
                     s.output(&text);
                 }
-                s.report(t.map_or_else(|| format!("codex:{method}"), |t| t.cause))
-            };
-            if let Some(st) = step(&method, &params) {
-                sink.emit(DriverEvent::Step(st));
+                if let Some(st) = step(&method, &params) {
+                    out.push(DriverEvent::Step(st));
+                }
             }
-            if let Some(ev) = status {
-                sink.emit(ev);
-            }
+            s.settle(t.map_or_else(|| format!("codex:{method}"), |t| t.cause), &mut out);
         }
         Incoming::Request { id, method, params } if APPROVAL_METHODS.contains(&method.as_str()) => {
-            let key = id.to_string();
-            let (tool, detail) = approval_card(&method, &params);
-            let status = {
-                let mut s = lock(shared);
-                s.output(&format!("[needs you] {tool}: {detail}  (mirante perms)\r\n"));
-                s.approvals.insert(key.clone(), (id, method, params));
-                let t = s.engine.apply(&CodexInput::ApprovalRequested(key.clone()));
-                s.report(t.map_or_else(|| "codex:approval_requested".into(), |t| t.cause))
-            };
-            sink.emit(DriverEvent::PermissionRequested { key, tool, detail });
-            if let Some(ev) = status {
-                sink.emit(ev);
+            let key = request_key(&id);
+            let mut s = lock(&ctx.shared);
+            let thread = params["threadId"].as_str().or(params["conversationId"].as_str());
+            let sub_agent = thread.is_some_and(|t| Some(t) != s.thread_id.as_deref());
+            let (mut tool, detail) = approval_card(&method, &params, &s.file_items);
+            if sub_agent {
+                tool.push_str(" (sub-agent)");
             }
+            s.output(&format!("[needs you] {tool}: {detail}  (mirante perms)\r\n"));
+            let turn = params["turnId"].as_str().map(str::to_string);
+            s.approvals.insert(key.clone(), (id, method, params));
+            let t = s.engine.apply(&CodexInput::ApprovalRequested { key: key.clone(), turn }, Instant::now());
+            out.push(DriverEvent::PermissionRequested { key, tool, detail });
+            s.settle(t.map_or_else(|| "codex:approval_requested".into(), |t| t.cause), &mut out);
         }
         Incoming::Request { id, method, .. } => {
-            let Some(conn) = conn.get() else { return };
-            // MCP elicitations are declined (never accepted on the user's behalf); other
-            // server requests (user input, tool calls, auth refresh) are not supported.
-            let _ = if method == "mcpServer/elicitation/request" {
-                conn.respond(&id, json!({ "action": "decline" }))
-            } else {
-                conn.respond_error(&id, -32601, "not supported by Mirante")
-            };
-            sink.emit(DriverEvent::Step(json!({ "type": "server_request_declined", "method": method })));
-        }
-        Incoming::Closed => {
-            {
-                let mut s = lock(shared);
-                s.engine.apply(&CodexInput::Closed);
-                s.fanout = Fanout::default();
+            if let Some(conn) = ctx.conn.get() {
+                // MCP elicitations are declined (never accepted on the user's behalf); other
+                // server requests (user input, tool calls, auth refresh) are not supported.
+                let _ = if method == "mcpServer/elicitation/request" {
+                    conn.respond(&id, json!({ "action": "decline" }))
+                } else {
+                    conn.respond_error(&id, -32601, "not supported by Mirante")
+                };
             }
-            sink.emit(DriverEvent::Exited { code: None });
+            out.push(DriverEvent::Step(json!({ "type": "server_request_declined", "method": method })));
         }
+        Incoming::Invalid(line) => out.push(DriverEvent::Step(json!({ "type": "codex_non_json", "line": line }))),
+        Incoming::Closed => {
+            // Reap first (outside the lock): the exit code goes into the report.
+            let code = ctx.process.as_ref().and_then(|p| p.reap(Duration::from_secs(2)));
+            let mut s = lock(&ctx.shared);
+            s.closed = true;
+            s.engine.apply(&CodexInput::Closed, Instant::now());
+            s.settle("codex:closed".into(), &mut out);
+            out.retain(|e| !matches!(e, DriverEvent::Status { .. }));
+            s.fanout = Fanout::default();
+            if let Some(p) = &ctx.process {
+                let tail = p.stderr_tail();
+                out.push(DriverEvent::Step(json!({ "type": "codex_exited", "code": code, "stderr_tail": tail })));
+            }
+            out.push(DriverEvent::Exited { code });
+        }
+    }
+    for e in out {
+        ctx.sink.emit(e);
     }
 }
 
+static MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+fn client_message_id() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("mirante-{nanos:x}-{}", MESSAGES.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Delivers one message: steer the open turn, else start one. Only a JSON-RPC rejection of
+/// a steer whose turn has meanwhile closed is retried as `turn/start`; a timeout is never
+/// retried (the message may have landed). A message that was certainly not delivered goes
+/// back to the hub's queue (`DeliveryAborted`).
 fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, timeout: Duration) {
-    let (thread, turn) = {
-        let s = lock(shared);
-        (s.thread_id.clone(), s.engine.turn_id().map(str::to_string))
+    let client_id = client_message_id();
+    let (thread, turn, sandbox) = {
+        let mut s = lock(shared);
+        s.unconfirmed.insert(client_id.clone(), text.to_string());
+        (s.thread_id.clone().unwrap_or_default(), s.engine.turn_id().map(str::to_string), s.sandbox_policy.clone())
     };
-    let input = json!([{ "type": "text", "text": text }]);
-    let start = || conn.request("turn/start", json!({ "threadId": thread, "input": input }), timeout);
+    let start = || -> Result<(), CallError> {
+        let r = conn.request("turn/start", turn_start_params(&thread, text, &client_id, &sandbox), timeout)?;
+        if let Some(id) = r["turn"]["id"].as_str() {
+            let mut out = Vec::new();
+            {
+                let mut s = lock(shared);
+                let t = s.engine.apply(&CodexInput::TurnAccepted(id.to_string()), Instant::now());
+                s.settle(t.map_or_else(|| "codex:turn/start".into(), |t| t.cause), &mut out);
+            }
+            for e in out {
+                sink.emit(e);
+            }
+        }
+        Ok(())
+    };
     let r = match turn {
-        Some(t) => conn
-            .request("turn/steer", json!({ "threadId": thread, "expectedTurnId": t, "input": input }), timeout)
-            .or_else(|e| {
-                // The turn ended between the check and the call: start a new one.
-                sink.emit(DriverEvent::Step(json!({ "type": "steer_fell_back", "error": e })));
-                start()
-            }),
+        Some(t) => {
+            let p = json!({
+                "threadId": thread,
+                "expectedTurnId": t,
+                "input": [{ "type": "text", "text": text }],
+                "clientUserMessageId": client_id,
+            });
+            match conn.request("turn/steer", p, timeout) {
+                Err(CallError::Rpc { message, .. }) if !lock(shared).engine.turn_open() => {
+                    sink.emit(DriverEvent::Step(json!({ "type": "steer_fell_back", "error": message })));
+                    start()
+                }
+                other => other.map(|_| ()),
+            }
+        }
         None => start(),
     };
-    if let Err(e) = r {
-        sink.emit(DriverEvent::Step(json!({ "type": "send_failed", "error": e })));
+    match r {
+        Ok(()) => {}
+        Err(CallError::Timeout(e)) => {
+            sink.emit(DriverEvent::Step(json!({ "type": "send_unconfirmed", "text": text, "error": e })));
+        }
+        Err(e) => {
+            lock(shared).unconfirmed.remove(&client_id);
+            sink.emit(DriverEvent::Step(json!({ "type": "send_failed", "error": e.to_string() })));
+            sink.emit(DriverEvent::DeliveryAborted { text: text.to_string(), reason: e.to_string() });
+        }
     }
 }
 
 impl CodexDriver {
-    /// Spawns `codex app-server` in `cwd` and connects (see [`CodexDriver::connect`]).
+    /// Spawns `codex app-server` in `cwd` in its own process group, stderr appended to
+    /// `stderr_log`, and connects (see [`CodexDriver::connect`]).
     pub fn spawn(
         bin: &Path,
         cwd: &str,
         resume: Option<&str>,
         env_remove: &[String],
-        stderr: Stdio,
+        stderr_log: &Path,
         sink: Sink,
+        timing: CodexTiming,
     ) -> Result<Arc<CodexDriver>, DriverError> {
+        let stderr = std::fs::OpenOptions::new().create(true).append(true).open(stderr_log)?;
         let mut cmd = Command::new(bin);
-        cmd.arg("app-server").current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(stderr);
+        cmd.arg("app-server")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr))
+            .process_group(0);
         for k in env_remove {
             cmd.env_remove(k);
         }
+        if std::env::var_os("RUST_LOG").is_none() {
+            cmd.env("RUST_LOG", "warn");
+        }
         let mut child = cmd.spawn()?;
+        let root = proctree::proc_of(child.id() as i32);
         let stdin = child.stdin.take().ok_or_else(|| DriverError::Failed("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| DriverError::Failed("no stdout".into()))?;
-        CodexDriver::connect(BufReader::new(stdout), stdin, Some(child), cwd, resume, sink, Duration::from_secs(30))
+        let process = Process {
+            child: Mutex::new(Some(child)),
+            root,
+            stderr_log: Some(stderr_log.to_path_buf()),
+            code: Mutex::default(),
+        };
+        CodexDriver::connect_process(BufReader::new(stdout), stdin, Some(Arc::new(process)), cwd, resume, sink, timing)
     }
 
-    /// Handshake over any stream pair: `initialize`, `initialized`, then `thread/start` or
-    /// `thread/resume`. Emits `NativeId` and `Boot(Ready)`. On failure the driver is
-    /// dropped, which kills `child`.
+    /// Handshake over any stream pair (tests use a socket pair): `initialize`,
+    /// `initialized`, then `thread/start` or `thread/resume` in auto-edits mode, whose
+    /// effective policy is checked. Emits `NativeId` and `Boot(Ready)`.
     pub fn connect(
         reader: impl BufRead + Send + 'static,
         writer: impl Write + Send + 'static,
-        child: Option<Child>,
         cwd: &str,
         resume: Option<&str>,
         sink: Sink,
-        timeout: Duration,
+        timing: CodexTiming,
+    ) -> Result<Arc<CodexDriver>, DriverError> {
+        CodexDriver::connect_process(reader, writer, None, cwd, resume, sink, timing)
+    }
+
+    fn connect_process(
+        reader: impl BufRead + Send + 'static,
+        writer: impl Write + Send + 'static,
+        process: Option<Arc<Process>>,
+        cwd: &str,
+        resume: Option<&str>,
+        sink: Sink,
+        timing: CodexTiming,
     ) -> Result<Arc<CodexDriver>, DriverError> {
         let shared = Arc::new(Mutex::new(Shared {
-            engine: CodexEngine::new(),
+            engine: CodexEngine::new(timing.settle_after),
             thread_id: None,
             approvals: HashMap::new(),
+            file_items: HashMap::new(),
+            file_order: VecDeque::new(),
             fanout: Fanout::default(),
             scrollback: Vec::new(),
             reported: (Status::Idle, false, None),
+            sandbox_policy: Value::Null,
+            unconfirmed: HashMap::new(),
+            rate_limits: None,
+            token_usage: None,
+            closed: false,
         }));
-        let slot: Arc<OnceLock<Arc<RpcConn>>> = Arc::default();
-        let (sh, sk, sl) = (shared.clone(), sink.clone(), slot.clone());
-        let conn = RpcConn::start(reader, writer, move |i| on_incoming(&sh, &sk, &sl, i));
-        let _ = slot.set(conn.clone());
+        let ctx = Arc::new(Ctx {
+            shared: shared.clone(),
+            sink: sink.clone(),
+            conn: OnceLock::new(),
+            process: process.clone(),
+        });
+        let c2 = ctx.clone();
+        let conn = RpcConn::start(reader, writer, move |i| on_incoming(&c2, i));
+        let _ = ctx.conn.set(conn.clone());
         let (tx, rx) = mpsc::channel();
+        // From here on a failure drops the driver, which ends the process tree.
         let driver = Arc::new(CodexDriver {
             conn: conn.clone(),
             shared: shared.clone(),
             sink: sink.clone(),
             work: Mutex::new(Some(tx)),
-            child: Mutex::new(child),
+            process,
+            stopped: Arc::default(),
+            timing,
         });
-        let fail = |e: String| DriverError::Failed(format!("codex app-server: {e}"));
+        let fail = |e: CallError| DriverError::Failed(format!("codex app-server: {e}"));
         let info =
             json!({ "clientInfo": { "name": "mirante", "title": "Mirante", "version": env!("CARGO_PKG_VERSION") } });
-        conn.request("initialize", info, timeout).map_err(fail)?;
+        conn.request("initialize", info, timing.request).map_err(fail)?;
         conn.notify("initialized", Value::Null)?;
-        let (method, params) = match resume {
-            Some(id) => ("thread/resume", thread_params(cwd, Some(id))),
-            None => ("thread/start", thread_params(cwd, None)),
+        let method = if resume.is_some() { "thread/resume" } else { "thread/start" };
+        let result = match conn.request(method, thread_params(cwd, resume), timing.request) {
+            Ok(r) => r,
+            Err(CallError::Rpc { message, .. }) if resume.is_some() && message.contains("no rollout found") => {
+                return Err(DriverError::NativeGone(format!("codex thread {}: {message}", resume.unwrap_or_default())));
+            }
+            Err(e) => return Err(fail(e)),
         };
-        let result = conn.request(method, params, timeout).map_err(fail)?;
+        check_mode(&result).map_err(DriverError::Failed)?;
         let thread_id = result["thread"]["id"]
             .as_str()
             .ok_or_else(|| DriverError::Failed(format!("{method} returned no thread id: {result}")))?
             .to_string();
-        lock(&shared).thread_id = Some(thread_id.clone());
+        {
+            let mut s = lock(&shared);
+            s.thread_id = Some(thread_id.clone());
+            s.engine.set_thread(&thread_id);
+            s.sandbox_policy = result["sandbox"].clone();
+        }
         sink.emit(DriverEvent::NativeId(thread_id));
         sink.emit(DriverEvent::Boot(BootState::Ready));
+        let (wsh, wsink, wconn) = (shared.clone(), sink.clone(), conn.clone());
         std::thread::spawn(move || {
             for w in rx {
                 match w {
-                    Work::Send(text) => send_now(&conn, &shared, &sink, &text, timeout),
-                    Work::Interrupt => {
-                        let (thread, turn) = {
-                            let s = lock(&shared);
-                            (s.thread_id.clone(), s.engine.turn_id().map(str::to_string))
-                        };
-                        if let Some(turn) = turn {
-                            let p = json!({ "threadId": thread, "turnId": turn });
-                            if let Err(e) = conn.request("turn/interrupt", p, timeout) {
-                                sink.emit(DriverEvent::Step(json!({ "type": "interrupt_failed", "error": e })));
-                            }
+                    Work::Send(text) => send_now(&wconn, &wsh, &wsink, &text, timing.request),
+                    Work::Interrupt(turn) => {
+                        let thread = lock(&wsh).thread_id.clone();
+                        let p = json!({ "threadId": thread, "turnId": turn });
+                        if let Err(e) = wconn.request("turn/interrupt", p, timing.request) {
+                            wsink
+                                .emit(DriverEvent::Step(json!({ "type": "interrupt_failed", "error": e.to_string() })));
                         }
                     }
                 }
+            }
+        });
+        let (weak, tsink, stopped): (Weak<Mutex<Shared>>, Sink, Arc<AtomicBool>) =
+            (Arc::downgrade(&shared), sink.clone(), driver.stopped.clone());
+        std::thread::spawn(move || loop {
+            std::thread::sleep(timing.tick);
+            let Some(shared) = weak.upgrade() else { return };
+            let mut out = Vec::new();
+            {
+                let mut s = lock(&shared);
+                if s.closed || stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(t) = s.engine.apply(&CodexInput::Tick, Instant::now()) {
+                    s.settle(t.cause, &mut out);
+                }
+            }
+            for e in out {
+                tsink.emit(e);
             }
         });
         Ok(driver)
@@ -10058,16 +12628,19 @@ impl CodexDriver {
             .map_err(|_| DriverError::Failed("driver stopped".into()))
     }
 
+    /// Ends the whole process tree (SIGTERM to its group and descendants, SIGKILL after
+    /// `grace`), then closes stdin and reaps.
     fn end_process(&self, grace: Duration) {
+        self.stopped.store(true, Ordering::SeqCst);
         lock(&self.work).take();
-        self.conn.close();
-        if let Some(mut child) = lock(&self.child).take() {
-            let deadline = Instant::now() + grace;
-            while Instant::now() < deadline && !matches!(child.try_wait(), Ok(Some(_))) {
-                std::thread::sleep(Duration::from_millis(50));
+        if let Some(p) = &self.process {
+            if let Some(root) = p.root {
+                proctree::kill_tree(root, grace, &Kill);
             }
-            let _ = child.kill();
-            let _ = child.wait();
+        }
+        self.conn.close();
+        if let Some(p) = &self.process {
+            p.reap(Duration::ZERO);
         }
     }
 }
@@ -10084,23 +12657,27 @@ impl Driver for CodexDriver {
     }
 
     fn interrupt(&self) -> Result<(), DriverError> {
-        self.queue(Work::Interrupt)
+        let turn = lock(&self.shared).engine.turn_id().map(str::to_string);
+        let turn = turn.ok_or_else(|| DriverError::NotNow("no running turn to interrupt".into()))?;
+        self.queue(Work::Interrupt(turn))
     }
 
     fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError> {
-        let (id, method, params) = lock(&self.shared)
-            .approvals
-            .remove(key)
-            .ok_or_else(|| DriverError::NoDialog(format!("no pending approval {key}")))?;
-        self.conn.respond(&id, approval_response(&method, &params, allow))?;
-        let ev = {
-            let mut s = lock(&self.shared);
-            s.output(&format!("[{}]\r\n", if allow { "allowed once" } else { "denied" }));
-            let t = s.engine.apply(&CodexInput::ApprovalAnswered(key.to_string()));
-            s.report(t.map_or_else(|| "mirante:approval_answered".into(), |t| t.cause))
-        };
-        if let Some(ev) = ev {
-            self.sink.emit(ev);
+        let mut s = lock(&self.shared);
+        let (id, method, params) =
+            s.approvals.remove(key).ok_or_else(|| DriverError::NoDialog(format!("no pending approval {key}")))?;
+        // Queued for the writer thread: never blocks on the child's stdin.
+        if let Err(e) = self.conn.respond(&id, approval_response(&method, &params, allow)) {
+            s.approvals.insert(key.to_string(), (id, method, params));
+            return Err(DriverError::Failed(format!("answer not sent: {e}")));
+        }
+        s.output(&format!("[{}]\r\n", if allow { "allowed once" } else { "denied" }));
+        let t = s.engine.apply(&CodexInput::ApprovalAnswered(key.to_string()), Instant::now());
+        let mut out = Vec::new();
+        s.settle(t.map_or_else(|| "mirante:approval_answered".into(), |t| t.cause), &mut out);
+        drop(s);
+        for e in out {
+            self.sink.emit(e);
         }
         Ok(())
     }
@@ -10118,7 +12695,9 @@ impl Driver for CodexDriver {
     fn attach(&self, _rows: u16, _cols: u16) -> Result<Attachment, DriverError> {
         let mut s = lock(&self.shared);
         let (id, output) = s.fanout.subscribe();
-        Ok(Attachment { id, initial: s.scrollback.clone(), output, input: false })
+        let mut initial = format!("{MODE_BANNER}\r\n").into_bytes();
+        initial.extend_from_slice(&s.scrollback);
+        Ok(Attachment { id, initial, output, input: false })
     }
 
     fn input(&self, _attachment: u64, _bytes: &[u8]) -> Result<(), DriverError> {
@@ -10131,26 +12710,36 @@ impl Driver for CodexDriver {
 
     fn screen_tail(&self) -> String {
         let s = lock(&self.shared);
-        let text = String::from_utf8_lossy(&s.scrollback).replace("\r\n", "\n");
-        super::screen::tail(&text, 20)
+        tail_lines(&String::from_utf8_lossy(&s.scrollback).replace("\r\n", "\n"), 20)
     }
 
     fn stop(&self) {
-        self.end_process(Duration::from_secs(3));
+        self.end_process(self.timing.stop_grace);
+    }
+
+    fn root(&self) -> Option<Proc> {
+        self.process.as_ref().and_then(|p| p.root)
     }
 }
 ```
 
-Replace `crates/mirante-daemon/src/driver/real.rs` with:
+Replace `crates/mirante-daemon/src/driver/real.rs` with (Task 15's Claude launch and its tests unchanged, plus the Codex launch):
 ```rust
 //! The production driver factory: the real `claude` in a PTY with Mirante's scoped hook
-//! settings, or the real `codex app-server`. Binaries: `MIRANTE_CLAUDE_BIN` /
+//! settings, or the real `codex app-server` in auto-edits mode (its stderr in a private log
+//! under `~/.mirante/sessions/<task>/`). Binaries: `MIRANTE_CLAUDE_BIN` /
 //! `MIRANTE_CODEX_BIN`, else PATH without wrapper shims. The hook command:
 //! `MIRANTE_HOOK_BIN`, else `mirante-hook` next to the daemon executable.
-use std::io::Write;
+//!
+//! Claude's launch comes from Plan 2a's `claude_launch::launch_spec` (real binary, env
+//! scrub that never touches auth, `--permission-mode manual`, additive `--settings`, the
+//! agent terminal variables, `MIRANTE_TASK_ID` and `MIRANTE_SESSION_ID` = this Mirante
+//! session, which the hook echoes back and the hub fences on). Added here: `MIRANTE_HOME`
+//! (the hook must reach this daemon) and, on a fresh start, `--session-id <uuid>`, so the
+//! native id is known before Claude prints anything.
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 
 use mirante_core::claude_launch::{launch_spec, resolve_claude_bin_from_env, settings_json, LaunchInput};
@@ -10158,9 +12747,9 @@ use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
 
 use super::claude::{ClaudeDriver, ClaudeTiming};
-use super::codex::{codex_env_to_scrub, resolve_codex_bin, CodexDriver};
+use super::codex::{codex_env_to_scrub, resolve_codex_bin, CodexDriver, CodexTiming};
 use super::pty::PtySpec;
-use super::{Driver, DriverError, DriverFactory, Sink, SpawnRequest};
+use super::{Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
 #[derive(Debug, Clone)]
 pub struct RealFactory {
@@ -10197,8 +12786,61 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     f.write_all(contents.as_bytes())
 }
 
+/// A random (version 4) UUID, lowercase `8-4-4-4-12`, from `/dev/urandom`.
+pub fn new_uuid_v4() -> std::io::Result<String> {
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+}
+
 fn parent_env() -> Vec<String> {
     std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
+}
+
+/// The PTY launch for `req`, and the native session id pinned for a fresh start
+/// (`None` when resuming: the id to resume is `req.resume`).
+pub fn claude_spec(
+    req: &SpawnRequest,
+    claude: &Path,
+    settings: &Path,
+    size: (u16, u16),
+    parent_env: Vec<String>,
+) -> std::io::Result<(PtySpec, Option<String>)> {
+    let spec = launch_spec(LaunchInput {
+        claude_bin: claude,
+        worktree: Path::new(&req.task.worktree_path),
+        settings_path: settings,
+        task_id: &req.task.id,
+        session_id: &req.session_id,
+        resume: req.resume.as_deref(),
+        parent_env,
+    });
+    let mut args = spec.args;
+    let pinned = match req.resume {
+        Some(_) => None,
+        None => {
+            let id = new_uuid_v4()?;
+            args.push("--session-id".to_string());
+            args.push(id.clone());
+            Some(id)
+        }
+    };
+    let mut env_set = spec.env_set;
+    // The hook (a child of claude) must reach this daemon, not one under another home.
+    env_set.push((HOME_ENV.to_string(), req.paths.home().to_string_lossy().into_owned()));
+    let pty = PtySpec {
+        program: spec.program,
+        args,
+        cwd: spec.cwd,
+        env_remove: spec.env_remove,
+        env_set,
+        rows: size.0,
+        cols: size.1,
+    };
+    Ok((pty, pinned))
 }
 
 impl RealFactory {
@@ -10207,29 +12849,12 @@ impl RealFactory {
         let hook = hook_bin()?;
         let settings = req.paths.session_dir(&req.task.id).join("claude-settings.json");
         write_private(&settings, &settings_json(&hook.to_string_lossy(), &[]).to_string())?;
-        let spec = launch_spec(LaunchInput {
-            claude_bin: &claude,
-            worktree: Path::new(&req.task.worktree_path),
-            settings_path: &settings,
-            task_id: &req.task.id,
-            session_id: &req.session_id,
-            resume: req.resume.as_deref(),
-            parent_env: parent_env(),
-        });
-        let mut env_set = spec.env_set;
-        // The hook (a child of claude) must reach this daemon, not one under another home.
-        env_set.push((HOME_ENV.to_string(), req.paths.home().to_string_lossy().into_owned()));
-        env_set.push(("TERM".to_string(), "xterm-256color".to_string()));
-        let pty = PtySpec {
-            program: spec.program,
-            args: spec.args,
-            cwd: spec.cwd,
-            env_remove: spec.env_remove,
-            env_set,
-            rows: self.rows,
-            cols: self.cols,
-        };
-        Ok(ClaudeDriver::spawn(pty, sink, ClaudeTiming::default())?)
+        let (pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env())?;
+        if let Some(id) = pinned {
+            // Known before Claude starts: a crash during boot can still be resumed.
+            sink.emit(DriverEvent::NativeId(id));
+        }
+        Ok(ClaudeDriver::spawn(pty, sink, ClaudeTiming::default(), req.resume.is_some())?)
     }
 
     fn codex(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
@@ -10237,15 +12862,15 @@ impl RealFactory {
         let bin = resolve_codex_bin(over.as_deref(), std::env::var("PATH").ok().as_deref())?;
         let log = req.paths.session_dir(&req.task.id).join("codex-stderr.log");
         write_private(&log, "")?;
-        let stderr = std::fs::OpenOptions::new().append(true).open(&log)?;
         let env_remove = codex_env_to_scrub(parent_env());
         let d = CodexDriver::spawn(
             &bin,
             &req.task.worktree_path,
             req.resume.as_deref(),
             &env_remove,
-            Stdio::from(stderr),
+            &log,
             sink,
+            CodexTiming::default(),
         )?;
         Ok(d)
     }
@@ -10263,7 +12888,9 @@ impl DriverFactory for RealFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mirante_core::model::{Lifecycle, Status, Task};
     use mirante_ipc::test_dir::TestDir;
+    use mirante_ipc::Paths;
 
     #[test]
     fn private_files_are_0600_in_0700_dirs() {
@@ -10275,6 +12902,73 @@ mod tests {
         write_private(&p, "{\"x\":1}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"x\":1}");
     }
+
+    #[test]
+    fn uuids_are_random_version_4() {
+        let (a, b) = (new_uuid_v4().unwrap(), new_uuid_v4().unwrap());
+        assert_ne!(a, b);
+        let parts: Vec<usize> = a.split('-').map(str::len).collect();
+        assert_eq!(parts, vec![8, 4, 4, 4, 12]);
+        assert_eq!(&a[14..15], "4");
+        assert!("89ab".contains(&a[19..20]), "{a}");
+        assert!(a.chars().all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    fn request(resume: Option<&str>) -> SpawnRequest {
+        SpawnRequest {
+            task: Task {
+                id: "task-1".into(),
+                title: "T".into(),
+                repo_path: "/r".into(),
+                worktree_path: "/w/tree".into(),
+                branch: "feat".into(),
+                agent: AgentKind::Claude,
+                goal: "g".into(),
+                notes: String::new(),
+                lifecycle: Lifecycle::Active,
+                status: Status::Idle,
+                created_at: 0,
+                updated_at: 0,
+            },
+            session_id: "sess-42".into(),
+            resume: resume.map(String::from),
+            paths: Paths::new(Path::new("/h")),
+        }
+    }
+
+    fn env<'a>(spec: &'a PtySpec, key: &str) -> Option<&'a str> {
+        spec.env_set.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session() {
+        let parent = vec!["CLAUDECODE".to_string(), "ANTHROPIC_API_KEY".to_string()];
+        let (spec, pinned) =
+            claude_spec(&request(None), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), parent).unwrap();
+        let id = pinned.expect("fresh start pins an id");
+        let args = spec.args.join(" ");
+        assert!(args.contains(&format!("--session-id {id}")), "{args}");
+        assert!(args.contains("--permission-mode manual") && args.contains("--settings /h/s.json"), "{args}");
+        assert!(!args.contains("--resume") && !args.contains("dangerously"), "{args}");
+        assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+        assert_eq!(env(&spec, "MIRANTE_TASK_ID"), Some("task-1"));
+        assert_eq!(env(&spec, "MIRANTE_HOME"), Some("/h"));
+        assert_eq!(env(&spec, "TERM"), Some("xterm-256color"));
+        assert!(spec.env_remove.contains(&"CLAUDECODE".to_string()));
+        assert!(!spec.env_remove.iter().any(|k| k.starts_with("ANTHROPIC_")));
+        assert_eq!((spec.cwd.as_path(), spec.rows, spec.cols), (Path::new("/w/tree"), 40, 120));
+    }
+
+    #[test]
+    fn a_resume_passes_the_native_id_and_pins_nothing() {
+        let (spec, pinned) =
+            claude_spec(&request(Some("nat-1")), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), vec![])
+                .unwrap();
+        assert_eq!(pinned, None);
+        let args = spec.args.join(" ");
+        assert!(args.contains("--resume nat-1") && !args.contains("--session-id"), "{args}");
+        assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+    }
 }
 ```
 
@@ -10284,19 +12978,20 @@ Run: `cargo test -p mirante-daemon`
 
 Expected (one line per test target, in this order; each line also ends with `; finished in …`):
 ```
-test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-No compiler warnings.
+`cargo clippy -p mirante-daemon --all-targets` prints no warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/mirante-daemon
+git add crates/mirante-daemon/src/driver/mod.rs crates/mirante-daemon/src/driver/codex.rs crates/mirante-daemon/src/driver/real.rs
 git commit -F - <<'EOF'
-feat(daemon): codex app-server driver with user approvals, steer fallback, resume
+feat(daemon): codex app-server driver in auto-edits mode with checked policy, withdrawn approvals, process-group stop
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -10304,57 +12999,2702 @@ EOF
 
 ---
 
-## Phase 2b-iv — End to end, verification, dogfood
+## Phase 2b-iv — Memory guard
 
-### Task 17: End to end with a fake `claude`; real-agent integration tests
+### Task 18: Memory guard: sampling and policy
+
+**Files:**
+- Create: `crates/mirante-daemon/src/memguard/mod.rs`
+- Create: `crates/mirante-daemon/src/memguard/sampler.rs`
+- Create: `crates/mirante-daemon/src/memguard/policy.rs`
+- Create: `crates/mirante-daemon/src/memguard/orphans.rs`
+- Modify: `crates/mirante-daemon/src/lib.rs`
+- Create: `docs/dogfood/memory-stress.md`
+
+A handful of agents (each a Node process plus its tools, dev servers and test runners) can take a 16 GB Mac into swap. This task builds the measuring and the deciding, as a module the hub does not use yet (Task 19 wires it in: the sampling thread, hibernate / wake, `mirante doctor`, the CLI columns). Facts measured on the founder's Mac, and what follows from them:
+
+- **No hard limits on macOS.** `setrlimit(RLIMIT_AS / RLIMIT_DATA)` is not enforced there (`EINVAL` or no effect), so Mirante measures and acts instead of limiting. Linux could use a cgroup: `Config::scope_prefix` builds a `systemd-run --user --scope --quiet -p MemoryHigh=<budget> --` argv prefix, off by default (`systemd_scope: false`); nothing executes it in this plan.
+- **What a process weighs.** macOS: `phys_footprint` from `proc_pid_rusage(pid, RUSAGE_INFO_V4)` (the number Activity Monitor shows; RSS undercounts compressed and swapped memory). Linux: `Pss` from `/proc/<pid>/smaps_rollup`, else `VmRSS`. A session weighs its whole process tree (Task 13's `proctree::descendants`, pid + start time).
+- **What the machine says.** macOS: `hw.memsize`, `vm.swapusage` (`xsw_usage`), the kernel's own pressure level `kern.memorystatus_vm_pressure_level` (1 normal, 2 warn, 4 critical), and a conservative "free" = (`vm.page_free_count` + `vm.page_speculative_count` + `vm.page_purgeable_count`) × `hw.pagesize` (sysctl only, no Mach host calls; the inactive file cache is not counted, so "free" reads low — it is only used as a trend). Linux: `/proc/meminfo` (`MemTotal`, `MemAvailable`, swap) and PSI `/proc/pressure/memory` (`some avg10` ≥ 10 → warn, ≥ 40 → critical).
+- **Budget and levels.** Per session `min(4 GiB, 25 % of RAM)` (configurable): `Soft` at 80 %, `Hard` at 100 %, each warned once when entered. Machine level: the kernel's own measure decides when there is one (macOS `memorystatus` level, Linux PSI; `SystemSample::kernel_signal`): warn → `Elevated`, critical → `Critical`. Swap and free are shown but not used then, because macOS keeps swap allocated and free pages near zero (file cache) on a machine under no pressure — measured on the founder's Mac while writing this task: 90 % swap used, ~2 % "free", kernel level normal; a swap rule paused every dispatch. Without a kernel signal (Linux without PSI): `Elevated` when swap > 75 % with under 10 % free; `Critical` when swap > 90 % with under 5 % free and falling. Up at once; down only after 3 calm samples below a 5-point margin (70 % / 85 %), so the level does not flap. Sampling every 2 s, every 500 ms while not `Normal` (`Policy::next_interval`).
+- **The ladder, and what is never automatic.** `Elevated` → `Pause(true)` (no new dispatches, no queued deliveries) and an offer to hibernate the largest idle session (the user confirms; at most one offer per 60 s). `Critical` sustained 10 s → `AutoHibernate` of the largest IDLE session, at most one per 60 s. A session that is working (streaming turn, running tool, background work) or has a pending permission request is never hibernated automatically; when only such sessions are left the policy returns `Refused` with the reason ("a permission request is pending: never hibernated automatically"), also at most once per 60 s. Leak detector: an idle session growing faster than 200 MB/min over (at least half of) a 5-minute window → `Leak` plus an offer, once until the growth stops. Idle hibernation (`idle_hibernate`, e.g. 60 min) is off by default and never touches a session with a pending permission. Every action is returned to the hub, which logs it as an event; the policy itself signals nothing.
+- **Orphans.** Processes re-parented to pid 1, owned by us, whose cwd or command line points into the worktree root (macOS: `proc_listallpids`, `PROC_PIDTBSDINFO`, `PROC_PIDVNODEPATHINFO`, `KERN_PROCARGS2`; Linux: `/proc`). Never matched by process name, never killed automatically: `kill_orphan` is for an explicit user request, re-verifies the start time and ends only that process tree.
+
+The policy is pure (the clock is a parameter), so every rule is tested without sleeping or allocating; the samplers and the orphan sweep are tested against real small processes (`sleep`, `sh`), never against a memory hog. The manual stress procedure is `docs/dogfood/memory-stress.md` (warns to close apps first).
+
+- [ ] **Step 1: Write the failing tests**
+
+`crates/mirante-daemon/src/lib.rs`: add the module after `pub mod hub;`:
+```rust
+pub mod memguard;
+```
+
+`crates/mirante-daemon/src/memguard/mod.rs` (module list only for now):
+```rust
+pub mod orphans;
+pub mod policy;
+pub mod sampler;
+```
+
+`crates/mirante-daemon/src/memguard/sampler.rs` (only the test module for now):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::proctree::proc_of;
+
+    #[test]
+    fn our_own_tree_has_a_sane_footprint() {
+        let me = proc_of(std::process::id() as i32).unwrap();
+        let s = os_sampler().tree(me).unwrap();
+        // A test binary: more than 1 MiB, far less than 64 GiB.
+        assert!(s.bytes > 1 << 20 && s.bytes < 64 << 30, "{s:?}");
+        assert!(s.procs >= 1);
+    }
+
+    #[test]
+    fn a_tree_weighs_at_least_its_root() {
+        let mut child =
+            std::process::Command::new("/bin/sh").args(["-c", "sleep 30 & sleep 30 & wait"]).spawn().unwrap();
+        let root = proc_of(child.id() as i32).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while descendants(root).len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "children never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let sampler = os_sampler();
+        let tree = sampler.tree(root).unwrap();
+        let alone = process_bytes(root.pid).unwrap();
+        assert!(tree.procs >= 3, "{tree:?}");
+        assert!(tree.bytes > alone, "{tree:?} vs root alone {alone}");
+        let r =
+            crate::driver::proctree::kill_tree(root, std::time::Duration::from_secs(2), &crate::driver::proctree::Kill);
+        assert!(r.survivors.is_empty());
+        let _ = child.wait();
+        assert_eq!(sampler.tree(root), None, "a gone root has no sample");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_sample_matches_the_kernel() {
+        let s = MacSampler.system();
+        assert_eq!(Some(s.total), mac::sysctl_int("hw.memsize"));
+        assert!(s.free > 0 && s.free < s.total, "{s:?}");
+        assert!(s.swap_used <= s.swap_total || s.swap_total == 0, "{s:?}");
+        let raw = mac::sysctl_int("kern.memorystatus_vm_pressure_level").unwrap();
+        assert!([1, 2, 4].contains(&raw), "pressure level {raw}");
+        assert!(s.kernel_signal);
+    }
+
+    #[test]
+    fn the_fake_returns_what_it_was_given() {
+        let f = FakeSampler::default();
+        let p = Proc { pid: 42, start: 1 };
+        assert_eq!(f.tree(p), None);
+        f.set_tree(42, 7);
+        assert_eq!(f.tree(p), Some(TreeSample { bytes: 7, procs: 1 }));
+        f.set_system(SystemSample { total: 100, swap_used: 3, swap_total: 4, ..Default::default() });
+        assert_eq!(f.system().swap_pct(), 75);
+        assert_eq!(SystemSample::default().swap_pct(), 0);
+    }
+}
+```
+
+`crates/mirante-daemon/src/memguard/policy.rs` (only the test module for now):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1 << 30;
+
+    fn cfg() -> Config {
+        Config::for_ram(16 * GB)
+    }
+
+    fn sys(pressure: Pressure, swap_pct: u64, free: u64) -> SystemSample {
+        SystemSample {
+            total: 16 * GB,
+            free,
+            swap_used: swap_pct * GB / 100,
+            swap_total: GB,
+            pressure,
+            kernel_signal: false,
+        }
+    }
+
+    fn normal() -> SystemSample {
+        sys(Pressure::Normal, 0, 4 * GB)
+    }
+
+    fn s(task: &str, idle: bool, pending: bool, bytes: u64) -> (SessionInfo, Option<TreeSample>) {
+        let info =
+            SessionInfo { task_id: task.into(), root: None, idle, pending_permission: pending, idle_since: None };
+        (info, Some(TreeSample { bytes, procs: 1 }))
+    }
+
+    fn kinds(a: &[Action]) -> Vec<String> {
+        a.iter()
+            .map(|a| match a {
+                Action::Warn { task_id, state, .. } => format!("warn:{task_id}:{}", state.as_str()),
+                Action::Pause(p) => format!("pause:{p}"),
+                Action::OfferHibernate { task_id, .. } => format!("offer:{task_id}"),
+                Action::AutoHibernate { task_id, .. } => format!("auto:{task_id}"),
+                Action::Leak { task_id, .. } => format!("leak:{task_id}"),
+                Action::IdleHibernate { task_id } => format!("idle:{task_id}"),
+                Action::LevelChanged { to, .. } => format!("level:{}", to.as_str()),
+                Action::Refused { task_id, .. } => format!("refused:{task_id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn defaults_follow_the_ram_and_leave_idle_hibernation_off() {
+        assert_eq!(Config::for_ram(16 * GB).budget, 4 * GB);
+        assert_eq!(Config::for_ram(8 * GB).budget, 2 * GB);
+        let c = cfg();
+        assert_eq!((c.soft_pct, c.hard_pct, c.idle_hibernate, c.systemd_scope), (80, 100, None, false));
+        assert_eq!(c.scope_prefix(), None);
+        let on = Config { systemd_scope: true, budget: 1000, ..c };
+        assert_eq!(
+            on.scope_prefix().unwrap(),
+            ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryHigh=1000", "--"]
+        );
+    }
+
+    #[test]
+    fn soft_and_hard_are_reported_once_per_state() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        assert!(kinds(&p.tick(t0, &normal(), &[s("a", false, false, GB)])).is_empty());
+        assert_eq!(kinds(&p.tick(t0, &normal(), &[s("a", false, false, 3 * GB + GB / 2)])), ["warn:a:soft"]);
+        assert!(kinds(&p.tick(t0, &normal(), &[s("a", false, false, 3 * GB + GB / 2)])).is_empty());
+        assert_eq!(kinds(&p.tick(t0, &normal(), &[s("a", false, false, 5 * GB)])), ["warn:a:hard"]);
+        let m = p.session("a").unwrap();
+        assert_eq!((m.bytes, m.peak, m.budget, m.state), (5 * GB, 5 * GB, 4 * GB, MemState::Hard));
+        p.tick(t0, &normal(), &[s("a", false, false, GB)]);
+        assert_eq!(p.session("a").unwrap().peak, 5 * GB);
+        assert_eq!(kinds(&p.tick(t0, &normal(), &[s("a", false, false, 3 * GB + GB / 2)])), ["warn:a:soft"]);
+        p.forget("a");
+        assert_eq!(p.session("a"), None);
+    }
+
+    #[test]
+    fn the_level_steps_up_at_once_and_down_only_after_calm_samples() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        assert_eq!(p.next_interval(), Duration::from_secs(2));
+        assert_eq!(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])), ["level:elevated", "pause:true"]);
+        assert_eq!(p.next_interval(), Duration::from_millis(500));
+        // Swap at 72 %: below the 75 % entry threshold but above the 70 % exit margin.
+        for _ in 0..5 {
+            assert!(kinds(&p.tick(t0, &sys(Pressure::Normal, 72, GB), &[])).is_empty());
+        }
+        assert_eq!(p.level(), Level::Elevated);
+        assert!(kinds(&p.tick(t0, &normal(), &[])).is_empty());
+        assert!(kinds(&p.tick(t0, &normal(), &[])).is_empty());
+        assert_eq!(kinds(&p.tick(t0, &normal(), &[])), ["level:normal", "pause:false"]);
+        // Swap over 90 % with little free memory: elevated; falling under 5 %: critical.
+        p.tick(t0, &sys(Pressure::Normal, 95, 3 * GB / 2), &[]);
+        assert_eq!(p.level(), Level::Elevated);
+        assert_eq!(kinds(&p.tick(t0, &sys(Pressure::Normal, 95, GB / 2), &[])), ["level:critical"]);
+    }
+
+    /// Measured on the founder's Mac: swap 90 % used, 2 % "free" (file cache), kernel level
+    /// normal. With the kernel's own level, that is normal: nothing is paused.
+    #[test]
+    fn the_kernels_level_wins_over_swap_and_free() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let mac = SystemSample { kernel_signal: true, ..sys(Pressure::Normal, 90, GB / 3) };
+        for i in 0..5 {
+            assert!(kinds(&p.tick(t0 + Duration::from_secs(i), &mac, &[])).is_empty());
+        }
+        assert_eq!(p.level(), Level::Normal);
+        let warn = SystemSample { kernel_signal: true, ..sys(Pressure::Warn, 0, 8 * GB) };
+        assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(9), &warn, &[])), ["level:elevated", "pause:true"]);
+        // Without a kernel signal the same swap counts only with little free memory.
+        let mut q = Policy::new(cfg());
+        assert!(kinds(&q.tick(t0, &sys(Pressure::Normal, 92, 4 * GB), &[])).is_empty());
+    }
+
+    #[test]
+    fn pressure_pauses_and_offers_the_largest_idle_session_once_per_cooldown() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let sessions = [s("busy", false, false, 3 * GB), s("small", true, false, GB / 2), s("big", true, false, GB)];
+        let a = kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &sessions));
+        assert_eq!(a, ["level:elevated", "pause:true", "offer:big"]);
+        assert!(kinds(&p.tick(t0 + Duration::from_secs(30), &sys(Pressure::Warn, 0, GB), &sessions)).is_empty());
+        assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(61), &sys(Pressure::Warn, 0, GB), &sessions)), ["offer:big"]);
+    }
+
+    #[test]
+    fn sustained_critical_hibernates_only_an_idle_session_without_a_pending_permission() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let crit = sys(Pressure::Critical, 0, GB);
+        let sessions = [s("busy", false, false, 3 * GB), s("asking", true, true, 2 * GB), s("idle", true, false, GB)];
+        // Not sustained yet: only the offer.
+        assert_eq!(kinds(&p.tick(t0, &crit, &sessions)), ["level:critical", "pause:true", "offer:idle"]);
+        assert!(kinds(&p.tick(t0 + Duration::from_secs(5), &crit, &sessions)).is_empty());
+        assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(10), &crit, &sessions)), ["auto:idle"]);
+        // One automatic action per cooldown.
+        assert!(kinds(&p.tick(t0 + Duration::from_secs(40), &crit, &sessions)).is_empty());
+        let later = t0 + Duration::from_secs(71);
+        assert_eq!(kinds(&p.tick(later, &crit, &sessions)), ["auto:idle"]);
+    }
+
+    #[test]
+    fn a_pending_permission_or_a_busy_agent_is_refused_explicitly() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let crit = sys(Pressure::Critical, 0, GB);
+        let asking = [s("busy", false, false, 3 * GB), s("asking", true, true, GB)];
+        p.tick(t0, &crit, &asking);
+        let a = p.tick(t0 + Duration::from_secs(10), &crit, &asking);
+        assert_eq!(kinds(&a), ["refused:asking"]);
+        let Action::Refused { reason, .. } = &a[0] else { unreachable!() };
+        assert!(reason.contains("permission request is pending"), "{reason}");
+        // Refusals are not repeated within the cooldown.
+        assert!(kinds(&p.tick(t0 + Duration::from_secs(20), &crit, &asking)).is_empty());
+        let mut q = Policy::new(cfg());
+        let busy = [s("busy", false, false, 3 * GB)];
+        q.tick(t0, &crit, &busy);
+        let a = q.tick(t0 + Duration::from_secs(10), &crit, &busy);
+        assert_eq!(kinds(&a), ["refused:busy"]);
+        assert!(matches!(&a[0], Action::Refused { reason, .. } if reason.contains("working")));
+    }
+
+    #[test]
+    fn an_idle_session_that_keeps_growing_is_a_leak() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for m in 0..=3u64 {
+            // 300 MB per minute, idle.
+            out.extend(p.tick(t0 + Duration::from_secs(60 * m), &normal(), &[s("a", true, false, GB + m * 300 * MIB)]));
+        }
+        assert_eq!(kinds(&out), ["leak:a", "offer:a"]);
+        assert!(matches!(&out[0], Action::Leak { mb_per_min: 300, .. }));
+        // Reported once; growth while working is not a leak.
+        let mut q = Policy::new(cfg());
+        let mut out = Vec::new();
+        for m in 0..=3u64 {
+            out.extend(q.tick(
+                t0 + Duration::from_secs(60 * m),
+                &normal(),
+                &[s("a", false, false, GB + m * 300 * MIB)],
+            ));
+        }
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn idle_hibernation_happens_only_when_configured() {
+        let t0 = Instant::now();
+        let idle = |since: Instant| {
+            let (mut info, sample) = s("a", true, false, GB);
+            info.idle_since = Some(since);
+            [(info, sample)]
+        };
+        let mut off = Policy::new(cfg());
+        assert!(off.tick(t0 + Duration::from_secs(7200), &normal(), &idle(t0)).is_empty());
+        let mut on = Policy::new(Config { idle_hibernate: Some(Duration::from_secs(3600)), ..cfg() });
+        assert!(on.tick(t0 + Duration::from_secs(3599), &normal(), &idle(t0)).is_empty());
+        assert_eq!(kinds(&on.tick(t0 + Duration::from_secs(3600), &normal(), &idle(t0))), ["idle:a"]);
+        assert!(on.tick(t0 + Duration::from_secs(3700), &normal(), &idle(t0)).is_empty(), "once per idle period");
+        // Never with a pending permission.
+        let (mut info, sample) = s("b", true, true, GB);
+        info.idle_since = Some(t0);
+        assert!(on.tick(t0 + Duration::from_secs(9000), &normal(), &[(info, sample)]).is_empty());
+    }
+}
+```
+
+`crates/mirante-daemon/src/memguard/orphans.rs` (only the test module for now):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use mirante_ipc::test_dir::TestDir;
+
+    use crate::driver::proctree::Kill;
+
+    struct Recorder(Mutex<Vec<(i32, i32, bool)>>);
+
+    impl Signaler for Recorder {
+        fn signal(&self, pid: i32, sig: i32) -> bool {
+            self.0.lock().unwrap().push((pid, sig, false));
+            Kill.signal(pid, sig)
+        }
+        fn signal_group(&self, pgid: i32, sig: i32) -> bool {
+            self.0.lock().unwrap().push((pgid, sig, true));
+            Kill.signal_group(pgid, sig)
+        }
+    }
+
+    /// Starts `inner` detached (its parent shell exits, so it is re-parented to pid 1) and
+    /// returns it once it is an orphan.
+    fn detached(inner: &str, dir: &Path, name: &str) -> Proc {
+        let pidfile = dir.join(name);
+        let script = format!("( {inner} ) >/dev/null 2>&1 & echo $! > '{}'", pidfile.display());
+        assert!(std::process::Command::new("/bin/sh").args(["-c", &script]).status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pid = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse::<i32>().ok());
+            if let Some(p) = pid.and_then(proc_of) {
+                if sys::owner(p.pid).is_some_and(|(ppid, _)| ppid == 1) {
+                    return p;
+                }
+            }
+            assert!(Instant::now() < deadline, "{name} never became an orphan");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Kills what a test started, even when an assertion failed first.
+    struct Cleanup(Vec<Proc>);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                kill_tree(*p, Duration::from_millis(500), &Kill);
+            }
+        }
+    }
+
+    #[test]
+    fn orphans_are_found_by_cwd_or_command_line_inside_the_worktree_root_only() {
+        let d = TestDir::new();
+        let root = d.path().join("worktrees");
+        std::fs::create_dir_all(root.join("app/feat")).unwrap();
+        let in_cwd = detached(&format!("cd '{}' && exec sleep 30", root.join("app/feat").display()), d.path(), "a");
+        let in_argv =
+            detached(&format!("cd / && exec sh -c 'sleep 30; :' '{}'", root.join("app/x").display()), d.path(), "b");
+        let outside = detached("cd / && exec sleep 31", d.path(), "c");
+        let _cleanup = Cleanup(vec![in_cwd, in_argv, outside]);
+        let found = find_orphans(&root);
+        let pids: Vec<i32> = found.iter().map(|o| o.proc.pid).collect();
+        assert!(pids.contains(&in_cwd.pid), "{found:?}");
+        assert!(pids.contains(&in_argv.pid), "{found:?}");
+        assert!(!pids.contains(&outside.pid), "{found:?}");
+        let by_cwd = found.iter().find(|o| o.proc.pid == in_cwd.pid).unwrap();
+        assert_eq!(by_cwd.ppid, 1);
+        assert!(by_cwd.cwd.as_ref().unwrap().ends_with("worktrees/app/feat"), "{by_cwd:?}");
+        let by_argv = found.iter().find(|o| o.proc.pid == in_argv.pid).unwrap();
+        assert!(by_argv.argv.contains("app/x"), "{by_argv:?}");
+    }
+
+    #[test]
+    fn killing_an_orphan_signals_only_that_process_and_never_a_stale_one() {
+        let d = TestDir::new();
+        let root = d.path().join("worktrees");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = detached(&format!("cd '{}' && exec sleep 30", root.display()), d.path(), "a");
+        let _cleanup = Cleanup(vec![p]);
+        let o = find_orphans(&root).into_iter().find(|o| o.proc == p).expect("found");
+        // A stale entry (same pid, another start time) is never signaled.
+        let stale = Orphan { proc: Proc { pid: p.pid, start: p.start.wrapping_sub(1) }, ..o.clone() };
+        let rec = Recorder(Mutex::new(Vec::new()));
+        assert_eq!(kill_orphan(&stale, &rec), KillReport::default());
+        assert!(rec.0.lock().unwrap().is_empty());
+        assert!(alive(p));
+        let r = kill_orphan(&o, &rec);
+        assert!(r.survivors.is_empty(), "{r:?}");
+        assert!(!alive(p));
+        let calls = rec.0.lock().unwrap();
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|(pid, _, _)| *pid == p.pid), "{calls:?}");
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p mirante-daemon`
+
+Expected: FAIL to compile; the first error is
+```
+error[E0405]: cannot find trait `Signaler` in this scope
+```
+
+- [ ] **Step 3: Implement**
+
+Replace `crates/mirante-daemon/src/memguard/mod.rs` with:
+```rust
+//! Memory guard: keep a handful of agents from taking the machine down.
+//!
+//! Measure and act, never limit: macOS does not enforce `RLIMIT_AS` / `RLIMIT_DATA`
+//! (`setrlimit` fails with `EINVAL` or has no effect), so there are no hard limits. Instead
+//! each live session's process tree is sampled ([`sampler`]: `phys_footprint` on macOS, PSS
+//! on Linux) every 2 s (500 ms under pressure), the machine's pressure is read from the OS,
+//! and a pure [`policy`] decides what to do:
+//! - a session over 80 % / 100 % of its budget (default `min(4 GiB, 25 % of RAM)`) → a
+//!   warning;
+//! - the machine under pressure (`Elevated`) → new dispatches and queued deliveries pause,
+//!   and the user is offered to hibernate the largest idle session;
+//! - sustained `Critical` pressure → the largest IDLE session is hibernated, at most one per
+//!   60 s, everything logged. Never a working session, never one with a pending permission
+//!   request (the refusal is reported instead);
+//! - an idle session that keeps growing → reported as a leak, with an offer;
+//! - optional (off by default): hibernate sessions idle for a configured time.
+//!
+//! Hibernating is stopping the agent's process tree and resuming its native conversation
+//! later; the hub does it (Task 19). Processes left behind by ended sessions are found by
+//! [`orphans`] and only reported; killing one is the user's call.
+pub mod orphans;
+pub mod policy;
+pub mod sampler;
+
+pub use orphans::{find_orphans, kill_orphan, Orphan};
+pub use policy::{Action, Config, Level, MemState, Policy, SessionInfo, SessionMem};
+pub use sampler::{os_sampler, FakeSampler, MemSampler, Pressure, SystemSample, TreeSample};
+```
+
+Add above the test module in `crates/mirante-daemon/src/memguard/sampler.rs`:
+```rust
+//! Measuring memory: one agent's process tree and the whole machine.
+//!
+//! macOS: a process's memory is its `phys_footprint` (`proc_pid_rusage`, `RUSAGE_INFO_V4`),
+//! the number Activity Monitor shows (RSS undercounts compressed and swapped pages). The
+//! system side reads `hw.memsize`, `vm.swapusage`, the kernel's own pressure level
+//! (`kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical) and a conservative
+//! "free" (`vm.page_free_count + vm.page_speculative_count + vm.page_purgeable_count`, times
+//! `hw.pagesize`; inactive file cache is not counted).
+//! Linux: `Pss` from `/proc/<pid>/smaps_rollup` (else `VmRSS` from `/proc/<pid>/status`),
+//! `/proc/meminfo` (`MemTotal`, `MemAvailable`, swap) and PSI `/proc/pressure/memory`.
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::driver::proctree::{descendants, Proc};
+
+/// Memory of one process tree (root plus descendants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TreeSample {
+    pub bytes: u64,
+    pub procs: usize,
+}
+
+/// The raw pressure signal of the operating system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pressure {
+    #[default]
+    Normal,
+    Warn,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SystemSample {
+    pub total: u64,
+    pub free: u64,
+    pub swap_used: u64,
+    pub swap_total: u64,
+    pub pressure: Pressure,
+    /// `pressure` came from the kernel's own measure (macOS memorystatus level, Linux PSI).
+    /// Then swap and free are shown but not used to judge: macOS keeps swap allocated and
+    /// free pages near zero (file cache) on a machine that is not under pressure.
+    pub kernel_signal: bool,
+}
+
+impl SystemSample {
+    /// Swap in use, in percent of the swap that exists (0 without swap).
+    pub fn swap_pct(&self) -> u64 {
+        (self.swap_used * 100).checked_div(self.swap_total).unwrap_or(0)
+    }
+}
+
+pub trait MemSampler: Send + Sync {
+    /// The tree under `root` (`None` when `root` is gone).
+    fn tree(&self, root: Proc) -> Option<TreeSample>;
+    fn system(&self) -> SystemSample;
+}
+
+/// One process's memory as this OS counts it (`None`: gone or not readable).
+pub fn process_bytes(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    return mac::footprint(pid);
+    #[cfg(target_os = "linux")]
+    return linux::process_bytes(pid);
+}
+
+/// Sums `bytes_of` over `root` and its live descendants.
+fn sum_tree(root: Proc, bytes_of: impl Fn(i32) -> Option<u64>) -> Option<TreeSample> {
+    let mut s = TreeSample { bytes: bytes_of(root.pid)?, procs: 1 };
+    for p in descendants(root) {
+        if let Some(b) = bytes_of(p.pid) {
+            s.bytes += b;
+            s.procs += 1;
+        }
+    }
+    Some(s)
+}
+
+#[cfg(target_os = "macos")]
+pub struct MacSampler;
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::ffi::{c_void, CString};
+    use std::mem::{size_of, zeroed};
+
+    /// `phys_footprint` of one process.
+    pub fn footprint(pid: i32) -> Option<u64> {
+        if pid <= 0 {
+            return None;
+        }
+        // SAFETY: the buffer is a `rusage_info_v4`, the flavor asks for exactly that struct.
+        let mut info: libc::rusage_info_v4 = unsafe { zeroed() };
+        let r = unsafe {
+            libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, &mut info as *mut _ as *mut libc::rusage_info_t)
+        };
+        (r == 0).then_some(info.ri_phys_footprint)
+    }
+
+    /// A fixed-size value from `sysctlbyname`.
+    pub fn sysctl<T: Copy>(name: &str) -> Option<T> {
+        let c = CString::new(name).ok()?;
+        // SAFETY: `out` has the size passed; the kernel writes at most that many bytes.
+        let mut out: T = unsafe { zeroed() };
+        let mut len = size_of::<T>();
+        let r = unsafe {
+            libc::sysctlbyname(c.as_ptr(), &mut out as *mut T as *mut c_void, &mut len, std::ptr::null_mut(), 0)
+        };
+        (r == 0 && len == size_of::<T>()).then_some(out)
+    }
+
+    /// An integer sysctl that may be 32 or 64 bits wide.
+    pub fn sysctl_int(name: &str) -> Option<u64> {
+        sysctl::<u64>(name).or_else(|| sysctl::<u32>(name).map(u64::from))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MemSampler for MacSampler {
+    fn tree(&self, root: Proc) -> Option<TreeSample> {
+        if !crate::driver::proctree::alive(root) {
+            return None;
+        }
+        sum_tree(root, process_bytes)
+    }
+
+    fn system(&self) -> SystemSample {
+        let page = mac::sysctl_int("hw.pagesize").unwrap_or(4096);
+        let pages: u64 = ["vm.page_free_count", "vm.page_speculative_count", "vm.page_purgeable_count"]
+            .iter()
+            .filter_map(|n| mac::sysctl_int(n))
+            .sum();
+        let swap = mac::sysctl::<libc::xsw_usage>("vm.swapusage");
+        let level = mac::sysctl_int("kern.memorystatus_vm_pressure_level");
+        let pressure = match level {
+            Some(4) => Pressure::Critical,
+            Some(2) => Pressure::Warn,
+            _ => Pressure::Normal,
+        };
+        SystemSample {
+            total: mac::sysctl_int("hw.memsize").unwrap_or(0),
+            free: pages * page,
+            swap_used: swap.map_or(0, |s| s.xsu_used),
+            swap_total: swap.map_or(0, |s| s.xsu_total),
+            pressure,
+            kernel_signal: level.is_some(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxSampler;
+
+#[cfg(target_os = "linux")]
+mod linux {
+    /// The `kB` value of `key:` in a `/proc` file of `key: value kB` lines, in bytes.
+    pub fn kb(text: &str, key: &str) -> Option<u64> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
+            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|k| k * 1024)
+    }
+
+    /// Pss (proportional set size) when readable, else VmRSS.
+    pub fn process_bytes(pid: i32) -> Option<u64> {
+        if pid <= 0 {
+            return None;
+        }
+        if let Some(pss) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok().and_then(|t| kb(&t, "Pss"))
+        {
+            return Some(pss);
+        }
+        kb(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?, "VmRSS")
+    }
+
+    /// `some avg10` of PSI memory (percent of time some task stalled on memory).
+    pub fn psi_some_avg10(text: &str) -> Option<f64> {
+        let line = text.lines().find(|l| l.starts_with("some "))?;
+        line.split_whitespace().find_map(|f| f.strip_prefix("avg10="))?.parse().ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MemSampler for LinuxSampler {
+    fn tree(&self, root: Proc) -> Option<TreeSample> {
+        if !crate::driver::proctree::alive(root) {
+            return None;
+        }
+        sum_tree(root, process_bytes)
+    }
+
+    fn system(&self) -> SystemSample {
+        let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let swap_total = linux::kb(&mem, "SwapTotal").unwrap_or(0);
+        let psi = std::fs::read_to_string("/proc/pressure/memory").ok().and_then(|t| linux::psi_some_avg10(&t));
+        let pressure = match psi {
+            Some(p) if p >= 40.0 => Pressure::Critical,
+            Some(p) if p >= 10.0 => Pressure::Warn,
+            _ => Pressure::Normal,
+        };
+        SystemSample {
+            total: linux::kb(&mem, "MemTotal").unwrap_or(0),
+            free: linux::kb(&mem, "MemAvailable").unwrap_or(0),
+            swap_used: swap_total.saturating_sub(linux::kb(&mem, "SwapFree").unwrap_or(0)),
+            swap_total,
+            pressure,
+            kernel_signal: psi.is_some(),
+        }
+    }
+}
+
+/// The sampler for this operating system.
+pub fn os_sampler() -> Box<dyn MemSampler> {
+    #[cfg(target_os = "macos")]
+    return Box::new(MacSampler);
+    #[cfg(target_os = "linux")]
+    return Box::new(LinuxSampler);
+}
+
+/// Test double: bytes per root pid and a fixed system sample, both settable.
+#[derive(Default)]
+pub struct FakeSampler {
+    pub trees: Mutex<HashMap<i32, TreeSample>>,
+    pub sys: Mutex<SystemSample>,
+}
+
+impl FakeSampler {
+    pub fn set_tree(&self, pid: i32, bytes: u64) {
+        self.trees.lock().unwrap().insert(pid, TreeSample { bytes, procs: 1 });
+    }
+
+    pub fn set_system(&self, s: SystemSample) {
+        *self.sys.lock().unwrap() = s;
+    }
+}
+
+impl MemSampler for FakeSampler {
+    fn tree(&self, root: Proc) -> Option<TreeSample> {
+        self.trees.lock().unwrap().get(&root.pid).copied()
+    }
+
+    fn system(&self) -> SystemSample {
+        *self.sys.lock().unwrap()
+    }
+}
+```
+
+Add above the test module in `crates/mirante-daemon/src/memguard/policy.rs`:
+```rust
+//! The memory policy: a pure state machine fed one sample per tick, with the clock injected
+//! (`now`), returning the actions the hub should take. It never touches a process itself.
+//!
+//! Per session: a budget (default `min(4 GiB, 25 % of RAM)`), `Soft` at 80 % and `Hard` at
+//! 100 % of it, each reported once when the state is entered. For the machine: a [`Level`]
+//! from the OS pressure signal and swap use, stepping up at once and down only after
+//! [`CALM_SAMPLES`] calm samples below a lower threshold (hysteresis). The ladder:
+//! 1. `Elevated` → pause new dispatches and queued deliveries, offer to hibernate the
+//!    largest idle session (the user confirms; one offer per cooldown);
+//! 2. `Critical` sustained for `critical_sustain` → hibernate the largest IDLE session
+//!    automatically, one action per cooldown. Never a session that is working (turn, tool,
+//!    background work) and never one with a pending permission request: when only such
+//!    sessions are left, `Refused` says so instead.
+//!
+//! Also: an idle session that keeps growing faster than `leak_mb_per_min` over
+//! `leak_window` is reported as a leak (with an offer), and, only when configured, a session
+//! idle longer than `idle_hibernate` is hibernated.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+use super::sampler::{Pressure, SystemSample, TreeSample};
+use crate::driver::proctree::Proc;
+
+const GIB: u64 = 1 << 30;
+const MIB: u64 = 1 << 20;
+/// Calm samples in a row before the level steps down.
+pub const CALM_SAMPLES: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// Bytes one session's process tree may use.
+    pub budget: u64,
+    pub soft_pct: u8,
+    pub hard_pct: u8,
+    /// Sampling interval while the level is `Normal`.
+    pub interval: Duration,
+    /// Sampling interval under pressure.
+    pub pressure_interval: Duration,
+    /// At most one offer, and one automatic action, per cooldown.
+    pub cooldown: Duration,
+    /// How long `Critical` must last before a session is hibernated automatically.
+    pub critical_sustain: Duration,
+    /// Hibernate sessions idle this long (`None`: never; the default).
+    pub idle_hibernate: Option<Duration>,
+    /// An idle session growing faster than this is reported as leaking.
+    pub leak_mb_per_min: u64,
+    pub leak_window: Duration,
+    /// Linux only: launch agents under `systemd-run --user --scope -p MemoryHigh=<budget>`.
+    pub systemd_scope: bool,
+}
+
+impl Config {
+    /// Defaults for a machine with `total` bytes of RAM.
+    pub fn for_ram(total: u64) -> Config {
+        Config {
+            budget: (4 * GIB).min(total / 4).max(GIB / 4),
+            soft_pct: 80,
+            hard_pct: 100,
+            interval: Duration::from_secs(2),
+            pressure_interval: Duration::from_millis(500),
+            cooldown: Duration::from_secs(60),
+            critical_sustain: Duration::from_secs(10),
+            idle_hibernate: None,
+            leak_mb_per_min: 200,
+            leak_window: Duration::from_secs(300),
+            systemd_scope: false,
+        }
+    }
+
+    /// The argv prefix that runs an agent in a systemd user scope with `MemoryHigh` set to
+    /// the budget (the kernel then reclaims from it first). `None` unless `systemd_scope`.
+    pub fn scope_prefix(&self) -> Option<Vec<String>> {
+        self.systemd_scope.then(|| {
+            ["systemd-run", "--user", "--scope", "--quiet", "-p"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain([format!("MemoryHigh={}", self.budget), "--".to_string()])
+                .collect()
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Normal,
+    Elevated,
+    Critical,
+}
+
+impl Level {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Normal => "normal",
+            Level::Elevated => "elevated",
+            Level::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemState {
+    Ok,
+    Soft,
+    Hard,
+}
+
+impl MemState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemState::Ok => "ok",
+            MemState::Soft => "soft",
+            MemState::Hard => "hard",
+        }
+    }
+}
+
+/// What the hub tells the policy about one live session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub task_id: String,
+    pub root: Option<Proc>,
+    /// No streaming turn, no running tool, no background work.
+    pub idle: bool,
+    pub pending_permission: bool,
+    /// When it last became idle (`None` while busy).
+    pub idle_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionMem {
+    pub bytes: u64,
+    pub peak: u64,
+    pub budget: u64,
+    pub state: MemState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// A session entered `Soft` or `Hard`.
+    Warn {
+        task_id: String,
+        bytes: u64,
+        budget: u64,
+        state: MemState,
+    },
+    /// Pause (true) or resume (false) new dispatches and queued deliveries.
+    Pause(bool),
+    /// Ask the user whether to hibernate this session.
+    OfferHibernate {
+        task_id: String,
+        reason: String,
+    },
+    /// Hibernate this idle session now (sustained critical pressure).
+    AutoHibernate {
+        task_id: String,
+        reason: String,
+    },
+    /// An idle session keeps growing.
+    Leak {
+        task_id: String,
+        mb_per_min: u64,
+    },
+    /// Configured idle hibernation is due.
+    IdleHibernate {
+        task_id: String,
+    },
+    LevelChanged {
+        from: Level,
+        to: Level,
+    },
+    /// An automatic hibernation was due but this session may not be touched.
+    Refused {
+        task_id: String,
+        reason: String,
+    },
+}
+
+struct Track {
+    mem: SessionMem,
+    /// (time, bytes) while idle, newest last, for the leak detector.
+    history: VecDeque<(Instant, u64)>,
+    leak_reported: bool,
+    /// The `idle_since` an idle hibernation was already asked for.
+    idle_reported: Option<Instant>,
+}
+
+pub struct Policy {
+    cfg: Config,
+    level: Level,
+    calm: u32,
+    last_free: Option<u64>,
+    critical_since: Option<Instant>,
+    last_offer: Option<Instant>,
+    last_action: Option<Instant>,
+    last_refusal: Option<Instant>,
+    sessions: HashMap<String, Track>,
+}
+
+/// The kernel's own level wins when there is one (`kernel_signal`): on macOS swap stays
+/// allocated and free pages stay near zero (file cache) on a machine under no pressure —
+/// measured on the founder's Mac: 90 % swap, 2 % "free", kernel level normal. Without it
+/// (Linux without PSI), swap counts only together with little free memory: over
+/// `elevated_pct` with under 10 % free is `Elevated`; over `critical_pct` with under 5 %
+/// free and falling is `Critical`.
+fn classify(s: &SystemSample, free_falling: bool, elevated_pct: u64, critical_pct: u64) -> Level {
+    match s.pressure {
+        Pressure::Critical => return Level::Critical,
+        Pressure::Warn => return Level::Elevated,
+        Pressure::Normal if s.kernel_signal => return Level::Normal,
+        Pressure::Normal => {}
+    }
+    let swap = s.swap_pct();
+    let free_pct = s.free.saturating_mul(100).checked_div(s.total).unwrap_or(100);
+    let swapping = |pct: u64| s.swap_total > 0 && swap > pct;
+    if swapping(critical_pct) && free_falling && free_pct < 5 {
+        Level::Critical
+    } else if swapping(elevated_pct) && free_pct < 10 {
+        Level::Elevated
+    } else {
+        Level::Normal
+    }
+}
+
+fn due(last: Option<Instant>, now: Instant, cooldown: Duration) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= cooldown)
+}
+
+impl Policy {
+    pub fn new(cfg: Config) -> Policy {
+        Policy {
+            cfg,
+            level: Level::Normal,
+            calm: 0,
+            last_free: None,
+            critical_since: None,
+            last_offer: None,
+            last_action: None,
+            last_refusal: None,
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
+    pub fn session(&self, task_id: &str) -> Option<SessionMem> {
+        self.sessions.get(task_id).map(|t| t.mem)
+    }
+
+    /// When to sample next: faster under pressure.
+    pub fn next_interval(&self) -> Duration {
+        if self.level == Level::Normal {
+            self.cfg.interval
+        } else {
+            self.cfg.pressure_interval
+        }
+    }
+
+    /// The session ended (or was hibernated): drop what was tracked about it.
+    pub fn forget(&mut self, task_id: &str) {
+        self.sessions.remove(task_id);
+    }
+
+    fn update_level(&mut self, now: Instant, s: &SystemSample, out: &mut Vec<Action>) {
+        let falling = self.last_free.is_some_and(|f| s.free < f);
+        self.last_free = Some(s.free);
+        let up = classify(s, falling, 75, 90);
+        // Stepping down needs a margin below the thresholds and several calm samples.
+        let down = classify(s, falling, 70, 85);
+        let from = self.level;
+        if up > self.level {
+            self.level = up;
+            self.calm = 0;
+        } else if down < self.level {
+            self.calm += 1;
+            if self.calm >= CALM_SAMPLES {
+                self.level = down;
+                self.calm = 0;
+            }
+        } else {
+            self.calm = 0;
+        }
+        if self.level != from {
+            out.push(Action::LevelChanged { from, to: self.level });
+            if from == Level::Normal {
+                out.push(Action::Pause(true));
+            } else if self.level == Level::Normal {
+                out.push(Action::Pause(false));
+            }
+        }
+        match self.level {
+            Level::Critical => {
+                self.critical_since.get_or_insert(now);
+            }
+            _ => self.critical_since = None,
+        }
+    }
+
+    fn update_session(&mut self, now: Instant, info: &SessionInfo, sample: TreeSample, out: &mut Vec<Action>) {
+        let budget = self.cfg.budget;
+        let state = if sample.bytes >= budget * u64::from(self.cfg.hard_pct) / 100 {
+            MemState::Hard
+        } else if sample.bytes >= budget * u64::from(self.cfg.soft_pct) / 100 {
+            MemState::Soft
+        } else {
+            MemState::Ok
+        };
+        let t = self.sessions.entry(info.task_id.clone()).or_insert_with(|| Track {
+            mem: SessionMem { bytes: 0, peak: 0, budget, state: MemState::Ok },
+            history: VecDeque::new(),
+            leak_reported: false,
+            idle_reported: None,
+        });
+        if state != t.mem.state && state != MemState::Ok {
+            out.push(Action::Warn { task_id: info.task_id.clone(), bytes: sample.bytes, budget, state });
+        }
+        t.mem = SessionMem { bytes: sample.bytes, peak: t.mem.peak.max(sample.bytes), budget, state };
+        // Leak detector: growth while idle only (a working agent may legitimately grow).
+        if !info.idle {
+            t.history.clear();
+            t.leak_reported = false;
+        } else {
+            t.history.push_back((now, sample.bytes));
+            while t.history.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > self.cfg.leak_window) {
+                t.history.pop_front();
+            }
+            let (first_at, first) = *t.history.front().expect("just pushed");
+            let span = now.saturating_duration_since(first_at);
+            if span >= self.cfg.leak_window / 2 && span > Duration::ZERO {
+                let grown = sample.bytes.saturating_sub(first);
+                let per_min = grown * 60 / span.as_secs().max(1) / MIB;
+                if per_min > self.cfg.leak_mb_per_min {
+                    if !t.leak_reported {
+                        t.leak_reported = true;
+                        out.push(Action::Leak { task_id: info.task_id.clone(), mb_per_min: per_min });
+                        out.push(Action::OfferHibernate {
+                            task_id: info.task_id.clone(),
+                            reason: format!("idle but growing {per_min} MB/min"),
+                        });
+                    }
+                } else {
+                    t.leak_reported = false;
+                }
+            }
+        }
+        // Configured idle hibernation, once per idle period.
+        if let (Some(after), Some(since), true) = (self.cfg.idle_hibernate, info.idle_since, info.idle) {
+            if !info.pending_permission
+                && now.saturating_duration_since(since) >= after
+                && t.idle_reported != Some(since)
+            {
+                t.idle_reported = Some(since);
+                out.push(Action::IdleHibernate { task_id: info.task_id.clone() });
+            }
+        }
+    }
+
+    /// One sample of the machine and of every live session; returns what to do.
+    pub fn tick(
+        &mut self,
+        now: Instant,
+        system: &SystemSample,
+        sessions: &[(SessionInfo, Option<TreeSample>)],
+    ) -> Vec<Action> {
+        let mut out = Vec::new();
+        self.update_level(now, system, &mut out);
+        for (info, sample) in sessions {
+            if let Some(sample) = sample {
+                self.update_session(now, info, *sample, &mut out);
+            }
+        }
+        // Candidates, largest first.
+        let mut measured: Vec<(&SessionInfo, u64)> =
+            sessions.iter().filter_map(|(i, s)| s.map(|s| (i, s.bytes))).collect();
+        measured.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.task_id.cmp(&b.0.task_id)));
+        let victim = measured.iter().find(|(i, _)| i.idle && !i.pending_permission).map(|(i, _)| i.task_id.clone());
+        let sustained =
+            self.critical_since.is_some_and(|t| now.saturating_duration_since(t) >= self.cfg.critical_sustain);
+        let mut acted = false;
+        if sustained && due(self.last_action, now, self.cfg.cooldown) {
+            match &victim {
+                Some(task_id) => {
+                    self.last_action = Some(now);
+                    acted = true;
+                    out.push(Action::AutoHibernate {
+                        task_id: task_id.clone(),
+                        reason: format!("critical memory pressure for {} s", self.cfg.critical_sustain.as_secs()),
+                    });
+                }
+                None if due(self.last_refusal, now, self.cfg.cooldown) => {
+                    let pending = measured.iter().find(|(i, _)| i.idle && i.pending_permission);
+                    let refusal = match pending {
+                        Some((i, _)) => Some((
+                            i.task_id.clone(),
+                            "a permission request is pending: never hibernated automatically".to_string(),
+                        )),
+                        None => measured.first().map(|(i, _)| {
+                            (
+                                i.task_id.clone(),
+                                "it is working (turn, tool or background work): never hibernated automatically"
+                                    .to_string(),
+                            )
+                        }),
+                    };
+                    if let Some((task_id, reason)) = refusal {
+                        self.last_refusal = Some(now);
+                        out.push(Action::Refused { task_id, reason });
+                    }
+                }
+                None => {}
+            }
+        }
+        if !acted && self.level != Level::Normal && due(self.last_offer, now, self.cfg.cooldown) {
+            if let Some(task_id) = victim {
+                self.last_offer = Some(now);
+                out.push(Action::OfferHibernate {
+                    task_id,
+                    reason: format!("memory pressure {}", self.level.as_str()),
+                });
+            }
+        }
+        out
+    }
+}
+```
+
+Add above the test module in `crates/mirante-daemon/src/memguard/orphans.rs`:
+```rust
+//! Orphan sweep: processes that outlived their agent. An agent's child that was re-parented
+//! to init/launchd (ppid 1), runs as us, and whose working directory or command line points
+//! into Mirante's worktree root is almost certainly left over from a session (a dev server, a
+//! watcher). They are only REPORTED (`mirante doctor`); killing one is the user's explicit
+//! choice, and even then only that process tree, re-verified by start time. Nothing is ever
+//! matched or killed by process name.
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::driver::proctree::{alive, kill_tree, proc_of, KillReport, Proc, Signaler};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub proc: Proc,
+    pub ppid: i32,
+    pub cwd: Option<PathBuf>,
+    pub argv: String,
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    use std::ffi::{c_void, CStr};
+    use std::mem::{size_of, zeroed};
+    use std::path::PathBuf;
+
+    pub fn all_pids() -> Vec<i32> {
+        let mut cap = 4096usize;
+        loop {
+            let mut buf = vec![0 as libc::pid_t; cap];
+            let bytes = (cap * size_of::<libc::pid_t>()) as libc::c_int;
+            // SAFETY: the buffer holds `cap` pids and its size in bytes is passed.
+            let n = unsafe { libc::proc_listallpids(buf.as_mut_ptr() as *mut c_void, bytes) };
+            if n < 0 {
+                return Vec::new();
+            }
+            if (n as usize) < cap {
+                buf.truncate(n as usize);
+                buf.retain(|p| *p > 0);
+                return buf;
+            }
+            cap *= 4;
+        }
+    }
+
+    /// (ppid, uid) of a process.
+    pub fn owner(pid: i32) -> Option<(i32, u32)> {
+        // SAFETY: plain C struct of the size passed.
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, size) };
+        (n == size).then_some((info.pbi_ppid as i32, info.pbi_uid))
+    }
+
+    pub fn cwd(pid: i32) -> Option<PathBuf> {
+        // SAFETY: plain C struct of the size passed.
+        let mut info: libc::proc_vnodepathinfo = unsafe { zeroed() };
+        let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, &mut info as *mut _ as *mut c_void, size)
+        };
+        if n != size {
+            return None;
+        }
+        // SAFETY: `vip_path` is a NUL-terminated MAXPATHLEN buffer, laid out as 32x32 chars.
+        let raw = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) };
+        let s = raw.to_str().ok()?;
+        (!s.is_empty()).then(|| PathBuf::from(s))
+    }
+
+    /// The command line (`KERN_PROCARGS2`: argc, exec path, padding, then argv).
+    pub fn argv(pid: i32) -> Option<String> {
+        let mut max: libc::c_int = 0;
+        let mut len = size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `max` is a c_int and its size is passed.
+        let r = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 2, &mut max as *mut _ as *mut c_void, &mut len, std::ptr::null_mut(), 0)
+        };
+        if r != 0 || max <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; max as usize];
+        let mut len = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the buffer has `len` bytes.
+        let r = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0)
+        };
+        if r != 0 || len < 4 {
+            return None;
+        }
+        let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?).max(0) as usize;
+        let mut rest = buf[4..len].split(|b| *b == 0).skip(1).skip_while(|s| s.is_empty());
+        let args: Vec<String> = rest.by_ref().take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        Some(args.join(" "))
+    }
+
+    pub fn my_uid() -> u32 {
+        // SAFETY: plain syscall.
+        unsafe { libc::getuid() }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod sys {
+    use std::path::PathBuf;
+
+    pub fn all_pids() -> Vec<i32> {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok()).collect()
+    }
+
+    pub fn owner(pid: i32) -> Option<(i32, u32)> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let field = |k: &str| status.lines().find_map(|l| l.strip_prefix(k)).and_then(|v| v.split_whitespace().next());
+        Some((field("PPid:")?.parse().ok()?, field("Uid:")?.parse().ok()?))
+    }
+
+    pub fn cwd(pid: i32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    pub fn argv(pid: i32) -> Option<String> {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let parts: Vec<String> =
+            raw.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        Some(parts.join(" "))
+    }
+
+    pub fn my_uid() -> u32 {
+        // SAFETY: plain syscall.
+        unsafe { libc::getuid() }
+    }
+}
+
+/// `root` as given and as the kernel spells it (symlinks resolved, e.g. /tmp → /private/tmp).
+fn spellings(root: &Path) -> Vec<PathBuf> {
+    let mut v = vec![root.to_path_buf()];
+    if let Ok(c) = std::fs::canonicalize(root) {
+        if c != root {
+            v.push(c);
+        }
+    }
+    v
+}
+
+/// Processes re-parented to init (ppid 1), owned by us, whose cwd or command line points
+/// into `worktree_root`.
+pub fn find_orphans(worktree_root: &Path) -> Vec<Orphan> {
+    let roots = spellings(worktree_root);
+    let me = sys::my_uid();
+    let mut out = Vec::new();
+    for pid in sys::all_pids() {
+        let Some((ppid, uid)) = sys::owner(pid) else { continue };
+        if ppid != 1 || uid != me {
+            continue;
+        }
+        let cwd = sys::cwd(pid);
+        let argv = sys::argv(pid).unwrap_or_default();
+        let by_cwd = cwd.as_ref().is_some_and(|c| roots.iter().any(|r| c.starts_with(r)));
+        let by_argv = roots.iter().any(|r| argv.contains(&*r.to_string_lossy()));
+        if by_cwd || by_argv {
+            if let Some(proc) = proc_of(pid) {
+                out.push(Orphan { proc, ppid, cwd, argv });
+            }
+        }
+    }
+    out
+}
+
+/// Ends `o` and its descendants (SIGTERM, then SIGKILL after 2 s). Re-checks first that the
+/// pid still names the same process (start time); a stale entry is never signaled.
+pub fn kill_orphan(o: &Orphan, s: &dyn Signaler) -> KillReport {
+    if !alive(o.proc) {
+        return KillReport::default();
+    }
+    kill_tree(o.proc, Duration::from_secs(2), s)
+}
+```
+
+Create `docs/dogfood/memory-stress.md`:
+````markdown
+# Memory guard: manual stress test
+
+This is the only test that puts real pressure on the machine. Automated tests use a fake
+sampler and never allocate on purpose.
+
+**Before you start: save your work and close the apps you care about** (browsers, IDEs,
+other agents). Pushing a Mac into critical memory pressure can make it sluggish for a
+minute and macOS may kill background apps. Stop at any moment with Ctrl-C in the hog's
+terminal; the memory is released at once.
+
+## The hog
+
+`hog.py` allocates memory in steps and touches every page (untouched pages cost nothing):
+
+```python
+# hog.py: allocate STEP_MB every 5 s up to MAX_MB, touching every page; Ctrl-C frees all.
+import sys, time
+max_mb = int(sys.argv[1]) if len(sys.argv) > 1 else 1024
+step_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 256
+held = []
+while sum(len(b) for b in held) < max_mb << 20:
+    b = bytearray(step_mb << 20)
+    for i in range(0, len(b), 4096):
+        b[i] = 1
+    held.append(b)
+    print(f"holding {sum(len(b) for b in held) >> 20} MB", flush=True)
+    time.sleep(5)
+print("at the cap; Ctrl-C to free", flush=True)
+time.sleep(3600)
+```
+
+Save it inside a task's worktree (so it runs in that session's process tree).
+
+## A. Per-session budget (safe: stays below a quarter of RAM)
+
+1. `mirante new <repo> --agent claude --branch mem-a "wait for instructions"`; keep
+   `mirante watch` open in another terminal (its header shows the system pressure level).
+2. In `mirante attach mem-a`, ask Claude to run `python3 hog.py 3500 256` and allow it once.
+3. Expect, as it grows: `mirante ls` MEM column climbing; `memory.warn` with `soft` at 80 %
+   of the budget (default min(4 GiB, 25 % of RAM)), then `hard` at 100 %. Nothing is killed:
+   the session is working (a tool is running).
+4. Ctrl-C the hog (Esc in attach, or `mirante interrupt mem-a`). MEM drops.
+
+## B. System pressure (only with apps closed; stop as soon as it reacts)
+
+1. Two idle sessions (`mem-a`, `mem-b`) plus a hog run from a plain terminal outside Mirante:
+   `python3 hog.py <about 80 % of RAM in MB> 512`.
+2. Expect: the `mirante watch` header goes `elevated` (the kernel pressure level reaches 2 — `sysctl kern.memorystatus_vm_pressure_level`; swap use alone does not count),
+   `memory.paused` (no new dispatches or queued deliveries), and an offer to hibernate the
+   largest idle session (`mirante hibernate <id>` to accept).
+3. Ctrl-C the hog the moment the header shows `critical`. Only if you deliberately let
+   critical last 10 s: the largest IDLE session without a pending permission is hibernated
+   (`memory.auto_hibernated`), at most one per minute; `mirante wake <id>` resumes it.
+4. With a permission dialog open in `mem-b`, `mem-b` is never hibernated automatically; the
+   event `memory.refused` says so.
+
+## Record
+
+| date | scenario | peak MB | events seen | hibernated (auto / offered) | ok? |
+|---|---|---|---|---|---|
+| | | | | | |
+````
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `cargo test -p mirante-daemon`
+
+Expected (one line per test target, in this order; each line also ends with `; finished in …`): the library has 14 more tests than after the previous task —
+```
+test result: ok. 178 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Run: `cargo clippy -p mirante-daemon --all-targets 2>&1 | grep -E '^(warning|error)'`
+
+Expected: no output.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/mirante-daemon/src/lib.rs crates/mirante-daemon/src/memguard docs/dogfood/memory-stress.md
+git commit -F - <<'EOF'
+feat(daemon): memory guard sampling, pressure policy and orphan sweep (not wired yet)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+### Task 19: Memory guard in the daemon and the CLI: budgets, pause, hibernate / wake, doctor
+
+**Files:**
+- Create: `crates/mirante-daemon/src/hub/memory.rs`
+- Modify: `crates/mirante-daemon/src/hub/mod.rs`, `crates/mirante-daemon/src/hub/session.rs`, `crates/mirante-daemon/src/hub/messages.rs`, `crates/mirante-daemon/src/server.rs`, `crates/mirante-daemon/src/main.rs`
+- Modify: `crates/mirante-ipc/src/types.rs`
+- Modify: `crates/mirante-cli/src/args.rs`, `crates/mirante-cli/src/render.rs`, `crates/mirante-cli/src/main.rs`, `crates/mirante-cli/src/daemon_ctl.rs`
+
+Task 18's policy, wired in. A guard thread (`Hub::spawn_memguard`) runs `Hub::memory_tick` every 2 s (every 500 ms under pressure): it reads the live sessions under the hub lock (root `Proc` from `Driver::root`, idle = status `Idle` + ready + no delivery starting, pending permission = the hold flag of Task 13, `idle_since`), samples the trees and the machine **without** the lock, asks the policy, and carries out its decisions:
+
+- `Warn` → `memory.warn`; `LevelChanged` → `memory.level`; `Leak` → `memory.leak`; `OfferHibernate` → `memory.offer_hibernate` with the hint `mirante hibernate <task>` (the user confirms; nothing happens on its own).
+- `Pause(true)` → new sessions are refused (`session.start` / `resume` / `wake`: CONFLICT "memory is tight") and queued messages wait (`kick` and the immediate-queue path hold them); an explicit steer still goes. `Pause(false)` → every live session is kicked again. Events `memory.paused` / `memory.resumed`.
+- `AutoHibernate` (sustained critical pressure only) and `IdleHibernate` (only when `MIRANTE_IDLE_HIBERNATE_MIN` is set; off by default) → hibernate, after re-checking under the lock that the session is still idle and has no pending permission; otherwise `memory.refused` says why. **A session waiting on a permission is never hibernated, by the guard or by `mirante hibernate`.**
+- **Hibernate** = record `memory.hibernated` (user) / `memory.auto_hibernated` (guard) with the session id, native id and transcript path; end the process tree (`Driver::stop`, Task 13's `kill_tree`); end the session (`mirante:hibernated`); mark the task hibernated. **Wake** (`mirante wake`) = `session.resume` of a hibernated task (Claude `--resume`, Codex `thread/resume`). The mark lives in the daemon's memory: after a daemon restart every session is ended anyway and `mirante resume` does the same.
+- **Doctor** (`mirante doctor`): orphan processes (Task 18 `find_orphans` under `~/.mirante/worktrees`: parent gone, cwd or argv inside a worktree; never by name), orphan checkouts (`WorktreeManager::checkouts()` minus the tasks' worktrees; never deleted), and the memory line. `mirante doctor --kill <pid>` asks `[y/N]`, then `daemon.kill_orphan { pid, start }` re-finds the orphan with the same pid **and** start time and kills only its tree. Nothing is killed automatically.
+- **Surface:** `TaskView.memory` (`bytes`, `peak`, `budget`, `state`) and `TaskView.hibernated`; `DaemonStatus.memory` (`SystemView`: level, free, swap, paused); `mirante ls` gets a `MEM` column (`1.2G/4.0G`, `!` past the soft share, `!!` past the budget) and a `hibernated: mirante wake` note; `mirante watch` shows the memory line under its header.
+- **Configuration:** `MIRANTE_MEM_BUDGET_MB` (per-session budget; default min(4 GB, 25 % of RAM)) and `MIRANTE_IDLE_HIBERNATE_MIN` (idle hibernation; off unless set), read once by the daemon at start. `MIRANTE_MEMGUARD=off` disables the guard (the end-to-end tests of Task 20 set it so their results never depend on the test machine's memory).
+- **Smoke-checked on the founder's Mac** (18 GB, swap 9.9 of 11 GB used, kernel level normal): `mirante doctor` printed `memory: normal · free 515M of 18.0G · swap 9.9G/11.0G` — nothing paused, as Task 18's kernel-level rule intends.
+
+- [ ] **Step 1: Write the failing tests**
+
+`crates/mirante-daemon/src/hub/memory.rs` (only the test module for now), and add `pub mod memory;` to `crates/mirante-daemon/src/hub/mod.rs`:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::super::testkit::Kit;
+    use super::*;
+    use crate::driver::proctree::{proc_of, Proc};
+    use crate::driver::DriverEvent;
+    use crate::memguard::{FakeSampler, Pressure};
+    use mirante_core::model::AgentKind;
+    use std::time::Duration;
+
+    const MB: u64 = 1 << 20;
+
+    fn sys(pressure: Pressure) -> SystemSample {
+        SystemSample {
+            total: 16 * GIB,
+            free: 4 * GIB,
+            swap_used: 0,
+            swap_total: 4 * GIB,
+            pressure,
+            kernel_signal: true,
+        }
+    }
+
+    fn cfg() -> Config {
+        let mut c = Config::for_ram(16 * GIB);
+        c.budget = 1000 * MB;
+        c
+    }
+
+    fn kinds(k: &Kit, task: Option<&str>) -> Vec<String> {
+        let st = k.hub.lock();
+        st.store
+            .events_since(0, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| task.is_none() || e.task_id.as_deref() == task)
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    /// A started session whose fake driver reports `pid` as its root.
+    fn with_root(k: &Kit, branch: &str, pid: i32) -> String {
+        *k.factory.driver.root.lock().unwrap() = Some(Proc { pid, start: 1 });
+        k.started(AgentKind::Claude, branch).task.id
+    }
+
+    #[test]
+    fn samples_show_in_the_view_and_soft_and_hard_warn_once() {
+        let k = Kit::new();
+        let t = with_root(&k, "a", 101);
+        let s = FakeSampler::default();
+        s.set_system(sys(Pressure::Normal));
+        let mut p = Policy::new(cfg());
+        let now = Instant::now();
+        s.set_tree(101, 500 * MB);
+        k.hub.memory_tick(&mut p, &s, now);
+        let v = k.hub.get_task(&t).unwrap();
+        assert_eq!(v.memory, Some(MemView { bytes: 500 * MB, peak: 500 * MB, budget: 1000 * MB, state: "ok".into() }));
+        s.set_tree(101, 900 * MB);
+        k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(2));
+        s.set_tree(101, 950 * MB);
+        k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(4));
+        assert_eq!(kinds(&k, Some(&t)).iter().filter(|k| *k == "memory.warn").count(), 1);
+        assert_eq!(k.hub.get_task(&t).unwrap().memory.unwrap().state, "soft");
+        assert_eq!(k.hub.status().memory.unwrap().level, "normal");
+    }
+
+    #[test]
+    fn pressure_pauses_queued_deliveries_and_new_sessions_until_it_eases() {
+        let k = Kit::new();
+        let t = with_root(&k, "a", 101);
+        let s = FakeSampler::default();
+        s.set_tree(101, 100 * MB);
+        let mut p = Policy::new(cfg());
+        let now = Instant::now();
+        s.set_system(sys(Pressure::Warn));
+        k.hub.memory_tick(&mut p, &s, now);
+        assert!(k.hub.status().memory.unwrap().paused);
+        // Queued while paused: held even though the agent is idle.
+        let m = mirante_ipc::types::SendMessage { task: t.clone(), text: "next".into(), mode: SendMode::Queue };
+        assert_eq!(k.hub.send(m).unwrap().delivered, SendMode::Queue);
+        assert!(k.calls().iter().all(|c| !c.starts_with("send:")));
+        let other = k.create(AgentKind::Claude, "b").task.id;
+        let r = k.hub.start_session(StartSession { task: other, prompt: None }, false);
+        assert!(matches!(r, Err(HubError::Conflict(ref m)) if m.contains("memory")), "{r:?}");
+        assert!(kinds(&k, None).contains(&"memory.offer_hibernate".to_string()));
+        s.set_system(sys(Pressure::Normal));
+        for i in 1..=5 {
+            k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(2 * i));
+        }
+        assert!(!k.hub.status().memory.unwrap().paused);
+        assert!(k.calls().contains(&"send:next".to_string()), "{:?}", k.calls());
+    }
+
+    #[test]
+    fn sustained_critical_pressure_hibernates_an_idle_session_but_never_one_waiting_on_you() {
+        let k = Kit::new();
+        let t = with_root(&k, "a", 101);
+        k.hook(&t, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}));
+        let s = FakeSampler::default();
+        s.set_tree(101, 800 * MB);
+        s.set_system(sys(Pressure::Critical));
+        let mut p = Policy::new(cfg());
+        let now = Instant::now();
+        for i in 0..20 {
+            k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(i));
+        }
+        assert!(k.hub.get_task(&t).unwrap().live, "a session with a pending permission is never hibernated");
+        assert!(!kinds(&k, Some(&t)).contains(&"memory.auto_hibernated".to_string()));
+        assert!(kinds(&k, Some(&t)).contains(&"memory.refused".to_string()));
+        // Answered and idle again: now it may go.
+        let id = k.pending(&t)[0].id.clone();
+        k.hub.answer_permission(mirante_ipc::types::AnswerPermission { id, allow: false }).unwrap();
+        k.hook(&t, json!({"hook_event_name": "Stop"}));
+        for i in 20..120 {
+            k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(i));
+        }
+        let v = k.hub.get_task(&t).unwrap();
+        assert!(v.hibernated && !v.live, "{v:?}");
+        assert_eq!(kinds(&k, Some(&t)).iter().filter(|k| *k == "memory.auto_hibernated").count(), 1);
+        assert!(k.calls().contains(&"stop".to_string()));
+    }
+
+    #[test]
+    fn hibernate_and_wake_round_trip_on_the_native_conversation() {
+        let k = Kit::new();
+        let t = with_root(&k, "a", 101);
+        k.emit(DriverEvent::NativeId("nat-7".into()));
+        assert!(matches!(k.hub.wake(&t), Err(HubError::Conflict(_))));
+        let v = k.hub.hibernate(&t).unwrap();
+        assert!(v.hibernated && !v.live);
+        let r = k.hub.wake(&t).unwrap();
+        assert!(r.resumed);
+        assert_eq!(k.factory.resumes.lock().unwrap().last().cloned().flatten().as_deref(), Some("nat-7"));
+        assert!(!k.hub.get_task(&t).unwrap().hibernated);
+        assert!(matches!(k.hub.hibernate("nope"), Err(HubError::NotFound(_))));
+    }
+
+    #[test]
+    fn a_real_process_tree_is_measured() {
+        use std::os::unix::process::CommandExt;
+        let k = Kit::new();
+        let mut child =
+            std::process::Command::new("/bin/sh").args(["-c", "sleep 30 & sleep 30"]).process_group(0).spawn().unwrap();
+        let root = proc_of(child.id() as i32).unwrap();
+        *k.factory.driver.root.lock().unwrap() = Some(root);
+        let t = k.started(AgentKind::Claude, "real").task.id;
+        let sampler = memguard::os_sampler();
+        let mut p = Policy::new(cfg());
+        k.hub.memory_tick(&mut p, sampler.as_ref(), Instant::now());
+        let m = k.hub.get_task(&t).unwrap().memory.expect("sampled");
+        assert!(m.bytes > 0 && m.bytes < 1000 * MB, "{m:?}");
+        let r = crate::driver::proctree::kill_tree(root, Duration::from_secs(2), &Kill);
+        assert!(r.survivors.is_empty());
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn doctor_reports_orphan_checkouts_and_refuses_to_kill_a_non_orphan() {
+        let k = Kit::new();
+        k.create(AgentKind::Claude, "owned");
+        let stray = k.hub.paths().worktrees().join("app/stray");
+        std::fs::create_dir_all(stray.join(".git")).unwrap();
+        let d = k.hub.doctor().unwrap();
+        assert_eq!(d.orphan_worktrees.len(), 1, "{d:?}");
+        assert!(d.orphan_worktrees[0].ends_with("app/stray"));
+        let me = proc_of(std::process::id() as i32).unwrap();
+        let r = k.hub.kill_orphan(KillOrphan { pid: me.pid, start: me.start });
+        assert!(matches!(r, Err(HubError::NotFound(_))), "{r:?}");
+    }
+
+    #[test]
+    fn config_reads_the_users_overrides() {
+        let c = config_from(16 * GIB, Some("2048"), Some("60"));
+        assert_eq!((c.budget, c.idle_hibernate), (2048 * MB, Some(Duration::from_secs(3600))));
+        let d = config_from(16 * GIB, Some("x"), None);
+        assert_eq!((d.budget, d.idle_hibernate), (4 * GIB, None));
+        assert_eq!(human(1536 * MB), "1.5G");
+        assert_eq!(human(512 * MB), "512M");
+    }
+
+    use mirante_ipc::types::SendMode;
+}
+```
+
+In `crates/mirante-ipc/src/types.rs`, the `TaskView` literal in `task_view_flattens_the_task` gets the two new fields, and `additive_fields_are_optional_on_the_wire` checks that an older `daemon.status` reply still parses:
+```rust
+            usage: None,
+            memory: Some(MemView { bytes: 1, peak: 2, budget: 3, state: "ok".into() }),
+            hibernated: false,
+        };
+```
+```rust
+        let d: DaemonStatus =
+            serde_json::from_value(json!({"pid": 1, "boot_id": "b", "version": "0.1.0", "live_sessions": 0})).unwrap();
+        assert_eq!(d.memory, None);
+```
+
+In `crates/mirante-cli/src/args.rs`, add to `simple_commands`:
+```rust
+        assert_eq!(p("hibernate feat").unwrap(), Cmd::Hibernate { task: "feat".into() });
+        assert_eq!(p("wake feat --trust").unwrap(), Cmd::Wake { task: "feat".into(), trust: true });
+        assert_eq!(p("doctor").unwrap(), Cmd::Doctor { kill: None });
+        assert_eq!(p("doctor --kill 4242").unwrap(), Cmd::Doctor { kill: Some(4242) });
+        assert_eq!(p("doctor --kill x").unwrap_err(), "--kill needs a pid, got x");
+```
+
+Replace the test module of `crates/mirante-cli/src/render.rs` with:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mirante_core::model::{PermissionStatus, Task};
+
+    fn view(status: Status, needs: usize, detail: Option<&str>) -> TaskView {
+        TaskView {
+            task: Task {
+                id: "0190aaaa-bbbb-7ccc-8ddd-eeee12345678".into(),
+                title: "Fix the login".into(),
+                repo_path: "/r".into(),
+                worktree_path: "/w".into(),
+                branch: "feat/login".into(),
+                agent: AgentKind::Claude,
+                goal: "fix it".into(),
+                notes: String::new(),
+                lifecycle: Lifecycle::Active,
+                status,
+                created_at: 0,
+                updated_at: 0,
+            },
+            live: true,
+            boot: Some(BootState::Ready),
+            needs_you: needs,
+            queued: 0,
+            detail: detail.map(String::from),
+            usage: None,
+            memory: None,
+            hibernated: false,
+        }
+    }
+
+    #[test]
+    fn short_ids_are_the_unique_suffix() {
+        assert_eq!(short("0190aaaa-bbbb-7ccc-8ddd-eeee12345678"), "12345678");
+        assert_eq!(short("abc"), "abc");
+    }
+
+    #[test]
+    fn fit_truncates_and_pads_by_characters() {
+        assert_eq!(fit("ação", 6), "ação  ");
+        assert_eq!(fit("abcdefgh", 5), "abcd…");
+    }
+
+    #[test]
+    fn table_shows_status_needs_and_detail() {
+        let t = tasks_table(
+            &[view(Status::NeedsYou, 2, None), view(Status::Working, 0, Some("turn done, 1 command still finishing"))],
+            false,
+        );
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("ID"));
+        assert!(lines[1].contains("12345678") && lines[1].contains("needs_you") && lines[1].contains(" 2 "));
+        assert!(lines[2].contains("[turn done, 1 command still finishing]"));
+        assert!(lines[0].contains("MODE") && lines[1].contains("manual"));
+        assert!(!t.contains('\x1b'));
+        assert!(tasks_table(&[view(Status::Idle, 0, None)], true).contains("\x1b[32m"));
+    }
+
+    #[test]
+    fn codex_rows_show_the_auto_edits_mode_and_usage() {
+        let mut v = view(Status::Working, 0, Some("turn done, 1 command still finishing"));
+        v.task.agent = AgentKind::Codex;
+        v.usage = Some("5h 42% · 31k tokens".into());
+        let t = tasks_table(&[v.clone()], false);
+        assert!(t.contains("auto-edits"), "{t}");
+        assert!(t.contains("[turn done, 1 command still finishing · 5h 42% · 31k tokens]"), "{t}");
+        assert!(task_detail(&v, &[]).contains("mode:      auto-edits (edits and commands inside the worktree"));
+        v.task.lifecycle = Lifecycle::Archiving;
+        assert!(tasks_table(&[v], false).contains("[archiving · 5h 42% · 31k tokens]"));
+    }
+
+    #[test]
+    fn memory_shows_per_task_in_watch_and_in_doctor() {
+        let mut v = view(Status::Idle, 0, None);
+        v.memory = Some(MemView { bytes: 3 << 30, peak: 3 << 30, budget: 4 << 30, state: "soft".into() });
+        let t = tasks_table(&[v.clone()], false);
+        assert!(t.lines().next().unwrap().contains("MEM") && t.contains("3.0G/4.0G!"), "{t}");
+        v.memory = None;
+        v.hibernated = true;
+        v.live = false;
+        assert!(tasks_table(&[v], false).contains("[hibernated: mirante wake]"));
+        let s = SystemView {
+            level: "elevated".into(),
+            total: 16 << 30,
+            free: 512 << 20,
+            swap_used: 9 << 30,
+            swap_total: 10 << 30,
+            paused: true,
+        };
+        assert_eq!(
+            memory_line(&s),
+            "memory: elevated · free 512M of 16.0G · swap 9.0G/10.0G · new sessions and queued messages paused"
+        );
+        let d = DoctorReport {
+            orphan_processes: vec![mirante_ipc::types::OrphanView {
+                pid: 4242,
+                start: 1,
+                cwd: Some("/w/app/feat".into()),
+                argv: "node server.js".into(),
+            }],
+            orphan_worktrees: vec![],
+            memory: Some(s),
+        };
+        let r = doctor_report(&d);
+        assert!(r.contains("pid 4242  cwd /w/app/feat  node server.js") && r.contains("mirante doctor --kill <pid>"));
+        assert!(r.contains("orphan checkouts: none"));
+    }
+
+    #[test]
+    fn perms_table_says_how_to_answer() {
+        let p = PermissionView {
+            request: PermissionRequest {
+                id: "p-0000-abcdef12".into(),
+                task_id: "t".into(),
+                session_id: "s".into(),
+                tool: "Bash".into(),
+                detail: "rm -rf build\nsecond line".into(),
+                status: PermissionStatus::Pending,
+                created_at: 0,
+                answered_at: None,
+            },
+            task_title: "T".into(),
+            branch: "feat".into(),
+        };
+        let t = perms_table(&[p]);
+        assert!(t.contains("abcdef12") && t.contains("rm -rf build") && !t.contains("second line"));
+        assert!(t.contains("mirante allow <perm>"));
+        assert_eq!(perms_table(&[]), "no pending permission requests\n");
+    }
+}
+```
+
+In `crates/mirante-cli/src/daemon_ctl.rs`, add `memory: None,` to the `DaemonStatus` literal in `version_skew_warns_and_offers_a_restart_only_when_idle`.
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p mirante-daemon`
+
+Expected: FAIL to compile; the first error is
+```
+error: cannot find macro `json` in this scope
+```
+
+- [ ] **Step 3: Implement**
+
+Add above the test module in `crates/mirante-daemon/src/hub/memory.rs`:
+```rust
+//! The memory guard in the daemon: a thread samples every live session's process tree and
+//! the machine (`crate::memguard`), feeds the policy, and carries out what it decides.
+//! Nothing is limited up front (macOS cannot enforce RLIMIT_AS/RLIMIT_DATA): Mirante
+//! measures and acts, in this order — warn; pause new sessions and queued deliveries; offer
+//! to hibernate the largest idle session (the user confirms with `mirante hibernate`);
+//! only under sustained critical pressure hibernate an idle session on its own, one per
+//! cooldown, never one with a pending permission and never one that is working. Every
+//! step is an `memory.*` event.
+//!
+//! Hibernate = remember the native id and transcript, end the process tree, mark the task
+//! hibernated; `mirante wake` resumes it natively (`--resume` / `thread/resume`).
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use mirante_core::model::Status;
+use mirante_ipc::types::{
+    BootState, DoctorReport, KillOrphan, MemView, OrphanView, StartResult, StartSession, SystemView, TaskView,
+};
+use serde_json::json;
+
+use super::{Hub, HubError, Result, State};
+use crate::driver::proctree::Kill;
+use crate::memguard::{self, Action, Config, MemSampler, Policy, SessionInfo, SessionMem, SystemSample, TreeSample};
+
+const GIB: u64 = 1 << 30;
+
+/// How the hub shows memory between samples.
+#[derive(Debug, Default)]
+pub(crate) struct MemShared {
+    pub(crate) system: Option<SystemView>,
+    /// New sessions and queued deliveries wait (the policy paused them).
+    pub(crate) paused: bool,
+    pub(crate) sessions: std::collections::HashMap<String, SessionMem>,
+    /// Tasks hibernated by this daemon (a restart ends every session anyway).
+    pub(crate) hibernated: std::collections::HashSet<String>,
+}
+
+pub(crate) fn mem_view(m: &SessionMem) -> MemView {
+    MemView { bytes: m.bytes, peak: m.peak, budget: m.budget, state: m.state.as_str().to_string() }
+}
+
+/// The guard's configuration for a machine with `total` bytes of RAM, with the user's
+/// overrides: `MIRANTE_MEM_BUDGET_MB` (per session) and `MIRANTE_IDLE_HIBERNATE_MIN`
+/// (hibernate a session idle that long; off unless set). Unparseable values are ignored.
+pub fn config_from(total: u64, budget_mb: Option<&str>, idle_min: Option<&str>) -> Config {
+    let mut c = Config::for_ram(total);
+    if let Some(mb) = budget_mb.and_then(|s| s.trim().parse::<u64>().ok()).filter(|mb| *mb > 0) {
+        c.budget = mb << 20;
+    }
+    if let Some(min) = idle_min.and_then(|s| s.trim().parse::<u64>().ok()).filter(|m| *m > 0) {
+        c.idle_hibernate = Some(std::time::Duration::from_secs(min * 60));
+    }
+    c
+}
+
+fn system_view(level: &str, s: &SystemSample, paused: bool) -> SystemView {
+    SystemView {
+        level: level.to_string(),
+        total: s.total,
+        free: s.free,
+        swap_used: s.swap_used,
+        swap_total: s.swap_total,
+        paused,
+    }
+}
+
+fn orphan_view(o: &memguard::Orphan) -> OrphanView {
+    OrphanView {
+        pid: o.proc.pid,
+        start: o.proc.start,
+        cwd: o.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        argv: o.argv.clone(),
+    }
+}
+
+impl State {
+    /// Everything the policy needs to know about the live sessions now.
+    fn mem_sessions(&self) -> Vec<SessionInfo> {
+        let mut out = Vec::new();
+        for (task_id, l) in &self.live {
+            let status = self.store.get_task(task_id).map(|t| t.status).unwrap_or(Status::Working);
+            let pending = l.hold.load(std::sync::atomic::Ordering::SeqCst);
+            out.push(SessionInfo {
+                task_id: task_id.clone(),
+                root: l.driver.as_ref().and_then(|d| d.root()),
+                idle: status == Status::Idle && l.boot == BootState::Ready && !l.delivering(),
+                pending_permission: pending,
+                idle_since: l.idle_since,
+            });
+        }
+        out
+    }
+
+    /// Carries out one policy decision that needs no process to end; hibernations are
+    /// returned for the caller to do without the lock.
+    fn apply_mem_action(&mut self, a: Action, hibernate: &mut Vec<(String, String)>) -> Result<()> {
+        match a {
+            Action::Warn { task_id, bytes, budget, state } => self.event(
+                Some(&task_id),
+                "memory.warn",
+                json!({ "bytes": bytes, "budget": budget, "state": state.as_str() }),
+            ),
+            Action::Pause(paused) => {
+                self.mem.paused = paused;
+                if let Some(v) = self.mem.system.as_mut() {
+                    v.paused = paused;
+                }
+                let kind = if paused { "memory.paused" } else { "memory.resumed" };
+                self.event(None, kind, json!({ "what": "new sessions and queued deliveries" }))?;
+                if !paused {
+                    let tasks: Vec<String> = self.live.keys().cloned().collect();
+                    for t in tasks {
+                        self.kick(&t)?;
+                    }
+                }
+                Ok(())
+            }
+            Action::OfferHibernate { task_id, reason } => self.event(
+                Some(&task_id),
+                "memory.offer_hibernate",
+                json!({ "reason": reason, "hint": "mirante hibernate <task> (mirante wake <task> resumes it)" }),
+            ),
+            Action::AutoHibernate { task_id, reason } => {
+                hibernate.push((task_id, reason));
+                Ok(())
+            }
+            Action::IdleHibernate { task_id } => {
+                hibernate.push((task_id, "idle hibernation".into()));
+                Ok(())
+            }
+            Action::Leak { task_id, mb_per_min } => {
+                self.event(Some(&task_id), "memory.leak", json!({ "mb_per_min": mb_per_min }))
+            }
+            Action::LevelChanged { from, to } => {
+                self.event(None, "memory.level", json!({ "from": from.as_str(), "to": to.as_str() }))
+            }
+            Action::Refused { task_id, reason } => {
+                self.event(Some(&task_id), "memory.refused", json!({ "reason": reason }))
+            }
+        }
+    }
+
+    /// Checkouts under the worktree root that no non-archived task owns.
+    fn orphan_checkouts(&self, all: Vec<PathBuf>) -> Result<Vec<String>> {
+        let owned: Vec<PathBuf> = self
+            .store
+            .list_tasks(false)?
+            .into_iter()
+            .map(|t| std::fs::canonicalize(&t.worktree_path).unwrap_or_else(|_| PathBuf::from(&t.worktree_path)))
+            .collect();
+        let mut out: Vec<String> =
+            all.into_iter().filter(|p| !owned.contains(p)).map(|p| p.to_string_lossy().into_owned()).collect();
+        out.sort();
+        Ok(out)
+    }
+}
+
+impl Hub {
+    /// One round of the guard: sample (without the hub lock), decide, act.
+    pub fn memory_tick(&self, policy: &mut Policy, sampler: &dyn MemSampler, now: Instant) {
+        let infos = self.lock().mem_sessions();
+        let system = sampler.system();
+        let sessions: Vec<(SessionInfo, Option<TreeSample>)> = infos
+            .into_iter()
+            .map(|i| {
+                let s = i.root.and_then(|r| sampler.tree(r));
+                (i, s)
+            })
+            .collect();
+        let actions = policy.tick(now, &system, &sessions);
+        let mut hibernate = Vec::new();
+        {
+            let mut st = self.lock();
+            let live: Vec<String> = st.live.keys().cloned().collect();
+            st.mem.sessions.retain(|t, _| live.contains(t));
+            for (info, _) in &sessions {
+                if let Some(m) = policy.session(&info.task_id) {
+                    st.mem.sessions.insert(info.task_id.clone(), m);
+                }
+            }
+            let paused = st.mem.paused;
+            st.mem.system = Some(system_view(policy.level().as_str(), &system, paused));
+            for a in actions {
+                if let Err(e) = st.apply_mem_action(a, &mut hibernate) {
+                    st.log_error(None, "memory guard", &e);
+                }
+            }
+            st.publish();
+        }
+        for (task_id, reason) in hibernate {
+            policy.forget(&task_id);
+            if let Err(e) = self.hibernate_with(&task_id, Some(&reason)) {
+                let mut st = self.lock();
+                let _ = st.event(Some(&task_id), "memory.refused", json!({ "reason": e.to_string() }));
+                st.publish();
+            }
+        }
+    }
+
+    /// The guard thread: [`Hub::memory_tick`] every 2 s (every 500 ms under pressure).
+    pub fn spawn_memguard(self: &Arc<Self>, sampler: Box<dyn MemSampler>, cfg: Config) -> std::thread::JoinHandle<()> {
+        let hub = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut policy = Policy::new(cfg);
+            loop {
+                hub.memory_tick(&mut policy, sampler.as_ref(), Instant::now());
+                std::thread::sleep(policy.next_interval());
+            }
+        })
+    }
+
+    /// The user's `mirante hibernate`: ends the live session to free memory, keeping it
+    /// resumable. Refused while a permission request waits (it would be lost).
+    pub fn hibernate(&self, reference: &str) -> Result<TaskView> {
+        self.hibernate_with(reference, None)
+    }
+
+    /// `auto` is the guard's reason: then the session must also be idle right now.
+    fn hibernate_with(&self, reference: &str, auto: Option<&str>) -> Result<TaskView> {
+        let (task_id, session_id, driver) = {
+            let mut st = self.lock();
+            let task = st.resolve(reference)?;
+            let infos = st.mem_sessions();
+            let l = st
+                .live
+                .get(&task.id)
+                .ok_or_else(|| HubError::Conflict(format!("task {} has no live session", task.branch)))?;
+            let info = infos.iter().find(|i| i.task_id == task.id);
+            if info.is_some_and(|i| i.pending_permission) {
+                return Err(HubError::Conflict(format!(
+                    "task {} waits on a permission request: answer it first (a session waiting on you is never hibernated)",
+                    task.branch
+                )));
+            }
+            if auto.is_some() && !info.is_some_and(|i| i.idle) {
+                return Err(HubError::Conflict(format!("task {} is busy: not hibernated", task.branch)));
+            }
+            let bytes = st.mem.sessions.get(&task.id).map(|m| m.bytes);
+            let payload = json!({
+                "session_id": l.session_id,
+                "native_id": l.native_id,
+                "transcript_path": l.transcript_path,
+                "bytes": bytes,
+                "auto": auto.is_some(),
+                "reason": auto.unwrap_or("asked by the user"),
+            });
+            let out = (task.id.clone(), l.session_id.clone(), l.driver.clone());
+            let kind = if auto.is_some() { "memory.auto_hibernated" } else { "memory.hibernated" };
+            st.event(Some(&task.id), kind, payload)?;
+            st.publish();
+            out
+        };
+        if let Some(d) = driver {
+            d.stop();
+        }
+        let mut st = self.lock();
+        st.finish_session(&task_id, &session_id, "mirante:hibernated")?;
+        st.mem.hibernated.insert(task_id.clone());
+        st.mem.sessions.remove(&task_id);
+        st.publish();
+        let t = st.store.get_task(&task_id)?;
+        st.view(t)
+    }
+
+    /// `mirante wake`: resumes a hibernated session on its native conversation.
+    pub fn wake(&self, reference: &str) -> Result<StartResult> {
+        let task_id = {
+            let st = self.lock();
+            let task = st.resolve(reference)?;
+            if !st.mem.hibernated.contains(&task.id) {
+                return Err(HubError::Conflict(format!(
+                    "task {} is not hibernated (mirante resume {} restarts an ended session)",
+                    task.branch, task.branch
+                )));
+            }
+            task.id
+        };
+        self.start_session(StartSession { task: task_id, prompt: None }, true)
+    }
+
+    /// Orphan processes (parent gone, inside Mirante's worktrees), orphan checkouts, and
+    /// memory. Nothing is killed or deleted here.
+    pub fn doctor(&self) -> Result<DoctorReport> {
+        let processes = memguard::find_orphans(&self.paths.worktrees());
+        let checkouts = self.worktrees.checkouts();
+        let st = self.lock();
+        Ok(DoctorReport {
+            orphan_processes: processes.iter().map(orphan_view).collect(),
+            orphan_worktrees: st.orphan_checkouts(checkouts)?,
+            memory: st.mem.system.clone(),
+        })
+    }
+
+    /// Kills one orphan the user picked: it must still be an orphan of Mirante's worktrees
+    /// with the same pid AND start time (never a reused pid, never by name).
+    pub fn kill_orphan(&self, k: KillOrphan) -> Result<OrphanView> {
+        let found = memguard::find_orphans(&self.paths.worktrees())
+            .into_iter()
+            .find(|o| o.proc.pid == k.pid && o.proc.start == k.start)
+            .ok_or_else(|| {
+                HubError::NotFound(format!("pid {} is not (or no longer) an orphan in Mirante's worktrees", k.pid))
+            })?;
+        let report = memguard::kill_orphan(&found, &Kill);
+        let mut st = self.lock();
+        let v = orphan_view(&found);
+        st.event(None, "orphan_killed", json!({ "pid": v.pid, "argv": v.argv, "survivors": report.survivors.len() }))?;
+        st.publish();
+        if report.survivors.is_empty() {
+            Ok(v)
+        } else {
+            Err(HubError::Conflict(format!("pid {} survived SIGKILL", k.pid)))
+        }
+    }
+}
+
+/// Budget shown for `n` bytes: "1.2G", "512M".
+pub fn human(n: u64) -> String {
+    if n >= GIB {
+        format!("{:.1}G", n as f64 / GIB as f64)
+    } else {
+        format!("{}M", n >> 20)
+    }
+}
+```
+
+In `crates/mirante-daemon/src/hub/mod.rs`:
+
+1. Add a field at the end of `struct Live` (and `idle_since: Some(Instant::now()),` in `Live::new`):
+```rust
+    /// Since when the status is `Idle` (the memory guard's idle hibernation and leak check).
+    pub(crate) idle_since: Option<Instant>,
+```
+2. Add a field to `struct State` (and `mem: memory::MemShared::default(),` in `Hub::new`):
+```rust
+    /// The memory guard's last view, pause flag and hibernated tasks.
+    pub(crate) mem: memory::MemShared,
+```
+3. In `State::view`, after `usage`, add:
+```rust
+            memory: live.and(self.mem.sessions.get(&task.id)).map(memory::mem_view),
+            hibernated: self.mem.hibernated.contains(&task.id),
+```
+4. In `State::set_status`, replace the `if cur == Status::Idle { … }` block after `self.store.set_status(…)?;` with:
+```rust
+        if let Some(l) = self.live.get_mut(task_id) {
+            if cur == Status::Idle {
+                l.delivery_in_flight = None;
+            }
+            l.idle_since = (to == Status::Idle).then(Instant::now);
+        }
+```
+5. In `Hub::status`, add `memory: st.mem.system.clone(),` after `live_sessions`.
+
+In `crates/mirante-daemon/src/hub/session.rs`, in `State::kick` right after the early return for a session that is not ready/idle/queued:
+```rust
+        if self.mem.paused {
+            // Memory is tight: queued messages wait (the guard kicks again when it eases).
+            return Ok(());
+        }
+```
+and in `Hub::start_session`, right after the "already has a live session" check:
+```rust
+            if st.mem.paused {
+                return Err(HubError::Conflict(
+                    "memory is tight: new sessions wait until it eases (mirante watch / mirante doctor)".into(),
+                ));
+            }
+            st.mem.hibernated.remove(&task.id);
+```
+
+In `crates/mirante-daemon/src/hub/messages.rs` (`Hub::send`), read the flag before borrowing the live session, and hold queued messages while paused:
+```rust
+        // Memory is tight: queued messages wait for the guard (an explicit steer still goes).
+        let paused = st.mem.paused;
+```
+```rust
+            SendMode::Queue => ready && !paused && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
+```
+
+In `crates/mirante-daemon/src/server.rs` (`dispatch`), after the `DAEMON_STATUS` arm:
+```rust
+        method::SESSION_HIBERNATE => out(hub.hibernate(&params::<TaskRef>(p)?.task)),
+        method::SESSION_WAKE => out(hub.wake(&params::<TaskRef>(p)?.task)),
+        method::DAEMON_DOCTOR => out(hub.doctor()),
+        method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
+```
+
+In `crates/mirante-daemon/src/main.rs` (`run`), right after `let pump = hub.spawn_pump(rx);`:
+```rust
+    // The memory guard: measure and act (nothing is limited up front; see hub::memory).
+    // `MIRANTE_MEMGUARD=off` disables it (tests that must not depend on this machine's memory).
+    if std::env::var("MIRANTE_MEMGUARD").as_deref() != Ok("off") {
+        let sampler = mirante_daemon::memguard::os_sampler();
+        let budget = std::env::var("MIRANTE_MEM_BUDGET_MB").ok();
+        let idle = std::env::var("MIRANTE_IDLE_HIBERNATE_MIN").ok();
+        let cfg = mirante_daemon::hub::memory::config_from(sampler.system().total, budget.as_deref(), idle.as_deref());
+        eprintln!("mirante-daemon: memory budget per session {}", mirante_daemon::hub::memory::human(cfg.budget));
+        hub.spawn_memguard(sampler, cfg);
+    }
+```
+
+In `crates/mirante-ipc/src/types.rs`: add the four method names to `mod method`:
+```rust
+    /// Ends an idle session to free memory, keeping it resumable ([`super::TaskRef`]).
+    pub const SESSION_HIBERNATE: &str = "session.hibernate";
+    /// Resumes a hibernated session ([`super::TaskRef`]; result: [`super::StartResult`]).
+    pub const SESSION_WAKE: &str = "session.wake";
+    /// Orphan processes / checkouts and memory ([`super::DoctorReport`]).
+    pub const DAEMON_DOCTOR: &str = "daemon.doctor";
+    /// Kills one orphan the user picked from `daemon.doctor` ([`super::KillOrphan`]).
+    pub const DAEMON_KILL_ORPHAN: &str = "daemon.kill_orphan";
+```
+add the two fields at the end of `TaskView` and the new types right after it:
+```rust
+    /// Memory of the live session's process tree, once sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemView>,
+    /// The session was hibernated to free memory (`mirante wake` resumes it).
+    #[serde(default)]
+    pub hibernated: bool,
+}
+
+/// One live session's memory: the summed footprint of its process tree (macOS:
+/// `phys_footprint`, what Activity Monitor shows), its peak, its budget and where it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemView {
+    pub bytes: u64,
+    pub peak: u64,
+    pub budget: u64,
+    /// "ok", "soft" (past the soft share of the budget) or "hard" (past the budget).
+    pub state: String,
+}
+
+/// The machine's memory as the daemon's guard sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemView {
+    /// "normal", "elevated" or "critical".
+    pub level: String,
+    pub total: u64,
+    pub free: u64,
+    pub swap_used: u64,
+    pub swap_total: u64,
+    /// New sessions and queued deliveries wait while memory is tight.
+    pub paused: bool,
+}
+
+/// A process left behind by an agent: parent gone (ppid 1), working directory or command
+/// line inside Mirante's worktrees. Shown by `mirante doctor`; killed only on request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanView {
+    pub pid: i32,
+    /// Start time; with the pid it names exactly this process.
+    pub start: u64,
+    pub cwd: Option<String>,
+    pub argv: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub orphan_processes: Vec<OrphanView>,
+    /// Checkouts under the worktree root that no task owns (never deleted by Mirante).
+    pub orphan_worktrees: Vec<String>,
+    pub memory: Option<SystemView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KillOrphan {
+    pub pid: i32,
+    pub start: u64,
+}
+```
+and the field at the end of `DaemonStatus`:
+```rust
+    /// The memory guard's view (absent from older daemons and before the first sample).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<SystemView>,
+```
+
+In `crates/mirante-cli/src/args.rs`: add to `USAGE` (before `archive`):
+```
+  hibernate <task>       end an idle agent to free memory (resumable; never one waiting on you)
+  wake <task> [--trust]  resume a hibernated task on its native conversation
+  doctor [--kill <pid>]  orphan processes / checkouts and memory; --kill asks, then kills one orphan
+```
+add the variants to `Cmd`:
+```rust
+    Hibernate {
+        task: String,
+    },
+    Wake {
+        task: String,
+        trust: bool,
+    },
+    Doctor {
+        kill: Option<i32>,
+    },
+```
+and parse them after `"archive"`:
+```rust
+        "hibernate" => Ok(Cmd::Hibernate { task: one(&split(rest, none, none)?, "task")? }),
+        "wake" => {
+            let p = split(rest, none, &["--trust"])?;
+            Ok(Cmd::Wake { task: one(&p, "task")?, trust: !p.bools.is_empty() })
+        }
+        "doctor" => {
+            let p = split(rest, &["--kill"], none)?;
+            if !p.positional.is_empty() {
+                return Err("doctor takes no arguments".into());
+            }
+            let kill = match p.values.get("--kill") {
+                Some(v) => Some(v.parse::<i32>().map_err(|_| format!("--kill needs a pid, got {v}"))?),
+                None => None,
+            };
+            Ok(Cmd::Doctor { kill })
+        }
+```
+
+In `crates/mirante-cli/src/render.rs`, replace everything above the test module with:
+```rust
+//! Plain-text tables. Colors only on a terminal (`color` = stdout is a tty).
+use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
+use mirante_ipc::types::{BootState, DoctorReport, MemView, PermissionView, SystemView, TaskView};
+
+/// Last 8 characters of an id (UUID v7 prefixes are time-based and collide; suffixes do not).
+pub fn short(id: &str) -> &str {
+    let mut start = id.len().saturating_sub(8);
+    while !id.is_char_boundary(start) {
+        start += 1;
+    }
+    &id[start..]
+}
+
+/// `s` cut to `width` characters (with `…`) and padded.
+pub fn fit(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n > width {
+        let cut: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        format!("{s}{}", " ".repeat(width - n))
+    }
+}
+
+pub fn status_label(s: Status) -> &'static str {
+    s.as_str()
+}
+
+/// The approval mode Mirante runs each agent in (fixed per agent; never a bypass mode).
+pub fn mode_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "manual",
+        AgentKind::Codex => "auto-edits",
+    }
+}
+
+/// What the mode means, for `mirante show`.
+pub fn mode_help(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "Claude asks before every tool that needs permission (--permission-mode manual)",
+        AgentKind::Codex => {
+            "edits and commands inside the worktree run without asking (sandbox workspace-write); \
+             anything beyond it asks you (approvalPolicy on-request, approvalsReviewer user)"
+        }
+    }
+}
+
+fn paint(s: Status, text: &str, color: bool) -> String {
+    if !color {
+        return text.to_string();
+    }
+    let code = match s {
+        Status::Working => "33",
+        Status::NeedsYou => "1;31",
+        Status::Idle => "32",
+        Status::Ended => "2",
+    };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn note(v: &TaskView) -> String {
+    let state = match (v.boot, &v.detail) {
+        _ if v.hibernated => Some("hibernated: mirante wake".to_string()),
+        _ if v.task.lifecycle == Lifecycle::Archiving => Some("archiving".to_string()),
+        (Some(BootState::TrustPrompt), _) => Some("trust prompt: mirante resume / attach".to_string()),
+        (Some(BootState::Booting), _) => Some("starting".to_string()),
+        (_, Some(d)) => Some(d.clone()),
+        _ => None,
+    };
+    state.into_iter().chain(v.usage.clone()).collect::<Vec<_>>().join(" · ")
+}
+
+pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
+    if tasks.is_empty() {
+        return "no tasks (mirante new <repo> --agent claude|codex --branch <name> <goal>)\n".into();
+    }
+    let mut out = format!(
+        "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
+        fit("ID", 8),
+        fit("BRANCH", 22),
+        fit("AGENT", 6),
+        fit("MODE", 10),
+        fit("STATUS", 9),
+        fit("MEM", 11),
+        fit("NEEDS", 5),
+        fit("Q", 2),
+        "TITLE"
+    );
+    for v in tasks {
+        let needs = if v.needs_you > 0 { v.needs_you.to_string() } else { String::new() };
+        let queued = if v.queued > 0 { v.queued.to_string() } else { String::new() };
+        let note = note(v);
+        let title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
+        out.push_str(&format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
+            fit(short(&v.task.id), 8),
+            fit(&v.task.branch, 22),
+            fit(v.task.agent.as_str(), 6),
+            fit(mode_label(v.task.agent), 10),
+            paint(v.task.status, &fit(status_label(v.task.status), 9), color),
+            fit(&v.memory.as_ref().map(mem_cell).unwrap_or_default(), 11),
+            fit(&needs, 5),
+            fit(&queued, 2),
+            title
+        ));
+    }
+    out
+}
+
+/// Bytes as "1.5G" / "512M".
+pub fn bytes(n: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if n >= GIB {
+        format!("{:.1}G", n as f64 / GIB as f64)
+    } else {
+        format!("{}M", n >> 20)
+    }
+}
+
+/// "1.2G/4.0G", with "!" past the soft share and "!!" past the budget.
+pub fn mem_cell(m: &MemView) -> String {
+    let mark = match m.state.as_str() {
+        "soft" => "!",
+        "hard" => "!!",
+        _ => "",
+    };
+    format!("{}/{}{mark}", bytes(m.bytes), bytes(m.budget))
+}
+
+/// The `watch` header line about the machine's memory.
+pub fn memory_line(s: &SystemView) -> String {
+    let paused = if s.paused { " · new sessions and queued messages paused" } else { "" };
+    format!(
+        "memory: {} · free {} of {} · swap {}/{}{paused}",
+        s.level,
+        bytes(s.free),
+        bytes(s.total),
+        bytes(s.swap_used),
+        bytes(s.swap_total)
+    )
+}
+
+pub fn doctor_report(d: &DoctorReport) -> String {
+    let mut out = String::new();
+    match &d.memory {
+        Some(m) => out.push_str(&format!("{}\n", memory_line(m))),
+        None => out.push_str("memory: not sampled yet\n"),
+    }
+    if d.orphan_processes.is_empty() {
+        out.push_str("orphan processes: none\n");
+    } else {
+        out.push_str("orphan processes (parent gone, inside Mirante's worktrees):\n");
+        for o in &d.orphan_processes {
+            let cwd = o.cwd.as_deref().unwrap_or("?");
+            out.push_str(&format!("  pid {}  cwd {}  {}\n", o.pid, cwd, o.argv));
+        }
+        out.push_str("kill one (asks first): mirante doctor --kill <pid>\n");
+    }
+    if d.orphan_worktrees.is_empty() {
+        out.push_str("orphan checkouts: none\n");
+    } else {
+        out.push_str("orphan checkouts (no task owns them; Mirante never deletes them):\n");
+        for w in &d.orphan_worktrees {
+            out.push_str(&format!("  {w}\n"));
+        }
+    }
+    out
+}
+
+pub fn perms_table(perms: &[PermissionView]) -> String {
+    if perms.is_empty() {
+        return "no pending permission requests\n".into();
+    }
+    let mut out = format!("{}  {}  {}  {}\n", fit("PERM", 8), fit("TASK", 22), fit("TOOL", 10), "DETAIL");
+    for p in perms {
+        out.push_str(&format!(
+            "{}  {}  {}  {}\n",
+            fit(short(&p.request.id), 8),
+            fit(&p.branch, 22),
+            fit(&p.request.tool, 10),
+            p.request.detail.lines().next().unwrap_or("")
+        ));
+    }
+    out.push_str("answer once: mirante allow <perm> | mirante deny <perm>\n");
+    out
+}
+
+pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
+    let t = &v.task;
+    let mut out = format!(
+        "{}  {}\n  id:        {}\n  agent:     {}\n  status:    {}{}\n  lifecycle: {}\n  branch:    {}\n  worktree:  {}\n  repo:      {}\n  goal:      {}\n",
+        short(&t.id),
+        t.title,
+        t.id,
+        t.agent.as_str(),
+        t.status.as_str(),
+        if note(v).is_empty() { String::new() } else { format!(" [{}]", note(v)) },
+        t.lifecycle.as_str(),
+        t.branch,
+        t.worktree_path,
+        t.repo_path,
+        t.goal.lines().next().unwrap_or("")
+    );
+    out.push_str(&format!("  mode:      {} ({})\n", mode_label(t.agent), mode_help(t.agent)));
+    out.push_str(&format!("  live:      {}  queued: {}\n", v.live, v.queued));
+    for p in perms {
+        out.push_str(&format!("  needs you: {} {} {}\n", short(&p.id), p.tool, p.detail));
+    }
+    out
+}
+```
+
+In `crates/mirante-cli/src/main.rs`: import `DoctorReport, KillOrphan, OrphanView, SystemView` from `mirante_ipc::types`; give `board` the memory line:
+```rust
+fn board(tasks: &[TaskView], memory: Option<&SystemView>, seen: &mut HashMap<String, Status>, color: bool) {
+    // Bell only when a task newly needs the user.
+    let bell = tasks
+        .iter()
+        .any(|v| v.task.status == Status::NeedsYou && seen.get(&v.task.id).is_some_and(|s| *s != Status::NeedsYou));
+    seen.clear();
+    seen.extend(tasks.iter().map(|v| (v.task.id.clone(), v.task.status)));
+    print!("\x1b[2J\x1b[H");
+    println!("mirante watch  (Ctrl-C to quit)");
+    match memory {
+        Some(m) => println!("{}\n", render::memory_line(m)),
+        None => println!(),
+    }
+    print!("{}", render::tasks_table(tasks, color));    // … unchanged
+```
+in `watch`, fetch it with each snapshot (both `board(…)` calls pass `memory(&mut q).as_ref()`):
+```rust
+            let memory = |q: &mut Client| q.call::<DaemonStatus>(method::DAEMON_STATUS, json!({})).ok()?.memory;
+            board(&tasks, memory(&mut q).as_ref(), &mut seen, color);
+```
+and add the commands to `run` (before `Cmd::Archive`):
+```rust
+        Cmd::Hibernate { task } => {
+            let v: TaskView = client(&paths)?.call(method::SESSION_HIBERNATE, TaskRef { task })?;
+            println!("{} hibernated (mirante wake {} resumes it)", render::short(&v.task.id), v.task.branch);
+        }
+        Cmd::Wake { task, trust } => {
+            let mut c = client(&paths)?;
+            let r: StartResult = c.call(method::SESSION_WAKE, TaskRef { task })?;
+            boot_flow(&mut c, r, trust)?;
+        }
+        Cmd::Doctor { kill: None } => {
+            let d: DoctorReport = client(&paths)?.call(method::DAEMON_DOCTOR, json!({}))?;
+            print!("{}", render::doctor_report(&d));
+        }
+        Cmd::Doctor { kill: Some(pid) } => {
+            let mut c = client(&paths)?;
+            let d: DoctorReport = c.call(method::DAEMON_DOCTOR, json!({}))?;
+            let o = d.orphan_processes.into_iter().find(|o| o.pid == pid).ok_or_else(|| {
+                format!("pid {pid} is not an orphan in Mirante's worktrees (mirante doctor lists them)")
+            })?;
+            if !ask(&format!("kill pid {} ({})? [y/N] ", o.pid, o.argv))? {
+                println!("left running");
+                return Ok(());
+            }
+            let k: OrphanView = c.call(method::DAEMON_KILL_ORPHAN, KillOrphan { pid: o.pid, start: o.start })?;
+            println!("killed pid {}", k.pid);
+        }
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `cargo test -p mirante-daemon -p mirante-ipc -p mirante-cli`
+
+Expected (one line per test target, in this order; each line also ends with `; finished in …`):
+```
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 185 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+No compiler warnings.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/mirante-daemon crates/mirante-ipc crates/mirante-cli
+git commit -F - <<'EOF'
+feat(daemon,cli): memory guard: budgets, pause, hibernate/wake, doctor
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+## Phase 2b-v — End to end, verification, dogfood
+
+### Task 20: End to end with a fake `claude`; real-agent integration tests
 
 **Files:**
 - Create: `crates/mirante-cli/tests/fake-claude.sh`
 - Create: `crates/mirante-cli/tests/e2e.rs`
 - Create: `crates/mirante-daemon/tests/real_agents.rs`
 
-`tests/e2e.rs` drives the real binaries (`mirante` → auto-started `mirante-daemon` → PTY → `fake-claude.sh` → `mirante-hook` → daemon) in a temp home: dispatch with a goal, status from hooks (`working` then a closed turn), native session id recorded, steer, `ls`, stop, resume on the same native id with `--permission-mode manual` and no bypass flag, archive refused while live then allowed, daemon stop. The fake shows the ready footer, emits hooks like Claude Code and starts/ends a turn per typed line. The e2e test needs every workspace binary built: `cargo test --workspace` builds them; with `-p mirante-cli` alone run `cargo build --workspace` first.
+`tests/e2e.rs` drives the real binaries (`mirante` → auto-started `mirante-daemon` → PTY → `fake-claude.sh` → `mirante-hook` → daemon) in a temp home. The fake behaves like Claude Code where the driver looks: `SessionStart` hook first (with the `--session-id` it was given, or the `--resume` id), an input prompt (`❯`) and the "manual mode on" footer, bracketed-paste input (markers stripped), one turn per line; `ask…` raises a real-looking permission dialog (PermissionRequest hook + `Do you want to proceed?` / `1. Yes` / `2. No` / `Esc to cancel` on screen) and records the one key it gets; a line with `hold` opens a turn that never ends. Every test sets `MIRANTE_MEMGUARD=off` (Task 19) so the results never depend on the test machine's memory. The tests:
 
-`tests/real_agents.rs` holds two `#[ignore]` tests against the real Claude Code and Codex (they need your logins and spend quota): turn → permission card answered once → file created → stop → resume → the secret is remembered (Claude); start → steer "BANANA" mid-run → turn ends → stop → resume by thread id → remembered (Codex). They run in a throwaway temp repo; the Claude one answers the trust dialog only when you set `MIRANTE_TEST_TRUST=1`.
+- **dispatch → steer → stop → resume → archive**: status from hooks, the native id pinned with `--session-id` at the first launch and reused with `--resume`, `--permission-mode manual`, never a bypass flag, `MODE manual` in `ls`, archive refused while live.
+- **bad input** is reported, not swallowed.
+- **concurrent answers** (D): two `mirante allow` for one card race; both succeed (the second gets the stored row, robustness round), exactly one key reaches the agent; a later `deny` is a conflict and types nothing.
+- **`kill -9` of the daemon mid-turn** (D): with a dialog pending and a message queued, the daemon is SIGKILLed; the next command starts a fresh daemon whose recovery ends the session (`ended`), expires the card (`permission_expired`) and reports the queued text (`queue_dropped`); `mirante resume` comes back on the same native id.
+- **slow subscriber** (D): a client subscribes and never reads while 2000 events are produced; the daemon keeps answering (`daemon.status` < 2 s), the slow stream is cut after its bounded queue, and the client resumes with `since_seq` exactly at the next event.
+- **stale hook after resume** (D): a hook stamped with the previous Mirante session (`MIRANTE_SESSION_ID` of the stopped session) is logged as `hook_stale` and changes nothing.
+- **hibernate / wake / doctor** from the CLI (Task 19).
+
+`tests/real_agents.rs` holds two `#[ignore]` tests against the real Claude Code and Codex (they need your logins and spend quota): turn → permission card answered once → file created → stop → resume → the secret is remembered (Claude); start → steer "BANANA" mid-run → turn ends → stop → resume by thread id → remembered (Codex). They run in a throwaway temp repo; the Claude one answers the trust dialog only when you set `MIRANTE_TEST_TRUST=1`. (Unchanged from the first version of this plan: the hub API they use did not change.)
 
 - [ ] **Step 1: Write the files**
 
 `crates/mirante-cli/tests/fake-claude.sh`:
 ```sh
 #!/bin/sh
-# Fake `claude` for the end-to-end test. Like Claude Code it shows the "manual mode on"
-# footer when ready, reports hooks through the hook command, starts a turn for each typed
-# line and ends it, and quits on /exit. It logs its arguments to $FAKE_CLAUDE_LOG.
+# Fake `claude` for the end-to-end tests. Like Claude Code it reports hooks through the
+# hook command (SessionStart first), shows an input prompt with the "manual mode on"
+# footer, takes bracketed-paste input, and starts and ends a turn per line. A line starting
+# with "ask" raises a permission dialog (PermissionRequest hook + the dialog on screen) and
+# waits for one key, appended to $FAKE_CLAUDE_LOG.keys; a line containing "hold" starts a
+# turn that never ends. Its arguments are appended to $FAKE_CLAUDE_LOG.
 hook() { printf '%s' "$1" | "$MIRANTE_HOOK_BIN"; }
-SID=fake-session-1
+SID=none
 SRC=startup
-for a in "$@"; do [ "$a" = "--resume" ] && SRC=resume; done
-echo "$*" >> "$FAKE_CLAUDE_LOG"
-printf '  manual mode on\r\n'
-hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$SID\",\"source\":\"$SRC\"}"
-while IFS= read -r line; do
-  case "$line" in
-    */exit*)
-      hook "{\"hook_event_name\":\"SessionEnd\",\"session_id\":\"$SID\"}"
-      exit 0 ;;
+prev=
+for a in "$@"; do
+  case "$prev" in
+    --session-id) SID=$a ;;
+    --resume) SID=$a; SRC=resume ;;
   esac
+  prev=$a
+done
+echo "$*" >> "$FAKE_CLAUDE_LOG"
+# Screen: a note, the input prompt and the footer (U+23F8 and U+276F as octal UTF-8).
+prompt() { printf '\033[2J\033[H%s\r\n\342\235\257 \r\n  \342\217\270 manual mode on\r\n' "$1"; }
+hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$SID\",\"source\":\"$SRC\"}"
+prompt "fake claude $SID"
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | tr -d '\033' | sed 's/\[20[01]~//g')
   hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"prompt\":\"typed\"}"
-  printf 'echo: %s\r\n' "$line"
-  hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\"}"
+  case "$line" in
+    ask*)
+      hook "{\"hook_event_name\":\"PermissionRequest\",\"session_id\":\"$SID\",\"tool_name\":\"Bash\",\"tool_use_id\":\"tu1\",\"tool_input\":{\"command\":\"touch x\"}}"
+      printf '\033[2J\033[H Bash command\r\n   touch x\r\n Do you want to proceed?\r\n \342\235\257 1. Yes\r\n   2. No\r\n Esc to cancel\r\n'
+      stty raw -echo
+      k=$(dd bs=1 count=1 2>/dev/null)
+      stty sane
+      echo "$k" >> "$FAKE_CLAUDE_LOG.keys"
+      if [ "$k" = 1 ]; then
+        hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$SID\",\"tool_name\":\"Bash\",\"tool_use_id\":\"tu1\"}"
+      fi
+      prompt "answered $k"
+      hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\"}" ;;
+    *hold*)
+      prompt "holding" ;;
+    *)
+      prompt "echo: $line"
+      hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\"}" ;;
+  esac
 done
 ```
 
 `crates/mirante-cli/tests/e2e.rs`:
 ```rust
 //! End to end through the real binaries (`mirante`, `mirante-daemon`, `mirante-hook`) with
-//! a fake `claude` (tests/fake-claude.sh): dispatch, status from hooks, steer, stop,
-//! resume on the native session id, archive, daemon stop. Everything lives in a temp dir.
+//! a fake `claude` (tests/fake-claude.sh): dispatch, status from hooks, steer, stop, resume
+//! on the pinned native session id, permissions answered once, a daemon killed mid-turn, a
+//! slow subscriber, a stale hook, hibernate/wake, archive. Everything lives in a temp dir.
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use mirante_ipc::test_dir::TestDir;
-use mirante_ipc::types::{method, Snapshot};
+use mirante_ipc::types::{method, DaemonStatus, HookEnvelope, HookParams, Snapshot, SubscribeParams, TaskView};
 use mirante_ipc::{Client, Paths};
 use serde_json::{json, Value};
 
@@ -10390,17 +15730,21 @@ impl Env {
         Env { dir, home, repo, log }
     }
 
-    fn mirante(&self, args: &[&str]) -> Output {
+    fn cmd(&self, program: &Path) -> Command {
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-claude.sh");
-        Command::new(bin("mirante"))
-            .args(args)
-            .env("MIRANTE_HOME", &self.home)
+        let mut c = Command::new(program);
+        c.env("MIRANTE_HOME", &self.home)
             .env("MIRANTE_DAEMON_BIN", bin("mirante-daemon"))
             .env("MIRANTE_HOOK_BIN", bin("mirante-hook"))
             .env("MIRANTE_CLAUDE_BIN", fake)
             .env("FAKE_CLAUDE_LOG", &self.log)
-            .output()
-            .unwrap()
+            // Results must not depend on this machine's memory pressure.
+            .env("MIRANTE_MEMGUARD", "off");
+        c
+    }
+
+    fn mirante(&self, args: &[&str]) -> Output {
+        self.cmd(&bin("mirante")).args(args).stdin(Stdio::null()).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -10408,6 +15752,40 @@ impl Env {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success(), "mirante {args:?}: {text}{}", String::from_utf8_lossy(&out.stderr));
         text
+    }
+
+    fn client(&self) -> Client {
+        let c = Client::connect(&Paths::new(&self.home).socket()).unwrap();
+        c.set_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    }
+
+    fn subscribe(&self) -> Client {
+        let mut sub = self.client();
+        let _: Snapshot = sub.call(method::EVENTS_SUBSCRIBE, json!({})).unwrap();
+        sub
+    }
+
+    fn task(&self, branch: &str) -> TaskView {
+        self.client().call(method::TASK_GET, json!({ "task": branch })).unwrap()
+    }
+
+    /// Every event of this daemon boot so far (replayed from seq 0).
+    fn events(&self) -> Vec<Value> {
+        let now: Snapshot = self.client().call(method::EVENTS_SUBSCRIBE, json!({})).unwrap();
+        let mut sub = self.client();
+        let replay = SubscribeParams { since_seq: Some(0), boot_id: Some(now.boot_id) };
+        let snap: Snapshot = sub.call(method::EVENTS_SUBSCRIBE, replay).unwrap();
+        assert!(snap.resumed);
+        let mut out: Vec<Value> = Vec::new();
+        while out.last().and_then(|e| e["seq"].as_u64()).unwrap_or(0) < now.seq {
+            out.push(sub.next_notification().unwrap().expect("replay").params);
+        }
+        out
+    }
+
+    fn keys(&self) -> String {
+        std::fs::read_to_string(self.log.with_extension("log.keys")).unwrap_or_default()
     }
 }
 
@@ -10430,14 +15808,33 @@ fn wait_events(sub: &mut Client, kind: &str, n: usize) -> Vec<Value> {
     seen
 }
 
+fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The `--session-id` the fake was started with on its first launch.
+fn pinned_id(log: &Path) -> String {
+    let args = std::fs::read_to_string(log).unwrap();
+    let first = args.lines().next().unwrap();
+    let mut it = first.split_whitespace();
+    while let Some(a) = it.next() {
+        if a == "--session-id" {
+            return it.next().unwrap().to_string();
+        }
+    }
+    panic!("no --session-id in {first}")
+}
+
 #[test]
 fn dispatch_steer_stop_resume_archive_with_a_fake_claude() {
     let env = Env::new();
     assert!(env.ok(&["daemon", "status"]).contains("not running"));
     assert!(env.ok(&["daemon", "start"]).contains("started"));
-    let mut sub = Client::connect(&Paths::new(&env.home).socket()).unwrap();
-    sub.set_timeout(Some(Duration::from_secs(10))).unwrap();
-    let _: Snapshot = sub.call(method::EVENTS_SUBSCRIBE, json!({})).unwrap();
+    let mut sub = env.subscribe();
 
     let repo = env.repo.to_string_lossy().into_owned();
     let out = env.ok(&["new", &repo, "--agent", "claude", "--branch", "e2e", "say", "hi"]);
@@ -10446,18 +15843,19 @@ fn dispatch_steer_stop_resume_archive_with_a_fake_claude() {
     let statuses: Vec<&str> =
         events.iter().filter(|e| e["kind"] == "status").filter_map(|e| e["payload"]["to"].as_str()).collect();
     assert!(statuses.contains(&"working"), "{statuses:?}");
-    assert!(events.iter().any(|e| e["kind"] == "native_session_id"));
+    let sid = pinned_id(&env.log);
+    assert!(events.iter().any(|e| e["kind"] == "native_session_id" || e["payload"].to_string().contains(&sid)));
 
     assert!(env.ok(&["say", "e2e", "again"]).contains("sent now"));
     wait_events(&mut sub, "turn_ended", 1);
     let ls = env.ok(&["ls"]);
-    assert!(ls.lines().any(|l| l.contains("e2e") && l.contains("idle")), "{ls}");
+    assert!(ls.lines().any(|l| l.contains("e2e") && l.contains("idle") && l.contains("manual")), "{ls}");
 
     assert!(env.ok(&["stop", "e2e"]).contains("ended"));
     let out = env.ok(&["resume", "e2e"]);
     assert!(out.contains("ready (resumed)"), "{out}");
     let args = std::fs::read_to_string(&env.log).unwrap();
-    assert!(args.lines().last().unwrap().contains("--resume fake-session-1"), "{args}");
+    assert!(args.lines().last().unwrap().contains(&format!("--resume {sid}")), "{args}");
     assert!(args.contains("--permission-mode manual") && !args.contains("dangerously"), "{args}");
 
     assert!(!env.mirante(&["archive", "e2e"]).status.success(), "archive must refuse a live session");
@@ -10478,6 +15876,136 @@ fn bad_input_is_reported_not_swallowed() {
     assert_eq!(out.status.code(), Some(2));
     let out = env.mirante(&["say", "missing-task", "hi"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("no task missing-task"));
+}
+
+#[test]
+fn concurrent_answers_to_one_permission_type_one_key() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "perm", "ask", "first"]);
+    wait_until("the card", || env.task("perm").needs_you == 1);
+    let perms = env.ok(&["perms"]);
+    let id = perms.lines().nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    // Two `allow`s race: both succeed (the second is the stored answer), one key is typed.
+    let a = env.cmd(&bin("mirante")).args(["allow", &id]).stdout(Stdio::piped()).spawn().unwrap();
+    let b = env.cmd(&bin("mirante")).args(["allow", &id]).stdout(Stdio::piped()).spawn().unwrap();
+    for out in [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()] {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("allowed_once"));
+    }
+    wait_until("the key", || !env.keys().is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(env.keys(), "1\n");
+    // A different answer to the answered card is a conflict, and types nothing.
+    let deny = env.mirante(&["deny", &id]);
+    assert!(!deny.status.success());
+    assert_eq!(env.keys(), "1\n");
+}
+
+#[test]
+fn a_daemon_killed_mid_turn_ends_the_session_on_restart_and_resume_works() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "crash", "ask", "now"]);
+    wait_until("the card", || env.task("crash").needs_you == 1);
+    assert!(env.ok(&["say", "--queue", "crash", "later"]).contains("queued"));
+    let s: DaemonStatus = env.client().call(method::DAEMON_STATUS, json!({})).unwrap();
+    // SAFETY: plain syscall on the daemon this test started.
+    assert_eq!(unsafe { libc::kill(s.pid as i32, libc::SIGKILL) }, 0);
+    wait_until("the old daemon gone", || unsafe { libc::kill(s.pid as i32, 0) } != 0);
+
+    // Any command starts a fresh daemon, whose recovery ends the orphaned session.
+    let ls = env.ok(&["ls"]);
+    assert!(ls.lines().any(|l| l.contains("crash") && l.contains("ended")), "{ls}");
+    let kinds: Vec<String> = env.events().iter().map(|e| e["kind"].as_str().unwrap_or("").to_string()).collect();
+    for k in ["permission_expired", "queue_dropped"] {
+        assert!(kinds.iter().any(|x| x == k), "{k} missing from {kinds:?}");
+    }
+    assert!(env.ok(&["perms"]).contains("no pending"));
+    let out = env.ok(&["resume", "crash"]);
+    assert!(out.contains("ready (resumed)"), "{out}");
+    let sid = pinned_id(&env.log);
+    assert!(std::fs::read_to_string(&env.log).unwrap().lines().last().unwrap().contains(&format!("--resume {sid}")));
+}
+
+#[test]
+fn a_slow_subscriber_is_dropped_while_the_daemon_keeps_answering_then_resumes() {
+    let env = Env::new();
+    env.ok(&["daemon", "start"]);
+    let mut slow = env.client();
+    let snap: Snapshot = slow.call(method::EVENTS_SUBSCRIBE, json!({})).unwrap();
+    // 2000 events (hooks for an unknown task are logged as `hook_orphan`) while `slow`
+    // reads nothing.
+    let mut c = env.client();
+    let hook = |i: usize| HookEnvelope {
+        params: HookParams { task: "nobody".into(), payload: json!({"hook_event_name": "Stop"}).to_string(), ts_ms: 0 },
+        event_id: Some(format!("e{i}")),
+        received_ts_ms: None,
+        truncated: None,
+        session: None,
+    };
+    for i in 0..2000 {
+        let _: Value = c.call(method::HOOK_EVENT, hook(i)).unwrap();
+    }
+    let started = Instant::now();
+    let _: DaemonStatus = env.client().call(method::DAEMON_STATUS, json!({})).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "the daemon must not wait for a slow reader");
+    // The slow stream ends after what was buffered; it then resumes where it stopped.
+    let mut last = snap.seq;
+    while let Ok(Some(n)) = slow.next_notification() {
+        last = n.params["seq"].as_u64().unwrap();
+    }
+    assert!(last < snap.seq + 2000, "the stream was cut");
+    let mut again = env.client();
+    let resumed: Snapshot = again
+        .call(method::EVENTS_SUBSCRIBE, SubscribeParams { since_seq: Some(last), boot_id: Some(snap.boot_id) })
+        .unwrap();
+    assert!(resumed.resumed);
+    let next = again.next_notification().unwrap().unwrap();
+    assert_eq!(next.params["seq"].as_u64(), Some(last + 1));
+}
+
+#[test]
+fn a_stale_hook_from_before_a_resume_is_dropped() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "stale", "say", "hi"]);
+    wait_until("idle", || env.task("stale").task.status.as_str() == "idle");
+    let task = env.task("stale").task.id;
+    let old = env
+        .events()
+        .into_iter()
+        .find(|e| e["kind"] == "session_launch")
+        .and_then(|e| e["payload"]["session_id"].as_str().map(String::from))
+        .unwrap();
+    env.ok(&["stop", "stale"]);
+    assert!(env.ok(&["resume", "stale"]).contains("ready (resumed)"));
+    // The old Claude's hook arrives late, stamped with the old Mirante session.
+    let mut h = env
+        .cmd(&bin("mirante-hook"))
+        .env("MIRANTE_TASK_ID", &task)
+        .env("MIRANTE_SESSION_ID", &old)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    h.stdin.take().unwrap().write_all(br#"{"hook_event_name":"UserPromptSubmit","prompt":"late"}"#).unwrap();
+    assert!(h.wait().unwrap().success());
+    wait_until("hook_stale", || env.events().iter().any(|e| e["kind"] == "hook_stale"));
+    assert_eq!(env.task("stale").task.status.as_str(), "idle");
+}
+
+#[test]
+fn hibernate_wake_and_doctor_from_the_cli() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "nap", "say", "hi"]);
+    wait_until("idle", || env.task("nap").task.status.as_str() == "idle");
+    assert!(env.ok(&["hibernate", "nap"]).contains("hibernated"));
+    assert!(env.ok(&["ls"]).contains("hibernated: mirante wake"));
+    assert!(env.ok(&["wake", "nap"]).contains("ready (resumed)"));
+    let doctor = env.ok(&["doctor"]);
+    assert!(doctor.contains("orphan processes: none") && doctor.contains("orphan checkouts: none"), "{doctor}");
 }
 ```
 
@@ -10683,18 +16211,18 @@ Run: `cargo build --workspace && cargo test -p mirante-cli --test e2e && cargo t
 
 Expected (one line per test target, in this order; each line also ends with `; finished in …`):
 ```
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 ```
 
-No compiler warnings.
+No compiler warnings. (Replayed 4 times in a row, all green; the whole e2e file takes about 3 s.)
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add crates/mirante-cli/tests crates/mirante-daemon/tests
 git commit -F - <<'EOF'
-test: end-to-end CLI/daemon/hook run with a fake claude; ignored real-agent tests
+test: end to end with a fake claude (pinned id, racing answers, daemon crash, slow subscriber, stale hook, hibernate); ignored real-agent tests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -10702,7 +16230,7 @@ EOF
 
 ---
 
-### Task 18: Full verification, real-agent run, dogfood checklist
+### Task 21: Full verification, real-agent run, dogfood checklist
 
 **Files:**
 - Create: `docs/dogfood/2026-11-07-plan-2b-dogfood.md`
@@ -10713,18 +16241,20 @@ The automated part proves the plumbing; this task answers the product question (
 
 Run: `cargo build --workspace && cargo test --workspace 2>&1 | grep 'test result'`
 
-Expected, in this order (mirante-cli lib, `mirante` bin, e2e, mirante-core, mirante-daemon lib, daemon bin, real_agents, mirante-hook lib, hook bin, mirante-ipc, spike-kit lib, then the spike-kit bins and doc tests), each line followed by `; finished in …`:
+Expected, in this order (mirante-cli lib, `mirante` bin, e2e, mirante-core, mirante-daemon lib, daemon bin, `daemon_signals`, real_agents, mirante-hook lib, hook bin, hook `binary`, mirante-ipc, spike-kit lib, then the spike-kit bins and doc tests), each line followed by `; finished in …`:
 ```
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 157 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 185 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 141 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
@@ -10738,21 +16268,17 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
-That is 303 passed and 2 ignored. If `mirante-core` gained tests after `99b8a2a`, only its line differs.
+That is 464 passed and 2 ignored (14 cli + 7 e2e + 157 core + 185 daemon + 2 daemon_signals + 14 hook + 2 hook binary + 22 ipc + 61 spike-kit). If `mirante-core` gained tests after `2b8030d`, only its line differs.
 
-- [ ] **Step 2: Lint the new crates; check that core and spike-kit are untouched**
+- [ ] **Step 2: Lint the new crates; check that Tasks 13–21 left core and spike-kit alone**
 
 Run: `cargo clippy -p mirante-ipc -p mirante-hook -p mirante-daemon -p mirante-cli --all-targets 2>&1 | grep -E '^(warning|error)'`
 
 Expected: no output.
 
-Run: `git diff --stat <commit before Task 1> -- crates/spike-kit crates/mirante-core`
+Run: `git diff --stat 2b8030d -- crates/spike-kit crates/mirante-core`
 
-Expected:
-```
- crates/spike-kit/src/bin/{mirante-hook.rs => spike-hook.rs} | 0
- 1 file changed, 0 insertions(+), 0 deletions(-)
-```
+Expected: no output (`2b8030d` is the robustness round Tasks 13–21 build on; the core changes of that round, `Archiving` and schema v3, came before them).
 
 - [ ] **Step 3: The founder runs the real-agent tests (they spend plan quota)**
 
@@ -10764,7 +16290,7 @@ MIRANTE_CODEX_BIN=~/.nvm/versions/node/v22.14.0/bin/codex \
   cargo test -p mirante-daemon --test real_agents -- --ignored --test-threads=1 codex
 ```
 
-Expected: `test claude_turn_permission_stop_and_resume ... ok` and `test codex_steer_and_resume ... ok`. If the Claude test stops at boot, read the `screen` in the assertion message. If the TUI footer or the trust wording changed, adjust `screen::is_ready` / `screen::is_trust_dialog` (Task 13). Never add a time-based "ready" fallback: it would type the goal into whatever dialog is on screen.
+Expected: `test claude_turn_permission_stop_and_resume ... ok` and `test codex_steer_and_resume ... ok`. If the Claude test stops at boot, read the `screen` in the assertion message. If the TUI footer, the input prompt or the trust wording changed, adjust `screen::has_manual_mode_footer` / `screen::has_input_prompt` / `screen::TRUST_YES` (Task 14); the trust wording and footer were written from the requirement, not captured from a live 2.1.x screen, so this is the first real check. Never add a time-based "ready" fallback: it would type the goal into whatever dialog is on screen.
 
 - [ ] **Step 4: Write the dogfood checklist**
 
@@ -10772,7 +16298,7 @@ Expected: `test claude_turn_permission_stop_and_resume ... ok` and `test codex_s
 ````markdown
 # Plan 2b dogfood: replace cmux with `mirante`
 
-Spec §6 metrics this run feeds: the founder uses it instead of cmux for 2 consecutive weeks; context recreated by hand after closing and reopening = 0; wrong status = 0 in 50 hand-checked transitions; mid-run steering works on both agents or the fallback is explicit. (The "3+ external developers" metric needs an installable build and is out of scope here.)
+Spec §6 metrics this run feeds (plus the memory guard of Tasks 18–19): the founder uses it instead of cmux for 2 consecutive weeks; context recreated by hand after closing and reopening = 0; wrong status = 0 in 50 hand-checked transitions; mid-run steering works on both agents or the fallback is explicit. (The "3+ external developers" metric needs an installable build and is out of scope here.)
 
 ## Setup (once)
 
@@ -10828,6 +16354,15 @@ Export the trail for the log:
 
 **F. Cleanup**
 - [ ] `mirante archive` on a task with uncommitted changes is refused; after committing, it succeeds and the branch still exists.
+- [ ] `kill -9` the daemon while `mirante archive` runs; after the restart the task is `archived` (clean worktree) or back to `active` (dirty worktree, `archive_abandoned`), never stuck in `archiving`.
+- [ ] Make a checkout under `~/.mirante/worktrees/` that no task owns (`git -C <repo> worktree add ~/.mirante/worktrees/<repo>/stray`): the next daemon start reports it (`worktree_orphan`) and `mirante doctor` lists it; nothing deletes it.
+- [ ] Queue a message (`mirante say --queue`) during a turn, then `kill -9` the daemon: after the restart the trail has `queue_dropped` with that text.
+
+**G. Memory**
+- [ ] `mirante ls` shows a `MEM` column for live tasks (e.g. `1.1G/4.0G`); `mirante watch` shows the `memory:` line (level, free, swap). On a normal day the level stays `normal` even with swap well used (the kernel's own pressure level decides on macOS).
+- [ ] `mirante hibernate <idle task>` → `hibernated`; `ls` says `hibernated: mirante wake`; `mirante wake <task>` → `ready (resumed)` and the agent remembers the conversation. `mirante hibernate` on a task with a pending permission is refused.
+- [ ] `mirante doctor` → `orphan processes: none` after a normal day; start a dev server from an agent, `kill -9` the daemon, restart it: `doctor` lists the server (ppid 1, cwd in the worktree); `mirante doctor --kill <pid>` asks first, then ends it.
+- [ ] Optional, apps closed first: the stress procedure in `docs/dogfood/memory-stress.md` (Task 18).
 
 ## Two-week log
 
@@ -10869,69 +16404,76 @@ Update and commit the two-week log the same way as it fills in.
 | Requirement (source) | Where | Test(s) |
 |---|---|---|
 | Dispatch: new task → agent → worktree; user-chosen branch, no prefix, no assumed `main` (spec §2.1) | Task 6 `create_task` (Plan 2a `WorktreeManager`), Task 12 `mirante new` | `create_makes_a_worktree_on_the_users_branch_and_a_task`, e2e `dispatch_steer_stop_resume_archive_with_a_fake_claude` |
-| Status `working / needs_you / idle / ended` only from hooks and protocol events, never the terminal (spec §2.2) | Task 7 (hooks + transcript → `StatusEngine`), Task 15 (Codex notifications); the screen is read only for dialogs (Task 13 module doc) | `hooks_drive_status_turns_and_the_native_id`, `codex_status_events_drive_status_turns_and_detail`, `plain_turn` |
-| Notify only when a task needs the user (spec §2.2) | Task 12 `watch` rings the bell on a new `needs_you` | manual (Task 18 §B) |
-| Open a task: live terminal (spec §2.3) | Tasks 10, 13, 14 (`attach`: repaint + live bytes + typed input), Task 12 CLI raw passthrough; Codex read-only stream (Task 16) | `attach_streams_raw_bytes_both_ways_until_the_client_closes`, `attach_repaints_then_streams_and_input_reaches_the_agent`, `late_command_completion_is_reported_and_the_stream_is_readable` |
-| Talk mid-run: steer now / queue for the turn end (spec §2.4; FINDINGS "Steer UI") | Task 8 `send`, Task 7 `kick`, Task 14 typing, Task 16 `turn/steer` + fallback | `steer_goes_out_now_and_queue_waits_for_the_turn_end`, `queue_on_an_idle_agent_is_delivered_at_once`, `send_starts_a_turn_then_steers_the_running_one_with_its_id`, `a_rejected_steer_falls_back_to_a_new_turn` |
-| Steering confirmed from the transcript, not `UserPromptSubmit` (FINDINGS rule 2) | Task 7 `classify_steers` (Plan 2a `classify_message`) | `steer_verdict_comes_from_the_transcript_at_the_turn_end` |
-| Never type into a dialog | Task 8 refusal (`NEEDS_YOU`), Task 14 `send` guard, `kick` re-queues | `steer_is_refused_while_a_dialog_is_open_but_queue_is_accepted`, `trust_prompt_waits_for_the_user_then_down_enter_accepts` |
-| Permissions: persisted cards, answered once, never auto-approved (spec §2.5, §5) | Tasks 7–8 (hub), 13–14 (Claude exact options), 16 (Codex one-time decisions) | `hook_permission_request_is_persisted_and_settled_when_the_tool_runs`, `claude_permission_answer_types_the_choice_then_persists_once`, `a_failed_driver_answer_persists_nothing`, `approvals_become_permission_cards_answered_once_with_one_time_decisions`, `decisions_per_request_kind` |
-| Answers given directly in the attached terminal are detected | Task 7 `settle_permissions` (PostToolUse → allowed, turn end → denied) | `hook_permission_request_is_persisted_and_settled_when_the_tool_runs`, `deny_in_the_terminal_is_settled_by_the_transcript_turn_end` |
-| Exact option, never "always" / "auto", below the dialog header (FINDINGS rule 6) | Task 13 `option_key`, `dialog_matches` | `exact_one_time_options_only`, `lookalike_options_above_the_dialog_are_ignored`, `permission_answer_types_the_exact_option_for_the_matching_dialog` |
-| Context survives: goal, history, native session id on disk; reopen resumes natively (spec §2.6, FINDINGS S4) | Task 7 resume path, Task 9 recovery, Task 14 `--resume`, Task 16 `thread/resume` | `process_exit_ends_the_session_expires_permissions_and_allows_resume`, `restart_ends_live_sessions_expires_permissions_and_keeps_resume_possible`, `resume_uses_thread_resume_with_the_same_policy`, e2e, `claude_turn_permission_stop_and_resume` / `codex_steer_and_resume` (ignored) |
-| Hook delivery survives a down daemon | Task 4 spool, Task 9 ingest | `daemon_down_spools_one_private_line_per_event`, `spooled_session_start_records_the_native_id_and_the_spool_is_consumed` |
+| Status `working / needs_you / idle / ended` only from hooks and protocol events, never the terminal (spec §2.2) | Task 7 (hooks + transcript → `StatusEngine`), Task 16 (Codex notifications of our thread only); the screen is read only for dialogs and readiness (Task 14 module doc) | `hooks_drive_status_turns_and_the_native_id`, `codex_status_events_drive_status_turns_and_detail`, `plain_turn`, `another_threads_events_never_move_our_status` |
+| Notify only when a task needs the user (spec §2.2) | Task 12 `watch` rings the bell on a new `needs_you` | manual (Task 21 §B) |
+| Open a task: live terminal (spec §2.3) | Tasks 10, 14, 15 (`attach`: full-state repaint incl. input modes + live bytes + typed input; terminal queries answered by the daemon and never forwarded), Task 12 CLI raw passthrough; Codex read-only stream with a mode banner (Task 17) | `attach_streams_raw_bytes_both_ways_until_the_client_closes`, `attach_repaints_with_input_modes_then_streams_and_input_reaches_the_agent`, `arbitrary_bytes_pass_through_attach_unchanged`, `queries_are_answered_while_attached_and_never_reach_the_client`, `a_query_split_across_reads_is_completed`, `the_stream_is_readable_starts_with_the_mode_and_reports_abandoned_commands` |
+| Talk mid-run: steer now / queue for the turn end (spec §2.4; FINDINGS "Steer UI") | Task 8 `send`, Task 7 `kick`, Task 15 typist (bracketed paste, one message at a time), Task 17 `turn/steer` (fallback to `turn/start` only on a JSON-RPC rejection after the turn closed, never on a timeout) | `steer_goes_out_now_and_queue_waits_for_the_turn_end`, `messages_are_one_bracketed_paste_then_enter`, `two_concurrent_sends_never_interleave`, `send_starts_a_turn_with_the_policy_then_steers_the_running_one`, `a_steer_rejected_after_its_turn_closed_falls_back_but_a_timeout_never_does` |
+| Steering confirmed from the transcript, not `UserPromptSubmit` (FINDINGS rule 2) | Task 7 `classify_steers`; Codex: `clientUserMessageId` confirmed by its `userMessage` item (Task 17) | `steer_verdict_comes_from_the_transcript_at_the_turn_end`, `send_starts_a_turn_with_the_policy_then_steers_the_running_one` |
+| Never type into a dialog | Task 8 refusal (`NEEDS_YOU`); Task 13 hold flag (pending permission); Task 15 typist re-checks the screen and the hold flag right before the paste and right before Enter (aborted text is re-queued at the front; after the paste the line is cleared with Ctrl-U, never Enter); nothing typed before `Ready`; Task 15 hub refuses `!` / multi-line `/` up front | `steer_is_refused_while_a_dialog_is_open_but_queue_is_accepted`, `a_dialog_that_appears_before_the_keystrokes_gets_nothing`, `a_permission_pending_before_enter_clears_the_line_instead_of_submitting`, `nothing_is_typed_before_ready`, `an_aborted_delivery_goes_back_to_the_front_of_the_queue`, `a_pending_permission_holds_the_drivers_typing`, `claude_messages_the_typist_would_refuse_are_refused_up_front` |
+| Bracketed paste is sanitized (CR→LF, CSI/OSC/C0/C1 stripped incl. a smuggled `ESC[201~`, tabs → 4 spaces, newlines and emoji kept); `/` = slash command typed as keys, `!` refused (Task 14 decision) | Task 14 `paste` | `controls_and_smuggled_paste_end_are_removed_newlines_and_emoji_kept`, `every_kind_of_control_is_dropped`, `slash_commands_are_keystrokes_and_bang_is_refused` |
+| Permissions: persisted cards, answered once, never auto-approved (spec §2.5, §5) | Tasks 7–8 (hub; a repeated identical answer returns the stored row), 14–15 (Claude exact options), 16–17 (Codex one-time decisions; legacy deny `{"denied":…}`, never `abort`; withdrawn requests settle their own card) | `claude_permission_answer_types_the_choice_then_persists_once`, `repeating_the_same_answer_returns_the_stored_row`, `approvals_become_cards_answered_once_and_are_withdrawn_when_resolved`, `decisions_per_request_kind_are_one_time_only`, `a_resolved_codex_request_settles_only_its_own_card`, e2e `concurrent_answers_to_one_permission_type_one_key` |
+| Answers given directly in the attached terminal are detected | Task 7 `settle_permissions` (PostToolUse / PostToolUseFailure → allowed, turn end → denied) | `hook_permission_request_is_persisted_and_settled_when_the_tool_runs`, `deny_in_the_terminal_is_settled_by_the_transcript_turn_end` |
+| Exact option, never "always" / "auto", in the live dialog only (bottom rows + `Esc to` footer) (FINDINGS rule 6) | Task 14 `screen` | `exact_one_time_options_only`, `lookalike_options_above_the_dialog_are_ignored`, `dialogs_need_a_footer_in_the_bottom_rows`, `plan_approval_has_no_plain_yes_but_still_blocks_typing`, `permission_answer_types_the_exact_option_for_the_matching_dialog` |
+| Trust dialog shown to the user, never accepted silently; accepted by the exact "Yes, I trust this folder" digit (FINDINGS rule 5) | Task 15 boot watcher (only before the first `Ready`), Task 7 `trust`, Task 12 CLI `[y/N]` | `trust_is_only_answered_when_the_prompt_is_open`, `the_trust_prompt_waits_for_the_user_then_its_exact_option_is_typed`, `the_trust_dialog_is_the_exact_option_with_a_footer`, `declining_trust_ends_the_process` |
+| Ready only when safe: `SessionStart` seen + input prompt + no dialog + stable screen (footer = fast path); no time-based fallback | Task 15 `watch_boot`, Task 13 `Driver::session_started` | `ready_needs_session_start_and_a_settled_input_prompt`, `the_input_prompt_and_the_ready_fast_path`, `session_start_reaches_the_driver_and_fenced_hooks_update_the_native_id` |
+| Context survives: native id pinned up front (`--session-id`), reopen resumes natively; a failed resume is reported, a fresh start is the user's explicit choice (spec §2.6, FINDINGS S4) | Task 7 resume path, Task 9 recovery, Task 13 (`ResumeFailed`, `NativeGone`, `mirante resume --fresh`), Task 15 `--session-id` / `--resume`, Task 17 `thread/resume` (`excludeTurns`) | `a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session`, `a_resume_that_exits_at_once_is_reported_never_restarted`, `a_vanished_native_conversation_fails_the_resume_with_a_typed_error`, `resume_uses_thread_resume_without_turns_and_a_vanished_thread_is_typed`, e2e `a_daemon_killed_mid_turn_ends_the_session_on_restart_and_resume_works`, `claude_turn_permission_stop_and_resume` / `codex_steer_and_resume` (ignored) |
+| Hook delivery survives a down daemon; stale hooks never touch a newer session | Task 4 spool, Task 9 ingest, robustness-round fence (`MIRANTE_SESSION_ID`, set by Task 15's launch) | `daemon_down_spools_one_private_line_per_event`, `a_late_hook_from_an_earlier_session_of_the_task_is_dropped`, e2e `a_stale_hook_from_before_a_resume_is_dropped` |
 | One owner of state; Unix socket 0600; peer uid; no TCP (spec §4, §5) | Task 10 | `socket_is_private_and_the_peer_is_us`, Task 10 smoke test |
-| One driver interface; unsupported is a typed result (spec §4) | Task 5 trait, Task 16 (`trust`, `input` on Codex) | `errors_map_to_typed_rpc_codes`, `late_command_completion_is_reported_and_the_stream_is_readable` |
-| Events carry `seq` + `boot_id`; clients reconcile from snapshots (spec §4) | Task 6 `subscribe`, Task 10 `events.subscribe`, Task 12 `watch` (re-snapshot per event) | `subscribers_get_every_event_after_the_snapshot`, `subscribe_sends_a_snapshot_then_events` |
-| State persisted on every transition (spec §4) | Every hub mutation goes through a `Store` method (Plan 2a: state + audit event in one transaction) | `hooks_drive_status_turns_and_the_native_id` (turn records), recovery tests |
-| Hooks scoped by env var; no global install (spec §4) | Task 14 per-session `--settings` file, `MIRANTE_TASK_ID`; Task 4 hook does nothing without it | `without_a_task_id_nothing_happens`, e2e (`--permission-mode manual`, no bypass flag) |
-| Worktree removed on archive, branch kept (spec §4) | Task 6 `archive` (refuses live sessions and dirty worktrees) | `archive_removes_the_worktree_keeps_the_branch_and_hides_the_task`, e2e |
+| One driver interface; unsupported / not-now are typed results (spec §4) | Tasks 5 and 13 (`NotNow`, `NativeGone`), Task 17 (`trust`, `input`, interrupt without a turn) | `errors_map_to_typed_rpc_codes`, `interrupting_with_no_running_turn_is_a_clear_error` |
+| Events carry `seq` + `boot_id`; clients reconcile; a slow client never stalls the daemon (spec §4) | Task 6 `subscribe` (bounded queues), Task 10 `events.subscribe { since_seq }`, Task 12 `watch` | `subscribers_get_every_event_after_the_snapshot`, `a_subscriber_that_never_reads_is_bounded_then_dropped`, e2e `a_slow_subscriber_is_dropped_while_the_daemon_keeps_answering_then_resumes` |
+| State persisted on every transition (spec §4) | Every hub mutation goes through a `Store` method | `hooks_drive_status_turns_and_the_native_id`, recovery tests |
+| Hooks scoped by env var; no global install (spec §4) | Task 15 per-session `--settings` file, `MIRANTE_TASK_ID`, `MIRANTE_SESSION_ID`; Task 4 hook does nothing without them | `without_a_task_id_nothing_happens`, `a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session`, e2e argument check |
+| Worktree removed on archive, branch kept; crash-safe (`Archiving`) (spec §4) | Task 6 `archive` (robustness round: `Archiving` persisted first) | `archive_removes_the_worktree_keeps_the_branch_and_hides_the_task`, `archive_persists_archiving_before_removing_the_worktree`, e2e |
 | Per-task lock, no orphaned lock, failures reach a final state (spec §8) | Store lock (Plan 2a) + Task 7 spawn-failure path | `start_takes_the_per_task_lock_and_boot_ready_delivers_the_first_prompt`, `spawn_failure_releases_the_lock_and_ends_the_session` |
-| Parse errors never silently empty (spec §8) | Task 7 `hook_unparseable` event + RPC error, Task 10 parse errors answered | `hooks_for_unknown_or_ended_sessions_are_logged_not_applied`, `garbage_lines_get_a_parse_error_and_the_connection_survives` |
-| Trust dialog shown to the user, never accepted silently (FINDINGS rule 5) | Task 14 watcher reports it; Task 7 `trust`; Task 12 CLI asks `[y/N]` | `trust_is_only_answered_when_the_prompt_is_open`, `trust_prompt_waits_for_the_user_then_down_enter_accepts`, `declining_trust_ends_the_process` |
-| Real binaries, env scrub, never auth vars, `--permission-mode manual`, additive `--settings` (FINDINGS rule 4; Codex launch hygiene) | Task 14 (via Plan 2a `launch_spec`), Task 16 | `binary_resolution_skips_shims_and_env_scrub_never_touches_auth`, e2e argument check |
-| Codex `approvalPolicy` not `never`; the user approves | Task 16 `thread_params` | `handshake_starts_a_thread_where_the_user_approves`, `resume_uses_thread_resume_with_the_same_policy` |
-| Codex: open commands after `turn/completed` (FINDINGS rule 8) | Task 15 engine, shown as `detail` (Tasks 6/12) | `command_finishing_after_turn_completed_keeps_working_with_detail`, `late_command_completion_is_reported_and_the_stream_is_readable`, `table_shows_status_needs_and_detail` |
-| Codex: steer lands at the next step; stop-now is interrupt (FINDINGS rule 9) | Task 16 `turn/interrupt`, Task 12 `mirante interrupt` | `send_starts_a_turn_then_steers_the_running_one_with_its_id` |
+| No orphaned agent processes: stop ends the whole tree, never a reused pid | Task 13 `proctree::kill_tree` (pid + start time, SIGTERM → SIGKILL, re-walk during the kill), Tasks 14/15/17 stop, Task 19 `doctor` | `kill_tree_ends_a_tree_that_forks_while_dying_and_ignores_sigterm`, `a_reused_pid_is_never_signaled`, `stop_ends_the_whole_tree_even_a_child_forked_during_the_kill`, `stop_ends_the_app_server_and_everything_it_started` |
+| Parse errors never silently empty (spec §8) | Task 7 `hook_unparseable`, Task 10 parse errors answered, Task 16 non-JSON app-server lines reported | `hooks_for_unknown_or_ended_sessions_are_logged_not_applied`, `garbage_lines_get_a_parse_error_and_the_connection_survives`, `notifications_server_requests_and_bad_lines_reach_the_callback_and_eof_closes` |
+| Real binaries, env scrub, never auth vars, `--permission-mode manual`, additive `--settings` (FINDINGS rule 4; Codex launch hygiene) | Task 15 (via Plan 2a `launch_spec`), Task 17 | `binary_resolution_skips_shims_and_env_scrub_never_touches_auth`, `a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session`, e2e argument check |
+| Codex "auto-edits" = `on-request` + `workspace-write` + reviewer `user`, verified against what the thread reports and re-sent each turn; labelled in `ls` / `show` / attach | Task 17 `thread_params` + boot check, Task 13 CLI `MODE` | `handshake_starts_a_thread_in_auto_edits_mode_and_checks_it_was_applied`, `a_thread_whose_effective_mode_differs_fails_the_boot`, `codex_rows_show_the_auto_edits_mode_and_usage` |
+| Codex: open commands after `turn/completed` (FINDINGS rule 8); interrupted/failed turns abandon them; settle on thread idle or a timeout | Task 16 engine, shown as `detail` | `command_finishing_after_turn_completed_keeps_working_with_detail`, `an_interrupted_or_failed_turn_abandons_its_open_commands`, `open_commands_settle_on_thread_idle_or_after_the_timeout` |
+| Codex: steer lands at the next step; stop-now is interrupt (FINDINGS rule 9) | Task 17 `turn/interrupt`, Task 12 `mirante interrupt` | `send_starts_a_turn_with_the_policy_then_steers_the_running_one` |
+| Codex errors, quota and token usage visible | Task 16 detail, Task 17 `Usage` → Task 13 `TaskView.usage` | `errors_become_the_detail`, `usage_errors_and_settling_reach_the_hub`, `usage_reports_show_in_the_task_view` |
+| Memory: measure and act, never limit up front (macOS cannot enforce RLIMIT_AS/DATA); kernel pressure level decides; warn → pause → offer → auto-hibernate only idle, never a session waiting on you, one per cooldown; leak and idle hibernation; orphans reported, killed only on request | Tasks 18–19 | `the_kernels_level_wins_over_swap_and_free`, `sustained_critical_hibernates_only_an_idle_session_without_a_pending_permission`, `sustained_critical_pressure_hibernates_an_idle_session_but_never_one_waiting_on_you`, `pressure_pauses_queued_deliveries_and_new_sessions_until_it_eases`, `an_idle_session_that_keeps_growing_is_a_leak`, `idle_hibernation_happens_only_when_configured`, `hibernate_and_wake_round_trip_on_the_native_conversation`, `killing_an_orphan_signals_only_that_process_and_never_a_stale_one`, `a_real_process_tree_is_measured`, e2e `hibernate_wake_and_doctor_from_the_cli` |
 | Resumed Claude session must not replay old turns (Plan 2a risk note) | Task 7 `follow_transcript` starts at the file's end | `transcript_path_starts_the_tailer_at_the_end_of_an_existing_file` |
-| Tail loops while `more`, never while offset < length (Plan 2a API) | Task 14 tail thread | `transcript_lines_and_offsets_are_emitted_from_the_given_offset` |
-| Process lifecycle: killed on drop, exit reported | Tasks 13, 14, 16 | `dropping_the_process_kills_it_and_resize_reaches_the_grid`, `stop_types_exit_and_the_driver_reports_the_exit`, `server_eof_is_an_exit` |
-| CLI commands from the brief (`new`, `ls`, `attach`, `say [--queue]`, `perms`, `allow`/`deny`, `stop`, `resume`, `archive`, `watch`, `daemon start/stop/status`) plus `show`, `interrupt` | Tasks 11–12 | `simple_commands`, `new_takes_flags_anywhere_and_joins_the_goal`, e2e |
-| Tests sandboxed in temp dirs; real-agent tests `#[ignore]` with documented commands | All tasks; Task 17 | every test uses `TestDir` / temp git repos; `real_agents.rs` header |
-| Spec §6 metrics | Task 18 checklist | manual |
+| Tail loops while `more`, never while offset < length (Plan 2a API) | Task 15 tail thread | `transcript_lines_and_offsets_are_emitted_from_the_given_offset` |
+| CLI commands from the brief plus `show`, `interrupt`, `resume --fresh`, `hibernate`, `wake`, `doctor` | Tasks 11–13, 19 | `simple_commands`, `new_takes_flags_anywhere_and_joins_the_goal`, e2e |
+| Tests sandboxed in temp dirs; real-agent tests `#[ignore]`; e2e independent of the machine's memory (`MIRANTE_MEMGUARD=off`) | All tasks; Task 20 | every test uses `TestDir` / temp git repos; `real_agents.rs` header |
+| Spec §6 metrics | Task 21 checklist | manual |
 
-Gaps, deliberately left to Plan 3 or later (also listed under "Out of scope"): editable / reorderable queue, step feed and per-turn diff, notification suppression for the task on screen, the steer verdict shown in a UI (recorded as `message_delivery` events now), quota display, cost ceilings, token redaction in logs, explicit "from the human operator" labels on mid-run messages (Claude receives them as typed prompts and Codex as user input, which is what they are), and a `capabilities()` method (each operation returns a typed `Unsupported` instead, and `attach` reports whether input is accepted; add the method when the UI needs to grey out buttons).
+Gaps, deliberately left to Plan 3 or later (also listed under "Out of scope"): editable / reorderable queue, step feed and per-turn diff, notification suppression for the task on screen, the steer verdict shown in a UI (recorded as `message_delivery` events now), cost ceilings, token redaction in logs, explicit "from the human operator" labels on mid-run messages, a `capabilities()` method, the optional Linux `systemd-run --scope -p MemoryHigh=` wrapper (Task 18 builds the argv behind a flag that is off; nothing runs it yet), and persisting the "hibernated" mark across daemon restarts (after a restart every session is ended and `mirante resume` does the same job).
 
 ### Placeholder scan
 
-No "TBD", "TODO", "implement later" or "similar to Task N". Every code step shows complete file contents; every run step has the command and the output it produced in the replay. `RealFactory` returns a typed `Unsupported` in Tasks 10–15: that is shipped behaviour of those intermediate commits (the CLI reports it with code 3), not a placeholder, and Tasks 14 and 16 replace it.
+No "TBD", "TODO", "implement later" or "similar to Task N". Every code block of Tasks 13–20 was generated from the replayed commits and checked byte for byte against them by script (new files: the test module and the code above it; replaced files: the whole file; edits: the snippet occurs verbatim in the file, except two blocks that end in an explicit `// … unchanged` marker). `RealFactory` returns a typed `Unsupported` for Codex between Tasks 15 and 17: shipped behaviour of those intermediate commits, not a placeholder.
 
 ### Type and name consistency
 
-- Wire types (Task 2) are the only ones crossing the socket: `TaskView`, `StartResult { task, boot, resumed, screen }`, `SendResult { delivered, queued }`, `PermissionView { request, task_title, branch }`, `AttachResult { input }`, `HookParams { task, payload, ts_ms }`, `Snapshot { boot_id, seq, tasks }`, `DaemonStatus`. The hub (Tasks 6–9), the server dispatch (Task 10), the hook (Task 4) and the CLI (Tasks 11–12) use exactly these.
-- `Driver` (Task 5) is implemented by `FakeDriver` (Task 5), `ClaudeDriver` (Task 14) and `CodexDriver` (Task 16) with the same eleven methods; `DriverEvent` variants emitted by the drivers are the ones `State::handle` (Task 7) matches.
-- `Sink::new(session_id, tx)` / `Sink::emit` (Task 5) are the only way drivers report; `Hub::handle_driver_event` / `drain` / `spawn_pump` (Task 7) consume them.
-- `Live` fields (Task 6) are used by Task 7 (`engine`, `turn_id`, `native_id`, `transcript_path`, `boot`, `detail`, `queue`, `steers`, `transcript`) and Task 8 (`perm_keys`, `driver`, `agent`).
-- `CodexEngine::{apply, status, turn_id, turn_open, detail}` and `CodexInput` (Task 15) are what `CodexDriver` (Task 16) calls. `RpcConn::{start, request, notify, respond, respond_error, close}` and `Incoming` (Task 15) likewise.
-- `screen::{has_permission_prompt, option_key, is_trust_dialog, is_ready, dialog_matches, tail}` (Task 13) are what `ClaudeDriver` and `CodexDriver::screen_tail` call. `PtyProcess::{spawn, write, grid, repaint, resize, subscribe, unsubscribe, exited, kill, wait_exit}` (Task 13) are what `ClaudeDriver` calls.
-- Environment variables: `MIRANTE_HOME` (`paths::HOME_ENV`), `MIRANTE_TASK_ID` (`claude_launch::TASK_ENV`), `MIRANTE_CLAUDE_BIN`, `MIRANTE_CODEX_BIN`, `MIRANTE_HOOK_BIN`, `MIRANTE_DAEMON_BIN`, `MIRANTE_TEST_TRUST` (test only).
+- Wire types crossing the socket: Task 2's types plus `TaskView.usage` (Task 13), `TaskView.memory` / `hibernated`, `MemView`, `SystemView`, `DoctorReport`, `OrphanView`, `KillOrphan`, `DaemonStatus.memory` and the methods `session.hibernate`, `session.wake`, `daemon.doctor`, `daemon.kill_orphan` (Task 19). Every addition is `#[serde(default)]`: an older client or daemon still parses.
+- `Driver` (Task 5, extended in Task 13 with `session_started` and `root`, both defaulted) is implemented by `FakeDriver`, `ClaudeDriver` (Task 15) and `CodexDriver` (Task 17). `DriverEvent` variants added in Task 13 (`PermissionResolved`, `DeliveryAborted`, `ResumeFailed`, `Usage`) are all matched in `State::handle`; `DriverError::{NotNow, NativeGone}` are mapped in `From<HubError> for RpcError`.
+- `Sink::{new, emit, held, hold_flag}` (Task 13): drivers read `held`, the hub sets the flag in `State::sync_holds` (run by every `publish`).
+- `proctree::{Proc, proc_of, alive, pgid, children, descendants, kill_tree, Signaler, Kill, KillReport}` (Task 13) are what Tasks 14, 15, 17, 18 and 19 use to name, sample and end processes.
+- `memguard::{Policy, Config, SessionInfo, SessionMem, Action, Level, MemState, MemSampler, SystemSample, TreeSample, Pressure, FakeSampler, os_sampler, find_orphans, kill_orphan, Orphan}` (Task 18) are what `hub::memory` (Task 19) uses.
+- Environment variables: `MIRANTE_HOME`, `MIRANTE_TASK_ID`, `MIRANTE_SESSION_ID` (set by Task 15's launch; the fence drops hooks stamped with another session), `MIRANTE_CLAUDE_BIN`, `MIRANTE_CODEX_BIN`, `MIRANTE_HOOK_BIN`, `MIRANTE_DAEMON_BIN`, `MIRANTE_MEM_BUDGET_MB`, `MIRANTE_IDLE_HIBERNATE_MIN`, `MIRANTE_MEMGUARD` (`off` for tests), `RUST_LOG` (Codex: `warn` unless set), `MIRANTE_TEST_TRUST` (test only).
 
 ### Decisions the founder should know
 
-1. **No async runtime.** std threads, one per connection and per agent stream. Simpler to test; a local daemon has a handful of clients. tokio was allowed, not needed.
-2. **A fourth crate, `mirante-ipc`.** The daemon, CLI and hook share the wire types and framing; the hook and CLI stay synchronous and small.
-3. **Attach framing.** Same socket: a JSON-RPC `attach` response, then raw bytes both ways. Detach is client-side (Ctrl-]). The PTY is resized to the attaching terminal (one size at a time); resizing mid-attach needs a re-attach.
-4. **The daemon owns the agent processes.** Stopping or crashing the daemon ends every session; recovery marks them `Ended` and `mirante resume` restores the context natively. Pending permission cards of an ended session expire as `denied` (the dialog died with the process); a restart therefore does not keep an *answerable* card, which is how spec §2.5's "survives a restart" is read here.
-5. **Trust UX.** `mirante new` / `resume` show Claude's trust dialog and ask `[y/N]`; `--trust` is the explicit yes up front. Every new worktree is a new folder for Claude, so expect the question once per task.
-6. **Queue is daemon-side.** For both agents "queue" means Mirante holds the message and delivers it when the turn ends, rather than relying on Claude's own type-ahead. Queued messages are in memory: when a session ends they are reported in a `queue_dropped` event, not re-sent.
-7. **Ready needs the input footer.** No time-based fallback: an unknown startup dialog leaves the task "starting" (attach and handle it) instead of receiving typed text.
+1. **No async runtime.** std threads, one per connection and per agent stream.
+2. **A fourth crate, `mirante-ipc`.** The daemon, CLI and hook share the wire types and framing.
+3. **Attach framing.** Same socket: a JSON-RPC `attach` response, then raw bytes both ways. The daemon answers the agent's terminal queries (cursor position, device attributes, colours) itself, always, and strips them from what the attached terminal sees, so nothing is answered twice and a detached TUI never stalls.
+4. **The daemon owns the agent processes.** Stopping or crashing the daemon ends every session; recovery marks them `Ended` and `mirante resume` restores the context natively. Every stop ends the agent's whole process tree.
+5. **Trust UX.** `mirante new` / `resume` show Claude's trust dialog and ask `[y/N]`; `--trust` is the explicit yes up front. Accept types the digit of "Yes, I trust this folder".
+6. **Queue is daemon-side.** Queued messages are reported in `queue_dropped` when a session ends, not re-sent; while memory is tight they wait.
+7. **Ready needs `SessionStart` + an input prompt + no dialog + a settled screen.** No time-based fallback.
+8. **Messages are one bracketed paste.** Multi-line text is sent as typed; a leading `/` is a slash command (typed as keys, one line); a leading `!` is refused (bash mode runs a shell command with no permission prompt; attach and type it yourself).
+9. **Codex runs in "auto-edits" mode:** `approvalPolicy: "on-request"`, `sandbox: "workspace-write"`, `approvalsReviewer: "user"`. Edits and commands inside the worktree run without asking; anything beyond the sandbox (network, other paths, escalation) asks you. The daemon checks the thread reports exactly that, re-sends it on every turn, and never answers "for the session".
+10. **A failed resume is never papered over.** Claude exiting within 3 s of `--resume`, or Codex reporting no rollout, is recorded as `resume_failed`; `mirante resume <task> --fresh` is the explicit way to start over.
+11. **Memory: measure and act, never limit.** Per-session budget min(4 GB, 25 % of RAM); the kernel's own pressure level decides (swap use alone does not count: on this Mac swap sits at 90 % with the kernel at "normal"); automatic hibernation only under sustained critical pressure, only of an idle session, never one waiting on you, one per minute; orphan processes are only reported (`mirante doctor`) and killed one at a time on request.
 
 ### Risks
 
-- **Claude TUI text is a moving target.** Ready (`manual mode on`), trust (`trust this folder` / `Do you trust`) and permission dialogs (`Do you want to …?`, `1. Yes`) are matched on 2.1.285 screens; the trust wording was inferred from the Week-1 notes ("Yes, I trust this folder") and is first exercised for real in Task 18 Step 3. A Claude update can break boot detection (safe failure: the task stays "starting").
-- **Codex approvals were never exercised live.** Their request/response shapes come from the generated 0.167 schema, not from a run (Week 1 used `approvalPolicy: "never"`). Task 18 §D is the first real approval; check `codex-stderr.log` under `~/.mirante/sessions/<task>/` if it misbehaves.
-- **Codex terms review is still open** (FINDINGS): driving `codex app-server` with a ChatGPT login is the documented IDE surface but not yet reviewed for Mirante.
-- **The steer verdict is only in the audit trail** in 2b (`message_delivery` events); the CLI prints "sent now", not "steered" vs "queued".
-- **Linux is compiled, not run.** The `SO_PEERCRED` branch and `stat`/`nc` smoke commands are macOS-tested only.
+- **Claude TUI text is a moving target.** Permission dialogs are matched on real 2.1.285 grids; the trust dialog (exact label "Yes, I trust this folder", a footer with "Esc to" / "Enter to confirm"), the input prompt (`❯`) and the ready footer were written from the Week-1 notes and the requirements, not captured live, and are first exercised in Task 21 Step 3. A mismatch fails safe (the task stays "starting"); answering trust by digit, Ctrl-U clearing a multi-line paste, and Claude's handling of bracketed paste are likewise unconfirmed live.
+- **A message that looks like a dialog.** A pasted text that itself contains a `❯ 1.` option and an "Esc to" footer would be judged a dialog by the second check and re-queued every turn (it is never typed into a real dialog, but it never goes out either).
+- **Codex shapes come from the 0.167 schema, not a run:** the effective-mode check compares `sandbox.type == "workspaceWrite"`, the missing-thread error is recognised by its "no rollout found" text, legacy deny is `{"decision":{"denied":{…}}}`. Task 21 §D is the first live approval; check `~/.mirante/sessions/<task>/codex-stderr.log` (its last 4 KiB is also in the `codex_exited` step).
+- **Codex terms review is still open** (FINDINGS).
+- **Memory thresholds are not measured under real pressure.** The ladder is unit-tested with an injected clock and the samplers against small real processes; the Linux PSI cut-offs (10 / 40) are a choice; the manual stress procedure (`docs/dogfood/memory-stress.md`) has not been run.
+- **Linux is compiled in pieces only.** `proctree` and `memguard` type-check for `x86_64-unknown-linux-gnu` in isolation (the full crate needs a Linux C toolchain for SQLite); nothing Linux-specific was run.
 - **Spike settings.** After Task 1, `target/debug/mirante-hook` is the forwarding hook; re-running a Week-1 spike needs its settings pointed at `target/debug/spike-hook`.
-- **Messages are single-line.** Newlines are collapsed to spaces before typing into Claude (an Enter would submit early); multi-line prompts need bracketed paste, untested.
