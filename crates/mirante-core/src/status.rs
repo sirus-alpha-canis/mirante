@@ -28,6 +28,13 @@
 //!   process or context: the engine resets and goes `Idle`, also from `Ended` (a resumed
 //!   session). `compact` (or no source) fires after a mid-turn compaction and only means
 //!   idle when no turn is open.
+//! - `/compact` is no turn (no prompt or assistant line, no `Stop`), but Claude works for
+//!   tens of seconds: a compaction is `Working` from its start (the main agent's
+//!   `PreCompact` hook, or the transcript's plain `/compact …` user line) until either
+//!   source shows it over (the transcript's `system` `compact_boundary` or a
+//!   `<local-command-stdout>` / `-stderr>` line; any `SessionStart`; a turn end, a prompt,
+//!   the idle `Notification`). Each source writes its start before its end, so whatever the
+//!   interleaving, the last marker delivered is an end.
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::Value;
@@ -211,6 +218,8 @@ pub struct StatusEngine {
     t_command: bool,
     /// The transcript's recently closed turns, newest last.
     t_closed: VecDeque<TxTurn>,
+    /// A compaction runs (see the module rules): `Working` even with no turn open.
+    compacting: bool,
 }
 
 impl Default for StatusEngine {
@@ -238,6 +247,7 @@ impl StatusEngine {
             t_enqueued: 0,
             t_command: false,
             t_closed: VecDeque::new(),
+            compacting: false,
         }
     }
 
@@ -297,7 +307,7 @@ impl StatusEngine {
         }
         let to = if !self.pending.is_empty() {
             Status::NeedsYou
-        } else if self.turn_open() {
+        } else if self.turn_open() || self.compacting {
             Status::Working
         } else {
             Status::Idle
@@ -313,6 +323,7 @@ impl StatusEngine {
         }
         self.slash_pending = false;
         self.main_dialog = false;
+        self.compacting = false;
         self.pending.clear();
     }
 
@@ -396,9 +407,21 @@ impl StatusEngine {
         let cause = format!("hook:{}", ev.hook_event_name);
         let side = ev.is_side_agent();
         let was_open = self.turn_open();
+        let was_compacting = self.compacting;
         if ev.hook_event_name == "SessionStart" {
             // `/compact` and friends: whatever command was pending has run.
             self.slash_pending = false;
+            // Fired right after a compaction (`source: compact`).
+            self.compacting = false;
+        }
+        match ev.hook_event_name.as_str() {
+            "PreCompact" if !side => self.compacting = true,
+            "UserPromptSubmit" | "Stop" | "StopFailure"
+                if !side && !ev.prompt.as_deref().is_some_and(is_slash_command) =>
+            {
+                self.compacting = false;
+            }
+            _ => {}
         }
         match ev.hook_event_name.as_str() {
             "SessionStart" if is_fresh_start(ev) => {
@@ -408,6 +431,7 @@ impl StatusEngine {
             // `compact` (or an unknown source) also fires after a mid-turn compaction; it
             // only means idle when no turn is open.
             "SessionStart" if !was_open => self.set(Status::Idle, cause),
+            "PreCompact" if !side && !was_compacting => self.settle(was_open, cause),
             "UserPromptSubmit" if !side => self.hook_prompt(ev, was_open, cause),
             "PreToolUse" => {
                 self.remember_tool(ev);
@@ -601,6 +625,17 @@ impl StatusEngine {
             return None;
         }
         let was_open = self.turn_open();
+        match compact_marker(v) {
+            // Only a change matters (an end with no compaction running changes nothing).
+            Some(start) if start == self.compacting => return None,
+            Some(start) => {
+                self.compacting = start;
+                let kind = if start { "compact" } else { v["subtype"].as_str().unwrap_or("local_command") };
+                return self.settle(was_open, format!("transcript:{kind}"));
+            }
+            None if is_prompt(v) || turn_end_kind(v).is_some() => self.compacting = false,
+            None => {}
+        }
         if is_prompt(v) {
             if self.t_open {
                 return None;
@@ -824,6 +859,29 @@ impl StatusEngine {
     }
 }
 
+/// A main-chain transcript line that starts a compaction (`Some(true)`: the plain user line
+/// `/compact …` Claude Code 2.1.285 writes when the command is submitted, with no `origin`)
+/// or shows one over (`Some(false)`: the `system` `compact_boundary` line, or the command's
+/// output, a `<local-command-stdout>` / `-stderr>` line, `system` `local_command` or user).
+fn compact_marker(v: &Value) -> Option<bool> {
+    if v["type"] == "system" && v["subtype"] == "compact_boundary" {
+        return Some(false);
+    }
+    let text = match v["type"].as_str() {
+        Some("system") if v["subtype"] == "local_command" => v["content"].as_str(),
+        Some("user") if v["isMeta"] != true => first_text(&v["message"]["content"]),
+        _ => None,
+    }?
+    .trim_start();
+    if text.starts_with("<local-command-stdout>") || text.starts_with("<local-command-stderr>") {
+        return Some(false);
+    }
+    let compact = v["type"] == "user"
+        && is_slash_command(text)
+        && text.strip_prefix("/compact").is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace));
+    compact.then_some(true)
+}
+
 /// `SessionStart` that begins a fresh process or context (not a mid-turn compaction).
 fn is_fresh_start(ev: &HookEvent) -> bool {
     ev.hook_event_name == "SessionStart"
@@ -994,7 +1052,7 @@ mod tests {
     fn unknown_and_neutral_events_change_nothing() {
         let mut e = StatusEngine::new();
         e.apply(&hook("UserPromptSubmit"));
-        assert!(e.apply_all(&[hook("SubagentStop"), hook("PreCompact"), hook("SomethingNew")]).is_empty());
+        assert!(e.apply_all(&[hook("SubagentStop"), hook("SomethingNew")]).is_empty());
         assert_eq!(e.status(), Status::Working);
     }
 
@@ -1094,7 +1152,9 @@ mod fusion_tests {
         // A side agent's interrupt line never ends the main turn.
         let mut e = StatusEngine::new();
         e.apply_all(&[hook("UserPromptSubmit"), prompt()]);
-        let side = tx(json!({"type": "user", "isSidechain": true, "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}));
+        let side = tx(
+            json!({"type": "user", "isSidechain": true, "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}),
+        );
         assert_eq!(e.apply(&side), None);
         assert_eq!(e.status(), Status::Working);
     }
@@ -1785,6 +1845,98 @@ mod pairing_tests {
         assert!(!e.turn_open());
     }
 
+    /// The live `/compact keep the plan` (Task 21, Claude Code 2.1.285), in file order: the
+    /// plain user line at submission, then ~19 s later the boundary, the summary, the
+    /// caveat, the command echo and its output. Hooks: `PreCompact` before, `SessionStart`
+    /// (`compact`) after.
+    fn live_compact() -> Vec<Value> {
+        vec![
+            json!({"isSidechain": false, "type": "user", "message": {"role": "user", "content": "/compact keep the plan"}}),
+            json!({"isSidechain": false, "type": "system", "subtype": "compact_boundary", "content": "Conversation compacted",
+                   "level": "info", "compactMetadata": {"trigger": "manual", "durationMs": 19289}}),
+            json!({"isSidechain": false, "type": "user", "isVisibleInTranscriptOnly": true, "isCompactSummary": true,
+                   "message": {"role": "user", "content": "This session is being continued from a previous conversation …"}}),
+            json!({"isSidechain": false, "type": "user", "isMeta": true,
+                   "message": {"role": "user", "content": "<local-command-caveat>The command below was run directly …"}}),
+            json!({"isSidechain": false, "type": "user", "message": {"role": "user",
+                   "content": "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args>keep the plan</command-args>"}}),
+            json!({"isSidechain": false, "type": "user", "message": {"role": "user",
+                   "content": "<local-command-stdout>\u{1b}[2mCompacted (ctrl+o to see full summary)\u{1b}[22m</local-command-stdout>"}}),
+        ]
+    }
+
+    #[test]
+    fn a_compaction_is_working_until_it_is_over_whichever_source_says_so() {
+        let tx = |v: &Value| Input::Transcript(v.clone());
+        let lines = live_compact();
+        // Both sources, hooks first.
+        let mut e = StatusEngine::new();
+        e.apply(&start("startup"));
+        let mut inputs = vec![ups("/compact keep the plan"), hook("PreCompact")];
+        inputs.extend(lines.iter().map(tx));
+        inputs.push(start("compact"));
+        let got = run(&mut e, &inputs);
+        assert_eq!(got, pairs(&[(Status::Working, "hook:PreCompact"), (Status::Idle, "transcript:compact_boundary")]));
+        assert!(!e.turn_open(), "a compaction is not a turn");
+        // Transcript only (the hooks were lost): the plain line starts it, the boundary ends it.
+        let mut e = StatusEngine::new();
+        let got = run(&mut e, &lines.iter().map(tx).collect::<Vec<_>>());
+        assert_eq!(
+            got,
+            pairs(&[(Status::Working, "transcript:compact"), (Status::Idle, "transcript:compact_boundary")])
+        );
+        // A failed or cancelled compaction writes no boundary: its output line ends it.
+        let mut e = StatusEngine::new();
+        let err = json!({"type": "system", "subtype": "local_command",
+                         "content": "<local-command-stderr>Error: Compaction canceled.</local-command-stderr>"});
+        let got = run(&mut e, &[tx(&lines[0]), tx(&err)]);
+        assert_eq!(got, pairs(&[(Status::Working, "transcript:compact"), (Status::Idle, "transcript:local_command")]));
+        // Hooks only.
+        let mut e = StatusEngine::new();
+        let got = run(&mut e, &[hook("PreCompact"), start("compact")]);
+        assert_eq!(got, pairs(&[(Status::Working, "hook:PreCompact"), (Status::Idle, "hook:SessionStart")]));
+        // The transcript ahead of the hooks: the late PreCompact starts it again, the
+        // SessionStart after it ends it.
+        let mut e = StatusEngine::new();
+        let mut inputs: Vec<Input> = lines.iter().map(tx).collect();
+        inputs.extend([hook("PreCompact"), start("compact")]);
+        assert_eq!(e.apply_all(&inputs).last().map(|t| t.to), Some(Status::Idle));
+        assert_eq!(e.status(), Status::Idle);
+        // A prompt typed meanwhile ends it too (a normal turn follows).
+        let mut e = StatusEngine::new();
+        e.apply_all(&[hook("PreCompact"), ups("next")]);
+        assert_eq!(e.apply(&hook("Stop")).map(|t| t.to), Some(Status::Idle));
+    }
+
+    #[test]
+    fn an_auto_compaction_inside_a_turn_keeps_it_working_and_ends_with_the_turn() {
+        let mut e = StatusEngine::new();
+        assert_eq!(e.apply(&ups("go")).map(|t| t.to), Some(Status::Working));
+        assert!(e.apply_all(&[hook("PreCompact"), start("compact")]).is_empty());
+        assert_eq!(e.status(), Status::Working);
+        assert_eq!(e.apply(&hook("Stop")).map(|t| t.to), Some(Status::Idle));
+        // A lost SessionStart: the turn end still ends the compaction.
+        let mut e = StatusEngine::new();
+        e.apply_all(&[ups("go"), hook("PreCompact"), hook("Stop")]);
+        assert_eq!(e.status(), Status::Idle);
+    }
+
+    #[test]
+    fn only_the_compact_command_line_starts_a_compaction() {
+        for other in ["/compactor", "/compact-x now", "compact", "/context"] {
+            let mut e = StatusEngine::new();
+            let line = json!({"type": "user", "message": {"role": "user", "content": other}});
+            assert_eq!(e.apply(&Input::Transcript(line)), None, "{other:?}");
+        }
+        let meta = json!({"type": "user", "isMeta": true, "message": {"content": "/compact"}});
+        let side = json!({"type": "user", "isSidechain": true, "message": {"content": "/compact"}});
+        let mut e = StatusEngine::new();
+        assert!(e.apply_all(&[Input::Transcript(meta), Input::Transcript(side)]).is_empty());
+        // A side agent's PreCompact is not the session compacting.
+        let side_pre = Input::Hook(HookEvent { agent_id: Some("a1".into()), ..HookEvent::named("PreCompact") });
+        assert_eq!(e.apply(&side_pre), None);
+    }
+
     /// M4: a `PermissionRequest` without `tool_use_id` borrows the id of the latest
     /// `PreToolUse` of the same agent and tool, so a parallel tool finishing first does not
     /// clear the dialog.
@@ -2160,9 +2312,13 @@ mod interleaving_tests {
         /// The API call fails: the tool reports `PostToolUseFailure`, the turn ends with
         /// `StopFailure` instead of `Stop`.
         Failure,
+        /// `/compact` (Task 21 live run): `UserPromptSubmit`, `PreCompact`, then
+        /// `SessionStart` (`compact`); the plain `/compact` user line, then the boundary, the
+        /// summary, the echo and its output. No turn; `Working` while it runs.
+        Compact,
     }
 
-    const PICK: [Kind; 13] = [
+    const PICK: [Kind; 14] = [
         Kind::Plain,
         Kind::Tool,
         Kind::Allow,
@@ -2176,6 +2332,7 @@ mod interleaving_tests {
         Kind::Stray,
         Kind::TwoDialogs,
         Kind::Failure,
+        Kind::Compact,
     ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2388,6 +2545,23 @@ mod interleaving_tests {
                 t.push(tx_ev(k, Other, "local_command echo", echo));
                 t.push(tx_ev(k, Other, "local_command stdout", out));
                 t.push(tx_ev(k, Other, "isMeta context", meta));
+            }
+            Kind::Compact => {
+                h.push(hook_ev(k, Other, "UPS /compact", ups("/compact keep")));
+                h.push(hook_ev(k, Other, "PreCompact", HookEvent::named("PreCompact")));
+                h.push(hook_ev(
+                    k,
+                    Other,
+                    "SessionStart compact",
+                    HookEvent { source: Some("compact".into()), ..HookEvent::named("SessionStart") },
+                ));
+                let line = |text: &str| json!({"type": "user", "message": {"role": "user", "content": text}});
+                t.push(tx_ev(k, Other, "/compact line", line("/compact keep")));
+                t.push(tx_ev(k, Other, "compact_boundary", system("compact_boundary")));
+                let summary = json!({"type": "user", "isCompactSummary": true, "message": {"content": "This session is being continued"}});
+                t.push(tx_ev(k, Other, "summary", summary));
+                t.push(tx_ev(k, Other, "echo", line("<command-name>/compact</command-name>")));
+                t.push(tx_ev(k, Other, "stdout", line("<local-command-stdout>Compacted</local-command-stdout>")));
             }
         }
         (h, t)
