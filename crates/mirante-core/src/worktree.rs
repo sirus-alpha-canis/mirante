@@ -30,6 +30,48 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
+/// Directories that tools the user runs inside every session (MCP servers, editors) create
+/// in each checkout. Untracked files under them alone never block an archive. Kept
+/// short on purpose: each entry is a directory whose loss costs nothing (a cache).
+pub const TOOL_DIRS: &[&str] = &[".serena/"];
+
+/// Changed paths named in a dirty-worktree refusal.
+const DIRTY_LISTED: usize = 10;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Dirt {
+    Clean,
+    /// Untracked files, every one under a [`TOOL_DIRS`] entry, and nothing else.
+    ToolDirsOnly,
+    /// `XY path` per change (git's porcelain codes), in git's order.
+    Changes(Vec<String>),
+}
+
+/// What `git status` sees in the checkout `path`: tracked changes, staged ones and every
+/// untracked file (not ignored ones: `git worktree remove` deletes those itself). A
+/// checkout with submodules is never treated as tool-dirs-only (a forced removal would
+/// take them along).
+fn dirt(path: &Path) -> Result<Dirt> {
+    let out = git(path, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"])?;
+    let mut changes = Vec::new();
+    let mut tool_only = true;
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
+    while let Some(entry) = fields.next() {
+        let (xy, file) = entry.split_at(entry.len().min(3));
+        let xy = xy.trim();
+        if xy.starts_with('R') || xy.starts_with('C') {
+            fields.next(); // the rename's source path
+        }
+        tool_only &= xy == "??" && TOOL_DIRS.iter().any(|d| file.starts_with(d));
+        changes.push(format!("{xy} {file}"));
+    }
+    Ok(match changes.is_empty() {
+        true => Dirt::Clean,
+        false if tool_only && !path.join(".gitmodules").exists() => Dirt::ToolDirsOnly,
+        false => Dirt::Changes(changes),
+    })
+}
+
 fn invalid(name: &str, reason: &str) -> CoreError {
     CoreError::InvalidBranch { name: name.to_string(), reason: reason.to_string() }
 }
@@ -253,7 +295,10 @@ impl WorktreeManager {
     }
 
     /// Removes the worktree directory and its git metadata. The branch is kept. Refuses a
-    /// dirty worktree (git's own check) so uncommitted work is never discarded silently.
+    /// dirty worktree ([`CoreError::DirtyWorktree`], listing what changed) so uncommitted
+    /// work is never discarded silently. The one exception: untracked files that all lie in
+    /// [`TOOL_DIRS`] (caches the user's own tools write into every checkout, e.g. Serena's
+    /// `.serena/`) do not count, and the removal is then forced (git would refuse it).
     /// If the directory is already gone (deleted by hand), the path is checked against the
     /// root lexically and `git worktree prune` drops the stale metadata.
     pub fn remove(&self, repo: &Path, path: &Path) -> Result<()> {
@@ -270,7 +315,22 @@ impl WorktreeManager {
             return Err(CoreError::OutsideRoot { path: path.display().to_string(), root: root.display().to_string() });
         }
         if path.exists() {
-            git(repo, &["worktree", "remove", "--end-of-options", &path.to_string_lossy()])?;
+            let force = match dirt(&path)? {
+                Dirt::Clean => false,
+                Dirt::ToolDirsOnly => true,
+                Dirt::Changes(all) => {
+                    let more = all.len().saturating_sub(DIRTY_LISTED);
+                    let changes = all.into_iter().take(DIRTY_LISTED).collect();
+                    return Err(CoreError::DirtyWorktree { path: path.display().to_string(), changes, more });
+                }
+            };
+            let target = path.to_string_lossy();
+            let mut args = vec!["worktree", "remove"];
+            if force {
+                args.push("--force");
+            }
+            args.extend(["--end-of-options", &target]);
+            git(repo, &args)?;
         } else {
             git(repo, &["worktree", "prune"])?;
         }
@@ -453,8 +513,67 @@ mod tests {
         let mgr = WorktreeManager::new(&dir.path().join("wt"));
         let a = mgr.create(&repo, "a", None).unwrap();
         std::fs::write(a.path.join("new.txt"), "work\n").unwrap();
-        assert!(matches!(mgr.remove(&repo, &a.path), Err(CoreError::Git { .. })));
+        std::fs::write(a.path.join("README.md"), "changed\n").unwrap();
+        let err = mgr.remove(&repo, &a.path).unwrap_err();
+        let CoreError::DirtyWorktree { changes, more, .. } = &err else { panic!("{err:?}") };
+        assert_eq!((changes.as_slice(), *more), (&["M README.md".to_string(), "?? new.txt".to_string()][..], 0));
+        let msg = err.to_string();
+        assert!(msg.contains("uncommitted changes") && msg.contains("new.txt") && msg.contains("commit"), "{msg}");
+        assert!(msg.contains("stash") && msg.contains("discard") && !msg.contains("--force"), "{msg}");
         assert!(a.path.exists());
+    }
+
+    #[test]
+    fn a_dirty_refusal_lists_at_most_ten_paths() {
+        let dir = TempDir::new("wt-dirty-many");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let a = mgr.create(&repo, "a", None).unwrap();
+        for i in 0..13 {
+            std::fs::write(a.path.join(format!("f{i:02}.txt")), "x\n").unwrap();
+        }
+        let err = mgr.remove(&repo, &a.path).unwrap_err();
+        let CoreError::DirtyWorktree { changes, more, .. } = &err else { panic!("{err:?}") };
+        assert_eq!((changes.len(), *more), (10, 3));
+        assert!(err.to_string().contains("and 3 more"), "{err}");
+    }
+
+    #[test]
+    fn tool_dirs_alone_do_not_block_a_remove_but_never_hide_real_work() {
+        let dir = TempDir::new("wt-tooldirs");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        // Only Serena's cache: removed.
+        let a = mgr.create(&repo, "a", None).unwrap();
+        std::fs::create_dir_all(a.path.join(".serena/cache")).unwrap();
+        std::fs::write(a.path.join(".serena/project.yml"), "x\n").unwrap();
+        std::fs::write(a.path.join(".serena/cache/doc.pkl"), "x\n").unwrap();
+        mgr.remove(&repo, &a.path).unwrap();
+        assert!(!a.path.exists());
+        // Serena's cache next to an untracked file: refused, and the file names it.
+        let b = mgr.create(&repo, "b", None).unwrap();
+        std::fs::create_dir_all(b.path.join(".serena")).unwrap();
+        std::fs::write(b.path.join(".serena/project.yml"), "x\n").unwrap();
+        std::fs::write(b.path.join("notes.txt"), "mine\n").unwrap();
+        let err = mgr.remove(&repo, &b.path).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::DirtyWorktree { changes, .. } if changes.contains(&"?? notes.txt".to_string()))
+        );
+        assert!(b.path.join("notes.txt").exists());
+        // Next to a tracked change: refused.
+        let c = mgr.create(&repo, "c", None).unwrap();
+        std::fs::create_dir_all(c.path.join(".serena")).unwrap();
+        std::fs::write(c.path.join(".serena/project.yml"), "x\n").unwrap();
+        std::fs::write(c.path.join("README.md"), "edited\n").unwrap();
+        assert!(matches!(mgr.remove(&repo, &c.path), Err(CoreError::DirtyWorktree { .. })));
+        assert!(c.path.exists());
+        // A tracked file inside a tool dir that was changed is real work: refused.
+        let d = mgr.create(&repo, "d", None).unwrap();
+        std::fs::create_dir_all(d.path.join(".serena")).unwrap();
+        std::fs::write(d.path.join(".serena/project.yml"), "tracked\n").unwrap();
+        git(&d.path, &["add", ".serena/project.yml"]).unwrap();
+        assert!(matches!(mgr.remove(&repo, &d.path), Err(CoreError::DirtyWorktree { .. })));
+        assert!(d.path.exists());
     }
 
     #[test]

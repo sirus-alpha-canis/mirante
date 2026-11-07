@@ -87,6 +87,7 @@ impl From<HubError> for RpcError {
                 | CoreError::StaleStatus { .. }
                 | CoreError::SessionEnded(_)
                 | CoreError::Git { .. }
+                | CoreError::DirtyWorktree { .. }
                 | CoreError::OutsideRoot { .. },
             )
             | HubError::Conflict(_)
@@ -782,7 +783,10 @@ mod tests {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "dirty").task;
         std::fs::write(Path::new(&t.worktree_path).join("wip.txt"), "unsaved\n").unwrap();
-        assert!(k.hub.archive("dirty").is_err());
+        let err = k.hub.archive("dirty").unwrap_err();
+        let rpc: RpcError = err.into();
+        assert_eq!(rpc.code, code::CONFLICT);
+        assert!(rpc.message.contains("uncommitted changes") && rpc.message.contains("?? wip.txt"), "{}", rpc.message);
         let v = k.hub.get_task(&t.id).unwrap();
         assert_eq!(v.task.lifecycle, Lifecycle::Active);
         assert!(Path::new(&t.worktree_path).join("wip.txt").exists());

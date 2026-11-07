@@ -28,6 +28,8 @@ pub enum CoreError {
     JournalMode(String),
     #[error("worktree path {path} is outside the managed root {root}")]
     OutsideRoot { path: String, root: String },
+    #[error("{}", dirty_message(path, changes, *more))]
+    DirtyWorktree { path: String, changes: Vec<String>, more: usize },
     #[error("claude binary not found: {0}")]
     ClaudeNotFound(String),
     #[error(transparent)]
@@ -36,4 +38,19 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+/// The archive refusal for a worktree with uncommitted work: what changed (git's status
+/// codes, at most ten paths) and what to do about it.
+fn dirty_message(path: &str, changes: &[String], more: usize) -> String {
+    let mut s = format!("the worktree {path} has uncommitted changes:");
+    for c in changes {
+        s.push_str("\n  ");
+        s.push_str(c);
+    }
+    if more > 0 {
+        s.push_str(&format!("\n  … and {more} more"));
+    }
+    s.push_str("\ncommit them, stash them (git stash -u) or discard them in the worktree, then archive again");
+    s
 }
