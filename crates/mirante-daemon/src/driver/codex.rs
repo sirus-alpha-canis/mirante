@@ -213,8 +213,16 @@ fn changes_summary(changes: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .map(|c| {
-            let (a, r) = diff_counts(c["diff"].as_str().unwrap_or(""));
             let kind = c["kind"]["type"].as_str().unwrap_or("change");
+            let diff = c["diff"].as_str().unwrap_or("");
+            // For an add (Codex 0.167) `diff` is the new file's raw content, not a unified
+            // diff; a delete is taken to be the same. A real unified diff is still counted.
+            let unified = diff.lines().any(|l| l.starts_with("@@"));
+            let (a, r) = match kind {
+                "add" if !unified => (diff.lines().count(), 0),
+                "delete" if !unified => (0, diff.lines().count()),
+                _ => diff_counts(diff),
+            };
             format!("{kind} {} (+{a} -{r})", c["path"].as_str().unwrap_or("?"))
         })
         .collect();
@@ -1468,6 +1476,23 @@ mod tests {
         let odd = json!({"availableDecisions": ["accept"]});
         assert_eq!(approval_response(m, &odd, false), json!({"decision": "decline"}));
         assert!(deny_decision(&odd).1.is_some());
+    }
+
+    #[test]
+    fn an_added_file_counts_its_content_lines() {
+        // Live (Codex 0.167.0): an add's `diff` is the raw content.
+        let live = json!([{"path": "/Users/u/m21-out/grant.txt", "kind": {"type": "add"}, "diff": "x\n"}]);
+        assert_eq!(changes_summary(&live).unwrap(), "add /Users/u/m21-out/grant.txt (+1 -0)");
+        let more = json!([
+            {"path": "b.rs", "kind": {"type": "add"}, "diff": "fn a() {}\n-not a removal\n+not an add header\n"},
+            {"path": "c.rs", "kind": {"type": "delete"}, "diff": "one\ntwo\n"},
+            {"path": "d.rs", "kind": {"type": "add"}, "diff": "@@ -0,0 +1,2 @@\n+a\n+b\n"},
+            {"path": "e.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-old\n+new\n"},
+        ]);
+        assert_eq!(
+            changes_summary(&more).unwrap(),
+            "add b.rs (+3 -0), delete c.rs (+0 -2), add d.rs (+2 -0), update e.rs (+1 -1)"
+        );
     }
 
     #[test]
