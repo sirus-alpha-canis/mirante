@@ -2,6 +2,7 @@
 //! transcript tailing, git worktrees and the Claude launch config. Pure library: no PTY,
 //! no daemon, no UI.
 pub mod error;
+pub mod model;
 
 pub use error::{CoreError, Result};
 
