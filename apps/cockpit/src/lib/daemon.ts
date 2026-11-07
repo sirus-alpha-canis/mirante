@@ -17,6 +17,14 @@ export class DaemonError extends Error {
   get unsupported(): boolean {
     return this.code === RpcCode.UNSUPPORTED || this.code === RpcCode.METHOD_NOT_FOUND;
   }
+  /** Mirante typed nothing: the person answers the dialog in the agent's terminal. */
+  get answerInTerminal(): boolean {
+    return this.code === RpcCode.ANSWER_IN_TERMINAL;
+  }
+  /** The daemon did not take a write in time (it may be stalled). */
+  get timedOut(): boolean {
+    return this.info.kind === "timeout";
+  }
 }
 
 function describe(e: BridgeError): string {
@@ -29,6 +37,8 @@ function describe(e: BridgeError): string {
       return `daemon protocol: ${e.message}`;
     case "forbidden":
       return `${e.method} is not allowed from the cockpit`;
+    case "timeout":
+      return `daemon timed out: ${e.message}`;
   }
 }
 
@@ -91,10 +101,19 @@ export async function attachWrite(id: number, text: string): Promise<void> {
 }
 
 export async function attachClose(id: number): Promise<void> {
-  await invoke("attach_close", { id });
+  try {
+    await invoke("attach_close", { id });
+  } catch (e) {
+    throw toDaemonError(e);
+  }
 }
 
 /** Starts `mirante-daemon` if nothing answers on the socket. Rejects with a message. */
 export async function daemonStart(): Promise<void> {
-  await invoke("daemon_start");
+  try {
+    await invoke("daemon_start");
+  } catch (e) {
+    // The shell rejects with a plain message: the daemon could not be found or started.
+    throw typeof e === "string" ? new DaemonError({ kind: "disconnected", message: e }) : toDaemonError(e);
+  }
 }

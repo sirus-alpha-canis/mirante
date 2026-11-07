@@ -6,7 +6,9 @@ export type Status = "idle" | "working" | "needs_you" | "ended";
 export type Lifecycle = "created" | "active" | "archiving" | "archived";
 export type BootState = "booting" | "trust_prompt" | "ready" | "exited";
 export type SendMode = "steer" | "queue";
-export type PermissionStatus = "pending" | "allowed_once" | "denied";
+/** `mirante_core::model::PermissionStatus`; `allowed_session` is a Codex `grantRoot` allowed
+ * for the rest of the session. */
+export type PermissionStatus = "pending" | "allowed_once" | "allowed_session" | "denied";
 
 export interface TaskView {
   id: string;
@@ -132,7 +134,9 @@ export type BridgeError =
   | { kind: "disconnected"; message: string }
   | { kind: "rpc"; code: number; message: string }
   | { kind: "protocol"; message: string }
-  | { kind: "forbidden"; method: string };
+  | { kind: "forbidden"; method: string }
+  /** A write to the daemon did not complete in time (stalled daemon). */
+  | { kind: "timeout"; message: string };
 
 /** `mirante_ipc::rpc::code`. */
 export const RpcCode = {
@@ -143,6 +147,9 @@ export const RpcCode = {
   UNSUPPORTED: 3,
   DRIVER: 4,
   NEEDS_YOU: 5,
+  FORBIDDEN: 6,
+  /** The daemon is at its connection limit; retry. */
+  BUSY: 7,
   /** Mirante typed nothing: answer the Claude dialog in the agent's terminal. */
   ANSWER_IN_TERMINAL: 8,
 } as const;

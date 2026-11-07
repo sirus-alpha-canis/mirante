@@ -16,7 +16,7 @@ export interface FeedItem {
   phase?: "started" | "ended";
 }
 
-export type PermState = "pending" | "allowed_once" | "denied" | "expired";
+export type PermState = "pending" | "allowed_once" | "allowed_session" | "denied" | "expired";
 
 export interface Perm {
   id: string;
@@ -27,6 +27,12 @@ export interface Perm {
   created_at: number;
   /** seq of the last event that changed it (older replays never win). */
   seq: number;
+  /** `State.permRev` when it last changed (a `permission.list` sent earlier never wins). */
+  rev: number;
+  /** seq of the event that closed it: the only one of its closing events with a feed line. */
+  closedBy?: number;
+  /** The live stream already lowered the task's `needs_you` for it. */
+  counted?: boolean;
 }
 
 export interface MemoryNotice {
@@ -48,7 +54,11 @@ export interface State {
   tasks: Record<string, TaskView>;
   feed: Record<string, FeedItem[]>;
   perms: Record<string, Perm>;
+  /** Bumped on every permission change made by an event. */
+  permRev: number;
   memory: MemoryNotice[];
+  /** Tasks whose history (`task.events`) could not be loaded, with why. */
+  historyErrors: Record<string, string>;
 }
 
 export const FEED_CAP = 300;
@@ -60,7 +70,9 @@ export const initialState: State = {
   tasks: {},
   feed: {},
   perms: {},
+  permRev: 0,
   memory: [],
+  historyErrors: {},
 };
 
 export type Action =
@@ -68,9 +80,22 @@ export type Action =
   | { type: "disconnected"; error: string; retryMs: number }
   | { type: "event"; event: DaemonEvent }
   | { type: "task"; view: TaskView }
-  | { type: "tasks"; views: TaskView[] }
-  | { type: "permissions"; list: PermissionView[] }
-  | { type: "history"; taskId: string; events: DaemonEvent[] };
+  /** `keep`: rows refreshed after this list was asked for (their current view stays). */
+  | { type: "tasks"; views: TaskView[]; keep?: string[] }
+  /** `rev`: `State.permRev` when the list was asked for (cards changed since are kept). */
+  | { type: "permissions"; list: PermissionView[]; rev?: number }
+  | { type: "history"; taskId: string; events: DaemonEvent[] }
+  | { type: "historyFailed"; taskId: string; error: string };
+
+/** Events that close a card. `permission_answered` always comes first from the daemon; the
+ * others refine it (or stand alone when the answer was lost or is outside the page). */
+const CLOSING = new Set(["permission_answered", "permission_settled", "permission_expired", "permission_superseded"]);
+
+const ANSWER_TEXT: Record<string, string> = {
+  allowed_once: "allowed once",
+  allowed_session: "allowed for this session",
+  denied: "denied",
+};
 
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
 
@@ -111,9 +136,11 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       return { ...base, kind: "permission", text: `asks: ${str(p.tool)} ${str(p.detail)}`.trim() };
     case "permission_answered":
     case "permission_settled":
-      return { ...base, kind: "system", text: p.answer === "allowed_once" ? "allowed once" : "denied" };
+      return { ...base, kind: "system", text: ANSWER_TEXT[str(p.answer)] ?? "denied" };
     case "permission_expired":
       return { ...base, kind: "system", text: "permission request expired" };
+    case "permission_superseded":
+      return { ...base, kind: "system", text: "permission request replaced by a newer one" };
     case "boot":
       return p.state === "trust_prompt" || p.state === "exited"
         ? { ...base, kind: "system", text: p.state === "exited" ? "agent exited during start" : "asks to trust the folder" }
@@ -137,25 +164,44 @@ function addFeed(feed: Record<string, FeedItem[]>, taskId: string, items: FeedIt
   return { ...feed, [taskId]: merged };
 }
 
-function permEffect(perms: Record<string, Perm>, e: DaemonEvent): Record<string, Perm> {
+function permId(e: DaemonEvent): string {
+  return e.kind === "permission_answer_unrecorded" ? "" : str((e.payload ?? {}).permission_id);
+}
+
+/** Whether `e` is the event a card's single feed line belongs to (its first closing event
+ * seen, or any non-closing event). */
+function ownsLine(perms: Record<string, Perm>, e: DaemonEvent): boolean {
+  if (!CLOSING.has(e.kind)) return true;
+  const closedBy = perms[permId(e)]?.closedBy;
+  return closedBy === undefined || closedBy === e.seq;
+}
+
+const statusOf = (e: DaemonEvent): PermState => {
+  const a = str((e.payload ?? {}).answer);
+  if (e.kind === "permission_expired") return "expired";
+  return a === "allowed_once" || a === "allowed_session" ? a : "denied";
+};
+
+function permEffect(perms: Record<string, Perm>, e: DaemonEvent, rev: number): Record<string, Perm> {
   const p = e.payload ?? {};
-  const id = str(p.permission_id);
+  const id = permId(e);
   // An answer typed after the card was settled is audit only: the card keeps its outcome.
   // (`permission_superseded` is recorded denied by the daemon, so it settles as one.)
-  if (!id || !e.task_id || e.kind === "permission_answer_unrecorded") return perms;
+  if (!id || !e.task_id || !e.kind.startsWith("permission_")) return perms;
   const cur = perms[id];
-  if (cur && cur.seq >= e.seq) return perms;
+  const closedBy = CLOSING.has(e.kind) ? (cur?.closedBy ?? e.seq) : cur?.closedBy;
+  if (cur && cur.seq >= e.seq) return closedBy === cur.closedBy ? perms : { ...perms, [id]: { ...cur, closedBy } };
   if (e.kind === "permission_requested") {
     const status: PermState = cur?.status ?? "pending";
     return {
       ...perms,
-      [id]: { id, task_id: e.task_id, tool: str(p.tool), detail: str(p.detail), status, created_at: e.ts_ms, seq: e.seq },
+      [id]: { ...cur, id, task_id: e.task_id, tool: str(p.tool), detail: str(p.detail), status, created_at: e.ts_ms, seq: e.seq, rev },
     };
   }
-  const status: PermState =
-    e.kind === "permission_expired" ? "expired" : p.answer === "allowed_once" ? "allowed_once" : "denied";
-  const known = cur ?? { id, task_id: e.task_id, tool: "", detail: "", created_at: e.ts_ms, status, seq: e.seq };
-  return { ...perms, [id]: { ...known, status, seq: e.seq } };
+  if (!CLOSING.has(e.kind)) return perms;
+  const status = statusOf(e);
+  const known = cur ?? { id, task_id: e.task_id, tool: "", detail: "", created_at: e.ts_ms, status, seq: e.seq, rev };
+  return { ...perms, [id]: { ...known, status, seq: e.seq, rev, closedBy } };
 }
 
 /** What an event says about the task row itself (refined later by `task.get`). */
@@ -184,10 +230,6 @@ function taskEffect(tasks: Record<string, TaskView>, e: DaemonEvent): Record<str
       return put({ live: false, boot: null });
     case "permission_requested":
       return put({ needs_you: t.needs_you + 1 });
-    case "permission_answered":
-    case "permission_settled":
-    case "permission_expired":
-      return put({ needs_you: Math.max(0, t.needs_you - 1) });
     case "message_queued":
       return put({ queued: t.queued + 1 });
     case "task_updated":
@@ -211,16 +253,27 @@ export function reduce(s: State, a: Action): State {
     case "event": {
       const e = a.event;
       if (e.boot_id === s.bootId && e.seq <= s.seq) return s;
-      const item = feedItem(e);
       const memory = isMemoryEvent(e.kind)
         ? [...s.memory, { seq: e.seq, task_id: e.task_id, kind: e.kind, text: describeMemoryEvent(e.kind, e.payload ?? {}) }].slice(-20)
         : s.memory;
+      let tasks = taskEffect(s.tasks, e);
+      let perms = permEffect(s.perms, e, s.permRev + 1);
+      const permRev = perms === s.perms ? s.permRev : s.permRev + 1;
+      const id = permId(e);
+      // Each card lowers its task's count once, whichever of its closing events comes first.
+      if (CLOSING.has(e.kind) && id && perms[id] && !perms[id].counted) {
+        perms = { ...perms, [id]: { ...perms[id], counted: true } };
+        const t = e.task_id ? tasks[e.task_id] : undefined;
+        if (t) tasks = { ...tasks, [t.id]: { ...t, needs_you: Math.max(0, t.needs_you - 1) } };
+      }
+      const item = ownsLine(perms, e) ? feedItem(e) : null;
       return {
         ...s,
         bootId: e.boot_id,
         seq: e.seq,
-        tasks: taskEffect(s.tasks, e),
-        perms: e.kind.startsWith("permission_") ? permEffect(s.perms, e) : s.perms,
+        tasks,
+        perms,
+        permRev,
         feed: item && e.task_id ? addFeed(s.feed, e.task_id, [item]) : s.feed,
         memory,
       };
@@ -230,13 +283,19 @@ export function reduce(s: State, a: Action): State {
     case "tasks": {
       const tasks: Record<string, TaskView> = {};
       for (const t of a.views) tasks[t.id] = t;
+      for (const id of a.keep ?? []) if (s.tasks[id]) tasks[id] = s.tasks[id];
       return { ...s, tasks };
     }
     case "permissions": {
+      const asked = a.rev ?? Infinity;
       const perms = { ...s.perms };
+      // Cards an event changed after the list was asked for: the event is newer.
+      const newer = (id: string) => (perms[id]?.rev ?? 0) > asked;
       for (const p of a.list) {
+        if (newer(p.id)) continue;
         const cur = perms[p.id];
         perms[p.id] = {
+          ...cur,
           id: p.id,
           task_id: p.task_id,
           tool: p.tool,
@@ -244,21 +303,32 @@ export function reduce(s: State, a: Action): State {
           status: p.status,
           created_at: p.created_at,
           seq: cur?.seq ?? 0,
+          rev: cur?.rev ?? 0,
         };
       }
       // A pending card the daemon no longer lists was answered elsewhere (CLI) or expired.
       for (const id of Object.keys(perms)) {
-        if (perms[id].status === "pending" && !a.list.some((p) => p.id === id)) {
+        if (perms[id].status === "pending" && !newer(id) && !a.list.some((p) => p.id === id)) {
           perms[id] = { ...perms[id], status: "expired" };
         }
       }
       return { ...s, perms };
     }
     case "history": {
-      const items = a.events.map(feedItem).filter((i): i is FeedItem => i !== null);
       let perms = s.perms;
-      for (const e of a.events) if (e.kind.startsWith("permission_")) perms = permEffect(perms, e);
-      return { ...s, feed: addFeed(s.feed, a.taskId, items), perms };
+      let permRev = s.permRev;
+      const items: FeedItem[] = [];
+      for (const e of [...a.events].sort((x, y) => x.seq - y.seq)) {
+        const next = permEffect(perms, e, permRev + 1);
+        if (next !== perms) permRev++;
+        perms = next;
+        const item = ownsLine(perms, e) ? feedItem(e) : null;
+        if (item) items.push(item);
+      }
+      const { [a.taskId]: _cleared, ...historyErrors } = s.historyErrors;
+      return { ...s, feed: addFeed(s.feed, a.taskId, items), perms, permRev, historyErrors };
     }
+    case "historyFailed":
+      return { ...s, historyErrors: { ...s.historyErrors, [a.taskId]: a.error } };
   }
 }
