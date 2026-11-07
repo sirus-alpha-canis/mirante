@@ -2,22 +2,21 @@
 //! order (transcript lines in file order). Rules come from docs/spikes/FINDINGS.md:
 //!
 //! - A turn opens only on a main-agent `UserPromptSubmit` hook or a main-chain transcript
-//!   prompt line. Tool events never open a turn, so a stray `PreToolUse` after `Stop`
-//!   (side agent, S3 mismatch 2) cannot flip the task back to `Working`. One exception, a
-//!   heuristic: after a slash-command `UserPromptSubmit` (prompt shaped `/name`, see
-//!   [`is_slash_command`]) the turn opens on the first main-agent `PreToolUse` (see
-//!   [`StatusEngine`]). Local-command transcript lines (`<command-name>`,
+//!   prompt line. Tool events never open a turn on their own, so a stray `PreToolUse` after
+//!   `Stop` (side agent, S3 mismatch 2) cannot flip the task back to `Working`. Exceptions,
+//!   both heuristics: after a slash-command `UserPromptSubmit` (prompt shaped `/name`, see
+//!   [`is_slash_command`]) the turn opens on the first main-agent `PreToolUse`; after a
+//!   queued prompt the transcript confirmed, on the first main-agent `PreToolUse` after the
+//!   turn's `Stop` (see [`StatusEngine`]). Local-command transcript lines (`<command-name>`,
 //!   `<local-command-stdout>`, ... wrappers, `isMeta` lines) are never prompts.
 //! - A turn closes on a main-agent `Stop`, the idle `Notification`, or the transcript's
 //!   `system` `turn_duration` / `stop_hook_summary` line. The transcript end covers the
-//!   deny path, where no hook fires (S3 mismatch 1).
-//! - Transcript turns are counted on their own; a transcript turn end closes the fused turn
-//!   only when both name the same turn, so a late transcript line from the previous turn
-//!   cannot end the turn the hooks already opened. Symmetrically, a hook `Stop` whose
-//!   turn the transcript already closed (its `stop_hook_summary` line was seen) is ignored
-//!   when a newer turn has since been opened by either source (queued prompt, Task 8
-//!   probe; or the next hook prompt). A hook `Stop` that arrives before the transcript has
-//!   even written its turn's prompt line is remembered and pairs with that turn's summary.
+//!   deny path, where no hook fires (S3 mismatch 1); so does the next prompt while the
+//!   main agent's dialog is open.
+//! - Each source numbers turns on its own and a turn end closes only the turn it names, so
+//!   a late line or a late `Stop` of an earlier turn cannot end a newer one (queued prompt,
+//!   Task 8 probe; or the next hook prompt), and either source may run whole turns ahead.
+//!   Cross-checks re-align the numbering when a `Stop` is lost or a prompt is queued.
 //! - Side-agent events (`agent_id` present, `SubagentStart`/`SubagentStop`; transcript
 //!   `isSidechain` / `agentId` / `parentToolUseID`) never open or close a turn. A side
 //!   agent's `PermissionRequest` still means `NeedsYou`: its dialog blocks the session.
@@ -79,48 +78,135 @@ impl Pending {
     }
 }
 
+/// How many recent turns of each source the engine remembers for alignment.
+const HISTORY: usize = 8;
+
+/// A `UserPromptSubmit` that arrived while the hook stream was inside a turn. It is a steer
+/// (absorbed at the next tool boundary), a queued prompt (run as the next turn), or, when
+/// the turn's own `Stop` was lost, the next turn's prompt. The hook stream cannot tell them
+/// apart (a steer and a queued prompt both arrive between a `PreToolUse` and its
+/// `PostToolUse`); the transcript does: a queued prompt opens the next transcript turn as a
+/// `queued` line, a steer leaves an `enqueue` line and no turn, a next prompt neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MidPrompt {
+    prompt: Option<String>,
+    slash: bool,
+    /// Main-agent hook activity (tool use, `Stop`) came after it, before any later prompt.
+    followed: bool,
+    /// The hook turn ended after it (a main-agent `Stop`, or a deny inferred from a prompt).
+    stopped: bool,
+    /// Counted as a turn of its own (queued, or the next turn's prompt).
+    counted: bool,
+}
+
+/// One turn as the hook stream saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookTurn {
+    id: u64,
+    prompt: Option<String>,
+    mids: Vec<MidPrompt>,
+    /// Over in the hook stream: its `Stop`, a deny inferred from the next prompt, or the
+    /// transcript closing it while a `Stop` taken as late stood for it.
+    done: bool,
+    /// The `Stop` that closed it was really the next turn's (its own was the one taken as
+    /// late): a queued turn adopted after it is already over.
+    next_stop: bool,
+}
+
+/// One turn the transcript closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TxTurn {
+    id: u64,
+    /// `queue-operation` `enqueue` lines inside it (one per mid-turn prompt).
+    enqueued: usize,
+    /// `queued` prompt lines that opened the turns right after it.
+    queued_after: usize,
+    /// Closed by `stop_hook_summary` (Stop hooks ran: a hook `Stop` was sent). A deny turn
+    /// has only `turn_duration`.
+    summary: bool,
+}
+
+impl TxTurn {
+    /// How many of the turn's mid-turn prompts the transcript accounts for (steered or
+    /// queued); any more were the next turns' prompts.
+    fn mid_slots(&self) -> usize {
+        self.enqueued.max(self.queued_after)
+    }
+}
+
 /// Fused status of one Claude Code session.
 ///
-/// Slash commands (heuristic): a `UserPromptSubmit` whose `prompt` is a command
-/// ([`is_slash_command`]) does not open a turn, because many commands (`/context`, `/cost`,
-/// `/clear`) never run the model and fire no `Stop` (2.1.285 fires no hook at all for
-/// `/context`; docs/spikes/raw/slash-command.md). The turn opens when the command turns out
-/// to run the model: on the next main-agent `PreToolUse` or the transcript's prompt line. A
-/// `Stop`, a non-slash prompt or any `SessionStart` forgets the pending command.
+/// Each source numbers turns on its own, and both number the same turns, so a turn end
+/// from either source names the turn it ends and can never end a newer one:
 ///
-/// Stop pairing: each main-agent hook `Stop` belongs to the same turn as one transcript
-/// `stop_hook_summary` line; whichever comes first is queued until its partner arrives.
-/// A lost hook delivery would leave a summary waiting forever and make every later `Stop`
-/// look late; instead, a `Stop` set aside as late that gets no successor before the
-/// transcript closes the current turn is taken to have been that turn's own `Stop`, so a
-/// lost `Stop` costs at most one turn of lag (the transcript still closes it).
+/// - Hooks: a main-agent `UserPromptSubmit` outside a hook turn opens the next one; `Stop`
+///   closes it. A prompt inside a hook turn is a [`MidPrompt`]. A prompt while a main-agent
+///   dialog is open means the dialog was denied and the turn is over (the deny path fires no
+///   `Stop`). A slash command ([`is_slash_command`]) opens no turn by itself (`/context`
+///   fires no `Stop`; 2.1.285 fires no hook at all for it); its turn opens on the next
+///   main-agent `PreToolUse`, or is counted when its `Stop` arrives. A queued prompt's turn
+///   opens on the next main-agent `PreToolUse` or `Stop` once the transcript confirmed it.
+/// - Transcript: a prompt line ([`is_prompt`]) opens the next turn; `stop_hook_summary` or
+///   `turn_duration` closes it. A model-running slash command writes a `<command-message>`
+///   wrapper user line instead of a prompt: its turn opens on the next main-chain
+///   `assistant` line, or is counted when its turn end arrives. (Counting it from the hook
+///   `PreToolUse` instead would break when the transcript is ahead: its end lines would
+///   already have been dropped.)
+///
+/// The fused turn is open while the newest turn either source has opened has not been
+/// closed by either source. Cross-checks keep the numbering aligned:
+///
+/// - A queued line renumbers the hook stream if it already went past the queued prompt's
+///   turn ([`StatusEngine::confirm_queued`]); a typed prompt line does the same for
+///   mid-turn prompts the transcript does not account for: the turn's `Stop` was lost and
+///   the "mid-turn" prompt was the next turn's ([`StatusEngine::recount`]).
+/// - A new hook turn opening while the previous one has no `Stop` but the transcript wrote
+///   its `stop_hook_summary` expects that `Stop` late (the queued-probe order): the next
+///   `Stop` is set aside. If that `Stop` was really lost, the set-aside one was the current
+///   turn's: the transcript closing that same turn settles it, so a lost `Stop` costs at most
+///   one turn of lag.
+/// - A transcript prompt whose text matches a later hook turn than the one it would number
+///   skips the hook-only turns in between (a prompt no transcript line was written for).
+///
+/// Duplicate deliveries: a second `UserPromptSubmit` with the current turn's prompt text is
+/// dropped; a second `Stop` finds no open turn and is ignored.
 #[derive(Debug, Clone)]
 pub struct StatusEngine {
     status: Status,
-    turn_open: bool,
-    /// Number of turns opened by either source (the fused turn counter).
-    turn_seq: u64,
-    /// Number of turns the transcript itself has opened, and whether one is open there.
-    tx_turn: u64,
-    tx_in_turn: bool,
     /// Pending permission dialog.
     pending: Option<Pending>,
-    /// A slash-command prompt was submitted and has not opened a turn yet.
-    slash_pending: bool,
-    /// Transcript turns whose `stop_hook_summary` was seen before their hook `Stop`.
-    /// The next hook `Stop` belongs to the front one. Entries older than the previous
-    /// transcript turn are pruned when a new one opens; cleared on reset.
-    unmatched_summaries: VecDeque<u64>,
-    /// Transcript turns whose hook `Stop` came before their `stop_hook_summary` line
-    /// (including a `Stop` that came before the turn's transcript prompt line).
-    early_stops: Vec<u64>,
-    /// The last main-agent `Stop` was set aside as late and no `Stop` has come since. If
-    /// the transcript closes the current turn before another `Stop`, the set-aside one was
-    /// this turn's (its predecessor's delivery was lost): pair the summary with it.
-    late_stop_unpaired: bool,
     /// Latest `tool_use_id` per (agent, tool name) from `PreToolUse`, for a
     /// `PermissionRequest` whose payload lacks one. Dropped when the tool finishes.
     recent_tool_ids: HashMap<(Option<String>, Option<String>), String>,
+    /// Every turn up to this number is over.
+    ended: u64,
+
+    /// Number of the hook stream's latest turn.
+    h_turn: u64,
+    /// The hook stream's recent turns, newest last (`h_turn` when it has a record).
+    h_turns: VecDeque<HookTurn>,
+    /// A slash-command prompt was submitted and has not opened a hook turn yet.
+    slash_pending: bool,
+    /// The main agent asked for permission in the current hook turn and no answer was seen.
+    main_dialog: bool,
+    /// Main-agent `Stop`s that found no hook turn to end since the last one closed (a queued
+    /// turn not confirmed yet, a duplicate).
+    stray_stops: usize,
+    /// Hook turns whose `Stop` is still expected after a newer hook turn opened.
+    late_stops: Vec<u64>,
+    /// A `Stop` was set aside as late while this hook turn was current: if the transcript
+    /// closes this turn, that `Stop` was this turn's own (its predecessor's was lost).
+    late_taken: Option<u64>,
+
+    /// Number of the transcript's latest turn, and whether it is still open there.
+    t_turn: u64,
+    t_open: bool,
+    /// `enqueue` lines in the open transcript turn.
+    t_enqueued: usize,
+    /// A model-running command's wrapper line was written and no transcript turn holds it.
+    t_command: bool,
+    /// The transcript's recently closed turns, newest last.
+    t_closed: VecDeque<TxTurn>,
 }
 
 impl Default for StatusEngine {
@@ -133,16 +219,21 @@ impl StatusEngine {
     pub fn new() -> Self {
         StatusEngine {
             status: Status::Idle,
-            turn_open: false,
-            turn_seq: 0,
-            tx_turn: 0,
-            tx_in_turn: false,
             pending: None,
-            slash_pending: false,
-            unmatched_summaries: VecDeque::new(),
-            early_stops: Vec::new(),
-            late_stop_unpaired: false,
             recent_tool_ids: HashMap::new(),
+            ended: 0,
+            h_turn: 0,
+            h_turns: VecDeque::new(),
+            slash_pending: false,
+            main_dialog: false,
+            stray_stops: 0,
+            late_stops: Vec::new(),
+            late_taken: None,
+            t_turn: 0,
+            t_open: false,
+            t_enqueued: 0,
+            t_command: false,
+            t_closed: VecDeque::new(),
         }
     }
 
@@ -151,7 +242,7 @@ impl StatusEngine {
     }
 
     pub fn turn_open(&self) -> bool {
-        self.turn_open
+        self.h_turn.max(self.t_turn) > self.ended
     }
 
     /// Applies one input; returns the transition if the status changed. Once `Ended`, only
@@ -181,54 +272,113 @@ impl StatusEngine {
         Some(Transition { from, to, cause })
     }
 
-    /// Opens a turn from a hook. If the transcript never wrote the previous turn's prompt
-    /// (a hook-only turn), it skipped that turn: re-align its counter so its next prompt
-    /// line names this turn. Early Stops for skipped turns can no longer pair.
-    fn open_turn_from_hook(&mut self) {
-        if !self.tx_in_turn && self.tx_turn < self.turn_seq {
-            self.tx_turn = self.turn_seq;
-            let tx_turn = self.tx_turn;
-            self.early_stops.retain(|t| *t > tx_turn);
+    /// Settles the status after an event: a dialog dies with the turn it was raised in;
+    /// then `NeedsYou` while a dialog is open, else `Working` inside a turn, else `Idle`.
+    fn settle(&mut self, was_open: bool, cause: String) -> Option<Transition> {
+        if was_open && !self.turn_open() {
+            self.pending = None;
         }
-        self.open_turn();
+        let to = if self.pending.is_some() {
+            Status::NeedsYou
+        } else if self.turn_open() {
+            Status::Working
+        } else {
+            Status::Idle
+        };
+        self.set(to, cause)
     }
 
-    fn open_turn(&mut self) {
-        self.turn_open = true;
-        self.turn_seq += 1;
-        self.pending = None;
+    /// Ends every turn either source has opened (idle notification, session end).
+    fn end_all(&mut self) {
+        self.ended = self.ended.max(self.h_turn).max(self.t_turn);
+        if let Some(t) = self.h_turns.back_mut() {
+            t.done = true;
+        }
         self.slash_pending = false;
-    }
-
-    /// The transcript counter is NOT re-aligned here: the transcript may still be about to
-    /// write this turn's prompt line (it lags the hooks). [`Self::open_turn_from_hook`]
-    /// re-aligns it once the next turn proves the transcript skipped this one.
-    fn close_turn(&mut self) {
-        self.turn_open = false;
+        self.main_dialog = false;
         self.pending = None;
     }
 
     /// A new process or a cleared context: nothing from before can still be in flight.
     fn reset(&mut self) {
-        self.turn_open = false;
-        self.tx_in_turn = false;
-        self.tx_turn = self.turn_seq;
-        self.pending = None;
-        self.slash_pending = false;
-        self.unmatched_summaries.clear();
-        self.early_stops.clear();
-        self.late_stop_unpaired = false;
-        self.recent_tool_ids.clear();
+        let n = self.ended.max(self.h_turn).max(self.t_turn);
+        *self = StatusEngine { status: self.status, ended: n, h_turn: n, t_turn: n, ..StatusEngine::new() };
     }
 
-    /// Status after a dialog goes away: `Working` inside a turn, else `Idle`.
-    fn after_dialog(&self) -> Status {
-        if self.turn_open { Status::Working } else { Status::Idle }
+    // --- Hook stream ----------------------------------------------------------------
+
+    /// Is the hook stream inside its latest turn?
+    fn hook_turn_open(&self) -> bool {
+        self.h_turns.back().is_some_and(|t| t.id == self.h_turn && !t.done)
+    }
+
+    fn push_hook_turn(&mut self, prompt: Option<String>, done: bool) {
+        self.h_turn += 1;
+        self.h_turns.push_back(HookTurn { id: self.h_turn, prompt, mids: Vec::new(), done, next_stop: false });
+        if done {
+            self.ended = self.ended.max(self.h_turn);
+        }
+        if self.h_turns.len() > HISTORY {
+            self.h_turns.pop_front();
+        }
+        self.main_dialog = false;
+        self.stray_stops = 0;
+    }
+
+    /// Closes the current hook turn (its `Stop`, or an inferred deny).
+    fn close_hook_turn(&mut self) {
+        if let Some(t) = self.h_turns.back_mut().filter(|t| !t.done) {
+            t.done = true;
+            t.mids.iter_mut().for_each(|m| m.stopped = true);
+            self.ended = self.ended.max(t.id);
+        }
+        self.main_dialog = false;
+    }
+
+    /// After the hook turn closed: if the transcript confirmed one of its mid-turn prompts
+    /// as queued and the hook stream has not counted it yet, count it now (its turn shows in
+    /// the hook stream only as tool events and a `Stop`).
+    fn take_queued(&mut self) -> bool {
+        let Some(t) = self.h_turns.back() else {
+            return false;
+        };
+        let confirmed = self.tx_closed(t.id).map_or(0, |c| c.queued_after);
+        let counted = t.mids.iter().filter(|m| m.counted).count();
+        if !t.done || counted >= confirmed {
+            return false;
+        }
+        let t = self.h_turns.back_mut().expect("checked above");
+        match t.mids.iter_mut().find(|m| !m.counted) {
+            Some(m) => {
+                m.counted = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Marks main-agent activity (a `Stop` if `stop`) after the current turn's mid-turn
+    /// prompts. Activity vouches only for the latest one: a slash command followed by
+    /// another prompt and then tool use was a local command.
+    fn follow_mids(&mut self, stop: bool) {
+        if self.hook_turn_open() {
+            if let Some(t) = self.h_turns.back_mut() {
+                if let Some(m) = t.mids.last_mut() {
+                    m.followed = true;
+                }
+                t.mids.iter_mut().for_each(|m| m.stopped |= stop);
+            }
+        }
+    }
+
+    fn tx_closed(&self, id: u64) -> Option<TxTurn> {
+        self.t_closed.iter().rev().find(|t| t.id == id).copied()
     }
 
     fn apply_hook(&mut self, ev: &HookEvent) -> Option<Transition> {
         let cause = format!("hook:{}", ev.hook_event_name);
         let side = ev.is_side_agent();
+        let was_open = self.turn_open();
         if ev.hook_event_name == "SessionStart" {
             // `/compact` and friends: whatever command was pending has run.
             self.slash_pending = false;
@@ -240,33 +390,40 @@ impl StatusEngine {
             }
             // `compact` (or an unknown source) also fires after a mid-turn compaction; it
             // only means idle when no turn is open.
-            "SessionStart" if !self.turn_open => self.set(Status::Idle, cause),
-            "UserPromptSubmit" if !side && !self.turn_open => {
-                if ev.prompt.as_deref().is_some_and(is_slash_command) {
-                    self.slash_pending = true;
-                    return None;
-                }
-                self.open_turn_from_hook();
-                self.set(Status::Working, cause)
-            }
-            "PreToolUse" if !side && self.slash_pending && !self.turn_open => {
-                self.remember_tool(ev);
-                self.open_turn_from_hook();
-                self.set(Status::Working, cause)
-            }
+            "SessionStart" if !was_open => self.set(Status::Idle, cause),
+            "UserPromptSubmit" if !side => self.hook_prompt(ev, was_open, cause),
             "PreToolUse" => {
                 self.remember_tool(ev);
-                // Progress inside a turn. Never clears a dialog: a parallel or stray tool
-                // call can start while the dialog waits.
-                if self.pending.is_none() && self.turn_open {
-                    return self.set(Status::Working, cause);
+                if !side && self.hook_turn_open() {
+                    self.follow_mids(false);
+                } else if !side && (std::mem::take(&mut self.slash_pending) || self.take_queued()) {
+                    // A pending slash command or a queued prompt turns out to run the model.
+                    self.push_hook_turn(None, false);
+                } else if !side {
+                    // Tool use after a stray Stop: that Stop did not end the turn these tools
+                    // belong to (a queued turn not confirmed yet ends after its tools).
+                    self.stray_stops = 0;
                 }
-                None
+                // Never clears a dialog: a parallel or stray tool call can start while the
+                // dialog waits.
+                self.settle(was_open, cause)
             }
             "PostToolUse" => {
                 self.forget_tool(ev);
-                self.apply_post_tool_use(ev, cause)
+                if !side {
+                    self.follow_mids(false);
+                }
+                if let Some(p) = self.pending.as_ref().filter(|p| p.answered_by(ev)) {
+                    if p.agent.is_none() {
+                        self.main_dialog = false;
+                    }
+                    self.pending = None;
+                }
+                self.settle(was_open, cause)
             }
+            // The main agent's dialog in a turn the transcript already closed: it was
+            // answered before this delivery came in.
+            "PermissionRequest" if !side && self.hook_turn_open() && self.tx_closed(self.h_turn).is_some() => None,
             "PermissionRequest" => {
                 // Some payloads lack `tool_use_id`: borrow it from the latest PreToolUse of
                 // the same agent and tool, so a parallel tool finishing is not the answer.
@@ -275,54 +432,105 @@ impl StatusEngine {
                     .clone()
                     .or_else(|| self.recent_tool_ids.get(&(ev.agent_id.clone(), ev.tool_name.clone())).cloned());
                 self.pending = Some(Pending { agent: ev.agent_id.clone(), tool_use_id });
+                if !side {
+                    self.main_dialog = true;
+                }
                 self.set(Status::NeedsYou, cause)
             }
             "Notification" if ev.message.as_deref().is_some_and(|m| m.contains(IDLE_NOTIFICATION)) => {
-                self.slash_pending = false;
-                self.close_turn();
+                self.end_all();
                 self.set(Status::Idle, cause)
             }
             "Notification" => self.set(Status::NeedsYou, cause),
             "Stop" if !side => {
-                self.slash_pending = false;
-                self.late_stop_unpaired = false;
-                match self.unmatched_summaries.pop_front() {
-                    // The transcript already closed this Stop's turn and a newer turn has
-                    // opened since (from either source): the Stop is late and must not end
-                    // the newer turn.
-                    Some(stopped) if self.turn_open && self.turn_seq.max(self.tx_turn) > stopped => {
-                        self.late_stop_unpaired = true;
-                        return None;
-                    }
-                    Some(_) => {}
-                    None if self.tx_in_turn => self.early_stops.push(self.tx_turn),
-                    // The transcript has not written this turn's prompt yet: its summary
-                    // will come under the next transcript turn number.
-                    None if self.turn_open && self.tx_turn < self.turn_seq => self.early_stops.push(self.tx_turn + 1),
-                    None => {}
-                }
-                self.close_turn();
-                self.set(Status::Idle, cause)
+                self.hook_stop();
+                self.settle(was_open, cause)
             }
             "SessionEnd" => {
-                self.slash_pending = false;
-                self.close_turn();
+                self.end_all();
                 self.set(Status::Ended, cause)
             }
             _ => None,
         }
     }
 
-    fn apply_post_tool_use(&mut self, ev: &HookEvent, cause: String) -> Option<Transition> {
-        match &self.pending {
-            Some(p) if p.answered_by(ev) => {
-                self.pending = None;
-                let to = self.after_dialog();
-                self.set(to, cause)
+    fn hook_prompt(&mut self, ev: &HookEvent, was_open: bool, cause: String) -> Option<Transition> {
+        let text = ev.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let slash = text.as_deref().is_some_and(is_slash_command);
+        if !slash {
+            // A command still pending when a normal prompt comes was a local one.
+            self.slash_pending = false;
+        }
+        if self.hook_turn_open() {
+            let t = self.h_turns.back().expect("open hook turn has a record");
+            // The same prompt delivered twice (a slash command may really be run again).
+            if text.is_some() && !slash && (t.prompt == text || t.mids.iter().any(|m| m.prompt == text)) {
+                return None;
             }
-            Some(_) => None,
-            None if self.turn_open => self.set(Status::Working, cause),
-            None => None,
+            let (id, mids) = (t.id, t.mids.len());
+            let closed = self.tx_closed(id);
+            // The transcript closed this turn with fewer mid-turn prompts than the hook
+            // stream holds: the extra ones were the next turns' prompts. Recount, then look
+            // at this prompt again from the turn it falls in.
+            if let Some(c) = closed.filter(|c| mids > c.mid_slots()) {
+                if self.recount_record(self.h_turns.len() - 1, c.mid_slots()) {
+                    return self.hook_prompt(ev, was_open, cause);
+                }
+            }
+            // Over when its dialog was dismissed (deny: no Stop), or when the transcript
+            // closed it with no room left for another mid-turn prompt (its Stop was lost).
+            if !self.main_dialog && closed.is_none_or(|c| mids < c.mid_slots()) {
+                let m = MidPrompt { prompt: text, slash, followed: false, stopped: false, counted: false };
+                self.h_turns.back_mut().expect("open hook turn has a record").mids.push(m);
+                return None;
+            }
+            if self.main_dialog {
+                // The dialog was denied: it is gone with its turn.
+                if self.pending.as_ref().is_some_and(|p| p.agent.is_none()) {
+                    self.pending = None;
+                }
+            } else if closed.is_some_and(|c| c.summary) {
+                // Its Stop hooks ran, so its Stop was sent: expect it late.
+                self.late_stops.push(id);
+            }
+            self.close_hook_turn();
+        }
+        // The previous turn, closed by both sources, holding a mid-turn prompt its transcript
+        // turn does not account for (activity showed up after the transcript moved on).
+        if let Some(t) = self.h_turns.back().filter(|t| t.done && t.id == self.h_turn) {
+            if let Some(c) = self.tx_closed(t.id) {
+                self.recount_record(self.h_turns.len() - 1, c.mid_slots());
+            }
+        }
+        // Confirmed queued turns the hook stream saw no event of (their Stop was lost).
+        while self.take_queued() {
+            self.push_hook_turn(None, true);
+        }
+        self.slash_pending = slash;
+        if !slash {
+            self.push_hook_turn(text, false);
+        }
+        self.settle(was_open, cause)
+    }
+
+    fn hook_stop(&mut self) {
+        if !self.late_stops.is_empty() {
+            // A turn the transcript already closed (Stop hooks ran) still owed its Stop and a
+            // newer turn has opened since: this is that Stop.
+            self.late_stops.remove(0);
+            self.late_taken = Some(self.h_turn);
+            self.follow_mids(true);
+            return;
+        }
+        if self.hook_turn_open() {
+            self.follow_mids(true);
+            self.close_hook_turn();
+        } else if std::mem::take(&mut self.slash_pending) || self.take_queued() {
+            // A slash command or a queued prompt that ran the model without a tool call.
+            self.push_hook_turn(None, true);
+        } else {
+            // No hook turn to end: a duplicate, or a queued turn not confirmed yet.
+            self.stray_stops += 1;
         }
     }
 
@@ -339,13 +547,16 @@ impl StatusEngine {
     }
 
     fn apply_answer(&mut self, allowed: bool) -> Option<Transition> {
-        self.pending.as_ref()?;
+        let p = self.pending.as_ref()?;
+        let was_open = self.turn_open();
         if allowed {
+            if p.agent.is_none() {
+                self.main_dialog = false;
+            }
             self.pending = None;
-            let to = self.after_dialog();
-            return self.set(to, "mirante:permission_allowed".into());
+            return self.settle(was_open, "mirante:permission_allowed".into());
         }
-        if self.turn_open {
+        if was_open {
             // Claude ends the turn with "[Request interrupted by user for tool use]"; the
             // transcript's `turn_duration` closes it. Until then the dialog stands.
             return None;
@@ -355,54 +566,233 @@ impl StatusEngine {
         self.set(Status::Idle, "mirante:permission_denied".into())
     }
 
+    // --- Transcript stream ----------------------------------------------------------
+
     fn apply_transcript(&mut self, v: &Value) -> Option<Transition> {
         if is_sidechain(v) {
             return None;
         }
+        let was_open = self.turn_open();
         if is_prompt(v) {
-            if self.tx_in_turn {
+            if self.t_open {
                 return None;
             }
-            self.tx_in_turn = true;
-            self.tx_turn += 1;
-            let tx_turn = self.tx_turn;
-            self.early_stops.retain(|t| t + 1 >= tx_turn);
-            // A summary two transcript turns back still waiting for its Stop will not get
-            // one (lost delivery): drop it so it cannot shadow a later Stop.
-            self.unmatched_summaries.retain(|t| t + 1 >= tx_turn);
-            if self.tx_turn > self.turn_seq {
-                // The transcript saw the prompt before the hook did.
-                self.open_turn();
-                return self.set(Status::Working, "transcript:prompt".into());
+            let id = self.prompt_turn_number(v);
+            if v["promptSource"] == "queued" {
+                self.confirm_queued();
+            } else {
+                self.recount();
+            }
+            self.open_tx_turn(id);
+            return self.settle(was_open, "transcript:prompt".into());
+        }
+        if is_command_wrapper(v) {
+            if !self.t_open {
+                self.t_command = true;
             }
             return None;
         }
-        if let Some(kind) = turn_end_kind(v) {
-            if kind == "stop_hook_summary" && self.tx_in_turn {
-                // Pair the summary with its hook Stop, whichever arrives first. Outside a
-                // transcript turn (tail attached mid-turn, a cleared turn) it has no Stop.
-                match self.early_stops.iter().position(|t| *t == self.tx_turn) {
-                    Some(i) => {
-                        self.early_stops.remove(i);
-                    }
-                    // The Stop set aside as late was this turn's (see `late_stop_unpaired`).
-                    None if self.late_stop_unpaired => self.late_stop_unpaired = false,
-                    None => self.unmatched_summaries.push_back(self.tx_turn),
-                }
+        if v["type"] == "assistant" && !self.t_open && self.t_command {
+            // The model answers the command: it runs as a turn.
+            self.recount();
+            self.open_tx_turn(self.t_turn + 1);
+            return self.settle(was_open, "transcript:command".into());
+        }
+        if v["type"] == "queue-operation" && v["operation"] == "enqueue" && self.t_open {
+            self.t_enqueued += 1;
+            return None;
+        }
+        let kind = turn_end_kind(v)?;
+        if !self.t_open && self.t_command {
+            // A command turn whose answer line was not seen: its end still counts it.
+            self.recount();
+            self.open_tx_turn(self.t_turn + 1);
+        }
+        if !self.t_open {
+            // The second end line of a closed turn, or the end of a turn this tail never saw
+            // open (attached mid-turn, cleared context).
+            return None;
+        }
+        self.close_tx_turn(kind == "stop_hook_summary");
+        self.settle(was_open, format!("transcript:{kind}"))
+    }
+
+    /// The next transcript number, unless the prompt's text is the prompt of a later hook
+    /// turn while the next number's hook turn had another text: the transcript never wrote
+    /// a line for the turns in between (hook-only prompts), so skip them.
+    fn prompt_turn_number(&self, v: &Value) -> u64 {
+        let next = self.t_turn + 1;
+        let Some(text) = first_text(&v["message"]["content"]).map(str::trim).filter(|s| !s.is_empty()) else {
+            return next;
+        };
+        let differs = self.h_turns.iter().any(|t| t.id == next && t.prompt.as_deref().is_some_and(|p| p != text));
+        if !differs {
+            return next;
+        }
+        self.h_turns.iter().find(|t| t.id > next && t.prompt.as_deref() == Some(text)).map_or(next, |t| t.id)
+    }
+
+    fn open_tx_turn(&mut self, id: u64) {
+        self.t_turn = id;
+        self.t_open = true;
+        self.t_enqueued = 0;
+        self.t_command = false;
+    }
+
+    fn close_tx_turn(&mut self, summary: bool) {
+        let id = self.t_turn;
+        self.t_open = false;
+        self.t_closed.push_back(TxTurn { id, enqueued: self.t_enqueued, queued_after: 0, summary });
+        if self.t_closed.len() > HISTORY {
+            self.t_closed.pop_front();
+        }
+        self.ended = self.ended.max(id);
+        // A Stop expected late for an older turn will not come any more (lost).
+        self.late_stops.retain(|t| *t >= id);
+        // The flag names one turn: settled when the transcript closes that turn, dropped once
+        // the transcript is past it, kept while the transcript is still behind it.
+        match self.late_taken {
+            Some(t) if t == id => {
+                self.late_taken = None;
+                self.settle_late_stop(id);
             }
-            if !self.tx_in_turn {
-                return None;
+            Some(t) if t < id => self.late_taken = None,
+            _ => {}
+        }
+    }
+
+    /// The transcript closed turn `id` while a `Stop` taken as late stood for it: that
+    /// `Stop` was this turn's own (its predecessor's was lost). A `Stop` that closed the
+    /// hook record since was the next turn's, and a prompt that came after the set-aside
+    /// `Stop` was the next turn's prompt, not a mid-turn one.
+    fn settle_late_stop(&mut self, id: u64) {
+        let Some(t) = self.h_turns.back_mut().filter(|t| t.id == id) else {
+            return;
+        };
+        t.next_stop = t.done;
+        t.done = true;
+        let dialog = std::mem::take(&mut self.main_dialog);
+        let Some(j) = t.mids.iter().position(|m| !m.stopped && !m.counted) else {
+            return;
+        };
+        let mut rest = t.mids.split_off(j).into_iter();
+        while let Some(m) = rest.next() {
+            if m.slash && !m.followed {
+                self.slash_pending = true; // a local command: no turn
+                continue;
             }
-            self.tx_in_turn = false;
-            if self.turn_open && self.tx_turn == self.turn_seq {
-                self.close_turn();
-                return self.set(Status::Idle, format!("transcript:{kind}"));
+            self.push_hook_turn(m.prompt, false);
+            self.slash_pending = false;
+            // A dialog raised after that prompt is the new turn's.
+            self.main_dialog = dialog && m.followed;
+            if let Some(t) = self.h_turns.back_mut() {
+                t.mids = rest.collect();
             }
-            if !self.turn_open {
-                self.tx_turn = self.turn_seq;
+            return;
+        }
+    }
+
+    /// A `queued` line opens the turn after `t_turn`: one of that turn's mid-turn prompts
+    /// was queued. If the hook stream already went past that turn without counting it,
+    /// count it now.
+    fn confirm_queued(&mut self) {
+        let prev = self.t_turn;
+        let Some(c) = self.t_closed.iter_mut().rev().find(|t| t.id == prev) else {
+            return;
+        };
+        c.queued_after += 1;
+        let Some(i) = self.h_turns.iter().position(|t| t.id == prev) else {
+            return;
+        };
+        let t = &mut self.h_turns[i];
+        if !t.done {
+            return; // still in that turn: its PreToolUse / Stop will count it (take_queued)
+        }
+        let Some(m) = t.mids.iter_mut().find(|m| !m.counted) else {
+            return;
+        };
+        m.counted = true;
+        let next_stop = t.next_stop;
+        if i + 1 == self.h_turns.len() {
+            // Nothing after it yet but maybe its Stop, which then found no turn to end, or a
+            // newer prompt (a pending slash command): either way it is over.
+            let done = self.stray_stops > 0 || next_stop || self.slash_pending;
+            self.push_hook_turn(None, done);
+        } else {
+            // Its events were taken as stray; the turns after it were numbered one too low.
+            self.renumber_after(i, 1);
+            let t = HookTurn { id: prev + 1, prompt: None, mids: Vec::new(), done: true, next_stop: false };
+            self.h_turns.insert(i + 1, t);
+            self.ended = self.ended.max(prev + 1);
+        }
+    }
+
+    /// A non-queued prompt opens the turn after `t_turn`: mid-turn prompts of that turn the
+    /// transcript does not account for were new prompts (that turn's `Stop` was lost, so the
+    /// hook stream took them for mid-turn ones). Renumber the hook stream after them.
+    fn recount(&mut self) {
+        let prev = self.t_turn;
+        let Some(slots) = self.tx_closed(prev).map(|c| c.mid_slots()) else {
+            return;
+        };
+        if let Some(i) = self.h_turns.iter().position(|t| t.id == prev) {
+            self.recount_record(i, slots);
+        }
+    }
+
+    /// Hook record `i` holds more mid-turn prompts than its transcript turn accounts for
+    /// (`slots`): the first extra one was the next turn's prompt (this turn's `Stop` was
+    /// lost). Counts it as a turn; the prompts after it move to that turn. Returns whether
+    /// one was counted.
+    fn recount_record(&mut self, i: usize, slots: usize) -> bool {
+        let prev = self.h_turns[i].id;
+        // A slash command with no activity after it was a local command, not a turn.
+        let Some(j) = (slots..self.h_turns[i].mids.len()).find(|&j| {
+            let m = &self.h_turns[i].mids[j];
+            !m.counted && !(m.slash && !m.followed)
+        }) else {
+            return false;
+        };
+        self.h_turns[i].mids[j].counted = true;
+        self.renumber_after(i, 1);
+        let last = i + 1 == self.h_turns.len();
+        let t = &mut self.h_turns[i];
+        // The hook events after that prompt were the new turn's: a `Stop` among them ended
+        // it; the hook stream moving on to a later record did too.
+        let done = !last || (t.done && t.mids[j].stopped);
+        if last {
+            let mids = t.mids.split_off(j + 1);
+            let prompt = t.mids[j].prompt.clone();
+            t.done = true;
+            self.h_turns.push_back(HookTurn { id: self.h_turn, prompt, mids, done, next_stop: false });
+            if self.h_turns.len() > HISTORY {
+                self.h_turns.pop_front();
             }
         }
-        None
+        if done {
+            self.ended = self.ended.max(prev + 1);
+        }
+        true
+    }
+
+    /// Adds `shift` to the number of every hook turn after index `i` (and to `h_turn`).
+    fn renumber_after(&mut self, i: usize, shift: u64) {
+        let from = self.h_turns[i].id;
+        self.h_turn += shift;
+        for t in self.h_turns.iter_mut().skip(i + 1) {
+            t.id += shift;
+            if t.done {
+                self.ended = self.ended.max(t.id);
+            }
+        }
+        for t in &mut self.late_stops {
+            if *t > from {
+                *t += shift;
+            }
+        }
+        if let Some(t) = self.late_taken.as_mut().filter(|t| **t > from) {
+            *t += shift;
+        }
     }
 }
 
@@ -427,6 +817,16 @@ pub fn is_prompt(v: &Value) -> bool {
         && v["isMeta"] != true
         && (v["origin"]["kind"] == "human" || v["promptSource"] == "sdk" || v["promptSource"] == "queued")
         && !first_text(&v["message"]["content"]).is_some_and(is_local_command_text)
+}
+
+/// The user line a model-running slash command writes in place of a prompt
+/// (`<command-message>review is running…</command-message><command-name>/review…`). A local
+/// command may write the same shape (older versions), so the line alone opens no turn.
+fn is_command_wrapper(v: &Value) -> bool {
+    v["type"] == "user"
+        && v["isMeta"] != true
+        && first_text(&v["message"]["content"])
+            .is_some_and(|t| ["<command-name>", "<command-message>"].iter().any(|p| t.trim_start().starts_with(p)))
 }
 
 /// The string content, or the first text block of an array content.
@@ -673,13 +1073,16 @@ mod fusion_tests {
         assert_eq!(e.apply(&system("turn_duration")).unwrap().to, Status::Idle);
     }
 
+    /// Without prompt texts a hook-only turn looks exactly like a transcript lagging a whole
+    /// turn (the prompt line would then be turn 1's); the texts tell them apart.
     #[test]
     fn hook_only_turn_does_not_desync_later_transcript_ends() {
+        let ups = |p: &str| Input::Hook(HookEvent { prompt: Some(p.into()), ..HookEvent::named("UserPromptSubmit") });
         let mut e = StatusEngine::new();
         // Turn 1 has no transcript prompt line (e.g. a hook-only prompt).
-        e.apply_all(&[hook("UserPromptSubmit"), hook("Stop")]);
+        e.apply_all(&[ups("blocked prompt"), hook("Stop")]);
         // Turn 2 is the deny path: only the transcript can close it.
-        e.apply_all(&[hook("UserPromptSubmit"), hook("PreToolUse"), hook("PermissionRequest"), prompt()]);
+        e.apply_all(&[ups("touch s3-denied.txt"), hook("PreToolUse"), hook("PermissionRequest"), prompt()]);
         assert_eq!(e.apply(&system("turn_duration")).unwrap().to, Status::Idle);
     }
 
@@ -1290,6 +1693,778 @@ mod pairing_tests {
                 assert!(e.apply_all(&[ups("/context"), line.clone()]).is_empty(), "{w:?}");
                 assert!(!e.turn_open());
             }
+        }
+    }
+}
+
+/// Reviewer probes (round 3): model-running slash commands (`/review`, whose transcript
+/// prompt line is a `<command-message>` wrapper) and a late-Stop flag going stale across a
+/// deny-path turn.
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn hook(name: &str) -> Input {
+        Input::Hook(HookEvent::named(name))
+    }
+    fn ups(p: &str) -> Input {
+        Input::Hook(HookEvent { prompt: Some(p.into()), ..HookEvent::named("UserPromptSubmit") })
+    }
+    fn typed(t: &str) -> Input {
+        Input::Transcript(
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "typed", "message": {"content": t}}),
+        )
+    }
+    fn queued(t: &str) -> Input {
+        Input::Transcript(
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued", "message": {"content": t}}),
+        )
+    }
+    /// The user line Claude Code writes for a model-running slash command, then the model's
+    /// first answer line (2.1.285).
+    fn wrapper(cmd: &str) -> Input {
+        let text = format!("<command-message>{cmd} is running…</command-message>\n<command-name>/{cmd}</command-name>");
+        Input::Transcript(
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "typed", "message": {"content": text}}),
+        )
+    }
+    fn system(s: &str) -> Input {
+        Input::Transcript(json!({"type": "system", "subtype": s}))
+    }
+    fn trace(e: &mut StatusEngine, inputs: &[Input]) -> Vec<Status> {
+        inputs
+            .iter()
+            .map(|i| {
+                e.apply(i);
+                e.status()
+            })
+            .collect()
+    }
+
+    /// A: model-running slash command, permission denied: the deny `turn_duration` closes it
+    /// and the next turn works normally.
+    #[test]
+    fn a_slash_command_deny_is_closed_by_turn_duration() {
+        let mut e = StatusEngine::new();
+        let t = trace(
+            &mut e,
+            &[
+                ups("/review"),
+                wrapper("review"),
+                hook("PreToolUse"),
+                hook("PermissionRequest"),
+                system("turn_duration"),
+                typed("next"),
+                ups("next"),
+                hook("PreToolUse"),
+                hook("PostToolUse"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+            ],
+        );
+        assert_eq!(t[4], Status::Idle, "deny turn_duration closes the slash turn: {t:?}");
+        assert_eq!(t[7], Status::Working, "turn 2 works: {t:?}");
+        assert_eq!(t[9], Status::Idle, "turn 2 idles on its Stop: {t:?}");
+    }
+
+    /// B: slash turn, then a deny-path turn (transcript prompt first): its `turn_duration`
+    /// must close it.
+    #[test]
+    fn b_slash_command_then_deny_turn() {
+        let mut e = StatusEngine::new();
+        let t = trace(
+            &mut e,
+            &[
+                ups("/review"),
+                wrapper("review"),
+                hook("PreToolUse"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+                typed("two"),
+                ups("two"),
+                hook("PreToolUse"),
+                hook("PermissionRequest"),
+                system("turn_duration"),
+                typed("three"),
+                ups("three"),
+                hook("PreToolUse"),
+                hook("PostToolUse"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+            ],
+        );
+        assert_eq!(t[10], Status::Idle, "deny turn_duration closes turn two: {t:?}");
+        assert_eq!(t[13], Status::Working, "turn three works: {t:?}");
+        assert_eq!(t[15], Status::Idle, "turn three idles on its Stop: {t:?}");
+    }
+
+    /// C: slash turn with a message queued mid-turn: the queued turn is Working.
+    #[test]
+    fn c_slash_command_then_queued_turn() {
+        let mut e = StatusEngine::new();
+        let t = trace(
+            &mut e,
+            &[
+                ups("/review"),
+                wrapper("review"),
+                hook("PreToolUse"),
+                ups("then BANANA"),
+                hook("PostToolUse"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+                queued("then BANANA"),
+                hook("PreToolUse"),
+                hook("PostToolUse"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+            ],
+        );
+        assert_eq!(t[8], Status::Working, "queued turn works: {t:?}");
+        assert_eq!(t[11], Status::Idle, "queued turn idles on its Stop: {t:?}");
+    }
+
+    /// D: slash turn, then a normal turn whose summary comes before its Stop.
+    #[test]
+    fn d_slash_command_then_summary_first_turn() {
+        let mut e = StatusEngine::new();
+        let t = trace(
+            &mut e,
+            &[
+                ups("/review"),
+                wrapper("review"),
+                hook("PreToolUse"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+                typed("two"),
+                ups("two"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+                hook("Stop"),
+                typed("three"),
+                ups("three"),
+                hook("Stop"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+            ],
+        );
+        assert_eq!(t[8], Status::Idle, "{t:?}");
+        assert_eq!(t[12], Status::Working, "{t:?}");
+        assert_eq!(t[13], Status::Idle, "turn three idles on its own Stop: {t:?}");
+    }
+
+    /// E2: a queued turn whose Stop comes late, then a deny-path turn (no Stop, no summary),
+    /// then another queued turn with a late Stop: that late Stop must not idle it.
+    #[test]
+    fn e2_late_stop_flag_does_not_survive_a_deny_turn() {
+        let mut e = StatusEngine::new();
+        let t = trace(
+            &mut e,
+            &[
+                ups("a"),
+                typed("a"),
+                ups("b"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+                queued("b"),
+                hook("Stop"),
+                hook("PreToolUse"),
+                hook("PermissionRequest"),
+                system("turn_duration"),
+                ups("d"),
+                typed("d"),
+                ups("e"),
+                system("stop_hook_summary"),
+                system("turn_duration"),
+                queued("e"),
+                hook("Stop"),
+                hook("PreToolUse"),
+            ],
+        );
+        assert_eq!(t[9], Status::Idle, "{t:?}");
+        assert_eq!(t[16], Status::Working, "late Stop of d must not idle queued e: {t:?}");
+    }
+}
+
+/// Systematic interleaving harness: canonical, well-formed session scripts, each delivered
+/// in many orders between the two sources (hooks and transcript keep their own order), with
+/// at most one lost `Stop` and one duplicated hook event, checked against invariants after
+/// every delivered event.
+///
+/// Delivery orders: the hook stream shifted against the transcript by -2..=+2 turns in
+/// quarter-turn steps with jitter (hooks entirely ahead or behind), or a seeded per-event
+/// random merge whose drift is bounded to [`MAX_DRIFT`] turns. `SessionStart` is always
+/// delivered first and `SessionEnd` last (no prompt can precede the first, nothing follows
+/// the second).
+///
+/// Invariants ("turn k is over" = an end event of k, or any event of a later turn, was
+/// delivered: each source delivers in order, so a later event proves the earlier turn ended):
+///
+/// - I-a: once every event of turns <= k (both sources) is delivered and none of a later
+///   turn, the status is `Idle` (`Ended` after `SessionEnd`).
+/// - I-b: while a turn's starts from both sources are delivered (hook prompt or the hook
+///   event that opens a slash / queued turn; transcript prompt, queued line or command
+///   answer) and it is not over, the status is not `Idle`. Holds with a lost `Stop` too.
+///   One relaxation, [`dup_stop_before_queued`]: a duplicated `Stop` of the turn before a
+///   queued turn.
+/// - I-c: `NeedsYou` only while a delivered `PermissionRequest` is unresolved: its
+///   `PostToolUse` not delivered and its turn not over.
+/// - I-d: a hook `Stop` delivered while no later-turn event is delivered idles the session,
+///   except at most one turn after a lost `Stop` (the `Stop` after a lost one is first taken
+///   for the lost one, late; the transcript then closes that turn).
+/// - Every run ends `Ended` (`SessionEnd` is last).
+///
+/// Local commands (`/context`) are not turns: they only have to stay `Idle` (I-a).
+#[cfg(test)]
+mod interleaving_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Scripts x interleavings per script (keep the run well under a few seconds).
+    const SCRIPTS: u64 = 200;
+    const INTERLEAVINGS: u64 = 50;
+    const MAX_TURNS: u64 = 7;
+    /// Bound on how many turns one source may run ahead of the other in a random merge.
+    const MAX_DRIFT: usize = 2;
+
+    /// xorshift64*: tiny, deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn percent(&mut self, p: u64) -> bool {
+            self.below(100) < p
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        /// Prompt, answer.
+        Plain,
+        /// Prompt, one tool call.
+        Tool,
+        /// Tool call behind an allowed permission dialog.
+        Allow,
+        /// Permission denied: no `Stop`, no `stop_hook_summary`.
+        Deny,
+        /// A second prompt mid-turn, absorbed at the tool boundary.
+        Steer,
+        /// A second prompt mid-turn, run as the next turn ([`Kind::QueuedRun`]).
+        Queued,
+        /// The queued prompt's turn: no `UserPromptSubmit`, a `queued` transcript line.
+        QueuedRun,
+        /// `/review`: a model-running slash command with a tool call.
+        Slash,
+        /// `/review` whose tool call is denied.
+        SlashDeny,
+        /// `/context` (2.1.285): no hook at all, `system` `local_command` lines.
+        Local,
+        /// `/context` from a version that fires `UserPromptSubmit` for it.
+        LocalUps,
+        /// A tool turn followed by a stray `PreToolUse` (no `agent_id`) after its `Stop`.
+        Stray,
+    }
+
+    const PICK: [Kind; 11] = [
+        Kind::Plain,
+        Kind::Tool,
+        Kind::Allow,
+        Kind::Deny,
+        Kind::Steer,
+        Kind::Queued,
+        Kind::Slash,
+        Kind::SlashDeny,
+        Kind::Local,
+        Kind::LocalUps,
+        Kind::Stray,
+    ];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        /// The hook event that opens the turn.
+        HookStart,
+        /// The transcript line that opens the turn.
+        TxStart,
+        Stop,
+        /// `stop_hook_summary` / `turn_duration`.
+        TxEnd,
+        Perm,
+        /// The `PostToolUse` answering the turn's dialog.
+        PermDone,
+        Other,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Ev {
+        input: Input,
+        turn: usize,
+        hook: bool,
+        role: Role,
+        label: String,
+    }
+
+    fn hook_ev(turn: usize, role: Role, label: &str, ev: HookEvent) -> Ev {
+        Ev { input: Input::Hook(ev), turn, hook: true, role, label: format!("H {label}") }
+    }
+    fn tx_ev(turn: usize, role: Role, label: &str, v: Value) -> Ev {
+        Ev { input: Input::Transcript(v), turn, hook: false, role, label: format!("T {label}") }
+    }
+    fn ups(text: &str) -> HookEvent {
+        HookEvent { prompt: Some(text.into()), ..HookEvent::named("UserPromptSubmit") }
+    }
+    fn tool(name: &str, id: &str) -> HookEvent {
+        HookEvent { tool_name: Some("Bash".into()), tool_use_id: Some(id.into()), ..HookEvent::named(name) }
+    }
+    fn user(source: &str, text: &str) -> Value {
+        json!({"type": "user", "origin": {"kind": "human"}, "promptSource": source, "message": {"content": text}})
+    }
+    fn assistant(stop: &str) -> Value {
+        json!({"type": "assistant", "message": {"stop_reason": stop, "content": []}})
+    }
+    fn system(subtype: &str) -> Value {
+        json!({"type": "system", "subtype": subtype})
+    }
+    fn op(operation: &str) -> Value {
+        json!({"type": "queue-operation", "operation": operation, "content": "queued"})
+    }
+    fn tool_result() -> Value {
+        json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "x"}]}})
+    }
+
+    /// One canonical turn: its hook events and its transcript lines, each in source order.
+    fn turn_events(k: usize, kind: Kind, rng: &mut Rng) -> (Vec<Ev>, Vec<Ev>) {
+        use Role::*;
+        let p = format!("prompt {k}");
+        let q = format!("prompt {}", k + 1); // the queued prompt is the next turn's
+        let id = format!("toolu_{k}");
+        let mut h = Vec::new();
+        let mut t = Vec::new();
+        let stop = |h: &mut Vec<Ev>| h.push(hook_ev(k, Stop, "Stop", HookEvent::named("Stop")));
+        let ends = |t: &mut Vec<Ev>| {
+            t.push(tx_ev(k, Other, "assistant end_turn", assistant("end_turn")));
+            t.push(tx_ev(k, TxEnd, "stop_hook_summary", system("stop_hook_summary")));
+            t.push(tx_ev(k, TxEnd, "turn_duration", system("turn_duration")));
+        };
+        let tool_use = |h: &mut Vec<Ev>, t: &mut Vec<Ev>| {
+            t.push(tx_ev(k, Other, "assistant tool_use", assistant("tool_use")));
+            h.push(hook_ev(k, Other, "PreToolUse", tool("PreToolUse", &id)));
+        };
+        let wrapper = json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "typed",
+            "message": {"content": "<command-message>review is running…</command-message>\n<command-name>/review</command-name>"}});
+        let meta = json!({"type": "user", "isMeta": true, "message": {"content": "Review the diff ..."}});
+        match kind {
+            Kind::Plain | Kind::Tool | Kind::Allow | Kind::Stray | Kind::Deny => {
+                h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
+                t.push(tx_ev(k, TxStart, "prompt", user("typed", &p)));
+                if kind != Kind::Plain {
+                    tool_use(&mut h, &mut t);
+                }
+                if matches!(kind, Kind::Allow | Kind::Deny) {
+                    h.push(hook_ev(k, Perm, "PermissionRequest", tool("PermissionRequest", &id)));
+                }
+                if kind == Kind::Deny {
+                    let interrupted = json!({"type": "user", "message": {"content": [{"type": "text",
+                        "text": "[Request interrupted by user for tool use]"}]}});
+                    t.push(tx_ev(k, Other, "interrupted", interrupted));
+                    t.push(tx_ev(k, TxEnd, "turn_duration", system("turn_duration")));
+                    return (h, t);
+                }
+                if kind != Kind::Plain {
+                    let role = if kind == Kind::Allow { PermDone } else { Other };
+                    h.push(hook_ev(k, role, "PostToolUse", tool("PostToolUse", &id)));
+                    t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                }
+                ends(&mut t);
+                stop(&mut h);
+                if kind == Kind::Stray {
+                    h.push(hook_ev(k, Other, "PreToolUse (stray)", HookEvent::named("PreToolUse")));
+                }
+            }
+            Kind::Steer => {
+                h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
+                t.push(tx_ev(k, TxStart, "prompt", user("typed", &p)));
+                tool_use(&mut h, &mut t);
+                h.push(hook_ev(k, Other, "UPS (steer)", ups(&format!("steer {k}"))));
+                t.push(tx_ev(k, Other, "enqueue", op("enqueue")));
+                t.push(tx_ev(k, Other, "remove absorbed", op("remove")));
+                h.push(hook_ev(k, Other, "PostToolUse", tool("PostToolUse", &id)));
+                t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                t.push(tx_ev(
+                    k,
+                    Other,
+                    "attachment",
+                    json!({"type": "attachment", "attachment": {"type": "queued_command"}}),
+                ));
+                ends(&mut t);
+                stop(&mut h);
+            }
+            Kind::Queued => {
+                h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
+                t.push(tx_ev(k, TxStart, "prompt", user("typed", &p)));
+                let with_tool = rng.percent(50);
+                if with_tool {
+                    tool_use(&mut h, &mut t);
+                }
+                h.push(hook_ev(k, Other, "UPS (queued)", ups(&q)));
+                t.push(tx_ev(k, Other, "enqueue", op("enqueue")));
+                if with_tool {
+                    h.push(hook_ev(k, Other, "PostToolUse", tool("PostToolUse", &id)));
+                    t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                }
+                t.push(tx_ev(k, Other, "assistant end_turn", assistant("end_turn")));
+                t.push(tx_ev(k, Other, "dequeue", op("dequeue")));
+                t.push(tx_ev(k, TxEnd, "stop_hook_summary", system("stop_hook_summary")));
+                t.push(tx_ev(k, TxEnd, "turn_duration", system("turn_duration")));
+                stop(&mut h);
+            }
+            Kind::QueuedRun => {
+                t.push(tx_ev(k, TxStart, "queued prompt", user("queued", &p)));
+                if rng.percent(50) {
+                    // The first hook event of a queued turn is what opens it in the hooks.
+                    t.push(tx_ev(k, Other, "assistant tool_use", assistant("tool_use")));
+                    h.push(hook_ev(k, HookStart, "PreToolUse", tool("PreToolUse", &id)));
+                    h.push(hook_ev(k, Other, "PostToolUse", tool("PostToolUse", &id)));
+                    t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                    ends(&mut t);
+                    stop(&mut h);
+                } else {
+                    ends(&mut t);
+                    h.push(hook_ev(k, Stop, "Stop", HookEvent::named("Stop")));
+                }
+            }
+            Kind::Slash | Kind::SlashDeny => {
+                h.push(hook_ev(k, Other, "UPS /review", ups("/review")));
+                t.push(tx_ev(k, Other, "command wrapper", wrapper));
+                t.push(tx_ev(k, Other, "isMeta prompt", meta));
+                t.push(tx_ev(k, TxStart, "assistant tool_use", assistant("tool_use")));
+                h.push(hook_ev(k, HookStart, "PreToolUse", tool("PreToolUse", &id)));
+                if kind == Kind::SlashDeny {
+                    h.push(hook_ev(k, Perm, "PermissionRequest", tool("PermissionRequest", &id)));
+                    t.push(tx_ev(k, TxEnd, "turn_duration", system("turn_duration")));
+                    return (h, t);
+                }
+                h.push(hook_ev(k, Other, "PostToolUse", tool("PostToolUse", &id)));
+                t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                ends(&mut t);
+                stop(&mut h);
+            }
+            Kind::Local | Kind::LocalUps => {
+                if kind == Kind::LocalUps {
+                    h.push(hook_ev(k, Other, "UPS /context", ups("/context")));
+                }
+                let echo = json!({"type": "system", "subtype": "local_command",
+                    "content": "<command-name>/context</command-name>\n<command-message>context</command-message>"});
+                let out = json!({"type": "system", "subtype": "local_command",
+                    "content": "<local-command-stdout>Context Usage</local-command-stdout>"});
+                let meta = json!({"type": "user", "isMeta": true, "message": {"content": "## Context Usage"}});
+                t.push(tx_ev(k, Other, "local_command echo", echo));
+                t.push(tx_ev(k, Other, "local_command stdout", out));
+                t.push(tx_ev(k, Other, "isMeta context", meta));
+            }
+        }
+        (h, t)
+    }
+
+    #[derive(Debug, Clone)]
+    struct Case {
+        kinds: Vec<Kind>,
+        mode: String,
+        lost: Option<usize>,
+        /// The duplicated hook event: its turn and label.
+        dup: Option<(usize, String)>,
+        /// Delivered events in order (`SessionStart` first, `SessionEnd` last).
+        events: Vec<Ev>,
+    }
+
+    fn script(seed: u64) -> Vec<Kind> {
+        let mut rng = Rng::new(seed);
+        let n = 2 + rng.below(MAX_TURNS - 1);
+        let mut kinds = Vec::new();
+        while (kinds.len() as u64) < n {
+            let k = PICK[rng.below(PICK.len() as u64) as usize];
+            kinds.push(k);
+            if k == Kind::Queued {
+                kinds.push(Kind::QueuedRun);
+            }
+        }
+        kinds
+    }
+
+    fn build(kinds: &[Kind], seed: u64) -> Case {
+        let mut rng = Rng::new(seed);
+        let mut hooks = Vec::new();
+        let mut txs = Vec::new();
+        for (i, kind) in kinds.iter().enumerate() {
+            let (h, t) = turn_events(i + 1, *kind, &mut rng);
+            hooks.extend(h);
+            txs.extend(t);
+        }
+        // At most one lost Stop, at most one duplicated hook event (delivered twice in a row).
+        let mut lost = None;
+        let stops: Vec<usize> = (0..hooks.len()).filter(|i| hooks[*i].role == Role::Stop).collect();
+        if !stops.is_empty() && rng.percent(25) {
+            let i = stops[rng.below(stops.len() as u64) as usize];
+            lost = Some(hooks[i].turn);
+            hooks.remove(i);
+        }
+        let mut dup = None;
+        if !hooks.is_empty() && rng.percent(25) {
+            let i = rng.below(hooks.len() as u64) as usize;
+            let mut copy = hooks[i].clone();
+            copy.label.push_str(" (dup)");
+            copy.role = Role::Other;
+            dup = Some((copy.turn, hooks[i].label.clone()));
+            hooks.insert(i + 1, copy);
+        }
+        let (mode, order) =
+            if rng.percent(40) { shifted(&hooks, &txs, &mut rng) } else { merged(&hooks, &txs, &mut rng) };
+        let start = HookEvent { source: Some("startup".into()), ..HookEvent::named("SessionStart") };
+        let mut events = vec![hook_ev(0, Role::Other, "SessionStart startup", start)];
+        events.extend(order);
+        events.push(hook_ev(kinds.len() + 1, Role::Other, "SessionEnd", HookEvent::named("SessionEnd")));
+        Case { kinds: kinds.to_vec(), mode, lost, dup, events }
+    }
+
+    /// Hooks shifted by a whole number of quarter turns against the transcript, with jitter.
+    fn shifted(hooks: &[Ev], txs: &[Ev], rng: &mut Rng) -> (String, Vec<Ev>) {
+        let quarters = rng.below(17) as i64 - 8; // -2..=+2 turns; negative: hooks ahead
+        let stamp = |evs: &[Ev], offset: i64, rng: &mut Rng| -> Vec<i64> {
+            let mut out: Vec<i64> = Vec::new();
+            for (i, e) in evs.iter().enumerate() {
+                let n = evs.iter().filter(|x| x.turn == e.turn).count() as i64;
+                let p = evs[..i].iter().filter(|x| x.turn == e.turn).count() as i64;
+                let mut ts = e.turn as i64 * 1000 + (p + 1) * 1000 / (n + 1) + offset + rng.below(150) as i64;
+                if let Some(prev) = out.last() {
+                    ts = ts.max(prev + 1);
+                }
+                out.push(ts);
+            }
+            out
+        };
+        let ht = stamp(hooks, quarters * 250, rng);
+        let tt = stamp(txs, 0, rng);
+        let (mut i, mut j) = (0, 0);
+        let mut out = Vec::new();
+        while i < hooks.len() || j < txs.len() {
+            let take_hook = j == txs.len() || (i < hooks.len() && (ht[i], rng.below(2)) < (tt[j], 1));
+            if take_hook {
+                out.push(hooks[i].clone());
+                i += 1;
+            } else {
+                out.push(txs[j].clone());
+                j += 1;
+            }
+        }
+        (format!("hooks shifted {:+} quarter turns", quarters), out)
+    }
+
+    /// Per-event random merge, drift bounded to MAX_DRIFT turns.
+    fn merged(hooks: &[Ev], txs: &[Ev], rng: &mut Rng) -> (String, Vec<Ev>) {
+        let p = 15 + rng.below(71);
+        let (mut i, mut j) = (0, 0);
+        let mut out = Vec::new();
+        while i < hooks.len() || j < txs.len() {
+            let take_hook = if i == hooks.len() {
+                false
+            } else if j == txs.len() {
+                true
+            } else if hooks[i].turn > txs[j].turn + MAX_DRIFT {
+                false
+            } else if txs[j].turn > hooks[i].turn + MAX_DRIFT {
+                true
+            } else {
+                rng.percent(p)
+            };
+            if take_hook {
+                out.push(hooks[i].clone());
+                i += 1;
+            } else {
+                out.push(txs[j].clone());
+                j += 1;
+            }
+        }
+        (format!("random merge, hook bias {p}%"), out)
+    }
+
+    /// Replays a case, checking the invariants after every event. Returns the first violation.
+    /// Checks one case; on success returns how many turns lagged (I-d's allowance).
+    fn check(case: &Case) -> Result<usize, String> {
+        let n_turns = case.kinds.len() + 2;
+        let evs = &case.events;
+        let total: Vec<usize> = (0..n_turns).map(|k| evs.iter().filter(|e| e.turn == k).count()).collect();
+        let mut seen = vec![0usize; n_turns];
+        let mut delivered = vec![false; evs.len()];
+        let mut lags: Vec<usize> = Vec::new();
+        let mut e = StatusEngine::new();
+        for (i, ev) in evs.iter().enumerate() {
+            e.apply(&ev.input);
+            delivered[i] = true;
+            seen[ev.turn] += 1;
+            let st = e.status();
+            let ended =
+                evs[..=i].iter().any(|x| matches!(&x.input, Input::Hook(h) if h.hook_event_name == "SessionEnd"));
+            let fail = |what: &str| Err(format!("{what} after event #{i} ({}): status {st:?}", ev.label));
+            if ended {
+                if st != Status::Ended {
+                    return fail("not Ended after SessionEnd");
+                }
+                continue;
+            }
+            let latest = (0..n_turns).rev().find(|k| seen[*k] > 0).unwrap_or(0);
+            // "Turn k is over": an end event of it, or any event of a later turn, delivered.
+            let over = |k: usize| {
+                latest > k || (0..=i).any(|x| evs[x].turn == k && matches!(evs[x].role, Role::Stop | Role::TxEnd))
+            };
+            let has = |k: usize, role: Role| evs.iter().any(|x| x.turn == k && x.role == role);
+            let got = |k: usize, role: Role| (0..=i).any(|x| evs[x].turn == k && evs[x].role == role);
+            // I-a
+            for k in 0..n_turns {
+                let complete = (0..=k).all(|j| seen[j] == total[j]) && (k + 1..n_turns).all(|j| seen[j] == 0);
+                if complete && st != Status::Idle {
+                    return fail(&format!("I-a: turn {k} fully delivered, nothing later"));
+                }
+            }
+            // I-b
+            for k in 1..=case.kinds.len() {
+                let kind = case.kinds[k - 1];
+                if matches!(kind, Kind::Local | Kind::LocalUps) || dup_stop_before_queued(case, k) {
+                    continue;
+                }
+                let started = (!has(k, Role::HookStart) || got(k, Role::HookStart)) && got(k, Role::TxStart);
+                if started && !over(k) && st == Status::Idle {
+                    return fail(&format!("I-b: turn {k} ({kind:?}) started in both sources and not over"));
+                }
+            }
+            // I-c
+            if st == Status::NeedsYou {
+                let open_dialog =
+                    (1..=case.kinds.len()).any(|k| got(k, Role::Perm) && !got(k, Role::PermDone) && !over(k));
+                if !open_dialog {
+                    return fail("I-c: NeedsYou without an unresolved PermissionRequest");
+                }
+            }
+            // I-d
+            if ev.hook && ev.role == Role::Stop && latest == ev.turn && st != Status::Idle {
+                lags.push(ev.turn);
+                let allowed = case.lost.is_some_and(|l| ev.turn > l) && lags.len() == 1;
+                if !allowed {
+                    return fail(&format!("I-d: Stop of turn {} did not idle (lagging turns {lags:?})", ev.turn));
+                }
+            }
+        }
+        Ok(lags.len())
+    }
+
+    /// The one relaxed case (I-b): the turn before queued turn `k` had its `Stop` delivered
+    /// twice. A duplicate carries nothing that sets it apart from the queued turn's own
+    /// `Stop` (no timestamp or event id in the payload Mirante reads, and a queued turn
+    /// without tool use shows the hooks nothing else), so the queued turn may be taken as
+    /// over until the transcript says otherwise. Erring the other way would make every
+    /// real tool-less queued turn lag.
+    fn dup_stop_before_queued(case: &Case, k: usize) -> bool {
+        case.kinds[k - 1] == Kind::QueuedRun && case.dup.as_ref().is_some_and(|(t, l)| *t + 1 == k && l == "H Stop")
+    }
+
+    fn describe(case: &Case, seed: (u64, u64), err: &str) -> String {
+        let mut e = StatusEngine::new();
+        let mut s = format!(
+            "{err}\n  seeds: script {} interleaving {} (reproduce: run_case({}, {}))\n  script: {:?}\n  mode: {}; lost Stop of turn: {:?}; duplicated hook event (turn, label): {:?}\n  delivered:\n",
+            seed.0, seed.1, seed.0, seed.1, case.kinds, case.mode, case.lost, case.dup
+        );
+        for (i, ev) in case.events.iter().enumerate() {
+            e.apply(&ev.input);
+            s.push_str(&format!(
+                "    #{i:<3} t{} {:<28} -> {:<8} (hook turn {}, transcript turn {}{}, ended {}, late {:?})\n",
+                ev.turn,
+                ev.label,
+                format!("{:?}", e.status()),
+                e.h_turn,
+                e.t_turn,
+                if e.t_open { " open" } else { "" },
+                e.ended,
+                e.late_stops
+            ));
+        }
+        s
+    }
+
+    /// Ok: (a Stop was lost, turns that lagged).
+    fn run_case(script_seed: u64, inter_seed: u64) -> Result<(bool, usize), String> {
+        let kinds = script(script_seed);
+        let case = build(&kinds, script_seed.wrapping_mul(1_000_003) ^ inter_seed);
+        check(&case)
+            .map(|lags| (case.lost.is_some(), lags))
+            .map_err(|err| describe(&case, (script_seed, inter_seed), &err))
+    }
+
+    /// `MIRANTE_HARNESS_CASE=<script seed>,<interleaving seed> cargo test reproduce_case --
+    /// --nocapture` prints one run with the engine's counters after every event.
+    #[test]
+    fn reproduce_case() {
+        let Some(spec) = std::env::var("MIRANTE_HARNESS_CASE").ok() else {
+            return;
+        };
+        let seeds: Vec<u64> = spec.split(',').map(|x| x.trim().parse().expect("seed")).collect();
+        let kinds = script(seeds[0]);
+        let case = build(&kinds, seeds[0].wrapping_mul(1_000_003) ^ seeds[1]);
+        let verdict = check(&case).err().unwrap_or_else(|| "ok".into());
+        eprintln!("{}", describe(&case, (seeds[0], seeds[1]), &verdict));
+    }
+
+    #[test]
+    fn interleavings_keep_the_invariants() {
+        // MIRANTE_HARNESS_SCALE=<n> multiplies the scripts swept (seeds stay deterministic).
+        let scale: u64 = std::env::var("MIRANTE_HARNESS_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut failures = Vec::new();
+        let (mut lost_runs, mut lagged_runs) = (0, 0);
+        for s in 0..SCRIPTS * scale {
+            for i in 0..INTERLEAVINGS {
+                match run_case(s, i) {
+                    Ok((lost, lags)) => {
+                        lost_runs += usize::from(lost);
+                        lagged_runs += usize::from(lags > 0);
+                    }
+                    Err(msg) => failures.push(msg),
+                }
+            }
+        }
+        eprintln!(
+            "{} runs; {lost_runs} with a lost Stop, {lagged_runs} of them lagged one turn",
+            SCRIPTS * scale * INTERLEAVINGS
+        );
+        if !failures.is_empty() {
+            let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+            for f in &failures {
+                let key = f.split(" after event").next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+                *kinds.entry(key).or_default() += 1;
+            }
+            if std::env::var_os("MIRANTE_HARNESS_ALL").is_some() {
+                for f in &failures {
+                    eprintln!("{}\n", f.lines().take(4).collect::<Vec<_>>().join("\n"));
+                }
+            }
+            panic!(
+                "{} of {} runs broke an invariant {kinds:?}; first:\n{}",
+                failures.len(),
+                SCRIPTS * scale * INTERLEAVINGS,
+                failures[0]
+            );
         }
     }
 }
