@@ -3,3 +3,4 @@
 //! transcript lines and Codex notifications into persisted status, turns and permissions.
 pub mod driver;
 pub mod hub;
+pub mod recover;
