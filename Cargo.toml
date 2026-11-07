@@ -1,3 +1,7 @@
 [workspace]
-members = ["crates/spike-kit", "crates/mirante-core"]
+members = [
+    "crates/spike-kit",
+    "crates/mirante-core",
+    "crates/mirante-ipc",
+]
 resolver = "2"
