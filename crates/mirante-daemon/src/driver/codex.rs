@@ -32,9 +32,12 @@
 //!   at the top of every attach stream and reported to the hub (`DriverEvent::Sandbox`,
 //!   e.g. `net:off`) for `mirante ls`.
 //! - `turn/interrupt` goes out from its own short-lived thread, naming the turn running
-//!   when it is sent: a message send waiting on a stuck request never delays it.
+//!   when it is sent: a message send waiting on a stuck request never delays it. Codex
+//!   ends the turn but not the command it was running; a command still not reported ended
+//!   after a short grace is killed with the other processes the turn started below
+//!   app-server (`command_killed`; limits in `reap_abandoned`).
 //! - Once app-server's output ended, `send` and `interrupt` fail at once.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -92,6 +95,9 @@ pub struct CodexTiming {
     pub tick: Duration,
     /// SIGTERM → SIGKILL grace when stopping.
     pub stop_grace: Duration,
+    /// How long a command an interrupted turn abandoned may take to end on its own before
+    /// Mirante kills it (see `reap_abandoned`).
+    pub abandon_grace: Duration,
 }
 
 impl Default for CodexTiming {
@@ -101,6 +107,7 @@ impl Default for CodexTiming {
             settle_after: SETTLE_AFTER,
             tick: Duration::from_secs(1),
             stop_grace: Duration::from_secs(3),
+            abandon_grace: Duration::from_secs(2),
         }
     }
 }
@@ -614,6 +621,13 @@ struct Shared {
     rate_limits: Option<Value>,
     token_usage: Option<Value>,
     closed: bool,
+    /// The app-server's descendants when the running turn started: a process not among
+    /// them was started during the turn.
+    turn_baseline: Option<HashSet<Proc>>,
+    /// Commands an interrupted turn abandoned, set by `settle` for `on_incoming` to act on.
+    reap_due: Option<Vec<String>>,
+    /// Abandoned command ids Codex has not reported ended yet.
+    abandoned_open: HashSet<String>,
 }
 
 impl Shared {
@@ -650,8 +664,12 @@ impl Shared {
                 out.push(DriverEvent::PermissionResolved { key });
             }
         }
-        for _ in 0..self.engine.take_abandoned() {
+        let (abandoned, interrupted) = self.engine.take_abandoned();
+        for _ in &abandoned {
             self.output("  [command abandoned]\r\n");
+        }
+        if interrupted && !abandoned.is_empty() {
+            self.reap_due = Some(abandoned);
         }
         let now = (self.engine.status(), self.engine.turn_open(), self.engine.detail());
         if now != self.reported {
@@ -684,6 +702,58 @@ struct Ctx {
     sink: Sink,
     conn: OnceLock<Arc<RpcConn>>,
     process: Option<Arc<Process>>,
+    abandon_grace: Duration,
+}
+
+/// Codex's `turn/interrupt` ends the turn but not the command it was running (0.167: a
+/// `sleep 30` ran to its end under app-server). After `ctx.abandon_grace`, if Codex still
+/// has not reported one of the abandoned commands ended, the processes that were started
+/// during the turn (descendants of app-server absent from the turn's baseline, still the
+/// same process by pid AND start time) and are still running are killed, each with its own
+/// tree, and `command_killed` is reported. Never app-server itself, never a process older
+/// than the turn, never one started after the interrupt (a next turn's).
+///
+/// Limits: Codex says nothing about which process runs which command, so everything the
+/// turn started below app-server goes, including a helper it launched lazily during that
+/// turn (an MCP server started on first use); nothing happens without a known app-server
+/// process (tests over pipes) or a baseline (a turn already running when Mirante connected).
+fn reap_abandoned(ctx: &Ctx, s: &mut Shared, ids: Vec<String>) {
+    let (Some(root), Some(baseline)) = (ctx.process.as_ref().and_then(|p| p.root), s.turn_baseline.take()) else {
+        return;
+    };
+    let started: Vec<Proc> =
+        proctree::descendants(root).into_iter().filter(|p| *p != root && !baseline.contains(p)).collect();
+    if started.is_empty() {
+        return;
+    }
+    s.abandoned_open.extend(ids.iter().cloned());
+    let (shared, sink, grace) = (ctx.shared.clone(), ctx.sink.clone(), ctx.abandon_grace);
+    std::thread::spawn(move || {
+        std::thread::sleep(grace);
+        let still: Vec<String> = {
+            let mut s = lock(&shared);
+            let still = ids.iter().filter(|id| s.abandoned_open.remove(*id)).cloned().collect();
+            if s.closed {
+                return;
+            }
+            still
+        };
+        if still.is_empty() {
+            return;
+        }
+        let victims: Vec<Proc> = started.into_iter().filter(|p| p.pid != root.pid && proctree::alive(*p)).collect();
+        if victims.is_empty() {
+            return;
+        }
+        let pids: Vec<i32> = victims.iter().map(|p| p.pid).collect();
+        for v in &victims {
+            proctree::kill_tree(*v, Duration::from_millis(500), &Kill);
+        }
+        let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+        lock(&shared)
+            .output(&format!("  [command killed: Codex left it running after the interrupt (pid {list})]\r\n"));
+        sink.emit(DriverEvent::Step(json!({ "type": "command_killed", "items": still, "pids": pids })));
+    });
 }
 
 fn on_incoming(ctx: &Ctx, incoming: Incoming) {
@@ -695,6 +765,15 @@ fn on_incoming(ctx: &Ctx, incoming: Incoming) {
             let ours = params["threadId"].as_str().is_none_or(|t| Some(t) == s.thread_id.as_deref());
             if method == "item/started" && item["type"] == "fileChange" {
                 s.remember_file_item(item);
+            }
+            if ours && method == "turn/started" {
+                let root = ctx.process.as_ref().and_then(|p| p.root);
+                s.turn_baseline = root.map(|r| proctree::descendants(r).into_iter().collect());
+            }
+            if method == "item/completed" && item["type"] == "commandExecution" {
+                if let Some(id) = item["id"].as_str() {
+                    s.abandoned_open.remove(id);
+                }
             }
             match method.as_str() {
                 "account/rateLimits/updated" => s.rate_limits = Some(params["rateLimits"].clone()),
@@ -728,6 +807,9 @@ fn on_incoming(ctx: &Ctx, incoming: Incoming) {
                 }
             }
             s.settle(t.map_or_else(|| format!("codex:{method}"), |t| t.cause), &mut out);
+            if let Some(ids) = s.reap_due.take() {
+                reap_abandoned(ctx, &mut s, ids);
+            }
         }
         Incoming::Request { id, method, params } if APPROVAL_METHODS.contains(&method.as_str()) => {
             let key = request_key(&id);
@@ -925,12 +1007,16 @@ impl CodexDriver {
             rate_limits: None,
             token_usage: None,
             closed: false,
+            turn_baseline: None,
+            reap_due: None,
+            abandoned_open: HashSet::new(),
         }));
         let ctx = Arc::new(Ctx {
             shared: shared.clone(),
             sink: sink.clone(),
             conn: OnceLock::new(),
             process: process.clone(),
+            abandon_grace: timing.abandon_grace,
         });
         let c2 = ctx.clone();
         let conn = RpcConn::start(reader, writer, move |i| on_incoming(&c2, i));
@@ -1207,6 +1293,7 @@ mod tests {
             settle_after: Duration::from_millis(300),
             tick: Duration::from_millis(20),
             stop_grace: Duration::from_secs(2),
+            abandon_grace: Duration::from_millis(400),
         }
     }
 
@@ -1728,6 +1815,84 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+
+    /// A fake app-server that runs one command for turn `tu-1` (`cmd`, started 300 ms after
+    /// `turn/started`, its pid written to `pids`) and answers `turn/interrupt` with an
+    /// interrupted `turn/completed`; `after` runs then. It also starts a helper before the
+    /// turn (pid on the second line), which must never be touched.
+    fn interrupt_script(pids: &Path, cmd: &str, after: &str) -> String {
+        let p = pids.display();
+        format!(
+            "sleep 60 & echo $! > {p}.pre\n\
+             read l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"turn\":{{\"id\":\"tu-1\"}}}}}}'\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{{\"threadId\":\"th-1\",\"turn\":{{\"id\":\"tu-1\"}}}}}}'\n\
+             sleep 0.3\n\
+             {cmd} & echo $! > {p}\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/started\",\"params\":{{\"threadId\":\"th-1\",\"turnId\":\"tu-1\",\"item\":{{\"type\":\"commandExecution\",\"id\":\"c1\",\"command\":\"sleep 30\"}}}}}}'\n\
+             read l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{}}}}'\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"th-1\",\"turn\":{{\"id\":\"tu-1\",\"status\":\"interrupted\"}}}}}}'\n\
+             {after}\n\
+             while :; do sleep 0.1; done"
+        )
+    }
+
+    fn pid_in(file: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(file).ok().and_then(|t| t.trim().parse().ok()) {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "{} never written", file.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn an_interrupt_kills_the_command_codex_leaves_running_and_nothing_else() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        let (d, rx) = spawn_fake(dir.path(), &interrupt_script(&pids, "sleep 30", ""));
+        let root = d.root().expect("spawned");
+        let pre = proctree::proc_of(pid_in(&pids.with_extension("pre"))).unwrap();
+        d.send("go").unwrap();
+        let cmd = proctree::proc_of(pid_in(&pids)).unwrap();
+        next_event(&rx, status_to(Status::Working));
+        d.interrupt().unwrap();
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "command_killed"));
+        let DriverEvent::Step(v) = ev else { unreachable!() };
+        assert_eq!(v["items"], json!(["c1"]));
+        assert!(v["pids"].as_array().unwrap().contains(&json!(cmd.pid)), "{v}");
+        assert!(!v["pids"].as_array().unwrap().contains(&json!(root.pid)), "{v}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proctree::alive(cmd) {
+            assert!(Instant::now() < deadline, "the abandoned command survived");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(proctree::alive(root), "app-server itself is never killed");
+        assert!(proctree::alive(pre), "a process older than the turn is never killed");
+        assert!(d.screen_tail().contains("[command killed"), "{}", d.screen_tail());
+        d.stop();
+    }
+
+    #[test]
+    fn a_command_that_finishes_within_the_grace_is_left_alone() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        let done = "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"item/completed\",\"params\":{\"threadId\":\"th-1\",\"turnId\":\"tu-1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"c1\",\"exitCode\":0}}}'";
+        // A process of the turn that keeps running (e.g. a server the command started) is
+        // not killed once Codex said the command ended.
+        let (d, rx) = spawn_fake(dir.path(), &interrupt_script(&pids, "sleep 30", done));
+        let root = d.root().expect("spawned");
+        d.send("go").unwrap();
+        let cmd = proctree::proc_of(pid_in(&pids)).unwrap();
+        next_event(&rx, status_to(Status::Working));
+        d.interrupt().unwrap();
+        std::thread::sleep(timing().abandon_grace + Duration::from_millis(600));
+        let killed = rx.try_iter().any(|(_, e)| matches!(e, DriverEvent::Step(ref v) if v["type"] == "command_killed"));
+        assert!(!killed);
+        assert!(proctree::alive(cmd) && proctree::alive(root));
+        d.stop();
     }
 
     #[test]

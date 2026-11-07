@@ -80,7 +80,9 @@ pub struct CodexEngine {
     settle_after: Duration,
     error: Option<String>,
     resolved: Vec<String>,
-    abandoned: usize,
+    /// Ids of the commands the last interrupted / failed turn abandoned, and whether it was
+    /// interrupted (not failed).
+    abandoned: (Vec<String>, bool),
 }
 
 impl Default for CodexEngine {
@@ -117,7 +119,7 @@ impl CodexEngine {
             settle_after,
             error: None,
             resolved: Vec::new(),
-            abandoned: 0,
+            abandoned: (Vec::new(), false),
         }
     }
 
@@ -147,8 +149,9 @@ impl CodexEngine {
         std::mem::take(&mut self.resolved)
     }
 
-    /// Commands abandoned by the last interrupted / failed turn.
-    pub fn take_abandoned(&mut self) -> usize {
+    /// Commands abandoned by the last interrupted / failed turn (their item ids, sorted),
+    /// and whether that turn was interrupted.
+    pub fn take_abandoned(&mut self) -> (Vec<String>, bool) {
         std::mem::take(&mut self.abandoned)
     }
 
@@ -243,7 +246,9 @@ impl CodexEngine {
                         self.turn = None;
                         match turn["status"].as_str() {
                             Some("interrupted" | "failed") => {
-                                self.abandoned = self.open_commands.len();
+                                let mut ids: Vec<String> = self.open_commands.iter().cloned().collect();
+                                ids.sort();
+                                self.abandoned = (ids, turn["status"] == "interrupted");
                                 self.close_commands();
                                 if turn["status"] == "failed" {
                                     let why = error_text(&turn["error"]).unwrap_or_else(|| "no reason given".into());
@@ -410,7 +415,10 @@ mod tests {
         e.apply(&n("item/started", &json!({"threadId": "th1", "item": {"type": "commandExecution", "id": "c1"}})), t0);
         let stop = json!({"threadId": "th1", "turn": {"id": "tu1", "status": "interrupted"}});
         assert_eq!(e.apply(&n("turn/completed", &stop), t0).unwrap().to, Status::Idle);
-        assert_eq!((e.take_abandoned(), e.background_commands(), e.detail()), (1, 0, None));
+        assert_eq!(
+            (e.take_abandoned(), e.background_commands(), e.detail()),
+            ((vec!["c1".to_string()], true), 0, None)
+        );
         e.apply(&n("turn/started", &json!({"threadId": "th1", "turn": {"id": "tu2"}})), t0);
         let failed = json!({"threadId": "th1", "turn": {"id": "tu2", "status": "failed",
             "error": {"message": "quota", "codexErrorInfo": "usageLimitExceeded"}}});

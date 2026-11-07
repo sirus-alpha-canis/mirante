@@ -371,6 +371,8 @@ impl State {
                 self.event(Some(task_id), "boot", json!({ "session_id": session_id, "state": state }))?;
                 self.kick(task_id)
             }
+            // Audited under its own kind: Mirante killed processes (Codex left them running).
+            DriverEvent::Step(v) if v["type"] == "command_killed" => self.event(Some(task_id), "command_killed", v),
             DriverEvent::Step(v) => self.event(Some(task_id), "step", v),
             DriverEvent::Exited { code } => {
                 self.event(Some(task_id), "process_exited", json!({ "session_id": session_id, "code": code }))?;
@@ -976,6 +978,16 @@ mod tests {
         let events = k.hub.lock().store.task_events(task).unwrap();
         let ended = events.iter().rev().find(|e| e.kind == "status" && e.payload["to"] == json!("ended")).unwrap();
         ended.payload["cause"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_killed_command_is_its_own_event() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "x").task.id;
+        k.emit(DriverEvent::Step(json!({ "type": "command_killed", "items": ["c1"], "pids": [42] })));
+        let ev = k.hub.lock().store.task_events(&t).unwrap();
+        let e = ev.iter().find(|e| e.kind == "command_killed").expect("command_killed");
+        assert_eq!(e.payload["pids"], json!([42]));
     }
 
     #[test]
