@@ -1,6 +1,7 @@
 //! Session lifecycle: start / resume (one live session per task), boot and trust, stop,
 //! and every input that moves a session's status: hook events (Claude, via `hook.event`)
 //! and driver events (transcript lines, Codex status, approvals, exit).
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,12 +10,49 @@ use mirante_core::hook::HookEvent;
 use mirante_core::model::{AgentKind, Lifecycle, PermissionStatus, Status};
 use mirante_core::status::{is_sidechain, Input};
 use mirante_ipc::types::{
-    AttachParams, BootState, HookParams, SendMode, StartResult, StartSession, TaskView, TrustAnswer,
+    AttachParams, BootState, HookEnvelope, HookParams, SendMode, StartResult, StartSession, TaskView, TrustAnswer,
 };
 use serde_json::{json, Value};
 
-use super::{EventRx, Hub, HubError, Live, Result, State};
+use super::{DialogKey, EventRx, Hub, HubError, Live, Result, State};
 use crate::driver::{Attachment, Driver, DriverEvent, Sink, SpawnRequest};
+
+/// How many hook `event_id`s the hub remembers for dedupe.
+pub(crate) const HOOK_DEDUPE_WINDOW: usize = 1024;
+
+/// A bounded set of recently seen hook event ids (oldest forgotten first).
+#[derive(Debug, Default)]
+pub(crate) struct SeenHooks {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl SeenHooks {
+    /// False when `id` was already seen (inside the window).
+    pub(crate) fn insert(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return false;
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        while self.order.len() > HOOK_DEDUPE_WINDOW {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+}
 
 /// (task id, session id, driver) of a live session.
 type LiveRef = (String, String, Option<Arc<dyn Driver>>);
@@ -45,7 +83,7 @@ impl State {
         let Some(l) = self.live.get_mut(task_id) else {
             return Ok(());
         };
-        if l.boot != BootState::Ready || status != Status::Idle || l.queue.is_empty() {
+        if l.boot != BootState::Ready || status != Status::Idle || l.queue.is_empty() || l.delivering() {
             return Ok(());
         }
         let Some(driver) = l.driver.clone() else {
@@ -53,7 +91,10 @@ impl State {
         };
         let text = l.queue.pop_front().expect("not empty");
         match driver.send(&text) {
-            Ok(()) => self.event(Some(task_id), "message_sent", json!({ "mode": SendMode::Queue, "text": text })),
+            Ok(()) => {
+                l.delivery_in_flight = Some(Instant::now());
+                self.event(Some(task_id), "message_sent", json!({ "mode": SendMode::Queue, "text": text }))
+            }
             Err(e) => {
                 if let Some(l) = self.live.get_mut(task_id) {
                     l.queue.push_front(text);
@@ -116,8 +157,11 @@ impl State {
     }
 
     /// Persists a status change and the turn records, then runs what a change implies:
-    /// leaving `NeedsYou` settles the pending requests the agent moved past; reaching
-    /// `Idle` classifies Claude steers and delivers the next queued message.
+    /// leaving `NeedsYou` because the turn ended (or was interrupted) settles the requests
+    /// still pending; reaching `Idle` classifies Claude steers and delivers the next queued
+    /// message. Leaving it because Mirante answered (`mirante:permission_*` /
+    /// `mirante:approval_*`, already persisted) or because a tool ran (`hook:PostToolUse`,
+    /// which settles only its own card) settles nothing else.
     pub(crate) fn after_input(
         &mut self,
         task_id: &str,
@@ -129,7 +173,12 @@ impl State {
         }
         self.sync_turn(task_id, turn_open)?;
         if let Some((from, to, cause)) = transition {
-            if from == Status::NeedsYou && to != Status::NeedsYou {
+            // Mirante's own answer (Claude: `mirante:permission_*`; Codex driver:
+            // `mirante:approval_answered`) is already persisted; a tool run settles its card.
+            let targeted = cause.starts_with("mirante:permission_")
+                || cause.starts_with("mirante:approval_")
+                || cause == "hook:PostToolUse";
+            if from == Status::NeedsYou && to != Status::NeedsYou && !targeted {
                 self.settle_permissions(task_id, &cause)?;
             }
             if to == Status::Idle {
@@ -156,29 +205,49 @@ impl State {
         Ok(())
     }
 
-    /// The status left `NeedsYou` without Mirante answering: the user answered in the
-    /// attached terminal, or the agent moved on. A `PostToolUse` means the tool ran
-    /// (allowed); anything else (turn end, interrupt) means it did not (denied).
+    /// The turn ended (or was interrupted) with requests still pending: the agent moved on
+    /// without running their tools, so each one is settled as denied.
     fn settle_permissions(&mut self, task_id: &str, cause: &str) -> Result<()> {
         let Some(session_id) = self.live.get(task_id).map(|l| l.session_id.clone()) else {
             return Ok(());
         };
-        let answer = if cause == "hook:PostToolUse" { PermissionStatus::AllowedOnce } else { PermissionStatus::Denied };
         for p in self.store.pending_permissions(task_id)? {
-            if p.session_id != session_id {
-                continue;
+            if p.session_id == session_id {
+                self.settle_card(task_id, &p.id, PermissionStatus::Denied, cause)?;
             }
-            self.store.answer_permission(&p.id, answer)?;
-            if let Some(l) = self.live.get_mut(task_id) {
-                l.perm_keys.remove(&p.id);
-            }
-            self.event(
-                Some(task_id),
-                "permission_settled",
-                json!({ "permission_id": p.id, "answer": answer, "cause": cause }),
-            )?;
         }
         Ok(())
+    }
+
+    /// A `PostToolUse` of the live Claude session: the tool behind the oldest matching card
+    /// ran, so the user allowed it (in the attached terminal).
+    fn settle_tool_ran(&mut self, task_id: &str, session_id: &str, ev: &HookEvent) -> Result<()> {
+        let Some(l) = self.live.get(task_id) else {
+            return Ok(());
+        };
+        let card = self
+            .store
+            .pending_permissions(task_id)?
+            .into_iter()
+            .filter(|p| p.session_id == session_id)
+            .find(|p| l.dialogs.get(&p.id).is_some_and(|k| k.answered_by(ev)));
+        match card {
+            Some(p) => self.settle_card(task_id, &p.id, PermissionStatus::AllowedOnce, "hook:PostToolUse"),
+            None => Ok(()),
+        }
+    }
+
+    fn settle_card(&mut self, task_id: &str, id: &str, answer: PermissionStatus, cause: &str) -> Result<()> {
+        self.store.answer_permission(id, answer)?;
+        if let Some(l) = self.live.get_mut(task_id) {
+            l.perm_keys.remove(id);
+            l.dialogs.remove(id);
+        }
+        self.event(
+            Some(task_id),
+            "permission_settled",
+            json!({ "permission_id": id, "answer": answer, "cause": cause }),
+        )
     }
 
     fn handle(&mut self, task_id: &str, session_id: &str, event: DriverEvent) -> Result<()> {
@@ -253,6 +322,9 @@ impl Hub {
             if st.live.contains_key(&task.id) {
                 return Err(HubError::Conflict(format!("task {} already has a live session", task.branch)));
             }
+            if st.archiving.contains(&task.id) {
+                return Err(HubError::Conflict(format!("task {} is being archived", task.branch)));
+            }
             // Resume continues the latest conversation; a plain start opens a fresh one
             // unless the latest never got a native id (nothing to lose).
             let latest = st.store.latest_conversation(&task.id)?;
@@ -262,17 +334,26 @@ impl Hub {
             };
             let native = if resume { conversation.native_session_id.clone() } else { None };
             let session = st.store.start_session(&task.id, &conversation.id)?;
-            st.set_status(&task.id, Status::Idle, "mirante:session_started")?;
+            let launched = st.set_status(&task.id, Status::Idle, "mirante:session_started").and_then(|()| {
+                st.event(
+                    Some(&task.id),
+                    "session_launch",
+                    json!({ "session_id": session.id, "resume": native, "resume_requested": resume }),
+                )
+            });
+            if let Err(e) = launched {
+                // Nothing is live yet: release the per-task lock and fail.
+                if let Err(undo) = st.store.end_session(&session.id) {
+                    st.log_error(Some(&task.id), "session.start rollback", &undo);
+                }
+                st.publish();
+                return Err(e);
+            }
             let mut live = Live::new(&session.id, task.agent, native.clone());
             if let Some(p) = req.prompt.filter(|p| !p.trim().is_empty()) {
                 live.queue.push_back(p);
             }
             st.live.insert(task.id.clone(), live);
-            st.event(
-                Some(&task.id),
-                "session_launch",
-                json!({ "session_id": session.id, "resume": native, "resume_requested": resume }),
-            )?;
             st.publish();
             (task, session.id, native)
         };
@@ -286,11 +367,21 @@ impl Hub {
         match self.factory.spawn(req, sink) {
             Ok(driver) => {
                 let mut st = self.lock();
-                if let Some(l) = st.live.get_mut(&task.id).filter(|l| l.session_id == session_id) {
-                    l.driver = Some(driver);
+                let attached = match st.live.get_mut(&task.id).filter(|l| l.session_id == session_id) {
+                    Some(l) => {
+                        l.driver = Some(driver.clone());
+                        true
+                    }
+                    None => false,
+                };
+                if attached {
+                    st.kick(&task.id)?;
+                    st.publish();
+                } else {
+                    // Stopped while the agent was spawning: nobody owns this process.
+                    drop(st);
+                    driver.stop();
                 }
-                st.kick(&task.id)?;
-                st.publish();
             }
             Err(e) => {
                 let mut st = self.lock();
@@ -410,11 +501,25 @@ impl Hub {
         st.publish();
     }
 
-    /// One Claude hook payload (from `mirante-hook`). Records the native session id and the
-    /// transcript path (starting the tailer), persists permission requests, and feeds the
-    /// status engine. A payload for a task without a live Claude session is only logged.
+    /// One Claude hook payload without an event id (see [`Hub::apply_hook_envelope`]).
     pub fn apply_hook(&self, p: HookParams) -> Result<()> {
+        self.apply_hook_envelope(HookEnvelope { params: p, event_id: None, received_ts_ms: None, truncated: None })
+    }
+
+    /// One Claude hook payload as `mirante-hook` sends it (`hook.event`). An `event_id`
+    /// already seen is dropped (the hook may deliver an event and also spool it). Records
+    /// the native session id and the transcript path (starting the tailer), persists
+    /// permission requests, and feeds the status engine. A payload for a task without a
+    /// live Claude session, or (once the native session id is known) from another native
+    /// session, is only logged.
+    pub fn apply_hook_envelope(&self, e: HookEnvelope) -> Result<()> {
         let mut st = self.lock();
+        if let Some(id) = &e.event_id {
+            if !st.seen_hooks.insert(id) {
+                return Ok(());
+            }
+        }
+        let p = e.params;
         let ev = match HookEvent::parse(&p.payload) {
             Ok(ev) => ev,
             Err(e) => {
@@ -430,6 +535,17 @@ impl Hub {
             return Ok(());
         };
         let session_id = live.session_id.clone();
+        let native = live.native_id.clone();
+        if ev.hook_event_name != "SessionStart" {
+            if let (Some(known), Some(sid)) = (native.as_deref(), ev.session_id.as_deref()) {
+                if known != sid {
+                    let payload = json!({ "hook": ev.hook_event_name, "session_id": sid, "native_id": known });
+                    st.event(Some(&p.task), "hook_orphan", payload)?;
+                    st.publish();
+                    return Ok(());
+                }
+            }
+        }
         if ev.hook_event_name == "SessionStart" {
             if let Some(sid) = &ev.session_id {
                 st.set_native_id(&p.task, &session_id, sid)?;
@@ -439,10 +555,13 @@ impl Hub {
             st.follow_transcript(&p.task, &session_id, &path)?;
         }
         if ev.hook_event_name == "PermissionRequest" {
-            let tool = ev.tool_name.clone().unwrap_or_else(|| "unknown".into());
-            st.store.create_permission_request(&session_id, &tool, &ev.permission_detail())?;
+            st.open_card(&p.task, &session_id, &ev)?;
         }
-        st.feed_claude(&p.task, &Input::Hook(ev))?;
+        let tool_ran = ev.hook_event_name == "PostToolUse";
+        st.feed_claude(&p.task, &Input::Hook(ev.clone()))?;
+        if tool_ran {
+            st.settle_tool_ran(&p.task, &session_id, &ev)?;
+        }
         st.publish();
         Ok(())
     }
@@ -478,6 +597,28 @@ impl Hub {
 }
 
 impl State {
+    /// Persists the card for a Claude `PermissionRequest` and remembers which tool call it
+    /// is about. A repeat of a dialog that already has a pending card adds none.
+    fn open_card(&mut self, task_id: &str, session_id: &str, ev: &HookEvent) -> Result<()> {
+        let Some(l) = self.live.get(task_id) else {
+            return Ok(());
+        };
+        let key = DialogKey {
+            agent: ev.agent_id.clone(),
+            tool_use_id: l.engine.tool_use_id_for(ev),
+            tool_name: ev.tool_name.clone(),
+        };
+        if key.tool_use_id.is_some() && l.dialogs.values().any(|k| *k == key) {
+            return Ok(());
+        }
+        let tool = ev.tool_name.clone().unwrap_or_else(|| "unknown".into());
+        let card = self.store.create_permission_request(session_id, &tool, &ev.permission_detail())?;
+        if let Some(l) = self.live.get_mut(task_id) {
+            l.dialogs.insert(card.id, key);
+        }
+        Ok(())
+    }
+
     /// Starts tailing a transcript the first time a hook names it. A file that already
     /// exists (a resumed session appends to the same file) is tailed from its end, so old
     /// turns are not replayed into the fresh engine; the persisted offset wins when the
@@ -530,8 +671,24 @@ impl super::testkit::Kit {
             .unwrap();
     }
 
+    /// A hook as `mirante-hook` sends it: with an event id.
+    pub fn hook_env(&self, task_id: &str, payload: Value, event_id: &str) {
+        self.hub
+            .apply_hook_envelope(mirante_ipc::types::HookEnvelope {
+                params: HookParams { task: task_id.into(), payload: payload.to_string(), ts_ms: 0 },
+                event_id: Some(event_id.into()),
+                received_ts_ms: None,
+                truncated: None,
+            })
+            .unwrap();
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.factory.driver.calls()
+    }
+
+    pub fn pending(&self, task_id: &str) -> Vec<mirante_core::model::PermissionRequest> {
+        self.hub.lock().store.pending_permissions(task_id).unwrap()
     }
 }
 
@@ -764,6 +921,184 @@ mod tests {
         assert_eq!(a.initial, b"screen");
         assert_eq!(a.output.recv().unwrap(), b"live");
         assert!(k.calls().contains(&"attach:30x100".to_string()));
+    }
+
+    fn tool(name: &str, id: &str) -> Value {
+        json!({"hook_event_name": name, "tool_name": "Bash", "tool_use_id": id})
+    }
+
+    fn perm(id: &str, cmd: &str) -> Value {
+        json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": id,
+            "tool_input": {"command": cmd}})
+    }
+
+    /// Started Claude task with two dialogs open (t1 "older", then t2 "newer").
+    fn two_dialogs(k: &Kit) -> String {
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "go"}));
+        k.emit(DriverEvent::Transcript(
+            json!({"type": "user", "origin": {"kind": "human"}, "message": {"content": "go"}}),
+        ));
+        k.hook(&t.id, tool("PreToolUse", "t1"));
+        k.hook(&t.id, perm("t1", "older"));
+        k.hook(&t.id, tool("PreToolUse", "t2"));
+        k.hook(&t.id, perm("t2", "newer"));
+        assert_eq!(status(k, &t.id), Status::NeedsYou);
+        assert_eq!(k.pending(&t.id).len(), 2);
+        t.id
+    }
+
+    fn settled(k: &Kit, task: &str) -> Vec<(String, Value)> {
+        let st = k.hub.lock();
+        st.store
+            .task_events(task)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "permission_settled")
+            .map(|e| (e.payload["permission_id"].as_str().unwrap().to_string(), e.payload["answer"].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn post_tool_use_settles_only_the_matching_card() {
+        let k = Kit::new();
+        let t = two_dialogs(&k);
+        let older = k.pending(&t)[0].id.clone();
+        // The user allowed the older dialog inside `mirante attach`: its tool ran.
+        k.hook(&t, tool("PostToolUse", "t1"));
+        let left = k.pending(&t);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].detail, "newer");
+        assert_eq!(status(&k, &t), Status::NeedsYou);
+        assert_eq!(settled(&k, &t), vec![(older, json!(PermissionStatus::AllowedOnce))]);
+        k.hook(&t, tool("PostToolUse", "t2"));
+        assert!(k.pending(&t).is_empty());
+        assert_eq!(status(&k, &t), Status::Working);
+    }
+
+    #[test]
+    fn a_mirante_answer_never_settles_the_other_cards() {
+        let k = Kit::new();
+        let t = two_dialogs(&k);
+        // Whatever the engine says, a status change caused by Mirante's own answer must not
+        // settle the cards Mirante did not answer.
+        k.hub
+            .lock()
+            .after_input(&t, Some((Status::NeedsYou, Status::Working, "mirante:permission_allowed".into())), true)
+            .unwrap();
+        assert_eq!(k.pending(&t).len(), 2);
+        assert!(settled(&k, &t).is_empty());
+    }
+
+    #[test]
+    fn a_codex_status_change_from_mirantes_own_answer_settles_no_other_card() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        for key in ["1", "2"] {
+            k.emit(DriverEvent::PermissionRequested { key: key.into(), tool: "command".into(), detail: key.into() });
+        }
+        let status = |to, cause: &str| DriverEvent::Status { to, cause: cause.into(), turn_open: true, detail: None };
+        k.emit(status(Status::NeedsYou, "codex:approval_requested"));
+        k.emit(status(Status::Working, "mirante:approval_answered"));
+        assert_eq!(k.pending(&t.id).len(), 2);
+        // The turn ending is what settles whatever is left.
+        k.emit(status(Status::NeedsYou, "codex:approval_requested"));
+        k.emit(status(Status::Working, "codex:turn/completed"));
+        assert!(k.pending(&t.id).is_empty());
+    }
+
+    #[test]
+    fn the_turn_end_settles_every_remaining_card_as_denied() {
+        let k = Kit::new();
+        let t = two_dialogs(&k);
+        k.emit(DriverEvent::Transcript(json!({"type": "system", "subtype": "turn_duration"})));
+        assert_eq!(status(&k, &t), Status::Idle);
+        assert!(k.pending(&t).is_empty());
+        let s = settled(&k, &t);
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|(_, a)| *a == json!(PermissionStatus::Denied)));
+    }
+
+    #[test]
+    fn a_hook_event_delivered_twice_is_applied_once() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook_env(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "go"}), "e1");
+        k.hook_env(&t.id, perm("t1", "ls"), "e2");
+        k.hook_env(&t.id, perm("t1", "ls"), "e2");
+        assert_eq!(k.pending(&t.id).len(), 1);
+        // No event id (an old hook binary): applied as before.
+        k.hook(&t.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t1"}));
+        assert_eq!(status(&k, &t.id), Status::Working);
+    }
+
+    #[test]
+    fn the_hook_dedupe_window_is_bounded() {
+        let mut seen = SeenHooks::default();
+        assert!(seen.insert("first"));
+        assert!(!seen.insert("first"));
+        for i in 0..HOOK_DEDUPE_WINDOW {
+            assert!(seen.insert(&format!("e{i}")));
+        }
+        assert_eq!(seen.len(), HOOK_DEDUPE_WINDOW);
+        // The oldest id fell out of the window.
+        assert!(seen.insert("first"));
+    }
+
+    #[test]
+    fn hooks_of_another_native_session_are_dropped_once_the_native_id_is_known() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        // Before the native id is known nothing is dropped.
+        k.hook(&t.id, json!({"hook_event_name": "SessionStart", "session_id": "nat-1", "source": "startup"}));
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "session_id": "stray", "prompt": "x"}));
+        assert_eq!(status(&k, &t.id), Status::Idle);
+        assert!(k.kinds(&t.id).contains(&"hook_orphan".to_string()));
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "session_id": "nat-1", "prompt": "x"}));
+        assert_eq!(status(&k, &t.id), Status::Working);
+        // A SessionStart always passes: `/clear` starts a new native session.
+        k.hook(&t.id, json!({"hook_event_name": "SessionStart", "session_id": "nat-2", "source": "clear"}));
+        assert_eq!(k.hub.lock().live[&t.id].native_id.as_deref(), Some("nat-2"));
+        // Hooks without a session id are kept.
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "y"}));
+        assert_eq!(status(&k, &t.id), Status::Working);
+    }
+
+    #[test]
+    fn stop_during_spawn_stops_the_late_driver() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Codex, "a").task;
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *k.factory.spawn_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let hub = k.hub.clone();
+        let id = t.id.clone();
+        let starter = std::thread::spawn(move || {
+            hub.start_session(StartSession { task: id, prompt: None }, false).map(|r| r.boot)
+        });
+        entered.recv().unwrap();
+        let v = k.hub.stop(&t.id).unwrap();
+        assert_eq!((v.task.status, v.live), (Status::Ended, false));
+        release.send(()).unwrap();
+        let boot = starter.join().unwrap();
+        assert!(matches!(boot, Ok(BootState::Exited) | Err(_)), "{boot:?}");
+        assert_eq!(k.calls(), vec!["stop".to_string()]);
+        assert_eq!(k.hub.status().live_sessions, 0);
+        // The per-task lock is free again.
+        assert!(k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).is_ok());
+    }
+
+    #[test]
+    fn start_is_refused_while_the_task_is_being_archived() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "a").task;
+        k.hub.lock().archiving.insert(t.id.clone());
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false);
+        assert!(matches!(r, Err(HubError::Conflict(_))), "{:?}", r.err());
+        assert!(matches!(k.hub.archive(&t.id), Err(HubError::Conflict(_))));
+        k.hub.lock().archiving.clear();
+        k.hub.archive(&t.id).unwrap();
+        assert!(k.hub.lock().archiving.is_empty());
     }
 
     #[test]

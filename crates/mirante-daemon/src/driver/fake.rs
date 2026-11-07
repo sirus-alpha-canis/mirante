@@ -80,6 +80,9 @@ pub struct FakeFactory {
     pub sinks: Mutex<Vec<Sink>>,
     pub resumes: Mutex<Vec<Option<String>>>,
     pub fail: AtomicBool,
+    /// When set, the next `spawn` reports on the first channel that it started, then blocks
+    /// until the second one yields (or closes).
+    pub spawn_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 impl FakeFactory {
@@ -94,6 +97,10 @@ impl FakeFactory {
 
 impl DriverFactory for Arc<FakeFactory> {
     fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
+        if let Some((entered, release)) = self.spawn_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(DriverError::Failed("spawn refused".into()));
         }

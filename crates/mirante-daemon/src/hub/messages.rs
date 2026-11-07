@@ -30,8 +30,9 @@ impl State {
 impl Hub {
     /// Steer: hand the message to the agent now (starts a turn if idle). Refused while a
     /// dialog is open, because typed text would answer it. Queue: hold it until the running
-    /// turn ends (delivered at once when the agent is already idle with an empty queue).
-    /// Before the agent is ready, both modes queue.
+    /// turn ends (delivered at once when the agent is already idle with an empty queue and
+    /// no earlier delivery is still starting its turn). Before the agent is ready, both
+    /// modes queue.
     pub fn send(&self, m: SendMessage) -> Result<SendResult> {
         if m.text.trim().is_empty() {
             return Err(HubError::Invalid("empty message".into()));
@@ -53,18 +54,25 @@ impl Hub {
                 }
                 ready
             }
-            SendMode::Queue => ready && task.status == Status::Idle && l.queue.is_empty(),
+            SendMode::Queue => ready && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
         };
         if !now {
             l.queue.push_back(m.text.clone());
-            let queued = l.queue.len();
-            st.event(Some(&task.id), "message_queued", json!({ "text": m.text, "position": queued }))?;
+            let position = l.queue.len();
+            st.event(Some(&task.id), "message_queued", json!({ "text": m.text, "position": position }))?;
+            // An idle, ready agent with a backlog (an earlier delivery failed) takes the
+            // next message now.
+            st.kick(&task.id)?;
+            let queued = st.live.get(&task.id).map_or(0, |l| l.queue.len());
             st.publish();
             return Ok(SendResult { delivered: SendMode::Queue, queued });
         }
         l.driver.clone().expect("ready implies a driver").send(&m.text)?;
         if l.agent == AgentKind::Claude && task.status == Status::Working {
             l.steers.push(m.text.clone());
+        }
+        if task.status == Status::Idle {
+            l.delivery_in_flight = Some(std::time::Instant::now());
         }
         let queued = l.queue.len();
         st.event(Some(&task.id), "message_sent", json!({ "mode": m.mode, "text": m.text }))?;
@@ -89,7 +97,8 @@ impl Hub {
 
     /// Answers a pending request once: the driver acts first (Claude: types the exact
     /// one-time option; Codex: answers the JSON-RPC request); only then is the answer
-    /// persisted. Claude dialogs are answered in order, oldest first.
+    /// persisted. Claude dialogs are answered in order, oldest first. Once the driver has
+    /// answered, the answer stands: a failure to record it is logged, not returned.
     pub fn answer_permission(&self, a: AnswerPermission) -> Result<PermissionRequest> {
         let mut st = self.lock();
         let p = st.find_permission(&a.id)?;
@@ -112,16 +121,27 @@ impl Hub {
                 }
                 p.detail.clone()
             }
-            AgentKind::Codex => l.perm_keys.get(&p.id).cloned().unwrap_or_default(),
+            AgentKind::Codex => l.perm_keys.get(&p.id).cloned().ok_or_else(|| {
+                HubError::Conflict(format!("permission request {} has no pending approval in the agent", p.id))
+            })?,
         };
         driver.answer_permission(&key, a.allow)?;
         let status = if a.allow { PermissionStatus::AllowedOnce } else { PermissionStatus::Denied };
-        let answered = st.store.answer_permission(&p.id, status)?;
+        let answered = match st.store.answer_permission(&p.id, status) {
+            Ok(answered) => answered,
+            Err(e) => {
+                st.log_error(Some(&p.task_id), "permission answered by the agent but not recorded", &e);
+                PermissionRequest { status, answered_at: Some(mirante_core::model::now_ms()), ..p.clone() }
+            }
+        };
         if let Some(l) = st.live.get_mut(&p.task_id) {
             l.perm_keys.remove(&p.id);
+            l.dialogs.remove(&p.id);
         }
         if agent == AgentKind::Claude {
-            st.feed_claude(&p.task_id, &Input::PermissionAnswered { allowed: a.allow })?;
+            if let Err(e) = st.feed_claude(&p.task_id, &Input::PermissionAnswered { allowed: a.allow }) {
+                st.log_error(Some(&p.task_id), "permission answer status update", &e);
+            }
         }
         st.publish();
         Ok(answered)
@@ -254,6 +274,64 @@ mod tests {
         k.hub.answer_permission(AnswerPermission { id, allow: false }).unwrap();
         assert_eq!(k.calls(), vec!["answer:7:false".to_string()]);
         assert!(k.hub.lock().live[&t.id].perm_keys.is_empty());
+    }
+
+    #[test]
+    fn answering_the_older_of_two_dialogs_keeps_the_newer_one_pending_and_listed() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        for (id, cmd) in [("t1", "older"), ("t2", "newer")] {
+            k.hook(&t.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": id}));
+            k.hook(
+                &t.id,
+                json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": id,
+                    "tool_input": {"command": cmd}}),
+            );
+        }
+        let p = k.hub.permissions().unwrap();
+        k.hub.answer_permission(AnswerPermission { id: p[0].request.id.clone(), allow: true }).unwrap();
+        let left = k.hub.permissions().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].request.id, p[1].request.id);
+        let v = k.hub.get_task(&t.id).unwrap();
+        assert_eq!((v.task.status, v.needs_you), (Status::NeedsYou, 1));
+    }
+
+    #[test]
+    fn queue_on_an_idle_agent_with_a_backlog_kicks_the_backlog() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.hub.lock().live.get_mut(&t.id).unwrap().queue.push_back("old".into());
+        let r = send(&k, &t.id, "new", SendMode::Queue).unwrap();
+        assert_eq!(r.delivered, SendMode::Queue);
+        assert_eq!(k.calls(), vec!["send:old".to_string()]);
+        assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 1);
+    }
+
+    #[test]
+    fn a_second_queued_message_waits_until_the_first_one_started_a_turn() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        assert_eq!(send(&k, &t.id, "a", SendMode::Queue).unwrap().delivered, SendMode::Steer);
+        assert_eq!(send(&k, &t.id, "b", SendMode::Queue).unwrap().delivered, SendMode::Queue);
+        assert_eq!(k.calls(), vec!["send:a".to_string()]);
+        let status = |to, turn_open| DriverEvent::Status { to, cause: "codex:x".into(), turn_open, detail: None };
+        k.emit(status(Status::Working, true));
+        assert_eq!(k.calls(), vec!["send:a".to_string()]);
+        k.emit(status(Status::Idle, false));
+        assert_eq!(k.calls(), vec!["send:a".to_string(), "send:b".to_string()]);
+    }
+
+    #[test]
+    fn codex_answer_without_a_request_key_is_a_conflict() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::PermissionRequested { key: "7".into(), tool: "command".into(), detail: "ls".into() });
+        k.hub.lock().live.get_mut(&t.id).unwrap().perm_keys.clear();
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        assert!(matches!(k.hub.answer_permission(AnswerPermission { id, allow: true }), Err(HubError::Conflict(_))));
+        assert!(k.calls().is_empty());
     }
 
     #[test]

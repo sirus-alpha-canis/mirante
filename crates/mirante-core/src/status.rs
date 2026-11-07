@@ -59,12 +59,13 @@ pub struct Transition {
     pub cause: String,
 }
 
-/// An open permission dialog: who raised it (`None` is the main agent) and, when the
-/// payload carried one, the tool call it is about.
+/// An open permission dialog: who raised it (`None` is the main agent), the tool call it is
+/// about when the payload carried one, and the tool's name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     agent: Option<String>,
     tool_use_id: Option<String>,
+    tool_name: Option<String>,
 }
 
 impl Pending {
@@ -173,8 +174,8 @@ impl TxTurn {
 #[derive(Debug, Clone)]
 pub struct StatusEngine {
     status: Status,
-    /// Pending permission dialog.
-    pending: Option<Pending>,
+    /// Pending permission dialogs, oldest first (Claude shows them one at a time, in order).
+    pending: VecDeque<Pending>,
     /// Latest `tool_use_id` per (agent, tool name) from `PreToolUse`, for a
     /// `PermissionRequest` whose payload lacks one. Dropped when the tool finishes.
     recent_tool_ids: HashMap<(Option<String>, Option<String>), String>,
@@ -219,7 +220,7 @@ impl StatusEngine {
     pub fn new() -> Self {
         StatusEngine {
             status: Status::Idle,
-            pending: None,
+            pending: VecDeque::new(),
             recent_tool_ids: HashMap::new(),
             ended: 0,
             h_turn: 0,
@@ -239,6 +240,19 @@ impl StatusEngine {
 
     pub fn status(&self) -> Status {
         self.status
+    }
+
+    /// How many permission dialogs wait for an answer.
+    pub fn pending_dialogs(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The tool call a `PermissionRequest` is about: its own `tool_use_id`, else the one of
+    /// the latest `PreToolUse` of the same agent and tool (what the engine pairs it with).
+    pub fn tool_use_id_for(&self, ev: &HookEvent) -> Option<String> {
+        ev.tool_use_id
+            .clone()
+            .or_else(|| self.recent_tool_ids.get(&(ev.agent_id.clone(), ev.tool_name.clone())).cloned())
     }
 
     pub fn turn_open(&self) -> bool {
@@ -276,9 +290,9 @@ impl StatusEngine {
     /// then `NeedsYou` while a dialog is open, else `Working` inside a turn, else `Idle`.
     fn settle(&mut self, was_open: bool, cause: String) -> Option<Transition> {
         if was_open && !self.turn_open() {
-            self.pending = None;
+            self.pending.clear();
         }
-        let to = if self.pending.is_some() {
+        let to = if !self.pending.is_empty() {
             Status::NeedsYou
         } else if self.turn_open() {
             Status::Working
@@ -296,7 +310,7 @@ impl StatusEngine {
         }
         self.slash_pending = false;
         self.main_dialog = false;
-        self.pending = None;
+        self.pending.clear();
     }
 
     /// A new process or a cleared context: nothing from before can still be in flight.
@@ -413,11 +427,8 @@ impl StatusEngine {
                 if !side {
                     self.follow_mids(false);
                 }
-                if let Some(p) = self.pending.as_ref().filter(|p| p.answered_by(ev)) {
-                    if p.agent.is_none() {
-                        self.main_dialog = false;
-                    }
-                    self.pending = None;
+                if let Some(i) = self.pending.iter().position(|p| p.answered_by(ev)) {
+                    self.remove_dialog(i);
                 }
                 self.settle(was_open, cause)
             }
@@ -427,11 +438,15 @@ impl StatusEngine {
             "PermissionRequest" => {
                 // Some payloads lack `tool_use_id`: borrow it from the latest PreToolUse of
                 // the same agent and tool, so a parallel tool finishing is not the answer.
-                let tool_use_id = ev
-                    .tool_use_id
-                    .clone()
-                    .or_else(|| self.recent_tool_ids.get(&(ev.agent_id.clone(), ev.tool_name.clone())).cloned());
-                self.pending = Some(Pending { agent: ev.agent_id.clone(), tool_use_id });
+                let tool_use_id = self.tool_use_id_for(ev);
+                let p = Pending { agent: ev.agent_id.clone(), tool_use_id, tool_name: ev.tool_name.clone() };
+                // A duplicate delivery of the same dialog is not a second dialog (without a
+                // `tool_use_id`, only a repeat of the newest one can be told apart).
+                let dup =
+                    if p.tool_use_id.is_some() { self.pending.contains(&p) } else { self.pending.back() == Some(&p) };
+                if !dup {
+                    self.pending.push_back(p);
+                }
                 if !side {
                     self.main_dialog = true;
                 }
@@ -486,9 +501,7 @@ impl StatusEngine {
             }
             if self.main_dialog {
                 // The dialog was denied: it is gone with its turn.
-                if self.pending.as_ref().is_some_and(|p| p.agent.is_none()) {
-                    self.pending = None;
-                }
+                self.pending.retain(|p| p.agent.is_some());
             } else if closed.is_some_and(|c| c.summary) {
                 // Its Stop hooks ran, so its Stop was sent: expect it late.
                 self.late_stops.push(id);
@@ -546,14 +559,24 @@ impl StatusEngine {
         }
     }
 
+    /// Drops dialog `i`; the main agent's dialog flag goes with its last main-agent dialog.
+    fn remove_dialog(&mut self, i: usize) {
+        let Some(p) = self.pending.remove(i) else {
+            return;
+        };
+        if p.agent.is_none() && self.pending.iter().all(|q| q.agent.is_some()) {
+            self.main_dialog = false;
+        }
+    }
+
+    /// Mirante answered the oldest open dialog (the one Claude shows).
     fn apply_answer(&mut self, allowed: bool) -> Option<Transition> {
-        let p = self.pending.as_ref()?;
+        if self.pending.is_empty() {
+            return None;
+        }
         let was_open = self.turn_open();
         if allowed {
-            if p.agent.is_none() {
-                self.main_dialog = false;
-            }
-            self.pending = None;
+            self.remove_dialog(0);
             return self.settle(was_open, "mirante:permission_allowed".into());
         }
         if was_open {
@@ -562,8 +585,8 @@ impl StatusEngine {
             return None;
         }
         // A side agent's dialog after the main turn: nothing else will end it.
-        self.pending = None;
-        self.set(Status::Idle, "mirante:permission_denied".into())
+        self.remove_dialog(0);
+        self.settle(was_open, "mirante:permission_denied".into())
     }
 
     // --- Transcript stream ----------------------------------------------------------
@@ -1301,6 +1324,88 @@ mod lifecycle_tests {
         assert_eq!(e.apply(&Input::PermissionAnswered { allowed: true }), None);
     }
 
+    // --- Several pending dialogs ---------------------------------------------------------
+
+    fn perm(id: &str) -> Input {
+        tool("PermissionRequest", id)
+    }
+
+    #[test]
+    fn two_dialogs_are_answered_oldest_first_and_need_you_until_both_are_gone() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[ups("go"), tool("PreToolUse", "t1"), perm("t1"), tool("PreToolUse", "t2"), perm("t2")]);
+        assert_eq!((e.status(), e.pending_dialogs()), (Status::NeedsYou, 2));
+        // Mirante answers the older one: the newer still waits.
+        assert_eq!(e.apply(&Input::PermissionAnswered { allowed: true }), None);
+        assert_eq!((e.status(), e.pending_dialogs()), (Status::NeedsYou, 1));
+        // The answered tool finishing is plain progress; the newer dialog still stands.
+        assert_eq!(e.apply(&tool("PostToolUse", "t1")), None);
+        assert_eq!(e.status(), Status::NeedsYou);
+        let t = e.apply(&tool("PostToolUse", "t2")).unwrap();
+        assert_eq!((t.from, t.to), (Status::NeedsYou, Status::Working));
+        assert_eq!(e.pending_dialogs(), 0);
+    }
+
+    #[test]
+    fn post_tool_use_clears_only_its_own_dialog() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[ups("go"), tool("PreToolUse", "t1"), perm("t1"), tool("PreToolUse", "t2"), perm("t2")]);
+        assert_eq!(e.apply(&tool("PostToolUse", "t2")), None);
+        assert_eq!((e.status(), e.pending_dialogs()), (Status::NeedsYou, 1));
+        assert_eq!(e.apply(&tool("PostToolUse", "t1")).unwrap().to, Status::Working);
+    }
+
+    #[test]
+    fn tool_use_id_for_borrows_from_the_matching_pre_tool_use() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[ups("go"), tool("PreToolUse", "t1")]);
+        let bare = HookEvent { tool_name: Some("Bash".into()), ..HookEvent::named("PermissionRequest") };
+        assert_eq!(e.tool_use_id_for(&bare).as_deref(), Some("t1"));
+        let own = HookEvent { tool_use_id: Some("t9".into()), ..bare.clone() };
+        assert_eq!(e.tool_use_id_for(&own).as_deref(), Some("t9"));
+        e.apply(&tool("PostToolUse", "t1"));
+        assert_eq!(e.tool_use_id_for(&bare), None);
+    }
+
+    #[test]
+    fn a_duplicate_permission_request_is_one_dialog() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[ups("go"), tool("PreToolUse", "t1"), perm("t1"), perm("t1")]);
+        assert_eq!(e.pending_dialogs(), 1);
+        assert_eq!(e.apply(&tool("PostToolUse", "t1")).unwrap().to, Status::Working);
+    }
+
+    #[test]
+    fn the_turn_end_clears_every_dialog() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[
+            ups("go"),
+            typed("go"),
+            tool("PreToolUse", "t1"),
+            perm("t1"),
+            side_tool("PermissionRequest", "a-1"),
+        ]);
+        assert_eq!(e.pending_dialogs(), 2);
+        assert_eq!(e.apply(&Input::PermissionAnswered { allowed: false }), None);
+        assert_eq!(e.apply(&system("turn_duration")).unwrap().to, Status::Idle);
+        assert_eq!(e.pending_dialogs(), 0);
+    }
+
+    #[test]
+    fn side_agent_dialogs_after_the_turn_are_denied_one_by_one() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[
+            ups("go"),
+            hook("Stop"),
+            side_tool("PermissionRequest", "a-1"),
+            side_tool("PermissionRequest", "a-2"),
+        ]);
+        assert_eq!(e.pending_dialogs(), 2);
+        assert_eq!(e.apply(&Input::PermissionAnswered { allowed: false }), None);
+        assert_eq!(e.status(), Status::NeedsYou);
+        assert_eq!(e.apply(&Input::PermissionAnswered { allowed: false }).unwrap().to, Status::Idle);
+    }
+
     // --- Late hook Stop -------------------------------------------------------------
 
     /// Real queued-probe order (task8-outputs.md "Probe"): the transcript closes turn 1 and
@@ -1979,9 +2084,11 @@ mod interleaving_tests {
         LocalUps,
         /// A tool turn followed by a stray `PreToolUse` (no `agent_id`) after its `Stop`.
         Stray,
+        /// Two tool calls in one turn, each behind its own allowed dialog (sequential).
+        TwoDialogs,
     }
 
-    const PICK: [Kind; 11] = [
+    const PICK: [Kind; 12] = [
         Kind::Plain,
         Kind::Tool,
         Kind::Allow,
@@ -1993,6 +2100,7 @@ mod interleaving_tests {
         Kind::Local,
         Kind::LocalUps,
         Kind::Stray,
+        Kind::TwoDialogs,
     ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2095,6 +2203,20 @@ mod interleaving_tests {
                 if kind == Kind::Stray {
                     h.push(hook_ev(k, Other, "PreToolUse (stray)", HookEvent::named("PreToolUse")));
                 }
+            }
+            Kind::TwoDialogs => {
+                h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
+                t.push(tx_ev(k, TxStart, "prompt", user("typed", &p)));
+                for suffix in ["a", "b"] {
+                    let id = format!("toolu_{k}{suffix}");
+                    t.push(tx_ev(k, Other, "assistant tool_use", assistant("tool_use")));
+                    h.push(hook_ev(k, Other, "PreToolUse", tool("PreToolUse", &id)));
+                    h.push(hook_ev(k, Perm, "PermissionRequest", tool("PermissionRequest", &id)));
+                    h.push(hook_ev(k, PermDone, "PostToolUse", tool("PostToolUse", &id)));
+                    t.push(tx_ev(k, Other, "tool_result", tool_result()));
+                }
+                ends(&mut t);
+                stop(&mut h);
             }
             Kind::Steer => {
                 h.push(hook_ev(k, HookStart, "UPS", ups(&p)));
@@ -2333,6 +2455,7 @@ mod interleaving_tests {
             };
             let has = |k: usize, role: Role| evs.iter().any(|x| x.turn == k && x.role == role);
             let got = |k: usize, role: Role| (0..=i).any(|x| evs[x].turn == k && evs[x].role == role);
+            let count = |k: usize, role: Role| (0..=i).filter(|x| evs[*x].turn == k && evs[*x].role == role).count();
             // I-a
             for k in 0..n_turns {
                 let complete = (0..=k).all(|j| seen[j] == total[j]) && (k + 1..n_turns).all(|j| seen[j] == 0);
@@ -2354,7 +2477,7 @@ mod interleaving_tests {
             // I-c
             if st == Status::NeedsYou {
                 let open_dialog =
-                    (1..=case.kinds.len()).any(|k| got(k, Role::Perm) && !got(k, Role::PermDone) && !over(k));
+                    (1..=case.kinds.len()).any(|k| count(k, Role::Perm) > count(k, Role::PermDone) && !over(k));
                 if !open_dialog {
                     return fail("I-c: NeedsYou without an unresolved PermissionRequest");
                 }

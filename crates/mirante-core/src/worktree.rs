@@ -13,6 +13,8 @@ pub struct Worktree {
     /// `None` for a detached HEAD.
     pub branch: Option<String>,
     pub head: String,
+    /// `create` made the branch (it did not exist before). Always false from `list`.
+    pub created_branch: bool,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
@@ -108,7 +110,7 @@ pub fn parse_porcelain(text: &str) -> Vec<Worktree> {
             }
         }
         if let Some(path) = path {
-            out.push(Worktree { path, branch, head });
+            out.push(Worktree { path, branch, head, created_branch: false });
         }
     }
     out
@@ -211,7 +213,22 @@ impl WorktreeManager {
             Some(base) => git(repo, &["worktree", "add", "-b", branch, "--end-of-options", &path_str, &base])?,
         };
         let head = git(&path, &["rev-parse", "HEAD"])?;
-        Ok(Worktree { path, branch: Some(branch.to_string()), head })
+        Ok(Worktree { path, branch: Some(branch.to_string()), head, created_branch: !exists })
+    }
+
+    /// Undoes `create` (e.g. when the task could not be recorded): removes the worktree,
+    /// then deletes its branch only if `create` made it and it still points at the commit
+    /// it started from (an atomic compare-and-delete), so no work is ever lost.
+    pub fn discard(&self, repo: &Path, wt: &Worktree) -> Result<()> {
+        self.remove(repo, &wt.path)?;
+        if let (true, Some(branch)) = (wt.created_branch, &wt.branch) {
+            let r#ref = format!("refs/heads/{branch}");
+            let now = git(repo, &["rev-parse", "--verify", "--quiet", "--end-of-options", &r#ref]);
+            if now.is_ok_and(|h| h == wt.head) {
+                git(repo, &["update-ref", "-d", &r#ref, &wt.head])?;
+            }
+        }
+        Ok(())
     }
 
     /// Removes the worktree directory and its git metadata. The branch is kept. Refuses a
@@ -338,6 +355,45 @@ mod tests {
     }
 
     #[test]
+    fn discard_deletes_only_a_branch_it_created_and_nobody_moved() {
+        let dir = TempDir::new("wt-discard");
+        let repo = repo(&dir);
+        let mgr = WorktreeManager::new(&dir.path().join("wt"));
+        let fresh = mgr.create(&repo, "fresh", None).unwrap();
+        assert!(fresh.created_branch);
+        mgr.discard(&repo, &fresh).unwrap();
+        assert!(!fresh.path.exists());
+        assert!(!branch_exists(&repo, "fresh").unwrap());
+
+        git(&repo, &["branch", "kept"]).unwrap();
+        let existing = mgr.create(&repo, "kept", None).unwrap();
+        assert!(!existing.created_branch);
+        mgr.discard(&repo, &existing).unwrap();
+        assert!(branch_exists(&repo, "kept").unwrap());
+
+        let moved = mgr.create(&repo, "moved", None).unwrap();
+        git(
+            &moved.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "work",
+            ],
+        )
+        .unwrap();
+        mgr.discard(&repo, &moved).unwrap();
+        assert!(branch_exists(&repo, "moved").unwrap());
+    }
+
+    #[test]
     fn remove_refuses_a_dirty_worktree() {
         let dir = TempDir::new("wt-dirty");
         let repo = repo(&dir);
@@ -419,6 +475,6 @@ mod tests {
         let w = parse_porcelain(text);
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].branch.as_deref(), Some("trunk"));
-        assert_eq!(w[1], Worktree { path: "/w/x".into(), branch: None, head: "bbb".into() });
+        assert_eq!(w[1], Worktree { path: "/w/x".into(), branch: None, head: "bbb".into(), created_branch: false });
     }
 }

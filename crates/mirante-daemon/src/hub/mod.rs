@@ -2,11 +2,11 @@
 //! the `Store` (which persists each transition with its audit event), then publishes the
 //! new events to subscribers. Submodules add the session lifecycle (`session`) and
 //! messaging / permissions (`messages`).
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mirante_core::model::{AgentKind, Event, Lifecycle, NewTask, Status, Task};
 use mirante_core::status::StatusEngine;
@@ -16,7 +16,7 @@ use mirante_core::CoreError;
 use mirante_ipc::rpc::{code, RpcError};
 use mirante_ipc::types::{BootState, CreateTask, DaemonStatus, Snapshot, TaskView};
 use mirante_ipc::Paths;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
@@ -106,13 +106,48 @@ pub(crate) struct Live {
     pub(crate) queue: VecDeque<String>,
     /// Permission id -> driver key (Codex request id).
     pub(crate) perm_keys: HashMap<String, String>,
+    /// Permission id -> the Claude dialog it shows (to settle exactly that card when its
+    /// tool runs).
+    pub(crate) dialogs: HashMap<String, DialogKey>,
+    /// A message was handed to the idle agent and the status has not left `Idle` since:
+    /// nothing else is delivered meanwhile (it would land in the turn it starts). Expires
+    /// after [`DELIVERY_GRACE`] in case the message started no turn (a local command).
+    pub(crate) delivery_in_flight: Option<Instant>,
     /// Claude messages typed mid-turn, waiting for the transcript to say steered or queued.
     pub(crate) steers: Vec<String>,
     /// Recent compacted main-chain transcript lines (for steer/queue classification).
     pub(crate) transcript: Vec<Value>,
 }
 
+/// How long a delivery to an idle agent blocks the next one if no turn shows up.
+pub(crate) const DELIVERY_GRACE: Duration = Duration::from_secs(30);
+
+/// Who raised a Claude permission dialog and about which tool call (`tool_use_id`, from the
+/// payload or borrowed from the matching `PreToolUse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DialogKey {
+    pub(crate) agent: Option<String>,
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) tool_name: Option<String>,
+}
+
+impl DialogKey {
+    /// Is `ev` (a `PostToolUse`) this dialog's tool finishing? By `tool_use_id` when both
+    /// sides have one, else by agent identity (as the status engine pairs them).
+    pub(crate) fn answered_by(&self, ev: &mirante_core::hook::HookEvent) -> bool {
+        match (&self.tool_use_id, &ev.tool_use_id) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.agent == ev.agent_id,
+        }
+    }
+}
+
 impl Live {
+    /// A delivery to the idle agent is still expected to start a turn.
+    pub(crate) fn delivering(&self) -> bool {
+        self.delivery_in_flight.is_some_and(|t| t.elapsed() < DELIVERY_GRACE)
+    }
+
     pub(crate) fn new(session_id: &str, agent: AgentKind, native_id: Option<String>) -> Live {
         Live {
             session_id: session_id.to_string(),
@@ -126,6 +161,8 @@ impl Live {
             detail: None,
             queue: VecDeque::new(),
             perm_keys: HashMap::new(),
+            dialogs: HashMap::new(),
+            delivery_in_flight: None,
             steers: Vec::new(),
             transcript: Vec::new(),
         }
@@ -137,6 +174,10 @@ pub(crate) struct State {
     pub(crate) live: HashMap<String, Live>,
     pub(crate) last_seq: u64,
     pub(crate) subscribers: Vec<mpsc::Sender<Event>>,
+    /// Tasks whose worktree is being removed by `archive` (no session may start meanwhile).
+    pub(crate) archiving: HashSet<String>,
+    /// Recently applied hook `event_id`s (a hook may deliver and also spool one event).
+    pub(crate) seen_hooks: session::SeenHooks,
 }
 
 pub struct Hub {
@@ -227,7 +268,19 @@ impl State {
             return Ok(());
         }
         self.store.set_status(task_id, cur, to, cause)?;
+        if cur == Status::Idle {
+            if let Some(l) = self.live.get_mut(task_id) {
+                l.delivery_in_flight = None;
+            }
+        }
         Ok(())
+    }
+
+    /// Logs an error that must not fail the operation it happened in (the user-visible
+    /// action already took effect): stderr plus a `daemon_error` event, best effort.
+    pub(crate) fn log_error(&mut self, task_id: Option<&str>, context: &str, e: &dyn fmt::Display) {
+        eprintln!("mirante-daemon: {context}: {e}");
+        let _ = self.event(task_id, "daemon_error", json!({ "context": context, "error": e.to_string() }));
     }
 
     pub(crate) fn event(&mut self, task_id: Option<&str>, kind: &str, payload: Value) -> Result<()> {
@@ -261,7 +314,14 @@ impl Hub {
         let (tx, rx) = mpsc::channel();
         let last_seq = last_seq(&store)?;
         let hub = Hub {
-            state: Mutex::new(State { store, live: HashMap::new(), last_seq, subscribers: Vec::new() }),
+            state: Mutex::new(State {
+                store,
+                live: HashMap::new(),
+                last_seq,
+                subscribers: Vec::new(),
+                archiving: HashSet::new(),
+                seen_hooks: session::SeenHooks::default(),
+            }),
             worktrees: WorktreeManager::new(&paths.worktrees()),
             paths,
             factory,
@@ -309,7 +369,10 @@ impl Hub {
             }
             Err(e) => {
                 drop(st);
-                let _ = self.worktrees.remove(&repo, &wt.path);
+                // Removes the worktree, and its branch only if we made it and it is unchanged.
+                if let Err(undo) = self.worktrees.discard(&repo, &wt) {
+                    self.lock().log_error(None, "task.create rollback", &undo);
+                }
                 Err(e.into())
             }
         }
@@ -329,19 +392,29 @@ impl Hub {
     /// kept. Refused while a session is live.
     pub fn archive(&self, reference: &str) -> Result<TaskView> {
         let task = {
-            let st = self.lock();
+            let mut st = self.lock();
             let t = st.resolve(reference)?;
             if st.live.contains_key(&t.id) {
                 return Err(HubError::Conflict(format!("task {} has a live session: stop it first", t.branch)));
             }
+            if st.archiving.contains(&t.id) {
+                return Err(HubError::Conflict(format!("task {} is already being archived", t.branch)));
+            }
             if t.lifecycle == Lifecycle::Archived {
                 return Err(HubError::Conflict(format!("task {} is already archived", t.branch)));
             }
+            // Until the worktree is gone no session may start (it would run in a directory
+            // being deleted).
+            st.archiving.insert(t.id.clone());
             t
         };
-        self.worktrees.remove(Path::new(&task.repo_path), Path::new(&task.worktree_path))?;
+        let removed = self.worktrees.remove(Path::new(&task.repo_path), Path::new(&task.worktree_path));
         let mut st = self.lock();
-        let t = st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
+        let archived = removed
+            .map_err(HubError::from)
+            .and_then(|()| st.store.transition_lifecycle(&task.id, Lifecycle::Archived).map_err(HubError::from));
+        st.archiving.remove(&task.id);
+        let t = archived?;
         let v = st.view(t)?;
         st.publish();
         Ok(v)
