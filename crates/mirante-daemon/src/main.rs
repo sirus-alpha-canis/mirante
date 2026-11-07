@@ -51,6 +51,12 @@ fn watch_log(path: PathBuf) {
     });
 }
 
+/// `MIRANTE_CLAUDE_INLINE_ANSWERS`: only an explicit "1" / "true" / "on" turns Claude inline
+/// answers on.
+fn inline_answers(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true" | "on"))
+}
+
 /// Exit code when the driver-event pump stops (EX_SOFTWARE).
 const PUMP_DIED: i32 = 70;
 
@@ -87,6 +93,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(&paths.database())?;
     // `Box::default` builds the factory whether `RealFactory` is a unit struct or has fields.
     let (hub, rx) = Hub::new(store, paths.clone(), Box::<RealFactory>::default())?;
+    // Claude inline answers are off unless asked for: screen text can never prove which
+    // request a dialog is, so by default Claude cards are answered in the terminal.
+    hub.set_claude_inline_answers(inline_answers(std::env::var("MIRANTE_CLAUDE_INLINE_ANSWERS").ok().as_deref()));
+    eprintln!("mirante-daemon: claude inline answers {}", if hub.claude_inline_answers() { "on" } else { "off" });
     let hub = Arc::new(hub);
     let report = hub.recover()?;
     eprintln!("mirante-daemon: recovered {report:?}");
@@ -129,6 +139,19 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("mirante-daemon: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inline_answers_need_an_explicit_yes() {
+        for on in ["1", "true", "on", " 1 "] {
+            assert!(super::inline_answers(Some(on)), "{on}");
+        }
+        for off in [None, Some(""), Some("0"), Some("yes please"), Some("off")] {
+            assert!(!super::inline_answers(off), "{off:?}");
         }
     }
 }

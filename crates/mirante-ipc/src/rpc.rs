@@ -31,6 +31,10 @@ pub mod code {
     pub const FORBIDDEN: i64 = 6;
     /// The daemon is at its connection limit; retry shortly.
     pub const BUSY: i64 = 7;
+    /// Mirante will not type this answer (Claude: inline answers are off, or the evidence
+    /// that the dialog on screen is this card's is missing). Nothing was typed; the user
+    /// answers it in the agent's terminal (`mirante attach <task>`).
+    pub const ANSWER_IN_TERMINAL: i64 = 8;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

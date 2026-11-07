@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mirante_core::model::{PermissionRequest, Status};
+use mirante_ipc::rpc::code;
 use mirante_ipc::types::{
     method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, DoctorReport,
     KillOrphan, ListParams, OrphanView, PermissionView, ResizeParams, SendMessage, SendMode, SendResult, Snapshot,
     StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
 };
-use mirante_ipc::{signals, Client, Paths};
+use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
 use mirante_cli::args::{self, Cmd, DaemonCmd, USAGE};
@@ -50,6 +51,23 @@ fn ask(question: &str) -> io::Result<bool> {
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Mirante did not type the answer (Claude: inline answers off, or no evidence the dialog
+/// is this card's): says so and, on a terminal, offers to attach to the task to answer it
+/// there. Not answered is an error (non-zero exit) unless the user attached.
+fn answer_in_terminal(paths: &Paths, c: &mut Client, id: &str, why: &str) -> Res {
+    eprintln!("mirante: {why}");
+    let perms: Vec<PermissionView> = c.call(method::PERMISSION_LIST, json!({}))?;
+    let card = perms.into_iter().find(|p| p.request.id == id || (id.len() >= 4 && p.request.id.ends_with(id)));
+    let Some(card) = card else {
+        return Err("not answered".into());
+    };
+    let task = card.branch;
+    if term::is_tty(0) && term::is_tty(1) && ask(&format!("attach to {task} now to answer it there? [y/N] "))? {
+        return attach(paths, &task);
+    }
+    Err(format!("not answered: answer it in `mirante attach {task}`").into())
 }
 
 /// Walks the start result: asks the user about Claude's trust dialog (unless `--trust`
@@ -329,9 +347,14 @@ fn run(cmd: Cmd) -> Res {
             print!("{}", render::perms_table(&perms));
         }
         Cmd::Answer { id, allow } => {
-            let p: PermissionRequest =
-                client(&paths)?.call(method::PERMISSION_ANSWER, AnswerPermission { id, allow })?;
-            println!("{} {}: {}", render::short(&p.id), p.tool, p.status.as_str());
+            let mut c = client(&paths)?;
+            match c.call::<PermissionRequest>(method::PERMISSION_ANSWER, AnswerPermission { id: id.clone(), allow }) {
+                Ok(p) => println!("{} {}: {}", render::short(&p.id), p.tool, p.status.as_str()),
+                Err(ClientError::Rpc(e)) if e.code == code::ANSWER_IN_TERMINAL => {
+                    return answer_in_terminal(&paths, &mut c, &id, &e.message);
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Cmd::Interrupt { task } => {
             let _: Value = client(&paths)?.call(method::SESSION_INTERRUPT, TaskRef { task })?;

@@ -76,6 +76,13 @@ impl Paths {
         self.home.join("hook-breaker")
     }
 
+    /// Appended to by the hook whenever an event did not reach the daemon live (spooled,
+    /// breaker tripped, or lost). The daemon refuses to type a Claude answer when it changed
+    /// since the card was created (see [`crate::hookloss`]).
+    pub fn hook_lost(&self) -> PathBuf {
+        self.home.join("hook-lost")
+    }
+
     /// Explicit error when the socket path would not fit `sockaddr_un`.
     pub fn validate_socket(&self) -> io::Result<()> {
         validate_socket_path(&self.socket())
@@ -137,7 +144,10 @@ pub fn validate_socket_path(p: &Path) -> io::Result<()> {
     if n >= SOCKET_PATH_LIMIT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("socket path is {n} bytes, limit is {}: set MIRANTE_HOME to a shorter directory", SOCKET_PATH_LIMIT - 1),
+            format!(
+                "socket path is {n} bytes, limit is {}: set MIRANTE_HOME to a shorter directory",
+                SOCKET_PATH_LIMIT - 1
+            ),
         ));
     }
     Ok(())

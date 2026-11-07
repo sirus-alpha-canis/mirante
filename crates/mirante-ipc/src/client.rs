@@ -212,7 +212,8 @@ mod tests {
         let sock = d.path().join("s.sock");
         let h = serve_once(&sock, |req| {
             vec![
-                serde_json::to_string(&Response::err(Some(req.id + 99), RpcError::new(code::NOT_FOUND, "other"))).unwrap(),
+                serde_json::to_string(&Response::err(Some(req.id + 99), RpcError::new(code::NOT_FOUND, "other")))
+                    .unwrap(),
                 serde_json::to_string(&Response::ok(req.id, json!(7))).unwrap(),
             ]
         });

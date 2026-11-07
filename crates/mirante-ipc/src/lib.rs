@@ -2,6 +2,7 @@
 //! newline-delimited JSON-RPC 2.0 over a Unix socket, the parameter and result types, and
 //! the on-disk layout under `~/.mirante`. Synchronous std I/O only.
 pub mod client;
+pub mod hookloss;
 pub mod logfile;
 pub mod paths;
 pub mod rpc;

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
+pub(crate) mod evidence;
 pub mod memory;
 pub mod messages;
 pub mod session;
@@ -37,6 +38,13 @@ pub enum HubError {
     /// Refused because a dialog waits for the user.
     NeedsYou(String),
     Invalid(String),
+    /// Mirante did not type this Claude answer (inline answers are off, or the evidence
+    /// that the dialog on screen is this card's is missing): the user answers it in the
+    /// agent's terminal. `task` is how to name the task (`mirante attach <task>`).
+    AnswerInTerminal {
+        task: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for HubError {
@@ -46,6 +54,9 @@ impl fmt::Display for HubError {
             HubError::Driver(e) => write!(f, "{e}"),
             HubError::NotFound(m) | HubError::Conflict(m) | HubError::NeedsYou(m) | HubError::Invalid(m) => {
                 write!(f, "{m}")
+            }
+            HubError::AnswerInTerminal { task, reason } => {
+                write!(f, "answer this dialog in the terminal (mirante attach {task}): {reason}; nothing was typed")
             }
         }
     }
@@ -85,6 +96,7 @@ impl From<HubError> for RpcError {
             HubError::Driver(DriverError::Unsupported(_)) => code::UNSUPPORTED,
             HubError::Driver(DriverError::Failed(_)) | HubError::Core(CoreError::ClaudeNotFound(_)) => code::DRIVER,
             HubError::NeedsYou(_) => code::NEEDS_YOU,
+            HubError::AnswerInTerminal { .. } => code::ANSWER_IN_TERMINAL,
             HubError::Core(_) => code::INTERNAL,
         };
         RpcError::new(c, e.to_string())
@@ -131,6 +143,13 @@ pub(crate) struct Live {
     /// The driver's hold flag ([`crate::driver::Sink::held`]): set while this session has a
     /// pending permission request, so the driver types nothing.
     pub(crate) hold: Arc<AtomicBool>,
+    /// Claude: the transcript's recent tool calls (the evidence a card's dialog is the one
+    /// waiting; see [`evidence`]).
+    pub(crate) ledger: evidence::ToolLedger,
+    /// Claude: bumped under the hub lock by everything that may change which dialog is on
+    /// screen (any applied hook, a card opened or settled, a tool call or result in the
+    /// transcript). An answer captures it and the typist compares it right before the key.
+    pub(crate) card_gen: Arc<AtomicU64>,
     /// Codex quota / token usage, as the driver last reported it.
     pub(crate) usage: Option<String>,
     /// Codex: the effective sandbox, as the driver last reported it (`net:off`).
@@ -169,9 +188,18 @@ pub(crate) struct DialogKey {
     /// The hook's `tool_input.description` (Bash shows it in the dialog box below the
     /// command); the driver matches it too.
     pub(crate) description: Option<String>,
+    /// The hook-loss marker when the card was created ([`mirante_ipc::hookloss`]). Not part
+    /// of the dialog's identity (see [`DialogKey::same_dialog`]).
+    pub(crate) hook_lost: mirante_ipc::hookloss::Fingerprint,
 }
 
 impl DialogKey {
+    /// The same dialog (agent, tool call, tool, description), whatever the marker said.
+    pub(crate) fn same_dialog(&self, o: &DialogKey) -> bool {
+        (&self.agent, &self.tool_use_id, &self.tool_name, &self.description)
+            == (&o.agent, &o.tool_use_id, &o.tool_name, &o.description)
+    }
+
     /// Is `ev` (a `PostToolUse`) this dialog's tool finishing? By `tool_use_id` when both
     /// sides have one, else by agent identity (as the status engine pairs them).
     pub(crate) fn answered_by(&self, ev: &mirante_core::hook::HookEvent) -> bool {
@@ -208,6 +236,8 @@ impl Live {
             steers: Vec::new(),
             transcript: Vec::new(),
             hold: Arc::default(),
+            ledger: evidence::ToolLedger::default(),
+            card_gen: Arc::default(),
             usage: None,
             sandbox: None,
             idle_since: Some(Instant::now()),
@@ -226,6 +256,8 @@ pub(crate) struct State {
     pub(crate) seen_hooks: session::SeenHooks,
     /// The memory guard's last view, pause flag and hibernated tasks.
     pub(crate) mem: memory::MemShared,
+    /// The daemon's home (the hook-loss marker lives there).
+    pub(crate) paths: Paths,
 }
 
 pub struct Hub {
@@ -235,6 +267,9 @@ pub struct Hub {
     pub(crate) factory: Box<dyn DriverFactory>,
     pub(crate) events: mpsc::Sender<(String, DriverEvent)>,
     pub(crate) boot_timeout: Duration,
+    /// Mirante types Claude permission answers (off by default; see
+    /// [`Hub::set_claude_inline_answers`]).
+    pub(crate) claude_inline: AtomicBool,
 }
 
 /// Highest event seq in the store (0 when empty).
@@ -390,12 +425,14 @@ impl Hub {
                 subscribers: Vec::new(),
                 seen_hooks: session::SeenHooks::default(),
                 mem: memory::MemShared::default(),
+                paths: paths.clone(),
             }),
             worktrees: WorktreeManager::new(&paths.worktrees()),
             paths,
             factory,
             events: tx,
             boot_timeout: Duration::from_secs(45),
+            claude_inline: AtomicBool::new(false),
         };
         Ok((hub, rx))
     }
@@ -403,6 +440,18 @@ impl Hub {
     /// How long `session.start` / `session.trust` wait for the agent to leave `Booting`.
     pub fn set_boot_timeout(&mut self, timeout: Duration) {
         self.boot_timeout = timeout;
+    }
+
+    /// Claude inline answers: when on, `permission.answer` on a Claude card types the
+    /// dialog's option key, but only with all the evidence `Hub::answer_permission` lists.
+    /// Off (the default; `MIRANTE_CLAUDE_INLINE_ANSWERS=1` turns it on): Claude cards are
+    /// answered in the terminal and `permission.answer` says so (`ANSWER_IN_TERMINAL`).
+    pub fn set_claude_inline_answers(&self, on: bool) {
+        self.claude_inline.store(on, Ordering::SeqCst);
+    }
+
+    pub fn claude_inline_answers(&self) -> bool {
+        self.claude_inline.load(Ordering::SeqCst)
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -550,6 +599,7 @@ impl Hub {
             version: env!("CARGO_PKG_VERSION").to_string(),
             live_sessions: st.live.len(),
             memory: st.mem.system.clone(),
+            claude_inline_answers: self.claude_inline_answers(),
         }
     }
 }

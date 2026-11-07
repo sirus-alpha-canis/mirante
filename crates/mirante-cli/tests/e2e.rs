@@ -23,6 +23,8 @@ struct Env {
     home: PathBuf,
     repo: PathBuf,
     log: PathBuf,
+    /// The daemon types Claude answers (`MIRANTE_CLAUDE_INLINE_ANSWERS=1`).
+    inline: bool,
 }
 
 impl Env {
@@ -40,7 +42,14 @@ impl Env {
             assert!(Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
         }
         let log = dir.path().join("fake-claude.log");
-        Env { dir, home, repo, log }
+        Env { dir, home, repo, log, inline: false }
+    }
+
+    /// A daemon with Claude inline answers on.
+    fn inline() -> Env {
+        let mut env = Env::new();
+        env.inline = true;
+        env
     }
 
     fn cmd(&self, program: &Path) -> Command {
@@ -53,6 +62,11 @@ impl Env {
             .env("FAKE_CLAUDE_LOG", &self.log)
             // Results must not depend on this machine's memory pressure.
             .env("MIRANTE_MEMGUARD", "off");
+        if self.inline {
+            c.env("MIRANTE_CLAUDE_INLINE_ANSWERS", "1");
+        } else {
+            c.env_remove("MIRANTE_CLAUDE_INLINE_ANSWERS");
+        }
         c
     }
 
@@ -192,8 +206,36 @@ fn bad_input_is_reported_not_swallowed() {
 }
 
 #[test]
-fn concurrent_answers_to_one_permission_type_one_key() {
+fn claude_answers_default_to_the_terminal_and_nothing_is_typed() {
     let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "perm", "ask", "first"]);
+    wait_until("the card", || env.task("perm").needs_you == 1);
+    let s: DaemonStatus = env.client().call(method::DAEMON_STATUS, json!({})).unwrap();
+    assert!(!s.claude_inline_answers);
+    let perms = env.ok(&["perms"]);
+    let id = perms.lines().nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    for verb in ["allow", "deny"] {
+        let out = env.mirante(&[verb, &id]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{verb}: {err}");
+        assert!(err.contains("answer this dialog in the terminal (mirante attach perm)"), "{err}");
+        assert!(err.contains("not answered"), "{err}");
+    }
+    // The typed error, as the cockpit sees it.
+    let r = env.client().call::<Value>(method::PERMISSION_ANSWER, json!({ "id": id, "allow": true }));
+    let Err(mirante_ipc::ClientError::Rpc(e)) = r else { panic!("{r:?}") };
+    assert_eq!(e.code, mirante_ipc::rpc::code::ANSWER_IN_TERMINAL);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(env.keys(), "", "nothing was typed into the dialog");
+    assert_eq!(env.task("perm").needs_you, 1, "the card waits for the terminal answer");
+}
+
+#[test]
+fn concurrent_answers_to_one_permission_type_one_key() {
+    // Inline answers on, with the evidence: the fake writes the tool_use line to its
+    // transcript before the dialog, and the hook carries its tool_use_id.
+    let env = Env::inline();
     let repo = env.repo.to_string_lossy().into_owned();
     env.ok(&["new", &repo, "--agent", "claude", "--branch", "perm", "ask", "first"]);
     wait_until("the card", || env.task("perm").needs_you == 1);

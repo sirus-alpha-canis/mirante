@@ -192,6 +192,7 @@ mod tests {
             version: version.into(),
             live_sessions: live,
             memory: None,
+            claude_inline_answers: false,
         };
         assert_eq!(version_warning(&st("0.1.0", 0), "0.1.0"), None);
         let idle = version_warning(&st("0.0.9", 0), "0.1.0").unwrap();

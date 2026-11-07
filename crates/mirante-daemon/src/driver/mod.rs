@@ -252,24 +252,33 @@ impl Fanout {
     }
 }
 
+/// The hub's evidence for a Claude answer, re-checked by the typist immediately before it
+/// types the answer key (the card generation it captured under its lock, the hook-loss
+/// marker): `Err(why)` and nothing is typed.
+pub type AnswerGuard = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 pub trait Driver: Send + Sync {
     /// Delivers a message now: types it into the TUI (Claude) or steers / starts a turn
     /// (Codex). Returns once the message is handed to the driver's worker.
     fn send(&self, text: &str) -> Result<(), DriverError>;
     /// Esc (Claude; refused with `NotNow` while a permission is pending or a dialog is open,
-    /// where Esc would answer it) or `turn/interrupt` (Codex).
+    /// where Esc would answer it: checked when asked AND by the typist right before the key,
+    /// so Claude waits for the typist) or `turn/interrupt` (Codex).
     fn interrupt(&self) -> Result<(), DriverError>;
     /// Answers the permission dialog / approval request named by `key` (Codex: the request
     /// id; Claude: the request detail, checked with `tool` and the hook's `description`, when
     /// it had one, against the dialog on screen). Selects only a one-time "Yes" or "No",
     /// never an "always" or "auto" option. May wait briefly (Claude: until the typist typed
-    /// the key or refused to); the hub does not hold its lock meanwhile.
+    /// the key or refused to); the hub does not hold its lock meanwhile. `guard` (Claude:
+    /// required) is called right before the key is typed; when it fails nothing is typed.
+    /// Codex ignores it (its answers go to a request id).
     fn answer_permission(
         &self,
         key: &str,
         tool: &str,
         description: Option<&str>,
         allow: bool,
+        guard: Option<AnswerGuard>,
     ) -> Result<(), DriverError>;
     /// Answers Claude's workspace-trust dialog. `false` ends the session.
     fn trust(&self, accept: bool) -> Result<(), DriverError>;

@@ -25,13 +25,18 @@
 //! - A blocked `send` is `NotNow`, its reason starting with `hold` (a permission request is
 //!   pending) or `dialog` (a dialog is on screen). Once nothing blocks any more, the driver
 //!   reports `DialogClosed` so the hub delivers what it requeued.
-//! - Permission answers: the digit of the exact "Yes" / "No" option of the dialog that is
+//! - Permission answers (only when the hub's Claude inline answers are on, and only with
+//!   its evidence): the digit of the exact "Yes" / "No" option of the dialog that is
 //!   exactly the request's (tool title and the whole command or path; see
-//!   `screen::dialog_matches`). Checked when asked AND again by the typist right before the
-//!   key, on the screen as it is then; if the dialog changed, nothing is typed and the
-//!   answer fails (`NoDialog`). Trust answers are re-checked the same way.
+//!   `screen::dialog_matches`, defence in depth only: screen text can never prove which
+//!   request a dialog is). Checked when asked AND again by the typist right before the key,
+//!   on the screen as it is then, and the hub's `AnswerGuard` (card generation, hook-loss
+//!   marker) is the very last check; if anything changed, nothing is typed and the answer
+//!   fails (`NoDialog`). No guard, no key. Trust answers are re-checked on the screen too.
 //! - Interrupt (Esc) is refused (`NotNow`) while a permission is pending or a dialog is
-//!   open: Esc would answer that dialog ("Esc to cancel").
+//!   open: Esc would answer that dialog ("Esc to cancel"). Checked when asked AND by the
+//!   typist right before the key (the caller waits for it), so an Esc that waited behind a
+//!   message never lands in a dialog that opened meanwhile.
 //! - Stop ends the whole process tree (SIGTERM, grace, SIGKILL; see `proctree`), also what
 //!   an agent that already exited left behind (see `pty`).
 //! - A `--resume` whose process exits within `resume_window`, before `SessionStart` or
@@ -48,7 +53,7 @@ use serde_json::json;
 use super::paste;
 use super::proctree::Proc;
 use super::pty::{PtyProcess, PtySpec};
-use super::{screen, Attachment, Driver, DriverError, DriverEvent, Sink};
+use super::{screen, AnswerGuard, Attachment, Driver, DriverError, DriverEvent, Sink};
 
 const ESC: &[u8] = b"\x1b";
 /// Ctrl-E: end of the line in the input box.
@@ -105,14 +110,16 @@ type Reply = mpsc::Sender<Result<(), DriverError>>;
 enum Typing {
     /// (the message as given, the bytes to type before Enter)
     Message(String, Vec<u8>),
-    /// Keys for the TUI (Esc): typed as they are.
-    Keys(Vec<u8>),
-    /// A permission answer, checked against the screen right before its key is typed.
+    /// Esc, typed only if nothing blocks typing right before the key (else `NotNow`).
+    Interrupt { deadline: Instant, reply: Reply },
+    /// A permission answer, checked against the screen and the hub's evidence (`guard`)
+    /// right before its key is typed.
     Answer {
         detail: String,
         tool: String,
         description: Option<String>,
         label: &'static str,
+        guard: AnswerGuard,
         deadline: Instant,
         reply: Reply,
     },
@@ -244,18 +251,26 @@ fn trust_key(grid: &str) -> Result<char, DriverError> {
         .ok_or_else(|| DriverError::NoDialog(format!("no trust dialog with a \"{}\" option", screen::TRUST_YES)))
 }
 
-/// Types `key` when `check` still finds it on the screen right now, before `deadline`.
+/// Types `key` when `check` still finds it on the screen right now and `guard` (the hub's
+/// evidence) still holds, before `deadline`. The guard is the very last check before the
+/// key.
 fn type_checked(
     pty: &PtyProcess,
     sink: &Sink,
     what: &str,
     deadline: Instant,
     check: impl FnOnce(&str) -> Result<char, DriverError>,
+    guard: Option<&AnswerGuard>,
 ) -> Result<(), DriverError> {
     let r = if Instant::now() >= deadline {
         Err(DriverError::Failed(format!("the {what} waited too long to be typed; nothing was typed")))
     } else {
-        check(&pty.grid()).and_then(|key| Ok(pty.write(&[key as u8])?))
+        check(&pty.grid()).and_then(|key| {
+            if let Some(why) = guard.and_then(|g| g().err()) {
+                return Err(DriverError::NoDialog(format!("{why}; nothing was typed, answer it in `mirante attach`")));
+            }
+            Ok(pty.write(&[key as u8])?)
+        })
     };
     if let Err(e) = &r {
         sink.emit(DriverEvent::Step(json!({ "type": "answer_aborted", "what": what, "error": e.to_string() })));
@@ -301,17 +316,26 @@ impl ClaudeDriver {
                     Typing::Message(text, bytes) => {
                         type_message(&typist_pty, &typist_sink, timing, text, &bytes, &mut dirty, &typist_owed)
                     }
-                    Typing::Keys(k) => {
-                        let _ = typist_pty.write(&k);
+                    Typing::Interrupt { deadline, reply } => {
+                        // Checked again right before the key: a dialog may have opened (or a
+                        // card become pending) while this waited behind a message.
+                        let r = if Instant::now() >= deadline {
+                            Err(DriverError::Failed("the interrupt waited too long; nothing was typed".into()))
+                        } else if blocked(&typist_pty, &typist_sink).is_some() {
+                            Err(DriverError::NotNow(INTERRUPT_REFUSED.into()))
+                        } else {
+                            typist_pty.write(ESC).map_err(DriverError::from)
+                        };
+                        let _ = reply.send(r);
                     }
-                    Typing::Answer { detail, tool, description, label, deadline, reply } => {
-                        let r = type_checked(&typist_pty, &typist_sink, "permission answer", deadline, |g| {
-                            answer_key(g, &tool, &detail, description.as_deref(), label, &cwd)
-                        });
+                    Typing::Answer { detail, tool, description, label, guard, deadline, reply } => {
+                        let check = |g: &str| answer_key(g, &tool, &detail, description.as_deref(), label, &cwd);
+                        let r =
+                            type_checked(&typist_pty, &typist_sink, "permission answer", deadline, check, Some(&guard));
                         let _ = reply.send(r);
                     }
                     Typing::Trust { deadline, reply } => {
-                        let r = type_checked(&typist_pty, &typist_sink, "trust answer", deadline, trust_key);
+                        let r = type_checked(&typist_pty, &typist_sink, "trust answer", deadline, trust_key, None);
                         let _ = reply.send(r);
                     }
                 }
@@ -466,11 +490,12 @@ impl Driver for ClaudeDriver {
     }
 
     fn interrupt(&self) -> Result<(), DriverError> {
-        // Esc answers a dialog ("Esc to cancel"): never typed while one is pending or open.
+        // Esc answers a dialog ("Esc to cancel"): never typed while one is pending or open,
+        // checked now and again by the typist right before the key.
         if blocked(&self.pty, &self.sink).is_some() {
             return Err(DriverError::NotNow(INTERRUPT_REFUSED.into()));
         }
-        self.type_(Typing::Keys(ESC.to_vec()))
+        self.type_answer(|deadline, reply| Typing::Interrupt { deadline, reply })
     }
 
     fn answer_permission(
@@ -479,12 +504,18 @@ impl Driver for ClaudeDriver {
         tool: &str,
         description: Option<&str>,
         allow: bool,
+        guard: Option<AnswerGuard>,
     ) -> Result<(), DriverError> {
+        // Screen text can never prove which request a dialog is: without the hub's evidence
+        // nothing is typed.
+        let guard = guard.ok_or_else(|| {
+            DriverError::NoDialog("no evidence that the dialog is this request's; answer it in `mirante attach`".into())
+        })?;
         let label = if allow { "Yes" } else { "No" };
         // Checked now for a quick answer, and again by the typist right before the key.
         answer_key(&self.pty.grid(), tool, detail, description, label, &self.cwd)?;
         let (detail, tool, description) = (detail.to_string(), tool.to_string(), description.map(str::to_string));
-        self.type_answer(|deadline, reply| Typing::Answer { detail, tool, description, label, deadline, reply })
+        self.type_answer(|deadline, reply| Typing::Answer { detail, tool, description, label, guard, deadline, reply })
     }
 
     fn trust(&self, accept: bool) -> Result<(), DriverError> {
@@ -659,7 +690,8 @@ mod tests {
         assert_eq!(next(&f.rx, |e| matches!(e, DriverEvent::Boot(_))), DriverEvent::Boot(BootState::Ready));
     }
 
-    const DIALOG: &[u8] = b"\x1b[2J\x1b[H Bash command\r\n   touch x\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n";
+    /// A live permission dialog: the box border (the widest row, at column 0), title, command.
+    const DIALOG: &[u8] = b"\x1b[2J\x1b[H\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n Bash command\r\n   touch x\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n";
 
     #[test]
     fn the_trust_prompt_waits_for_the_user_then_its_exact_option_is_typed() {
@@ -831,10 +863,10 @@ mod tests {
         wait_grid(&f.d, "pasted");
         f.d.pty.mirror(DIALOG);
         let d = f.d.clone();
-        let answer = std::thread::spawn(move || d.answer_permission("touch x", "Bash", None, true));
+        let answer = std::thread::spawn(move || d.answer_permission("touch x", "Bash", None, true, Some(pass())));
         std::thread::sleep(Duration::from_millis(150));
         // Before the typist gets to it, another dialog replaced the one that was asked about.
-        f.d.pty.mirror(b"\x1b[2J\x1b[H Bash command\r\n   rm -rf ~\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n");
+        f.d.pty.mirror(b"\x1b[2J\x1b[H\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n Bash command\r\n   rm -rf ~\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n");
         let r = answer.join().unwrap();
         assert!(matches!(r, Err(DriverError::NoDialog(_))), "{r:?}");
         next(&f.rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "answer_aborted"));
@@ -883,7 +915,7 @@ mod tests {
         f.d.pty.mirror(DIALOG);
         f.hold.store(true, Ordering::SeqCst);
         let t0 = Instant::now();
-        let r = f.d.answer_permission("touch x", "Bash", None, true);
+        let r = f.d.answer_permission("touch x", "Bash", None, true, Some(pass()));
         let took = t0.elapsed();
         assert!(r.is_ok(), "{r:?}");
         assert!(took < Duration::from_millis(300), "the answer waited {took:?} behind the steers");
@@ -895,6 +927,95 @@ mod tests {
             }
         }
         assert_eq!(aborted, 5);
+    }
+
+    fn pass() -> AnswerGuard {
+        Arc::new(|| Ok(()))
+    }
+
+    /// Ported from the second driver review's probe
+    /// (`review_probe_esc_queued_behind_a_message_lands_in_a_dialog`): an Esc accepted by
+    /// `interrupt` while the typist was busy with a message was typed later with no re-check,
+    /// after a dialog (hold + screen) appeared. Now the interrupt waits for the typist, which
+    /// checks again right before the key and refuses (`NotNow`): nothing reaches the agent.
+    #[test]
+    fn probe_an_esc_queued_behind_a_message_is_never_typed_into_a_dialog_that_opened_meanwhile() {
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let pasted = paste::bracketed("go on");
+        let f = fake_with(
+            &format!(
+                "{READY}; dd bs=1 count={} >/dev/null 2>&1; printf 'pasted'; stty min 0 time 20; \
+                 dd bs=1 count=1 of={} 2>/dev/null; printf ' read'; sleep 5",
+                pasted.len(),
+                out.display()
+            ),
+            ClaudeTiming { type_pause: Duration::from_millis(800), ..fast() },
+            false,
+        );
+        ready(&f);
+        f.d.send("go on").unwrap();
+        wait_grid(&f.d, "pasted");
+        // Nothing blocks yet: the interrupt is accepted and waits behind the message.
+        let d = f.d.clone();
+        let esc = std::thread::spawn(move || d.interrupt());
+        std::thread::sleep(Duration::from_millis(100));
+        // The PermissionRequest hook arrives and the dialog is drawn.
+        f.hold.store(true, Ordering::SeqCst);
+        f.d.pty.mirror(DIALOG);
+        let r = esc.join().unwrap();
+        assert!(matches!(r, Err(DriverError::NotNow(ref m)) if m.starts_with("dialog open")), "{r:?}");
+        wait_grid(&f.d, " read");
+        assert_eq!(std::fs::read(&out).unwrap_or_default(), b"", "no Esc reached the dialog");
+    }
+
+    #[test]
+    fn an_interrupt_with_nothing_in_the_way_types_esc_and_returns_once_typed() {
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let f = fake(&format!(
+            "{READY}; stty min 0 time 20; dd bs=1 count=1 of={} 2>/dev/null; printf 'read'; sleep 5",
+            out.display()
+        ));
+        ready(&f);
+        f.d.interrupt().unwrap();
+        wait_grid(&f.d, "read");
+        assert_eq!(std::fs::read(&out).unwrap(), b"\x1b");
+    }
+
+    #[test]
+    fn an_answer_whose_evidence_changed_before_the_key_types_nothing() {
+        let f = fake(&format!(
+            "{READY}; stty min 0 time 15; k=$(dd bs=1 count=1 2>/dev/null); printf 'got:[%s]' \"$k\"; sleep 5"
+        ));
+        ready(&f);
+        f.d.pty.mirror(DIALOG);
+        f.hold.store(true, Ordering::SeqCst);
+        // The dialog on screen matches, but the hub's evidence no longer holds.
+        let stale: AnswerGuard = Arc::new(|| Err("a newer tool call has no card".into()));
+        let r = f.d.answer_permission("touch x", "Bash", None, true, Some(stale));
+        assert!(matches!(r, Err(DriverError::NoDialog(ref m)) if m.contains("newer tool call")), "{r:?}");
+        // No guard at all: Claude answers are never typed without the hub's evidence.
+        let r = f.d.answer_permission("touch x", "Bash", None, true, None);
+        assert!(matches!(r, Err(DriverError::NoDialog(_))), "{r:?}");
+        wait_grid(&f.d, "got:[]");
+    }
+
+    #[test]
+    fn the_guard_is_called_after_the_screen_check_right_before_the_key() {
+        let f = fake(&format!("{READY}; k=$(dd bs=1 count=1 2>/dev/null); printf 'got:[%s]' \"$k\"; sleep 5"));
+        ready(&f);
+        f.d.pty.mirror(DIALOG);
+        f.hold.store(true, Ordering::SeqCst);
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        let g: AnswerGuard = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        f.d.answer_permission("touch x", "Bash", None, true, Some(g)).unwrap();
+        wait_grid(&f.d, "got:[1]");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "checked once, by the typist");
     }
 
     #[test]

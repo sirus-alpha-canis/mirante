@@ -44,7 +44,7 @@ Plus one small CLI refactor (Task 4): `daemon_ctl::start_daemon_with(paths, bin)
 | Card history after restart | `task.events {task, limit: 200}` (Task 1) |
 | Dispatch | `task.create {repo, agent, branch, goal}` then `session.start {task, prompt: goal}` |
 | Trust dialog | `session.trust {task, accept}` |
-| Permission cards | `permission.list`, `permission.answer {id, allow}` (once; CONFLICT = already answered) |
+| Permission cards | `permission.list`, `permission.answer {id, allow}` (once; CONFLICT = already answered; ANSWER_IN_TERMINAL (8) = Mirante typed nothing, answer the Claude dialog in the Terminal tab). Claude cards show Allow/Deny only when `daemon.status.claude_inline_answers` is true (off by default, Plan 2b decision 12) |
 | Talk mid-run | `message.send {task, text, mode: steer|queue}`; UNSUPPORTED → `session.interrupt` then queue |
 | Terminal | `attach {task, rows, cols}` (raw bytes after the response), `session.resize` |
 | Session actions | `session.interrupt`, `session.stop`, `session.resume`, `session.hibernate`, `session.wake` |
@@ -55,9 +55,9 @@ The bridge refuses everything else (`hook.event`, `daemon.shutdown`, `daemon.kil
 
 ### The screen (founder's design)
 
-- **V3 home (default):** left rail = projects/repos (needs-you badge, add by path) + agents; center = the selected project's feed: one live card per task (dispatch line, labels, last steps, permission card with **Allow once** / **Deny**, trust card, done card with diff summary + **Open PR**), dispatch box `@claude <repo>/<branch> goal` / `@codex …`; right rail = board: **Needs you / Working / Ready for review**.
+- **V3 home (default):** left rail = projects/repos (needs-you badge, add by path) + agents; center = the selected project's feed: one live card per task (dispatch line, labels, last steps, permission card with **Allow once** / **Deny** — for a Claude card while the daemon's inline answers are off, **Answer in terminal** instead, which opens V1 on that task's Terminal tab —, trust card, done card with diff summary + **Open PR**), dispatch box `@claude <repo>/<branch> goal` / `@codex …`; right rail = board: **Needs you / Working / Ready for review**.
 - **V1 detail:** click a card → tasks grouped by state on the left; the task with tabs **Steps / Terminal / Diff / Memory** (Memory is a placeholder until the memory layer) and a composer with **Steer now** / **Queue**.
-- **V2 grid:** ⌘G toggles 2–6 live tiles (last lines, status, inline allow/deny, mini input). ⌘K command bar everywhere.
+- **V2 grid:** ⌘G toggles 2–6 live tiles (last lines, status, inline allow/deny — Claude with inline answers off: **Answer in terminal** —, mini input). ⌘K command bar everywhere.
 - Notifications: native, when a task starts needing the user, suppressed when that task is on screen in the focused window.
 
 ## File structure
@@ -2173,6 +2173,9 @@ export interface DaemonStatus {
   live_sessions: number;
   /** The memory guard's view (absent from older daemons and before the first sample). */
   memory?: SystemView | null;
+  /** Mirante types Claude permission answers (`MIRANTE_CLAUDE_INLINE_ANSWERS=1`). Absent or
+   * false: Claude cards are answered in the Terminal tab. */
+  claude_inline_answers?: boolean;
 }
 
 export interface StartResult {
@@ -2207,6 +2210,8 @@ export const RpcCode = {
   UNSUPPORTED: 3,
   DRIVER: 4,
   NEEDS_YOU: 5,
+  /** Mirante typed nothing: answer the Claude dialog in the agent's terminal. */
+  ANSWER_IN_TERMINAL: 8,
 } as const;
 
 /** `mirante_ipc::types::method` (the ones the cockpit may call). */
@@ -3832,6 +3837,8 @@ EOF
 
 Components get the outside world from `Env` (store, `rpc`, storage, `openUrl`, `startDaemon`, `notify`) so tests inject fakes (`src/test/env.tsx`). The card shows the dispatch line, labels (Codex **auto-edits**; a `grantRoot` request, which the daemon names `file_change (session-wide grant)`, gets **session-wide grant**), the last five feed lines, Allow once / Deny cards (a CONFLICT answer means "already answered"), the trust card, and when the turn ended the diff summary with **Open PR** (disabled until pushed).
 
+**Claude cards and inline answers (Plan 2b decision 12).** Screen text can never prove which request a Claude dialog is, so the daemon types Claude answers only when `daemon.status.claude_inline_answers` is true (off by default) and it has the evidence. A Claude card therefore shows **Answer in terminal** instead of Allow once / Deny while inline answers are off (`inlineAnswers` prop, false unless the polled status says true): it calls `onOpen(taskId, "Terminal")`, which opens V1 on that task with the **Terminal** tab focused, where the user answers in Claude's own TUI. With inline answers on, Allow once / Deny are shown, and an `ANSWER_IN_TERMINAL` (8) reply (the daemon refused for lack of evidence, nothing typed) turns the card into the same **Answer in terminal** button with the daemon's reason. Codex cards always show Allow once / Deny (answers go to a JSON-RPC request id).
+
 **Files:**
 - Create: `apps/cockpit/src/env.tsx`
 - Create: `apps/cockpit/src/lib/labels.ts`
@@ -3939,11 +3946,24 @@ const diff: TaskDiff = {
   pushed: true,
 };
 
-function setup(answers: Record<string, unknown>, t: TaskView, events: ReturnType<typeof ev>[] = []) {
+function setup(
+  answers: Record<string, unknown>,
+  t: TaskView,
+  events: ReturnType<typeof ev>[] = [],
+  inlineAnswers = true,
+) {
   const h = makeEnv(answers);
   h.load([t], events);
-  renderWith(h.env, <AgentCard t={h.env.cockpit.getState().tasks[t.id]} onOpen={() => {}} />);
-  return h;
+  const opened: [string, string | undefined][] = [];
+  renderWith(
+    h.env,
+    <AgentCard
+      t={h.env.cockpit.getState().tasks[t.id]}
+      inlineAnswers={inlineAnswers}
+      onOpen={(id, tab) => opened.push([id, tab])}
+    />,
+  );
+  return { ...h, opened };
 }
 
 describe("AgentCard", () => {
@@ -3966,6 +3986,39 @@ describe("AgentCard", () => {
     ]);
     await userEvent.click(screen.getByRole("button", { name: "Deny" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("already answered");
+  });
+
+  it("a Claude card with inline answers off offers Answer in terminal, never Allow/Deny", async () => {
+    const h = setup({}, task("a", { status: "needs_you" }), [
+      ev(1, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "rm -rf dist" }),
+    ], false);
+    const perm = screen.getByRole("group", { name: "Permission request: Bash" });
+    expect(within(perm).queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(within(perm).queryByRole("button", { name: "Deny" })).toBeNull();
+    await userEvent.click(within(perm).getByRole("button", { name: "Answer in terminal" }));
+    expect(h.opened).toEqual([["a", "Terminal"]]);
+    expect(h.calls.filter(([m]) => m === "permission.answer")).toEqual([]);
+  });
+
+  it("a refused inline answer (ANSWER_IN_TERMINAL) turns the card into Answer in terminal", async () => {
+    const h = setup(
+      { "permission.answer": rpcError(RpcCode.ANSWER_IN_TERMINAL, "answer this dialog in the terminal (mirante attach feat/a): a newer tool call") },
+      task("a", { status: "needs_you" }),
+      [ev(1, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "ls" })],
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("a newer tool call");
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Answer in terminal" }));
+    expect(h.opened).toEqual([["a", "Terminal"]]);
+  });
+
+  it("Codex cards keep Allow/Deny whatever the Claude setting", () => {
+    setup({}, task("c", { agent: "codex", status: "needs_you" }), [
+      ev(1, "c", "permission_requested", { permission_id: "p3", tool: "command", detail: "curl x" }),
+    ], false);
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Answer in terminal" })).toBeNull();
   });
 
   it("labels Codex auto-edits and session-wide grants", () => {
@@ -4108,23 +4161,42 @@ import { useState } from "react";
 import { useEnv } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { permissionScope } from "../lib/labels";
-import { M, RpcCode } from "../lib/protocol";
+import { type AgentKind, M, RpcCode } from "../lib/protocol";
 import type { Perm } from "../store/state";
 
-/** A pending permission request. Answers are one-time; there is no "always allow". */
-export function PermissionCard({ perm, compact = false }: { perm: Perm; compact?: boolean }) {
+/**
+ * A pending permission request. Answers are one-time; there is no "always allow". A Claude
+ * card is answered in the Terminal tab unless the daemon types Claude answers
+ * (`inlineAnswers`), and also once the daemon refused to (`ANSWER_IN_TERMINAL`).
+ */
+export function PermissionCard({
+  perm,
+  agent,
+  inlineAnswers,
+  onAnswerInTerminal,
+  compact = false,
+}: {
+  perm: Perm;
+  agent: AgentKind;
+  inlineAnswers: boolean;
+  onAnswerInTerminal(): void;
+  compact?: boolean;
+}) {
   const { rpc } = useEnv();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
   const scope = permissionScope(perm.tool);
+  const inTerminal = agent === "claude" && (!inlineAnswers || refused);
   const answer = async (allow: boolean) => {
     setBusy(true);
     setError(null);
     try {
       await rpc(M.permissionAnswer, { id: perm.id, allow });
     } catch (e) {
-      const conflict = e instanceof DaemonError && e.code === RpcCode.CONFLICT;
-      setError(conflict ? "already answered" : String(e instanceof Error ? e.message : e));
+      const code = e instanceof DaemonError ? e.code : null;
+      if (code === RpcCode.ANSWER_IN_TERMINAL) setRefused(true);
+      setError(code === RpcCode.CONFLICT ? "already answered" : String(e instanceof Error ? e.message : e));
     } finally {
       setBusy(false);
     }
@@ -4139,12 +4211,24 @@ export function PermissionCard({ perm, compact = false }: { perm: Perm; compact?
         <code className="perm-detail">{perm.detail}</code>
       </div>
       <div className="perm-actions">
-        <button className="btn btn-primary" disabled={busy} onClick={() => answer(true)}>
-          Allow once
-        </button>
-        <button className="btn" disabled={busy} onClick={() => answer(false)}>
-          Deny
-        </button>
+        {inTerminal ? (
+          <button
+            className="btn btn-primary"
+            title="Mirante does not type this answer: answer the dialog in Claude's own terminal."
+            onClick={onAnswerInTerminal}
+          >
+            Answer in terminal
+          </button>
+        ) : (
+          <>
+            <button className="btn btn-primary" disabled={busy} onClick={() => answer(true)}>
+              Allow once
+            </button>
+            <button className="btn" disabled={busy} onClick={() => answer(false)}>
+              Deny
+            </button>
+          </>
+        )}
       </div>
       {error && (
         <p className="error" role="alert">
@@ -4292,8 +4376,18 @@ export function FeedLine({ item }: { item: FeedItem }) {
   );
 }
 
-/** One task in the project feed: the dispatch, live progress, and whatever needs the user. */
-export function AgentCard({ t, onOpen }: { t: TaskView; onOpen(id: string): void }) {
+/** One task in the project feed: the dispatch, live progress, and whatever needs the user.
+ * `onOpen(id, "Terminal")` opens V1 on the task's Terminal tab (Claude cards answered there). */
+export function AgentCard({
+  t,
+  onOpen,
+  inlineAnswers = false,
+}: {
+  t: TaskView;
+  onOpen(id: string, tab?: "Terminal"): void;
+  /** `daemon.status.claude_inline_answers` (false when unknown). */
+  inlineAnswers?: boolean;
+}) {
   const s = useStore();
   const feed = s.feed[t.id];
   const col = columnOf(t, feed);
@@ -4320,7 +4414,13 @@ export function AgentCard({ t, onOpen }: { t: TaskView; onOpen(id: string): void
       )}
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
       {perms.map((p) => (
-        <PermissionCard key={p.id} perm={p} />
+        <PermissionCard
+          key={p.id}
+          perm={p}
+          agent={t.agent}
+          inlineAnswers={inlineAnswers}
+          onAnswerInTerminal={() => onOpen(t.id, "Terminal")}
+        />
       ))}
       {col === "review" && <DoneCard taskId={t.id} version={turnsEnded(feed)} onOpen={() => onOpen(t.id)} />}
     </article>
@@ -4332,7 +4432,16 @@ export function AgentCard({ t, onOpen }: { t: TaskView; onOpen(id: string): void
 
 Run: `pnpm --dir apps/cockpit exec vitest run src/components/AgentCard.test.tsx src/lib/labels.test.ts && pnpm --dir apps/cockpit typecheck`
 
-Expected: exit 0; output contains `Tests  8 passed (8)`
+Expected: exit 0; output contains `Tests  11 passed (11)`
+
+- [ ] **Step 13b: Wiring in later tasks (Claude answers in the terminal)**
+
+The props above are threaded through the later tasks; apply these when writing them:
+- **Task 13 (Home):** `Home` passes `inlineAnswers={props.status?.claude_inline_answers ?? false}` to each `AgentCard`, and its `onOpen` prop becomes `onOpen(taskId: string, tab?: "Terminal"): void` (passed through unchanged).
+- **Task 15 (Detail):** `Detail` takes `initialTab?: Tab` (`useState<Tab>(initialTab ?? "Steps")`, and `key={taskId + (initialTab ?? "")}` at the call site so a new request re-focuses), and its pending-permission cards get the same `agent` / `inlineAnswers` / `onAnswerInTerminal={() => setTab("Terminal")}` props; add a test: a Claude card with inline answers off shows **Answer in terminal**, and clicking it selects the Terminal tab (`aria-selected="true"`) with `Terminal of feat/a` visible.
+- **Task 16 (Grid):** `Tile` renders `<PermissionCard perm={perm} agent={t.agent} inlineAnswers={inline} onAnswerInTerminal={() => onOpen(t.id, "Terminal")} compact />` (`inline` from the polled status via a `status` prop on `Grid`); the grid test's inline **Allow once** runs with `claude_inline_answers: true`, plus one assertion that the same Claude tile with it false shows **Answer in terminal** and calls `onOpen("…", "Terminal")`.
+- **Task 18 (App):** `open` becomes `(id: string, tab?: "Terminal") => { setTaskId(id); setDetailTab(tab); setMode("detail"); }`, `Detail` gets `initialTab={detailTab}`, `Grid` gets `status`; the ⌘K command for a task needing the user on a Claude card with inline answers off reads "Answer in terminal" and opens the Terminal tab.
+- **Task 21 (dogfood):** see the two checklist lines on Claude cards.
 
 - [ ] **Step 14: Commit**
 
@@ -6785,7 +6894,8 @@ Setup: `cargo install --path crates/mirante-daemon`, `crates/mirante-hook`,
 
 ## C. Permissions
 
-- [ ] Claude asks for a command: the card shows tool and command; **Allow once** runs it,
+- [ ] Claude asks for a command with the daemon's inline answers off (default): the card shows tool and command and **Answer in terminal** (no Allow/Deny); clicking it opens the task's Terminal tab, focused, where answering in Claude's TUI clears the card.
+- [ ] With `MIRANTE_CLAUDE_INLINE_ANSWERS=1` (only after Plan 2b Task 21 §H's evidence check passed): Claude asks for a command: the card shows tool and command; **Allow once** runs it,
       the card leaves; **Deny** stops it, the status leaves Needs you within 2 s.
 - [ ] Codex asks for write access outside the sandbox: the card says
       **session-wide grant**.

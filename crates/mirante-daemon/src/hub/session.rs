@@ -2,6 +2,7 @@
 //! and every input that moves a session's status: hook events (Claude, via `hook.event`)
 //! and driver events (transcript lines, Codex status, approvals, exit).
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -254,6 +255,7 @@ impl State {
         if let Some(l) = self.live.get_mut(task_id) {
             l.perm_keys.remove(id);
             l.dialogs.remove(id);
+            l.card_gen.fetch_add(1, Ordering::SeqCst);
         }
         self.event(
             Some(task_id),
@@ -271,6 +273,9 @@ impl State {
         match event {
             DriverEvent::Transcript(line) => {
                 if let Some(l) = self.live.get_mut(task_id) {
+                    if l.ledger.observe(&line) {
+                        l.card_gen.fetch_add(1, Ordering::SeqCst);
+                    }
                     if let Some(c) = compact(&line) {
                         l.transcript.push(c);
                         let excess = l.transcript.len().saturating_sub(TRANSCRIPT_WINDOW);
@@ -664,6 +669,7 @@ impl State {
         };
         let session_id = live.session_id.clone();
         let native = live.native_id.clone();
+        let card_gen = live.card_gen.clone();
         // Generation fence: a hook stamped with an earlier Mirante session of this task (its
         // Claude process outlived the session, or the hook was slow) must not touch the new
         // one. Unstamped hooks (an older hook binary) are still applied.
@@ -673,6 +679,9 @@ impl State {
             st.publish();
             return Ok(());
         }
+        // Any hook of this session may mean another dialog: an answer in flight for an
+        // earlier view of the session types nothing.
+        card_gen.fetch_add(1, Ordering::SeqCst);
         if ev.hook_event_name == "SessionStart" {
             if let Some(d) = live.driver.clone() {
                 d.session_started();
@@ -802,8 +811,9 @@ impl State {
             tool_use_id: l.engine.tool_use_id_for(ev),
             tool_name: ev.tool_name.clone(),
             description,
+            hook_lost: mirante_ipc::hookloss::fingerprint(&self.paths),
         };
-        if key.tool_use_id.is_some() && l.dialogs.values().any(|k| *k == key) {
+        if key.tool_use_id.is_some() && l.dialogs.values().any(|k| k.same_dialog(&key)) {
             return Ok(());
         }
         let older: Vec<String> = self
@@ -825,6 +835,7 @@ impl State {
         }
         if let Some(l) = self.live.get_mut(task_id) {
             l.dialogs.insert(card.id, key);
+            l.card_gen.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -909,6 +920,18 @@ impl super::testkit::Kit {
 
     pub fn calls(&self) -> Vec<String> {
         self.factory.driver.calls()
+    }
+
+    /// Turns Claude inline answers on (off by default).
+    pub fn inline(&self) {
+        self.hub.set_claude_inline_answers(true);
+    }
+
+    /// The transcript shows the main agent's tool call `id` (the answer evidence).
+    pub fn tool_use(&self, id: &str) {
+        let line = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {}}]}});
+        self.emit(DriverEvent::Transcript(line));
     }
 
     pub fn pending(&self, task_id: &str) -> Vec<mirante_core::model::PermissionRequest> {
@@ -1553,7 +1576,9 @@ mod tests {
         let t = k.started(AgentKind::Claude, "a").task;
         let sink = k.factory.last_sink();
         assert!(!sink.held());
+        k.inline();
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
         k.hook(&t.id, perm("t1", "ls"));
         assert!(sink.held());
         let id = k.pending(&t.id)[0].id.clone();

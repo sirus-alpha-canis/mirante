@@ -10,6 +10,10 @@
 //! `received_ts_ms`. **The daemon's `hook.event` handling and spool ingest must dedupe by
 //! `event_id`** (a timed-out forward is also spooled, so it can arrive twice), skip lines
 //! that do not parse, and remember that spool replays can be older than live events.
+//!
+//! Every event that misses the live daemon (spooled, breaker tripped, lost) is also marked
+//! in `<home>/hook-lost` ([`mirante_ipc::hookloss`]): the daemon then stops typing Claude
+//! answers for the cards it had, since it may have missed a newer dialog.
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use mirante_ipc::rpc::{code, MAX_LINE};
 use mirante_ipc::types::{method, HookEnvelope, HookParams};
-use mirante_ipc::{Client, ClientError, Paths};
+use mirante_ipc::{hookloss, Client, ClientError, Paths};
 use serde_json::Value;
 
 /// Overall deadline for forwarding (connect + write + read the ack), then spool.
@@ -141,18 +145,23 @@ fn deliver_inner(
             Some(Ok(())) | Some(Err(ClientError::Rpc(_))) => return Outcome::Forwarded,
             // A socket timeout and the overall deadline are the same failure (a daemon that
             // accepts but does not answer): either one trips the breaker.
-            Some(Err(ClientError::Io(e))) if is_timeout(&e) => trip_breaker(paths),
+            Some(Err(ClientError::Io(e))) if is_timeout(&e) => trip_breaker(paths, ts_ms),
             Some(Err(_)) => {}
-            None => trip_breaker(paths),
+            None => trip_breaker(paths, ts_ms),
         }
     }
-    match spool(paths, &env) {
+    // The live daemon will not see this event (until a restart ingests the spool): mark the
+    // loss, so it stops typing Claude answers for cards created before it.
+    let outcome = match spool(paths, &env) {
         Ok(()) => Outcome::Spooled,
         Err(e) => {
             eprintln!("mirante-hook: event lost: {e}");
             Outcome::Lost
         }
-    }
+    };
+    let what = if outcome == Outcome::Spooled { "spooled" } else { "lost" };
+    let _ = hookloss::record(paths, what, ts_ms);
+    outcome
 }
 
 fn breaker_open(paths: &Paths) -> bool {
@@ -163,10 +172,11 @@ fn breaker_open(paths: &Paths) -> bool {
         .is_some_and(|age| age < BREAKER_WINDOW)
 }
 
-fn trip_breaker(paths: &Paths) {
+fn trip_breaker(paths: &Paths, ts_ms: i64) {
     if paths.ensure_home().is_ok() {
         let _ = std::fs::write(paths.hook_breaker(), b"");
     }
+    let _ = hookloss::record(paths, "breaker", ts_ms);
 }
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -307,6 +317,49 @@ mod tests {
         let v = lines(&paths);
         assert_eq!(v[0].session.as_deref(), Some("sess-1"));
         assert_eq!((v[1].session.as_deref(), v[2].session.as_deref()), (None, None));
+    }
+
+    #[test]
+    fn every_event_that_misses_the_daemon_marks_a_hook_loss_and_a_forward_does_not() {
+        use mirante_ipc::hookloss::fingerprint;
+        let d = TestDir::new();
+        let paths = Paths::new(&d.path().join("home"));
+        assert_eq!(fingerprint(&paths), None);
+        assert_eq!(deliver(&paths, Some("t"), "{}", 1), Outcome::Spooled);
+        let first = fingerprint(&paths);
+        assert!(first.is_some(), "a spooled event is a loss for the live daemon");
+        assert_eq!(deliver(&paths, Some("t"), "{}", 2), Outcome::Spooled);
+        assert_ne!(fingerprint(&paths), first);
+        // A forwarded event leaves the marker alone.
+        let up = TestDir::new();
+        let paths = Paths::new(up.path());
+        let listener = UnixListener::bind(paths.socket()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let req: Request =
+                serde_json::from_str(&read_line(&mut BufReader::new(stream.try_clone().unwrap())).unwrap().unwrap())
+                    .unwrap();
+            let mut w = stream;
+            write_line(&mut w, &Response::ok(req.id, json!({}))).unwrap();
+        });
+        assert_eq!(deliver(&paths, Some("t"), "{}", 3), Outcome::Forwarded);
+        server.join().unwrap();
+        assert_eq!(fingerprint(&paths), None);
+    }
+
+    #[test]
+    fn a_tripped_breaker_marks_a_hook_loss() {
+        let d = TestDir::new();
+        let paths = Paths::new(d.path());
+        let listener = UnixListener::bind(paths.socket()).unwrap();
+        let _hold = std::thread::spawn(move || {
+            let c = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(c);
+        });
+        deliver_inner(&paths, Some("t"), None, "{}", 1, false, Duration::from_millis(100));
+        let lines = std::fs::read_to_string(paths.hook_lost()).unwrap();
+        assert!(lines.contains("breaker") && lines.contains("spooled"), "{lines}");
     }
 
     #[test]

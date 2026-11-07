@@ -299,6 +299,10 @@ pub struct DaemonStatus {
     /// The memory guard's view (absent from older daemons and before the first sample).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<SystemView>,
+    /// Mirante types Claude permission answers itself (`MIRANTE_CLAUDE_INLINE_ANSWERS=1`).
+    /// Off (the default): Claude cards are answered in the terminal (`mirante attach`).
+    #[serde(default)]
+    pub claude_inline_answers: bool,
 }
 #[cfg(test)]
 mod tests {

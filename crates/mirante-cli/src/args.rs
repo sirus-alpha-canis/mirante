@@ -17,7 +17,9 @@ usage: mirante <command>
                          steer now (default) or queue for the end of the running turn
   perms                  pending permission requests
   allow <perm> | deny <perm>
-                         answer one request, once (never \"always\")
+                         answer one request, once (never \"always\"); a Claude dialog is
+                         answered in the terminal (offers to attach) unless the daemon runs
+                         with MIRANTE_CLAUDE_INLINE_ANSWERS=1 and has the evidence
   interrupt <task>       stop the current step (Esc / turn/interrupt)
   stop <task>            end the agent process (resumable)
   resume <task> [--trust] [--fresh]

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use super::proctree::Proc;
-use super::{Attachment, Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
+use super::{AnswerGuard, Attachment, Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
 #[derive(Default)]
 pub struct FakeDriver {
@@ -21,6 +21,10 @@ pub struct FakeDriver {
     /// second before answering (a test acts on the hub meanwhile).
     #[allow(clippy::type_complexity)]
     pub answer_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    /// Like `answer_gate`, but before the guard is checked (the time between the hub's
+    /// checks and the typist's last check).
+    #[allow(clippy::type_complexity)]
+    pub guard_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 impl FakeDriver {
@@ -51,13 +55,24 @@ impl Driver for FakeDriver {
         tool: &str,
         description: Option<&str>,
         allow: bool,
+        guard: Option<AnswerGuard>,
     ) -> Result<(), DriverError> {
-        if let Some((entered, go)) = self.answer_gate.lock().unwrap().take() {
+        if let Some((entered, go)) = self.guard_gate.lock().unwrap().take() {
             let _ = entered.send(());
             let _ = go.recv();
         }
         if self.fail_answers.load(Ordering::SeqCst) {
             return Err(DriverError::NoDialog("fake".into()));
+        }
+        // Like the Claude typist: the guard is the last check before the key.
+        if let Some(why) = guard.as_ref().and_then(|g| g().err()) {
+            self.record(format!("guard_refused:{why}"));
+            return Err(DriverError::NoDialog(why));
+        }
+        // The key is typed; the driver has not returned yet.
+        if let Some((entered, go)) = self.answer_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = go.recv();
         }
         self.record(format!("answer:{key}:{tool}:{allow}"));
         if let Some(d) = description {
