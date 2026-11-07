@@ -959,7 +959,7 @@ Expected: `2 passed`
 - [ ] **Step 3: Run the whole suite**
 
 Run: `cargo test -p spike-kit`
-Expected: `test result: ok. 21 passed` (2 util + 4 hook + 3 status + 7 delivery + 1 stream + 2 transcript + 2 codex).
+Expected: `test result: ok. 32 passed` (3 util + 5 hook + 3 status + 13 delivery + 1 stream + 3 transcript + 4 codex).
 
 - [ ] **Step 4: Commit**
 
@@ -1506,11 +1506,16 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use spike_kit::{codex, delivery, util};
 
-fn wait_capture(out: &Path, pointers: &[&str], timeout: Duration) -> Result<Option<String>> {
+fn wait_capture(
+    out: &Path,
+    pick: fn(&[Value], &[&str]) -> Option<String>,
+    pointers: &[&str],
+    timeout: Duration,
+) -> Result<Option<String>> {
     let start = Instant::now();
     loop {
         if out.exists() {
-            if let Some(id) = codex::capture(&util::read_jsonl(out)?, pointers) {
+            if let Some(id) = pick(&util::read_jsonl(out)?, pointers) {
                 return Ok(Some(id));
             }
         }
@@ -1551,16 +1556,16 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(step["delay_ms"].as_u64().unwrap_or(0)));
         let template = step["msg"].to_string();
         let thread = if template.contains("$THREAD") {
-            wait_capture(&out, &codex::THREAD_POINTERS, Duration::from_secs(15))?
+            wait_capture(&out, codex::capture, &codex::THREAD_POINTERS, Duration::from_secs(15))?
         } else {
             None
         };
         let turn = if template.contains("$TURN") {
-            wait_capture(&out, &codex::TURN_POINTERS, Duration::from_secs(15))?
+            wait_capture(&out, codex::capture_last, &codex::TURN_POINTERS, Duration::from_secs(15))?
         } else {
             None
         };
-        let msg = codex::fill(&template, &cwd, thread.as_deref(), turn.as_deref());
+        let msg = codex::fill(&template, &cwd, thread.as_deref(), turn.as_deref()).map_err(anyhow::Error::msg)?;
         writeln!(stdin, "{msg}")?;
         stdin.flush()?;
         util::append_jsonl(&out, &json!({"ts": util::now_ms(), "dir": "in", "line": serde_json::from_str::<Value>(&msg)?}))?;

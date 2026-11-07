@@ -9,14 +9,19 @@ pub enum Delivery {
     Steered,
     /// Acted on only after the first turn ended.
     Queued,
-    /// Never acted on.
+    /// Never acted on (the first turn did end).
     Never,
+    /// The first turn never ended in the log, so steered vs queued cannot be told apart.
+    Inconclusive,
 }
 
-fn decide(marker_at: Option<u64>, first_end: u64) -> Delivery {
+fn decide(marker_at: Option<u64>, first_end: Option<u64>) -> Delivery {
+    let Some(end) = first_end else {
+        return Delivery::Inconclusive;
+    };
     match marker_at {
         None => Delivery::Never,
-        Some(t) if t < first_end => Delivery::Steered,
+        Some(t) if t < end => Delivery::Steered,
         Some(_) => Delivery::Queued,
     }
 }
@@ -28,15 +33,19 @@ pub fn classify_hooks(events: &[LoggedEvent]) -> Delivery {
         .filter(|e| e.event.hook_event_name == "UserPromptSubmit")
         .map(|e| e.ts_ms)
         .collect();
+    // Fewer than 2 prompts: injection without a UserPromptSubmit is possible, so not provably Never.
     if prompts.len() < 2 {
-        return Delivery::Never;
+        return Delivery::Inconclusive;
     }
-    let first_stop = events
+    // Events are sorted by ts (hook::load_events), so strict `>` is fine here.
+    let Some(first_stop) = events
         .iter()
         .filter(|e| e.event.hook_event_name == "Stop" && e.ts_ms > prompts[0])
         .map(|e| e.ts_ms)
         .min()
-        .unwrap_or(u64::MAX);
+    else {
+        return Delivery::Inconclusive;
+    };
     if prompts[1] < first_stop {
         Delivery::Steered
     } else {
@@ -53,12 +62,18 @@ pub fn classify_stream(log: &[Value], marker: &str) -> Delivery {
         .filter(out)
         .filter(|v| v["line"]["type"] == "result")
         .filter_map(|v| v["ts"].as_u64())
-        .min()
-        .unwrap_or(u64::MAX);
+        .min();
     let marker_at = log
         .iter()
         .filter(out)
-        .filter(|v| v["line"]["type"] == "assistant" && v["line"]["message"]["content"].to_string().contains(marker))
+        .filter(|v| {
+            v["line"]["type"] == "assistant"
+                && v["line"]["message"]["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|b| {
+                        b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.contains(marker))
+                    })
+                })
+        })
         .filter_map(|v| v["ts"].as_u64())
         .min();
     decide(marker_at, first_result)
@@ -73,14 +88,13 @@ pub fn classify_codex(log: &[Value], marker: &str) -> Delivery {
         .filter(out)
         .filter(|v| v["line"]["method"] == "turn/completed")
         .filter_map(|v| v["ts"].as_u64())
-        .min()
-        .unwrap_or(u64::MAX);
+        .min();
     let marker_at = log
         .iter()
         .filter(out)
         .filter(|v| {
-            let s = v["line"].to_string();
-            s.contains(marker) && s.contains("agentMessage")
+            let item = &v["line"]["params"]["item"];
+            item["type"] == "agentMessage" && item["text"].as_str().is_some_and(|t| t.contains(marker))
         })
         .filter_map(|v| v["ts"].as_u64())
         .min();
@@ -121,8 +135,14 @@ mod tests {
     }
 
     #[test]
-    fn hooks_single_prompt_is_never() {
-        assert_eq!(classify_hooks(&[logged(1, "UserPromptSubmit")]), Delivery::Never);
+    fn hooks_single_prompt_is_inconclusive() {
+        assert_eq!(classify_hooks(&[logged(1, "UserPromptSubmit")]), Delivery::Inconclusive);
+    }
+
+    #[test]
+    fn hooks_no_stop_after_first_prompt_is_inconclusive() {
+        let e = vec![logged(1, "UserPromptSubmit"), logged(5, "UserPromptSubmit")];
+        assert_eq!(classify_hooks(&e), Delivery::Inconclusive);
     }
 
     fn out(ts: u64, line: serde_json::Value) -> serde_json::Value {
@@ -151,6 +171,48 @@ mod tests {
     #[test]
     fn stream_without_marker_is_never() {
         assert_eq!(classify_stream(&[out(5, json!({"type": "result"}))], "BANANA"), Delivery::Never);
+    }
+
+    #[test]
+    fn stream_without_result_is_inconclusive() {
+        let log = vec![out(5, json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "BANANA"}]}}))];
+        assert_eq!(classify_stream(&log, "BANANA"), Delivery::Inconclusive);
+    }
+
+    #[test]
+    fn stream_marker_only_in_tool_use_input_is_not_counted() {
+        let log = vec![
+            out(5, json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "echo BANANA"}}]}})),
+            out(9, json!({"type": "result"})),
+        ];
+        assert_eq!(classify_stream(&log, "BANANA"), Delivery::Never);
+    }
+
+    #[test]
+    fn codex_without_turn_completed_is_inconclusive() {
+        let log = vec![out(4, json!({"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "BANANA"}}}))];
+        assert_eq!(classify_codex(&log, "BANANA"), Delivery::Inconclusive);
+    }
+
+    #[test]
+    fn codex_marker_only_in_user_message_inside_turn_completed_is_never() {
+        let log = vec![out(
+            8,
+            json!({"method": "turn/completed", "params": {"turn": {"items": [
+                {"type": "userMessage", "text": "BANANA"},
+                {"type": "agentMessage", "text": "ok"}]}}}),
+        )];
+        assert_eq!(classify_codex(&log, "BANANA"), Delivery::Never);
+    }
+
+    #[test]
+    fn codex_agent_message_after_turn_completed_is_queued() {
+        let log = vec![
+            out(8, json!({"method": "turn/completed"})),
+            out(12, json!({"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "got BANANA"}}})),
+        ];
+        assert_eq!(classify_codex(&log, "BANANA"), Delivery::Queued);
     }
 
     #[test]

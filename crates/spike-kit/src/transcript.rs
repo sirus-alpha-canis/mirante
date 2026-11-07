@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -19,7 +19,8 @@ impl Usage {
 /// Sums token usage of assistant messages in a Claude Code transcript (JSONL).
 /// One API message can span several lines with the same message.id: counted once.
 pub fn sum_transcript(lines: &[Value], session_id: Option<&str>) -> Usage {
-    let mut seen = HashSet::new();
+    // Per message.id: per-field MAX across its lines (streamed lines may carry partial counts).
+    let mut by_id: HashMap<String, Usage> = HashMap::new();
     let mut u = Usage::default();
     for v in lines {
         if v["type"] != "assistant" {
@@ -30,17 +31,35 @@ pub fn sum_transcript(lines: &[Value], session_id: Option<&str>) -> Usage {
                 continue;
             }
         }
-        if let Some(id) = v["message"]["id"].as_str() {
-            if !seen.insert(id.to_string()) {
-                continue;
-            }
-        }
         let m = &v["message"]["usage"];
         let f = |k: &str| m[k].as_u64().unwrap_or(0);
-        u.input += f("input_tokens");
-        u.output += f("output_tokens");
-        u.cache_creation += f("cache_creation_input_tokens");
-        u.cache_read += f("cache_read_input_tokens");
+        let cur = Usage {
+            input: f("input_tokens"),
+            output: f("output_tokens"),
+            cache_creation: f("cache_creation_input_tokens"),
+            cache_read: f("cache_read_input_tokens"),
+        };
+        match v["message"]["id"].as_str() {
+            Some(id) => {
+                let e = by_id.entry(id.to_string()).or_default();
+                e.input = e.input.max(cur.input);
+                e.output = e.output.max(cur.output);
+                e.cache_creation = e.cache_creation.max(cur.cache_creation);
+                e.cache_read = e.cache_read.max(cur.cache_read);
+            }
+            None => {
+                u.input += cur.input;
+                u.output += cur.output;
+                u.cache_creation += cur.cache_creation;
+                u.cache_read += cur.cache_read;
+            }
+        }
+    }
+    for e in by_id.values() {
+        u.input += e.input;
+        u.output += e.output;
+        u.cache_creation += e.cache_creation;
+        u.cache_read += e.cache_read;
     }
     u
 }
@@ -89,6 +108,13 @@ mod tests {
         let u = sum_transcript(&lines, Some("s1"));
         assert_eq!(u, Usage { input: 30, output: 12, cache_creation: 2, cache_read: 4 });
         assert_eq!(u.total(), 48);
+    }
+
+    #[test]
+    fn duplicate_message_id_takes_per_field_max() {
+        let lines = vec![assistant("s1", "m1", 10, 1, "a"), assistant("s1", "m1", 10, 5, "a")];
+        let u = sum_transcript(&lines, Some("s1"));
+        assert_eq!(u, Usage { input: 10, output: 5, cache_creation: 1, cache_read: 2 });
     }
 
     #[test]

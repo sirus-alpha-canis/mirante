@@ -59,11 +59,14 @@ pub fn logged_from_stdin(raw: &str, task_id: Option<String>, ts_ms: u64) -> Valu
 }
 
 pub fn load_events(lines: &[Value], task_id: Option<&str>) -> Vec<LoggedEvent> {
-    lines
+    let mut events: Vec<LoggedEvent> = lines
         .iter()
         .filter_map(|v| serde_json::from_value::<LoggedEvent>(v.clone()).ok())
-        .filter(|e| task_id.map_or(true, |t| e.task_id.as_deref() == Some(t)))
-        .collect()
+        .filter(|e| task_id.is_none_or(|t| e.task_id.as_deref() == Some(t)))
+        .collect();
+    // Concurrent hook processes can append out of order; stable sort keeps ties in file order.
+    events.sort_by_key(|e| e.ts_ms);
+    events
 }
 
 #[cfg(test)]
@@ -108,5 +111,26 @@ mod tests {
         ];
         assert_eq!(load_events(&lines, Some("a")).len(), 1);
         assert_eq!(load_events(&lines, None).len(), 2);
+    }
+
+    #[test]
+    fn load_events_sorts_by_timestamp_stably() {
+        let lines = vec![
+            logged_from_stdin(r#"{"hook_event_name":"Stop"}"#, None, 9),
+            logged_from_stdin(r#"{"hook_event_name":"SessionStart"}"#, None, 1),
+            logged_from_stdin(r#"{"hook_event_name":"PreToolUse"}"#, None, 5),
+            logged_from_stdin(r#"{"hook_event_name":"PostToolUse"}"#, None, 5),
+        ];
+        let names: Vec<(u64, String)> =
+            load_events(&lines, None).into_iter().map(|e| (e.ts_ms, e.event.hook_event_name)).collect();
+        assert_eq!(
+            names,
+            vec![
+                (1, "SessionStart".to_string()),
+                (5, "PreToolUse".to_string()),
+                (5, "PostToolUse".to_string()),
+                (9, "Stop".to_string())
+            ]
+        );
     }
 }
