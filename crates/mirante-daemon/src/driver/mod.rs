@@ -17,6 +17,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 pub mod fake;
+pub mod real;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverError {

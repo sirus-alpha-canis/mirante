@@ -4,3 +4,4 @@
 pub mod driver;
 pub mod hub;
 pub mod recover;
+pub mod server;
