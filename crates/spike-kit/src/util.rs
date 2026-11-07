@@ -81,9 +81,35 @@ pub fn claude_bin() -> String {
     std::env::var("MIRANTE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
 }
 
+/// Variables to remove before spawning a spike `codex`: the Claude nested-session list
+/// plus every `CMUX_*` variable (the cmux codex shim/wrapper integration). Codex auth
+/// lives in `$CODEX_HOME/auth.json` and `OPENAI_*`; neither is ever named here.
+pub fn codex_env_to_scrub() -> Vec<String> {
+    let mut keys = env_to_scrub();
+    keys.extend(std::env::vars().map(|(k, _)| k).filter(|k| k.starts_with("CMUX_")));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The `codex` binary for spikes: `MIRANTE_CODEX_BIN` or `codex` on PATH. Point it at the
+/// real binary when PATH `codex` is a terminal-wrapper shim.
+pub fn codex_bin() -> String {
+    std::env::var("MIRANTE_CODEX_BIN").unwrap_or_else(|_| "codex".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_env_to_scrub_never_names_auth_variables() {
+        for k in codex_env_to_scrub() {
+            assert!(!k.starts_with("OPENAI_"), "{k}");
+            assert!(!k.starts_with("CODEX_"), "{k}");
+            assert!(!k.starts_with("ANTHROPIC_"), "{k}");
+        }
+    }
 
     #[test]
     fn env_to_scrub_never_names_auth_variables() {

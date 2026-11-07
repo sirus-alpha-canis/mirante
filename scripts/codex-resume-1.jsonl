@@ -1,0 +1,4 @@
+{"delay_ms":0,"msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"mirante-spike","version":"0.1.0"}}}}
+{"delay_ms":500,"msg":{"jsonrpc":"2.0","method":"initialized"}}
+{"delay_ms":500,"msg":{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"$CWD","approvalPolicy":"never","sandbox":"read-only"}}}
+{"delay_ms":2000,"msg":{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"$THREAD","input":[{"type":"text","text":"Memorize: a palavra secreta é JABUTICABA. Responda apenas OK."}]}}}
