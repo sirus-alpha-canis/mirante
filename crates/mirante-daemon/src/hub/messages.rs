@@ -69,6 +69,11 @@ impl Hub {
         }
         let mut st = self.lock();
         let task = st.resolve(&m.task)?;
+        if task.agent == AgentKind::Claude {
+            // Refused now rather than queued: the typist would refuse it at every turn end
+            // (a `!` bash-mode line, a multi-line slash command).
+            crate::driver::paste::typed_message(&m.text).map_err(HubError::Invalid)?;
+        }
         let l = st.live.get_mut(&task.id).ok_or_else(|| {
             HubError::Conflict(format!("task {} has no live session: mirante resume {}", task.branch, task.branch))
         })?;
@@ -210,6 +215,20 @@ mod tests {
         k.hook(&t.id, json!({"hook_event_name": "Stop"}));
         assert_eq!(k.calls(), vec!["send:use tabs".to_string(), "send:then run tests".to_string()]);
         assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 0);
+    }
+
+    #[test]
+    fn claude_messages_the_typist_would_refuse_are_refused_up_front() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        for text in ["!rm -rf build", "/compact\nnow"] {
+            for mode in [SendMode::Steer, SendMode::Queue] {
+                assert!(matches!(send(&k, &t.id, text, mode), Err(HubError::Invalid(_))), "{text:?}");
+            }
+        }
+        assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 0);
+        assert!(send(&k, &t.id, "/compact", SendMode::Queue).is_ok());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use mirante_ipc::types::BootState;
 use mirante_ipc::Paths;
 use serde_json::Value;
 
+pub mod claude;
 #[cfg(test)]
 pub mod fake;
 pub mod paste;
