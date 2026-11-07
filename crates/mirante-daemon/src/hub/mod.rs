@@ -15,7 +15,9 @@ use mirante_core::store::Store;
 use mirante_core::worktree::WorktreeManager;
 use mirante_core::CoreError;
 use mirante_ipc::rpc::{code, RpcError};
-use mirante_ipc::types::{BootState, CreateTask, DaemonStatus, Snapshot, TaskEventsParams, TaskView, TASK_EVENTS_MAX};
+use mirante_ipc::types::{
+    BootState, CreateTask, DaemonStatus, Snapshot, TaskDiff, TaskEventsParams, TaskView, TASK_EVENTS_MAX,
+};
 use mirante_ipc::Paths;
 use serde_json::{json, Value};
 
@@ -521,6 +523,16 @@ impl Hub {
         st.view(t)
     }
 
+    /// The task branch's changes against its base. git runs without the hub lock held.
+    pub fn task_diff(&self, reference: &str) -> Result<TaskDiff> {
+        let t = self.lock().resolve(reference)?;
+        if t.lifecycle == Lifecycle::Archived {
+            return Err(HubError::Conflict(format!("task {} is archived; its worktree is gone", t.branch)));
+        }
+        crate::diff::task_diff(Path::new(&t.repo_path), Path::new(&t.worktree_path), &t.branch)
+            .map_err(HubError::Conflict)
+    }
+
     /// A page of the task's audit trail, oldest first (see [`TaskEventsParams`]). Clients
     /// rebuild a task's step feed from it after a restart.
     pub fn task_events(&self, p: TaskEventsParams) -> Result<Vec<Event>> {
@@ -708,6 +720,35 @@ mod tests {
     use super::testkit::Kit;
     use super::*;
     use mirante_ipc::types::CreateTask;
+
+    #[test]
+    fn task_diff_reports_committed_uncommitted_and_untracked_changes() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "feat/d").task;
+        let wt = Path::new(&t.worktree_path);
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap().success();
+            assert!(ok, "git {args:?}");
+        };
+        std::fs::write(wt.join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        git(wt, &["add", "lib.rs"]);
+        git(wt, &["commit", "-q", "-m", "add lib"]);
+        std::fs::write(wt.join("README"), "hello\n").unwrap();
+        std::fs::write(wt.join("notes.txt"), "scratch\n").unwrap();
+        let d = k.hub.task_diff("feat/d").unwrap();
+        assert_eq!(d.base, "trunk");
+        let mut files: Vec<(String, Option<u64>, Option<u64>)> =
+            d.files.iter().map(|f| (f.path.clone(), f.added, f.removed)).collect();
+        files.sort();
+        assert_eq!(files, vec![("README".into(), Some(1), Some(1)), ("lib.rs".into(), Some(2), Some(0))]);
+        assert_eq!(d.untracked, vec!["notes.txt".to_string()]);
+        assert!(d.patch.contains("+fn b() {}") && d.patch.contains("+hello"), "{}", d.patch);
+        assert!(!d.truncated && !d.pushed);
+        assert_eq!(d.compare_url, None);
+        git(&k.repo, &["remote", "add", "origin", "git@github.com:acme/app.git"]);
+        let url = k.hub.task_diff(&t.id).unwrap().compare_url;
+        assert_eq!(url.as_deref(), Some("https://github.com/acme/app/compare/trunk...feat/d?expand=1"));
+    }
 
     #[test]
     fn task_events_pages_backwards_oldest_first() {

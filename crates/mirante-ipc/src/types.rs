@@ -10,6 +10,8 @@ pub mod method {
     pub const TASK_ARCHIVE: &str = "task.archive";
     /// A task's audit trail, oldest first ([`super::TaskEventsParams`]).
     pub const TASK_EVENTS: &str = "task.events";
+    /// The task branch's changes against its base ([`super::TaskDiff`]).
+    pub const TASK_DIFF: &str = "task.diff";
     pub const SESSION_START: &str = "session.start";
     pub const SESSION_RESUME: &str = "session.resume";
     pub const SESSION_TRUST: &str = "session.trust";
@@ -290,6 +292,34 @@ pub struct Snapshot {
     /// is empty, and the missed events follow as notifications. The client keeps its state.
     #[serde(default)]
     pub resumed: bool,
+}
+
+/// One changed file in a [`TaskDiff`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFile {
+    pub path: String,
+    /// Lines added / removed; `None` for a binary file.
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// `task.diff` result: the task branch (committed and uncommitted) against the fork point
+/// from its base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDiff {
+    /// The base branch (the repo checkout's current branch), or a commit when detached.
+    pub base: String,
+    pub merge_base: String,
+    pub files: Vec<DiffFile>,
+    /// Untracked files (not in `patch`).
+    pub untracked: Vec<String>,
+    /// Unified diff, cut at 512 KiB.
+    pub patch: String,
+    pub truncated: bool,
+    /// GitHub's "open a pull request" page, when `origin` is on GitHub.
+    pub compare_url: Option<String>,
+    /// `origin/<branch>` exists locally (the branch was pushed at least once).
+    pub pushed: bool,
 }
 
 /// Most events one `task.events` call returns.

@@ -239,6 +239,7 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         method::TASK_GET => out(hub.get_task(&params::<TaskRef>(p)?.task)),
         method::TASK_ARCHIVE => out(hub.archive(&params::<TaskRef>(p)?.task)),
         method::TASK_EVENTS => out(hub.task_events(params(p)?)),
+        method::TASK_DIFF => out(hub.task_diff(&params::<TaskRef>(p)?.task)),
         method::SESSION_START => out(hub.start_session(params(p)?, false)),
         method::SESSION_RESUME => out(hub.start_session(params(p)?, true)),
         method::SESSION_TRUST => out(hub.trust(params(p)?)),
@@ -402,6 +403,8 @@ mod tests {
         assert_eq!(v[0]["kind"], "task_created");
         let e = dispatch(&k.hub, method::TASK_EVENTS, json!({})).unwrap_err();
         assert_eq!(e.code, code::INVALID_PARAMS);
+        let d = dispatch(&k.hub, method::TASK_DIFF, json!({"task": "te"})).unwrap();
+        assert_eq!((d["base"].as_str(), d["files"].as_array().map(Vec::len)), (Some("trunk"), Some(0)));
     }
 
     #[test]
