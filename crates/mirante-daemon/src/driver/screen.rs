@@ -20,6 +20,9 @@ pub const FOOTER_ROWS: usize = 2;
 /// How far above its question a dialog's tool box may start (a long, wrapped command).
 const BOX_ROWS: usize = 40;
 
+/// How many wrapped continuation lines a dialog's "Tip:" line may have.
+const TIP_WRAP: usize = 3;
+
 /// Cursor glyphs Claude Code draws on the selected option (and on the input prompt).
 const CURSORS: [char; 3] = ['❯', '›', '>'];
 
@@ -167,7 +170,9 @@ fn trust_option(l: &str) -> Option<(bool, &str)> {
 pub fn trust_key(grid: &str) -> Option<TrustKey> {
     let lines = bottom(grid);
     let footer = footer_at_bottom(&lines, |l| is_footer(l) || l.contains("Enter to confirm"))?;
-    if let Some(d) = lines[..footer].iter().rev().find_map(|l| option(l).filter(|(_, t)| *t == TRUST_YES).map(|(d, _)| d)) {
+    if let Some(d) =
+        lines[..footer].iter().rev().find_map(|l| option(l).filter(|(_, t)| *t == TRUST_YES).map(|(d, _)| d))
+    {
         return Some(TrustKey::Digit(d));
     }
     let (yes, no) = (footer.checked_sub(1)?, footer.checked_sub(2)?);
@@ -319,7 +324,8 @@ fn walk(lines: &[Vec<char>], card: &[char]) -> bool {
 /// - every line between the title and the question belongs to the box: none starts with a
 ///   conversation or prompt glyph (⏺ ⎿ ✻ ❯ ›), none is a border, another question or a
 ///   known tool-box title, and all are indented deeper than the title (except one "Tip:"
-///   line right below the title, at its indentation, as Claude Code 2.1.285 draws it);
+///   line right below the title, at its indentation, as Claude Code 2.1.285 draws it, with
+///   up to [`TIP_WRAP`] lines it wraps onto at that indentation in a narrow terminal);
 /// - those lines are, character by character (see [`walk`]), the whole detail, then exactly
 ///   the description when the request has one (Claude shows it below the command), else
 ///   nothing: a shared prefix, a longer or multi-line command, different spacing or a file
@@ -357,16 +363,17 @@ pub fn dialog_matches(
     }
     let ti = indent(all[title]);
     let mut body = &all[title + 1..question];
+    let marker = |l: &&str| {
+        is_question(l) || is_border(l) || ALL_TITLES.contains(&l.trim()) || l.trim_start().starts_with(CHROME)
+    };
     if body.first().is_some_and(|l| indent(l) == ti && l.trim_start().starts_with("Tip:")) {
         body = &body[1..];
+        // At narrow widths the Tip wraps onto lines at the same indentation (70 columns:
+        // one more line, 60: still one; never more than a few).
+        let wrapped = body.iter().take(TIP_WRAP).take_while(|l| indent(l) == ti && !marker(l)).count();
+        body = &body[wrapped..];
     }
-    let foreign = |l: &&str| {
-        is_question(l)
-            || is_border(l)
-            || ALL_TITLES.contains(&l.trim())
-            || l.trim_start().starts_with(CHROME)
-            || indent(l) <= ti
-    };
+    let foreign = |l: &&str| marker(l) || indent(l) <= ti;
     if body.is_empty() || body.iter().any(foreign) {
         return false;
     }
@@ -735,6 +742,71 @@ mod tests {
         // A tip line is skipped only right below the title and at its indentation.
         assert!(dialog_matches(&boxed(" Tip: t\n   touch a"), "Bash", "touch a", None, None));
         assert!(!dialog_matches(&boxed("   Tip: t\n   touch a"), "Bash", "touch a", None, None));
+    }
+
+    /// The real Bash dialog at 70 columns (Task 21 live run, 2.1.285): the Tip wraps onto a
+    /// second line at the title's indentation.
+    const REAL_BASH_70: &str = "\
+⏺ Cria h1
+  ⎿  $ touch h1.txt
+──────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose \"switch to
+ auto mode\" below
+
+   touch h1.txt
+   cria h1
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /Users/u/m21home/worktrees/m21-cl
+      aude/c1 from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts
+      for you
+   4. No
+
+ Esc to cancel · Tab to amend";
+
+    /// The same at 60 columns: the Tip takes two lines, options wrap more.
+    const REAL_BASH_60: &str = "\
+⏺ Cria h1
+  ⎿  $ touch h1.txt
+────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose
+ \"switch to auto mode\" below
+
+   touch h1.txt
+   cria h1
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /Users/u/m21home/worktrees/m21-claude/c1 from this
+      project
+   3. Yes, and switch to auto mode · auto mode handles
+      these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend";
+
+    #[test]
+    fn a_wrapped_tip_line_at_narrow_widths_still_matches_the_bash_box() {
+        for g in [REAL_BASH_70, REAL_BASH_60] {
+            assert!(has_permission_prompt(g));
+            assert_eq!(option_key(g, "No"), Some('4'));
+            assert!(dialog_matches(g, "Bash", "touch h1.txt", Some("cria h1"), None), "{g}");
+            assert!(!dialog_matches(g, "Bash", "touch h2.txt", Some("cria h1"), None));
+            assert!(!dialog_matches(g, "Bash", "touch h1.txt", None, None));
+        }
+        // Continuation lines are taken only after a Tip line, at the title's indentation;
+        // a command line at that indentation is still outside the box.
+        assert!(dialog_matches(&boxed(" Tip: a\n b\n   touch a"), "Bash", "touch a", None, None));
+        assert!(!dialog_matches(&boxed(" touch a\n   touch a"), "Bash", "touch a", None, None));
+        assert!(!dialog_matches(&boxed(" Tip: a\n b\n"), "Bash", "b", None, None));
+        // Chrome is never a continuation.
+        assert!(!dialog_matches(&boxed(" Tip: a\n⏺ b\n   touch a"), "Bash", "touch a", None, None));
+        assert!(!dialog_matches(&boxed(" Tip: a\n Bash command\n   touch a"), "Bash", "touch a", None, None));
     }
 
     // Ported from the driver review's probes: each one showed a hole (the assertion was the
