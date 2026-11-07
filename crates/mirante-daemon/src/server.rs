@@ -238,6 +238,7 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         }
         method::TASK_GET => out(hub.get_task(&params::<TaskRef>(p)?.task)),
         method::TASK_ARCHIVE => out(hub.archive(&params::<TaskRef>(p)?.task)),
+        method::TASK_EVENTS => out(hub.task_events(params(p)?)),
         method::SESSION_START => out(hub.start_session(params(p)?, false)),
         method::SESSION_RESUME => out(hub.start_session(params(p)?, true)),
         method::SESSION_TRUST => out(hub.trust(params(p)?)),
@@ -391,6 +392,16 @@ mod tests {
         assert_eq!(code_of(c.call(method::TASK_GET, json!({"nope": 1}))), code::INVALID_PARAMS);
         assert_eq!(code_of(c.call("task.explode", json!({}))), code::METHOD_NOT_FOUND);
         assert_eq!(code_of(c.call(method::SESSION_STOP, json!({"task": "rpc"}))), code::CONFLICT);
+    }
+
+    #[test]
+    fn task_events_is_served_over_rpc() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Codex, "te").task;
+        let v = dispatch(&k.hub, method::TASK_EVENTS, json!({"task": t.id, "limit": 5})).unwrap();
+        assert_eq!(v[0]["kind"], "task_created");
+        let e = dispatch(&k.hub, method::TASK_EVENTS, json!({})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
     }
 
     #[test]

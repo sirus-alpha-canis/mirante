@@ -15,7 +15,7 @@ use mirante_core::store::Store;
 use mirante_core::worktree::WorktreeManager;
 use mirante_core::CoreError;
 use mirante_ipc::rpc::{code, RpcError};
-use mirante_ipc::types::{BootState, CreateTask, DaemonStatus, Snapshot, TaskView};
+use mirante_ipc::types::{BootState, CreateTask, DaemonStatus, Snapshot, TaskEventsParams, TaskView, TASK_EVENTS_MAX};
 use mirante_ipc::Paths;
 use serde_json::{json, Value};
 
@@ -521,6 +521,19 @@ impl Hub {
         st.view(t)
     }
 
+    /// A page of the task's audit trail, oldest first (see [`TaskEventsParams`]). Clients
+    /// rebuild a task's step feed from it after a restart.
+    pub fn task_events(&self, p: TaskEventsParams) -> Result<Vec<Event>> {
+        let st = self.lock();
+        let t = st.resolve(&p.task)?;
+        let limit = p.limit.unwrap_or(200).clamp(1, TASK_EVENTS_MAX);
+        let mut events: Vec<Event> =
+            st.store.task_events(&t.id)?.into_iter().filter(|e| p.before_seq.is_none_or(|b| e.seq < b)).collect();
+        let excess = events.len().saturating_sub(limit);
+        events.drain(..excess);
+        Ok(events)
+    }
+
     /// Removes the worktree (git refuses a dirty one) and archives the task. The branch is
     /// kept. Refused while a session is live.
     ///
@@ -695,6 +708,25 @@ mod tests {
     use super::testkit::Kit;
     use super::*;
     use mirante_ipc::types::CreateTask;
+
+    #[test]
+    fn task_events_pages_backwards_oldest_first() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "ev").task;
+        k.hub.lock().store.append_event(Some(&t.id), "step", &json!({"n": 1})).unwrap();
+        k.hub.lock().store.append_event(Some(&t.id), "step", &json!({"n": 2})).unwrap();
+        let all = k.hub.task_events(TaskEventsParams { task: t.id.clone(), ..Default::default() }).unwrap();
+        assert_eq!(all.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["task_created", "step", "step"]);
+        assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+        let last =
+            k.hub.task_events(TaskEventsParams { task: "ev".into(), limit: Some(1), ..Default::default() }).unwrap();
+        assert_eq!(last, all[2..].to_vec());
+        let before =
+            k.hub.task_events(TaskEventsParams { task: t.id.clone(), before_seq: Some(all[2].seq), limit: Some(10) });
+        assert_eq!(before.unwrap(), all[..2].to_vec());
+        let none = k.hub.task_events(TaskEventsParams { task: "nope-nope".into(), ..Default::default() });
+        assert!(matches!(none, Err(HubError::NotFound(_))), "{none:?}");
+    }
 
     #[test]
     fn create_makes_a_worktree_on_the_users_branch_and_a_task() {

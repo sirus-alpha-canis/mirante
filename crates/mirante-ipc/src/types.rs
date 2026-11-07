@@ -8,6 +8,8 @@ pub mod method {
     pub const TASK_LIST: &str = "task.list";
     pub const TASK_GET: &str = "task.get";
     pub const TASK_ARCHIVE: &str = "task.archive";
+    /// A task's audit trail, oldest first ([`super::TaskEventsParams`]).
+    pub const TASK_EVENTS: &str = "task.events";
     pub const SESSION_START: &str = "session.start";
     pub const SESSION_RESUME: &str = "session.resume";
     pub const SESSION_TRUST: &str = "session.trust";
@@ -288,6 +290,21 @@ pub struct Snapshot {
     /// is empty, and the missed events follow as notifications. The client keeps its state.
     #[serde(default)]
     pub resumed: bool,
+}
+
+/// Most events one `task.events` call returns.
+pub const TASK_EVENTS_MAX: usize = 500;
+
+/// `task.events`: the last `limit` events of a task (default 200, at most
+/// [`TASK_EVENTS_MAX`]) with `seq < before_seq` when given, oldest first. Page backwards by
+/// passing the first returned `seq` as the next `before_seq`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEventsParams {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
