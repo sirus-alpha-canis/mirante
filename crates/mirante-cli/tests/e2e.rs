@@ -358,6 +358,9 @@ fn hibernate_wake_and_doctor_from_the_cli() {
     wait_until("idle", || env.task("nap").task.status.as_str() == "idle");
     assert!(env.ok(&["hibernate", "nap"]).contains("hibernated"));
     assert!(env.ok(&["ls"]).contains("hibernated: mirante wake"));
+    // The mark survives a daemon restart (rebuilt from the trail).
+    env.ok(&["daemon", "restart"]);
+    assert!(env.ok(&["ls"]).contains("hibernated: mirante wake"));
     assert!(env.ok(&["wake", "nap"]).contains("ready (resumed)"));
     let doctor = env.ok(&["doctor"]);
     assert!(doctor.contains("orphan processes: none") && doctor.contains("orphan checkouts: none"), "{doctor}");

@@ -3,6 +3,9 @@
 //! expire, messages it had queued but never sent are reported (`queue_dropped`), and the
 //! task becomes `Ended`, ready for `mirante resume`.
 //!
+//! A task whose last session was hibernated is marked hibernated again (the mark is
+//! replayed from its `memory.hibernated` event), so `mirante wake` still resumes it.
+//!
 //! An archive the crash interrupted (`Archiving`) is finished: the worktree is removed if
 //! still there (git refuses a dirty one: the task then goes back to `Active`, with an
 //! `archive_abandoned` event) and the task becomes `Archived`. Checkouts under the worktree
@@ -64,6 +67,13 @@ impl Hub {
         for task in st.store.list_tasks(false)? {
             if let Err(e) = end_stale_session(&mut st, &task.id, &mut report) {
                 st.log_error(Some(&task.id), "recovery", &e);
+            }
+            match was_hibernated(&st, &task.id) {
+                Ok(true) => {
+                    st.mem.hibernated.insert(task.id.clone());
+                }
+                Ok(false) => {}
+                Err(e) => st.log_error(Some(&task.id), "recovery: hibernation mark", &e),
             }
             if task.lifecycle == Lifecycle::Archiving {
                 if let Err(e) = self.finish_archive(&mut st, &task, &mut report) {
@@ -209,6 +219,18 @@ fn unsent_queue(st: &State, task_id: &str, session_id: &str) -> Result<Vec<Strin
         }
     }
     Ok(queue)
+}
+
+/// The task's last session ended in a hibernation (`memory.hibernated` /
+/// `memory.auto_hibernated` after its latest `session_launch`): the mark lives in memory,
+/// so a restart rebuilds it from the trail and `mirante wake` keeps working.
+fn was_hibernated(st: &State, task_id: &str) -> Result<bool> {
+    let events = st.store.task_events(task_id)?;
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind.as_str(), "session_launch" | "memory.hibernated" | "memory.auto_hibernated"));
+    Ok(last.is_some_and(|e| e.kind != "session_launch"))
 }
 
 fn end_stale_session(st: &mut State, task_id: &str, report: &mut Recovery) -> Result<()> {
@@ -410,6 +432,26 @@ mod tests {
 
     fn task_kinds(hub: &Hub, task: &str) -> Vec<mirante_core::model::Event> {
         hub.lock().store.task_events(task).unwrap()
+    }
+
+    #[test]
+    fn a_hibernated_task_stays_hibernated_across_a_restart_and_wakes() {
+        let k = file_kit();
+        let t = k.started(AgentKind::Claude, "a").task.id;
+        k.emit(DriverEvent::NativeId("nat-9".into()));
+        k.hub.hibernate(&t).unwrap();
+        let woke = k.started(AgentKind::Codex, "b").task.id;
+        k.hub.hibernate(&woke).unwrap();
+        k.hub.wake(&woke).unwrap();
+        k.hub.shutdown();
+        let (hub2, _) = crash_and_recover(&k);
+        let v = hub2.get_task(&t).unwrap();
+        assert!(v.hibernated && !v.live, "{v:?}");
+        assert!(!hub2.get_task(&woke).unwrap().hibernated, "woken, then ended by the restart");
+        let r = hub2.wake(&t).unwrap();
+        assert!(r.resumed);
+        assert_eq!(k.factory.resumes.lock().unwrap().last().cloned().flatten().as_deref(), Some("nat-9"));
+        assert!(!hub2.get_task(&t).unwrap().hibernated);
     }
 
     #[test]

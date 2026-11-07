@@ -32,7 +32,7 @@ pub(crate) struct MemShared {
     /// New sessions and queued deliveries wait (the policy paused them).
     pub(crate) paused: bool,
     pub(crate) sessions: std::collections::HashMap<String, SessionMem>,
-    /// Tasks hibernated by this daemon (a restart ends every session anyway).
+    /// Hibernated tasks (rebuilt from the event trail at daemon start, see `recover`).
     pub(crate) hibernated: std::collections::HashSet<String>,
 }
 
