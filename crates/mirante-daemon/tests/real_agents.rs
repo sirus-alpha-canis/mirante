@@ -205,8 +205,9 @@ fn codex_steer_and_resume() {
     std::thread::sleep(Duration::from_secs(8));
     r.say(&t, "Mudança de planos: pare o que está fazendo e responda apenas a palavra BANANA.");
     r.wait_event(&t, "step", 180, |e| e.payload["type"] == "agent_message" && e.payload["text"] == "BANANA");
-    r.wait_event(&t, "turn_ended", 180, |_| true);
-    r.wait_event(&t, "status", 60, |e| to(e) == Status::Idle);
+    // The status moves to idle before `turn_ended` is recorded (events are read in order).
+    r.wait_event(&t, "status", 180, |e| to(e) == Status::Idle);
+    r.wait_event(&t, "turn_ended", 60, |_| true);
 
     r.hub.stop(&t).unwrap();
     assert!(r.start(&t, None, true), "resume must reuse the thread id");
