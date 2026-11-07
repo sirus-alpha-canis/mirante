@@ -3,5 +3,6 @@ members = [
     "crates/spike-kit",
     "crates/mirante-core",
     "crates/mirante-ipc",
+    "crates/mirante-hook",
 ]
 resolver = "2"
