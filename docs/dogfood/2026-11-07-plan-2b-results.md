@@ -317,19 +317,21 @@ Real-agent test fixes (the tests could not pass as written):
 | `fb549d2` | Claude: wait until the dialog is drawn; poll for the resumed answer's transcript line. |
 | `72ffcc1` | Codex: wait for `idle` before `turn_ended` (event order). |
 
-## Open issues (not fixed; for the founder or a later plan)
+## Open issues, then fixed
 
-| ID | Issue |
-|---|---|
-| I1 | `/compact` runs for ~20 s with the board `idle`: no prompt or assistant line opens a turn. Decide whether compaction counts as `working` (the PreCompact hook could open it). |
-| I2 | The hibernated mark lives only in daemon memory. After a daemon restart, `ls` no longer shows `[hibernated: mirante wake]` and `wake` says "not hibernated (mirante resume …)". `resume` works. |
-| I3 | Codex `turn/interrupt` does not stop the running command; Mirante shows `[command abandoned]`. Consider killing the abandoned command's process tree, or say in the CLI that it keeps running. |
-| I4 | A Codex file-change card shows `(+0 -0)` for an `add`, whose `diff` is the raw file content (`"x\n"`), not a unified diff. |
-| I5 | At narrow widths the Tip line wraps onto a second line at the title's indentation, and the Bash box is no longer matched (safe refusal). Only relevant with inline answers on. Writes and Edits are never matched (path at title indent, preview box). |
-| I6 | User-level config leaks into worktrees. The founder's Serena MCP creates `.serena/` in every Claude worktree, which makes `archive` refuse until it is removed. Consider ignoring known tool dirs, or documenting it. The user's statusline and hooks also run in Mirante sessions (expected; `--settings` is additive). |
-| I7 | An archive of a dirty worktree is refused with git's raw message. A Mirante wording ("commit or remove … first") would be clearer. |
-| I8 | On `daemon restart`, two sessions were recorded as `mirante:process_exited` rather than `mirante:daemon_shutdown` (seq 311/314). The status is right; only the cause differs. |
-| I9 | Codex lists no `"decline"` in `availableDecisions`, but accepts it. Re-check after Codex upgrades (`"cancel"` would abort the turn). |
+Found in this run, fixed afterwards (TDD, fixtures from the live evidence above; not re-run against the real agents).
+
+| ID | Issue | Fix |
+|---|---|---|
+| I1 | `/compact` runs for ~20 s with the board `idle`: no prompt or assistant line opens a turn. | `c151a15`: a compaction is tracked apart from turns and shows `Working`. It starts on the main agent's `PreCompact` hook or the transcript's plain `/compact …` user line, and ends on `compact_boundary`, a `<local-command-stdout>`/`-stderr>` line (failed or cancelled), any `SessionStart`, a prompt, a turn end or the idle Notification. The interleaving harness has a `Compact` kind. |
+| I2 | The hibernated mark lives only in daemon memory. After a daemon restart, `ls` no longer shows `[hibernated: mirante wake]` and `wake` says "not hibernated (mirante resume …)". `resume` works. | `2a486e9`: recovery rebuilds the mark from the trail (the latest `memory.hibernated` / `memory.auto_hibernated` after the latest `session_launch`); no migration. The e2e test restarts the daemon between `hibernate` and `wake`. |
+| I3 | Codex `turn/interrupt` does not stop the running command; Mirante shows `[command abandoned]`. | `b744889`: app-server's descendants are recorded when a turn starts. After an interrupted turn abandons commands, if Codex has not reported them ended within 2 s, the processes started during that turn and still running (pid AND start time) are killed with their trees, and a `command_killed` event is recorded. Never app-server, never a process older than the turn, never one started after the interrupt. Limit: Codex does not say which process runs which command, so a helper app-server started lazily during that turn (an MCP server on first use) goes too. |
+| I4 | A Codex file-change card shows `(+0 -0)` for an `add`, whose `diff` is the raw file content (`"x\n"`), not a unified diff. | `5b88b0c`: an add (or delete) without a `@@` hunk counts its content lines: `add …/grant.txt (+1 -0)`. |
+| I5 | At narrow widths the Tip line wraps onto a second line at the title's indentation, and the Bash box is no longer matched (safe refusal). Only relevant with inline answers on. Writes and Edits are never matched (path at title indent, preview box). | `63b449b`: up to three continuation lines at the Tip's indentation belong to the Tip. Tested on 70- and 60-column grids. Write/Edit are still never matched. |
+| I6 | User-level config leaks into worktrees. The founder's Serena MCP creates `.serena/` in every Claude worktree, which makes `archive` refuse until it is removed. The user's statusline and hooks also run in Mirante sessions (expected; `--settings` is additive). | `ef1a476`: worktrees share the repo's `info/exclude`, so the user's repo is not touched. Instead, when `git status --porcelain --untracked-files=all` shows only untracked files under a known tool cache (`.serena/`) and the checkout has no submodules, the removal is forced. Any tracked or staged change, or any other untracked file, still refuses. |
+| I7 | An archive of a dirty worktree is refused with git's raw message. | `ef1a476`: "the worktree … has uncommitted changes:" plus up to 10 paths with git's status codes ("… and N more"), and "commit them, stash them (git stash -u) or discard them in the worktree, then archive again". |
+| I8 | On `daemon restart`, two sessions were recorded as `mirante:process_exited` rather than `mirante:daemon_shutdown` (seq 311/314). The status is right; only the cause differs. | `47a05d7`: the cause was a race: the pump thread applied the agent's exit before `shutdown` ended the session. Mirante's cause (`mirante:daemon_shutdown`, `mirante:stopped`, `mirante:hibernated`) is now set on the live session before the driver is stopped, and the exit uses it. Sessions still live at the next start are ended by recovery with `mirante:daemon_restart`, as before. |
+| I9 | Codex lists no `"decline"` in `availableDecisions`, but accepts it. | `5e33591`: when `availableDecisions` is present without `"decline"`, a deny sends the listed `"cancel"` (which also ends the turn), records a `deny_decision` step and says so in the stream. `"decline"` stays the answer when there is no list. Behaviour change: a Codex command deny now ends the turn under 0.167. |
 
 ## Left for the founder to try by hand
 
