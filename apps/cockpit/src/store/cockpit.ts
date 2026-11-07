@@ -1,9 +1,11 @@
 // The store instance and its wiring to the daemon: subscribe, then on every event refresh
 // the task it names with `task.get` (coalesced), reload pending permissions after
 // permission events, and load each task's history (`task.events`) after a full snapshot.
+// Replies can arrive out of order: each one is dropped when a newer one for the same thing
+// was already applied.
 import { useSyncExternalStore } from "react";
 import type { DaemonEvent, PermissionView, StreamMsg, TaskView } from "../lib/protocol";
-import { M } from "../lib/protocol";
+import { M, RpcCode } from "../lib/protocol";
 import { type Action, initialState, reduce, type State } from "./state";
 
 export interface Transport {
@@ -12,6 +14,35 @@ export interface Transport {
 }
 
 export const REFRESH_MS = 120;
+/** History loads in flight at once after a snapshot (the daemon serves 64 connections). */
+export const HISTORY_CONCURRENCY = 4;
+/** Retries of a history load the daemon refused as busy (or could not take), with backoff. */
+export const HISTORY_RETRIES = 3;
+export const HISTORY_BACKOFF_MS = 250;
+
+/** The bridge error inside `e` (a `DaemonError` carries it as `info`). */
+function bridgeError(e: unknown): { kind?: string; code?: number; message?: string } {
+  if (!e || typeof e !== "object") return { message: String(e) };
+  const o = e as { info?: object };
+  return (o.info ?? e) as { kind?: string; code?: number; message?: string };
+}
+
+/** Worth retrying: the daemon is at its connection limit, or the connection failed. */
+function transient(e: unknown): boolean {
+  const b = bridgeError(e);
+  return (b.kind === "rpc" && b.code === RpcCode.BUSY) || b.kind === "disconnected";
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Runs `jobs` with at most `n` at once. */
+async function pool(jobs: (() => Promise<void>)[], n: number): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < jobs.length) await jobs[next++]();
+  };
+  await Promise.all(Array.from({ length: Math.min(n, jobs.length) }, worker));
+}
 
 export interface Cockpit {
   getState(): State;
@@ -47,12 +78,52 @@ export function createCockpit(t: Transport): Cockpit {
     );
   };
 
+  // Request numbers, in send order; per key, the number of the reply last applied.
+  let sent = 0;
+  const applied = new Map<string, number>();
+  const fresh = (key: string, n: number) => (applied.get(key) ?? 0) < n;
+
   const refreshTask = (id: string) =>
-    later(`task:${id}`, async () => dispatch({ type: "task", view: await t.rpc<TaskView>(M.taskGet, { task: id }) }));
+    later(`task:${id}`, async () => {
+      const n = ++sent;
+      const view = await t.rpc<TaskView>(M.taskGet, { task: id });
+      if (!fresh(`task:${id}`, n)) return;
+      applied.set(`task:${id}`, n);
+      dispatch({ type: "task", view });
+    });
+  const refreshList = () =>
+    later("list", async () => {
+      const n = ++sent;
+      const views = await t.rpc<TaskView[]>(M.taskList);
+      if (!fresh("list", n)) return;
+      applied.set("list", n);
+      // Rows a `task.get` sent after this list already refreshed keep that newer view.
+      const keep = views.map((v) => v.id).filter((id) => !fresh(`task:${id}`, n));
+      for (const v of views) if (fresh(`task:${v.id}`, n)) applied.set(`task:${v.id}`, n);
+      dispatch({ type: "tasks", views, keep });
+    });
   const loadPermissions = () =>
-    later("perms", async () => dispatch({ type: "permissions", list: await t.rpc<PermissionView[]>(M.permissionList) }));
-  const loadHistory = async (id: string) =>
-    dispatch({ type: "history", taskId: id, events: await t.rpc<DaemonEvent[]>(M.taskEvents, { task: id, limit: 200 }) });
+    later("perms", async () => {
+      const rev = state.permRev;
+      const list = await t.rpc<PermissionView[]>(M.permissionList);
+      dispatch({ type: "permissions", list, rev });
+    });
+  const loadHistory = async (id: string) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const events = await t.rpc<DaemonEvent[]>(M.taskEvents, { task: id, limit: 200 });
+        dispatch({ type: "history", taskId: id, events });
+        return;
+      } catch (e) {
+        if (attempt < HISTORY_RETRIES && transient(e)) {
+          await sleep(HISTORY_BACKOFF_MS * 2 ** attempt);
+          continue;
+        }
+        dispatch({ type: "historyFailed", taskId: id, error: bridgeError(e).message ?? String(e) });
+        return;
+      }
+    }
+  };
 
   const onMsg = (m: StreamMsg) => {
     switch (m.type) {
@@ -62,9 +133,10 @@ export function createCockpit(t: Transport): Cockpit {
         if (m.snapshot.resumed) {
           // Missed events follow; the rows they touch are refreshed one by one, but rows
           // changed by events older than the stream's buffer are only right after a list.
-          later("list", async () => dispatch({ type: "tasks", views: await t.rpc<TaskView[]>(M.taskList) }));
+          refreshList();
         } else {
-          for (const v of m.snapshot.tasks) loadHistory(v.id).catch(() => {});
+          const ids = m.snapshot.tasks.map((v) => v.id);
+          pool(ids.map((id) => () => loadHistory(id)), HISTORY_CONCURRENCY).catch(() => {});
         }
         break;
       case "event":

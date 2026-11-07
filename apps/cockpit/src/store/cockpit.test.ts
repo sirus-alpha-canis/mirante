@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamMsg } from "../lib/protocol";
 import { ev, snapshot, task } from "../test/fixtures";
-import { createCockpit, REFRESH_MS } from "./cockpit";
+import { createCockpit, HISTORY_CONCURRENCY, HISTORY_RETRIES, REFRESH_MS } from "./cockpit";
 
 function fakeTransport(answers: Record<string, unknown>) {
   let push: (m: StreamMsg) => void = () => {};
@@ -68,5 +68,147 @@ describe("createCockpit", () => {
     t.push({ type: "connected", snapshot: snapshot([task("t1")], 0) });
     t.push({ type: "event", event: ev(1, "t1", "status", { to: "needs_you" }) });
     expect(seen).toEqual(["->idle", "idle>needs_you"]);
+  });
+
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const busy = { kind: "rpc", code: 7, message: "the daemon is at its connection limit; retry" };
+
+  it("loads histories at most HISTORY_CONCURRENCY at a time (a daemon refusing more stays happy)", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const t = fakeTransport({
+      "permission.list": [],
+      "task.events": async (p: { task: string }) => {
+        if (inFlight >= HISTORY_CONCURRENCY) throw busy;
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await wait(20);
+        inFlight--;
+        return [ev(1, p.task, "turn_ended")];
+      },
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    const ids = Array.from({ length: 12 }, (_, i) => `t${i}`);
+    t.push({ type: "connected", snapshot: snapshot(ids.map((id) => task(id)), 1) });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(peak).toBe(HISTORY_CONCURRENCY);
+    expect(ids.filter((id) => c.getState().feed[id]?.length === 1)).toEqual(ids);
+    expect(c.getState().historyErrors).toEqual({});
+  });
+
+  it("retries a busy history load with backoff, then surfaces the error for that task", async () => {
+    const tries: Record<string, number> = {};
+    const t = fakeTransport({
+      "permission.list": [],
+      "task.events": async (p: { task: string }) => {
+        tries[p.task] = (tries[p.task] ?? 0) + 1;
+        if (p.task === "t2" || tries[p.task] < 3) throw busy;
+        return [ev(1, p.task, "turn_ended")];
+      },
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([task("t1"), task("t2")], 1) });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(c.getState().feed.t1).toHaveLength(1);
+    expect(tries.t2).toBe(HISTORY_RETRIES + 1);
+    expect(c.getState().historyErrors.t2).toMatch(/connection limit/);
+    expect(c.getState().historyErrors.t1).toBeUndefined();
+  });
+
+  it("a non-busy history failure is surfaced without retrying", async () => {
+    const t = fakeTransport({
+      "permission.list": [],
+      "task.events": async () => {
+        throw { kind: "rpc", code: 1, message: "no task t1" };
+      },
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([task("t1")], 1) });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(t.calls.filter((x) => x[0] === "task.events")).toHaveLength(1);
+    expect(c.getState().historyErrors.t1).toBe("no task t1");
+  });
+
+  it("drops a task.get reply older than one already applied", async () => {
+    let n = 0;
+    const t = fakeTransport({
+      "task.events": [],
+      "permission.list": [],
+      "task.get": async () => {
+        n++;
+        // The first call answers late, with what was true before the second.
+        if (n === 1) {
+          await wait(500);
+          return task("t1", { status: "working" });
+        }
+        return task("t1", { status: "idle", queued: 3 });
+      },
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([task("t1")], 0) });
+    t.push({ type: "event", event: ev(1, "t1", "turn_started") });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    t.push({ type: "event", event: ev(2, "t1", "turn_ended") });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    expect(c.getState().tasks.t1.queued).toBe(3);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(c.getState().tasks.t1).toMatchObject({ status: "idle", queued: 3 });
+  });
+
+  it("drops a task.list reply older than one already applied, and keeps newer task.get rows", async () => {
+    let lists = 0;
+    const t = fakeTransport({
+      "permission.list": [],
+      "task.list": async () => {
+        lists++;
+        if (lists === 1) {
+          await wait(500);
+          return [task("t1", { status: "working" }), task("t2", { status: "working" })];
+        }
+        return [task("t1", { status: "idle" }), task("t2", { status: "ended" })];
+      },
+      "task.get": task("t1", { status: "needs_you" }),
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([], 4, { resumed: true }) });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    t.push({ type: "connected", snapshot: snapshot([], 4, { resumed: true }) });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    t.push({ type: "event", event: ev(5, "t1", "status", { to: "needs_you" }) });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect([c.getState().tasks.t1.status, c.getState().tasks.t2.status]).toEqual(["needs_you", "ended"]);
+  });
+
+  it("a permission.list answered after a newer close does not reopen the card", async () => {
+    let lists = 0;
+    const pending = { id: "p1", task_id: "t1", session_id: "s", tool: "Bash", detail: "", status: "pending", created_at: 1, answered_at: null, task_title: "", branch: "" };
+    const t = fakeTransport({
+      "task.events": [],
+      "task.get": task("t1"),
+      "permission.list": async () => {
+        lists++;
+        if (lists === 2) {
+          // Asked right after the request, answered after the card closed.
+          await wait(500);
+          return [pending];
+        }
+        return lists === 1 ? [] : [];
+      },
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([task("t1")], 0) });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    t.push({ type: "event", event: ev(1, "t1", "permission_requested", { permission_id: "p1", tool: "Bash" }) });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    t.push({ type: "event", event: ev(2, "t1", "permission_answered", { permission_id: "p1", answer: "denied" }) });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(c.getState().perms.p1.status).toBe("denied");
   });
 });
