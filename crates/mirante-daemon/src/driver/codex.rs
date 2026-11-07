@@ -51,6 +51,7 @@ use serde_json::{json, Value};
 use super::codex_rpc::{CallError, Incoming, RpcConn};
 use super::codex_status::{request_key, CodexEngine, CodexInput, SETTLE_AFTER};
 use super::proctree::{self, Kill, Proc};
+use super::pty;
 use super::{Attachment, Driver, DriverError, DriverEvent, Fanout, Sink};
 
 pub const APPROVAL_METHODS: [&str; 5] = [
@@ -457,11 +458,73 @@ struct Process {
     /// `Some(exit code)` once reaped.
     outcome: Mutex<Option<Option<i32>>>,
     reaped: Condvar,
+    /// Processes seen below the app-server (refreshed while it runs): once it exits, its
+    /// children that left the group are found by nothing else.
+    snapshot: Mutex<Vec<Proc>>,
 }
 
 impl Process {
     fn new(child: Child, root: Option<Proc>, stderr_log: Option<PathBuf>) -> Process {
-        Process { child: Mutex::new(Some(child)), root, stderr_log, outcome: Mutex::default(), reaped: Condvar::new() }
+        Process {
+            child: Mutex::new(Some(child)),
+            root,
+            stderr_log,
+            outcome: Mutex::default(),
+            reaped: Condvar::new(),
+            snapshot: Mutex::default(),
+        }
+    }
+
+    /// Keeps the descendant snapshot fresh and, when the app-server exits on its own, ends
+    /// what it left (even while a leftover holds its stdout open, so the reader sees no EOF).
+    fn watch(self: &Arc<Self>) {
+        let Some(root) = self.root else { return };
+        let weak = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let mut walked = Instant::now() - pty::SNAPSHOT_EVERY;
+            loop {
+                let Some(p) = weak.upgrade() else { return };
+                if lock(&p.outcome).is_some() {
+                    return;
+                }
+                if walked.elapsed() >= pty::SNAPSHOT_EVERY {
+                    walked = Instant::now();
+                    p.refresh_snapshot(root);
+                }
+                let gone = {
+                    // Held so nobody reaps the zombie (which pins its pid and group id) meanwhile.
+                    let child = lock(&p.child);
+                    child.is_some() && pty::exited_unreaped(root.pid) && {
+                        p.end_tree(pty::LEFTOVER_GRACE, true);
+                        true
+                    }
+                };
+                drop(p);
+                if gone {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+
+    fn refresh_snapshot(&self, root: Proc) {
+        let now = proctree::descendants(root);
+        let mut snap = lock(&self.snapshot);
+        snap.retain(|p| proctree::alive(*p));
+        for p in now {
+            if !snap.contains(&p) && snap.len() < pty::SNAPSHOT_MAX {
+                snap.push(p);
+            }
+        }
+    }
+
+    /// Ends the root's tree plus the snapshot (see `proctree::kill_tree_with`); `pinned`: the
+    /// caller holds the exited, unreaped root.
+    fn end_tree(&self, grace: Duration, pinned: bool) {
+        let Some(root) = self.root else { return };
+        let snapshot: Vec<Proc> = lock(&self.snapshot).iter().copied().filter(|p| proctree::alive(*p)).collect();
+        proctree::kill_tree_with(root, &snapshot, pinned, grace, &Kill);
     }
 
     /// Waits up to `wait` for the exit, then ends what is left of the tree; records the code.
@@ -475,11 +538,23 @@ impl Process {
             return (*g).flatten();
         };
         let deadline = Instant::now() + wait;
-        while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if let Some(root) = self.root {
-            proctree::kill_tree(root, Duration::from_millis(500), &Kill);
+        match self.root {
+            Some(root) => {
+                // Wait without reaping: the unreaped root pins its pid and group id while
+                // its leftovers are ended.
+                while Instant::now() < deadline
+                    && !pty::exited_unreaped(root.pid)
+                    && matches!(child.try_wait(), Ok(None))
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                self.end_tree(Duration::from_millis(500), pty::exited_unreaped(root.pid));
+            }
+            None => {
+                while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
         let code = child.wait().ok().and_then(|s| s.code());
         *lock(&self.outcome) = Some(code);
@@ -781,8 +856,9 @@ impl CodexDriver {
         let root = proctree::proc_of(child.id() as i32);
         let stdin = child.stdin.take().ok_or_else(|| DriverError::Failed("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| DriverError::Failed("no stdout".into()))?;
-        let process = Process::new(child, root, Some(stderr_log.to_path_buf()));
-        CodexDriver::connect_process(BufReader::new(stdout), stdin, Some(Arc::new(process)), cwd, resume, sink, timing)
+        let process = Arc::new(Process::new(child, root, Some(stderr_log.to_path_buf())));
+        process.watch();
+        CodexDriver::connect_process(BufReader::new(stdout), stdin, Some(process), cwd, resume, sink, timing)
     }
 
     /// Handshake over any stream pair (tests use a socket pair): `initialize`,
@@ -923,9 +999,9 @@ impl CodexDriver {
         self.stopped.store(true, Ordering::SeqCst);
         lock(&self.work).take();
         if let Some(p) = &self.process {
-            if let Some(root) = p.root {
-                proctree::kill_tree(root, grace, &Kill);
-            }
+            // The child lock is held so the exit cannot be reaped while the group is signaled.
+            let child = lock(&p.child);
+            p.end_tree(grace, child.is_some() && p.root.is_some_and(|r| pty::exited_unreaped(r.pid)));
         }
         self.conn.close();
         if let Some(p) = &self.process {
@@ -1529,6 +1605,36 @@ mod tests {
             assert!(proctree::proc_of(pid).is_none(), "{pid} survived the stop");
         }
         next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. }));
+    }
+
+    #[test]
+    fn an_app_server_that_exits_on_its_own_takes_its_background_children_along() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        // The children keep the server's stdout open (no EOF for the reader); one leaves the group.
+        let rest = format!(
+            "sleep 60 & echo $! > {p}\nperl -e 'setpgrp(0,0); sleep 60' & echo $! >> {p}\nsleep 1\nexit 0",
+            p = pids.display()
+        );
+        let (_d, rx) = spawn_fake(dir.path(), &rest);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let kids: Vec<i32> = loop {
+            let text = std::fs::read_to_string(&pids).unwrap_or_default();
+            let v: Vec<i32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+            if v.len() == 2 {
+                break v;
+            }
+            assert!(Instant::now() < deadline, "children never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        next_event(&rx, |e| matches!(e, DriverEvent::Exited { .. }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for pid in kids {
+            while proctree::proc_of(pid).is_some() {
+                assert!(Instant::now() < deadline, "{pid} survived the app-server's own exit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

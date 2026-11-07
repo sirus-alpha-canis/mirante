@@ -108,6 +108,10 @@ pub(crate) struct Live {
     pub(crate) detail: Option<String>,
     /// Messages held until the running turn ends (front = next).
     pub(crate) queue: VecDeque<String>,
+    /// Where the next handed-back message goes: after the ones handed back before it (so a
+    /// run of them keeps its original order), ahead of everything queued since. Reset when
+    /// the queue is next delivered from.
+    pub(crate) requeue_at: usize,
     /// Permission id -> driver key (Codex request id).
     pub(crate) perm_keys: HashMap<String, String>,
     /// Permission id -> the Claude dialog it shows (to settle exactly that card when its
@@ -196,6 +200,7 @@ impl Live {
             boot: BootState::Booting,
             detail: None,
             queue: VecDeque::new(),
+            requeue_at: 0,
             perm_keys: HashMap::new(),
             dialogs: HashMap::new(),
             answering: HashSet::new(),

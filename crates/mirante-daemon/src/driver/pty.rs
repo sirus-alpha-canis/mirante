@@ -46,14 +46,14 @@ type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 /// nothing interleaves with it).
 const WRITE_CHUNK: usize = 4096;
 /// How often the descendant snapshot is refreshed while the agent runs.
-const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
+pub(super) const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
 /// SIGTERM → SIGKILL grace for what an agent left behind when it exited on its own.
-const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
+pub(super) const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
 /// Most processes the snapshot remembers.
-const SNAPSHOT_MAX: usize = 4096;
+pub(super) const SNAPSHOT_MAX: usize = 4096;
 
 /// `pid` (our child) has exited and is not reaped yet. Does not reap it.
-fn exited_unreaped(pid: i32) -> bool {
+pub(super) fn exited_unreaped(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }

@@ -95,6 +95,7 @@ impl State {
             return Ok(());
         };
         let text = l.queue.pop_front().expect("not empty");
+        l.requeue_at = 0;
         match driver.send(&text) {
             Ok(()) => {
                 l.delivery_in_flight = Some(Instant::now());
@@ -103,6 +104,7 @@ impl State {
             Err(e) => {
                 if let Some(l) = self.live.get_mut(task_id) {
                     l.queue.push_front(text);
+                    l.requeue_at = 1;
                 }
                 self.event(Some(task_id), "message_failed", json!({ "error": e.to_string() }))
             }
@@ -317,7 +319,9 @@ impl State {
                     if let Some(i) = l.steers.iter().rposition(|s| *s == text) {
                         l.steers.remove(i);
                     }
-                    l.queue.push_front(text.clone());
+                    let at = l.requeue_at.min(l.queue.len());
+                    l.queue.insert(at, text.clone());
+                    l.requeue_at = at + 1;
                     l.delivery_in_flight = None;
                 }
                 self.event(Some(task_id), "message_requeued", json!({ "text": text, "reason": reason }))
@@ -1474,6 +1478,31 @@ mod tests {
         // At the turn end the requeued message goes out first.
         k.hook(&t.id, json!({"hook_event_name": "Stop"}));
         assert_eq!(k.calls().last().map(String::as_str), Some("send:steer me"));
+    }
+
+    #[test]
+    fn several_handed_back_messages_are_delivered_in_their_original_order() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        for text in ["one", "two", "three"] {
+            k.hub.send(SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Steer }).unwrap();
+        }
+        k.hub.send(SendMessage { task: t.id.clone(), text: "later".into(), mode: SendMode::Queue }).unwrap();
+        for text in ["one", "two", "three"] {
+            k.emit(DriverEvent::DeliveryAborted { text: text.into(), reason: "hold".into() });
+        }
+        {
+            let st = k.hub.lock();
+            let q: Vec<String> = st.live[&t.id].queue.iter().cloned().collect();
+            assert_eq!(q, ["one", "two", "three", "later"]);
+        }
+        for _ in 0..4 {
+            k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+            k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "x"}));
+        }
+        let sent: Vec<String> = k.calls().into_iter().filter(|c| c.starts_with("send:")).collect();
+        assert_eq!(sent[sent.len() - 4..], ["send:one", "send:two", "send:three", "send:later"]);
     }
 
     #[test]
