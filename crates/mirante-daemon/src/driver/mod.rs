@@ -103,6 +103,9 @@ pub enum DriverEvent {
         text: String,
         reason: String,
     },
+    /// Claude: typing is no longer blocked (a dialog closed, or the hold was released): the
+    /// hub delivers what it requeued.
+    DialogClosed,
     /// Resuming the native conversation failed (Claude exited right away). The hub records
     /// `resume_failed`; a fresh start is the user's call (`mirante resume --fresh`).
     ResumeFailed {
@@ -253,9 +256,10 @@ pub trait Driver: Send + Sync {
     /// Esc (Claude) or `turn/interrupt` (Codex).
     fn interrupt(&self) -> Result<(), DriverError>;
     /// Answers the permission dialog / approval request named by `key` (Codex: the request
-    /// id; Claude: the request detail, checked against the dialog on screen). Selects only
-    /// a one-time "Yes" or "No", never an "always" or "auto" option.
-    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError>;
+    /// id; Claude: the request detail, checked with `tool` against the dialog on screen).
+    /// Selects only a one-time "Yes" or "No", never an "always" or "auto" option. May wait
+    /// briefly (Claude: until the typist typed the key or refused to).
+    fn answer_permission(&self, key: &str, tool: &str, allow: bool) -> Result<(), DriverError>;
     /// Answers Claude's workspace-trust dialog. `false` ends the session.
     fn trust(&self, accept: bool) -> Result<(), DriverError>;
     /// True while a dialog would capture typed text (a message must not be typed then).

@@ -5,16 +5,31 @@
 //! `spike_kit::screen`, whose fixtures are real 2.1.285 grids.
 //!
 //! Live dialogs sit at the bottom of the screen and end with a key-hint footer ("Esc to
-//! cancel", "Enter to confirm · Esc to exit"). Only the last [`BOTTOM_ROWS`] non-blank
-//! rows are searched and a footer is required, so the same words in the conversation above
-//! (a quoted dialog, prose asking "Do you want to …?") never count as a dialog.
+//! cancel", "Enter to confirm · Esc to exit") in the last [`FOOTER_ROWS`] non-blank rows.
+//! Only the last [`BOTTOM_ROWS`] non-blank rows are searched for the dialog, so the same
+//! words in the conversation above (a quoted dialog, prose asking "Do you want to …?")
+//! never count as a dialog.
+
+use std::path::Path;
 
 /// How many non-blank rows at the bottom of the screen a live dialog can occupy.
 pub const BOTTOM_ROWS: usize = 20;
+/// The key-hint footer of a live dialog is one of the last this many non-blank rows (a
+/// status line may sit below it).
+pub const FOOTER_ROWS: usize = 2;
+/// How far above its question a dialog's tool box may start (a long, wrapped command).
+const BOX_ROWS: usize = 40;
+
+/// Cursor glyphs Claude Code draws on the selected option (and on the input prompt).
+const CURSORS: [char; 3] = ['❯', '›', '>'];
+
+fn non_blank(grid: &str) -> Vec<&str> {
+    grid.lines().filter(|l| !l.trim().is_empty()).collect()
+}
 
 /// The last [`BOTTOM_ROWS`] non-blank lines of the screen.
 fn bottom(grid: &str) -> Vec<&str> {
-    let lines: Vec<&str> = grid.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines = non_blank(grid);
     lines[lines.len().saturating_sub(BOTTOM_ROWS)..].to_vec()
 }
 
@@ -22,23 +37,35 @@ fn is_footer(l: &str) -> bool {
     l.contains("Esc to")
 }
 
+/// The index of the last line matching `pred` among the last [`FOOTER_ROWS`] lines.
+fn footer_at_bottom(lines: &[&str], pred: impl Fn(&str) -> bool) -> Option<usize> {
+    let from = lines.len().saturating_sub(FOOTER_ROWS);
+    (from..lines.len()).rev().find(|&i| pred(lines[i]))
+}
+
 /// `(digit, label)` of a numbered option line (`❯ 1. Yes`, `  2. No`).
 fn option(l: &str) -> Option<(char, &str)> {
-    let t = l.trim().trim_start_matches('❯').trim();
+    let t = l.trim().trim_start_matches(CURSORS).trim();
     let (num, rest) = t.split_once(". ")?;
     let digit = num.parse::<u8>().ok().filter(|d| (1..10).contains(d))?;
     Some((char::from(b'0' + digit), rest.trim()))
 }
 
+fn starts_with_cursor(l: &str) -> bool {
+    l.trim_start().starts_with(CURSORS)
+}
+
+fn is_question(l: &str) -> bool {
+    let t = l.trim();
+    t.starts_with("Do you want to") && t.ends_with('?')
+}
+
 /// In the bottom rows: the index of the last permission-dialog header (`Do you want to …?`)
-/// that is followed by a `1.` option and then a footer.
+/// that is followed by a `1.` option and then a footer at the very bottom.
 fn dialog_start(lines: &[&str]) -> Option<usize> {
-    let footer = lines.iter().rposition(|l| is_footer(l))?;
+    let footer = footer_at_bottom(lines, is_footer)?;
     (0..footer).rev().find(|&i| {
-        let t = lines[i].trim();
-        t.starts_with("Do you want to")
-            && t.ends_with('?')
-            && lines[i + 1..footer].iter().any(|l| option(l).is_some_and(|(d, _)| d == '1'))
+        is_question(lines[i]) && lines[i + 1..footer].iter().any(|l| option(l).is_some_and(|(d, _)| d == '1'))
     })
 }
 
@@ -48,14 +75,14 @@ pub fn has_permission_prompt(grid: &str) -> bool {
 }
 
 /// Any selection dialog at the bottom of the screen: an option list with the cursor on an
-/// option (`❯ N.`) and a footer below it. Covers dialogs Mirante does not know (plan
-/// approval, model pickers): typed text must never land in one.
+/// option (`❯ N.`) and a footer at the very bottom. Covers dialogs Mirante does not know
+/// (plan approval, model pickers): typed text must never land in one.
 pub fn has_any_dialog(grid: &str) -> bool {
     let lines = bottom(grid);
-    let Some(footer) = lines.iter().rposition(|l| is_footer(l) || l.contains("Enter to confirm")) else {
+    let Some(footer) = footer_at_bottom(&lines, |l| is_footer(l) || l.contains("Enter to confirm")) else {
         return false;
     };
-    lines[..footer].iter().any(|l| l.trim_start().starts_with('❯') && option(l).is_some())
+    lines[..footer].iter().any(|l| starts_with_cursor(l) && option(l).is_some())
 }
 
 /// The digit of the live permission dialog's option whose label is exactly `label`
@@ -65,19 +92,18 @@ pub fn has_any_dialog(grid: &str) -> bool {
 pub fn option_key(grid: &str, label: &str) -> Option<char> {
     let lines = bottom(grid);
     let start = dialog_start(&lines)?;
-    let footer = lines.iter().rposition(|l| is_footer(l))?;
+    let footer = footer_at_bottom(&lines, is_footer)?;
     lines[start + 1..footer].iter().find_map(|l| option(l).filter(|(_, t)| *t == label).map(|(d, _)| d))
 }
 
 pub const TRUST_YES: &str = "Yes, I trust this folder";
 
 /// The digit of the trust dialog's exact "Yes, I trust this folder" option, when the
-/// dialog is live: that option and a key-hint footer below it in the bottom rows.
+/// dialog is live: that option and a key-hint footer below it at the very bottom.
 pub fn trust_key(grid: &str) -> Option<char> {
     let lines = bottom(grid);
-    let i = lines.iter().position(|l| option(l).is_some_and(|(_, t)| t == TRUST_YES))?;
-    let footer = lines[i + 1..].iter().any(|l| is_footer(l) || l.contains("Enter to confirm"));
-    footer.then(|| option(lines[i]).map(|(d, _)| d)).flatten()
+    let footer = footer_at_bottom(&lines, |l| is_footer(l) || l.contains("Enter to confirm"))?;
+    lines[..footer].iter().rev().find_map(|l| option(l).filter(|(_, t)| *t == TRUST_YES).map(|(d, _)| d))
 }
 
 /// Claude's workspace-trust dialog (new folder) is live. Its default option is "No, exit".
@@ -90,13 +116,10 @@ pub fn dialog_open(grid: &str) -> bool {
     has_permission_prompt(grid) || is_trust_dialog(grid) || has_any_dialog(grid)
 }
 
-/// The input box is on screen: a `❯` / `>` prompt line in the bottom rows that is not a
-/// dialog option.
+/// The input box is on screen: a `❯` / `›` / `>` prompt line in the bottom rows that is not
+/// a dialog option.
 pub fn has_input_prompt(grid: &str) -> bool {
-    bottom(grid).iter().any(|l| {
-        let t = l.trim_start();
-        (t.starts_with('❯') || t.starts_with('>')) && option(l).is_none()
-    })
+    bottom(grid).iter().any(|l| starts_with_cursor(l) && option(l).is_none())
 }
 
 /// The ready fast path: Mirante launches with `--permission-mode manual`, whose footer
@@ -105,26 +128,81 @@ pub fn has_manual_mode_footer(grid: &str) -> bool {
     bottom(grid).iter().any(|l| l.contains("manual mode on"))
 }
 
-/// Does the dialog on screen concern `detail` (a permission request's command or path)?
-/// Compared without whitespace, so a command wrapped across lines still matches: the
-/// first 30 characters of the detail, or, for an absolute path, its file name (the dialog
-/// shows paths relative to the project). An empty detail matches any dialog.
-pub fn dialog_matches(grid: &str, detail: &str) -> bool {
-    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    let detail = detail.lines().next().unwrap_or("").trim();
-    let lines = bottom(grid);
-    let Some(start) = dialog_start(&lines) else {
+/// The titles Claude Code (2.1.285) puts on the tool box of a permission dialog, per tool.
+/// "Bash command" and "Edit file" are from real grids; the others are to be confirmed in
+/// the Task 21 real run. A tool not listed here is never matched (answer it in attach).
+fn titles(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "Bash" => &["Bash command"],
+        "Edit" | "MultiEdit" => &["Edit file"],
+        "Write" => &["Create file", "Overwrite file", "Edit file"],
+        "NotebookEdit" => &["Edit notebook"],
+        "Read" => &["Read file"],
+        "WebFetch" => &["Fetch"],
+        _ => &[],
+    }
+}
+
+const ALL_TITLES: [&str; 7] =
+    ["Bash command", "Edit file", "Create file", "Overwrite file", "Edit notebook", "Read file", "Fetch"];
+
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// What the dialog box shows for `detail`: an absolute path inside the worktree is shown
+/// relative to it (the whole relative path, never just the file name); anything else as is.
+fn shown_detail(detail: &str, worktree: Option<&Path>) -> String {
+    if let (true, Some(wt)) = (detail.starts_with('/'), worktree) {
+        let canonical = std::fs::canonicalize(wt).ok();
+        for root in std::iter::once(wt).chain(canonical.as_deref()) {
+            if let Ok(rel) = Path::new(detail).strip_prefix(root) {
+                if !rel.as_os_str().is_empty() {
+                    return rel.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    detail.to_string()
+}
+
+/// Is the dialog on screen exactly the one for this request (`tool` and its `detail`, a
+/// command or a path)? All of it must hold:
+/// - a permission dialog is live (question, options, footer at the very bottom);
+/// - the nearest tool-box title above its question is one of `tool`'s titles, and no other
+///   question sits between them;
+/// - the box's first lines, whitespace removed (a command wraps across lines), are exactly
+///   the whole detail, ending at a line boundary: a shared prefix, a longer command or a
+///   file with the same name in another directory is another request;
+/// - an empty detail never matches anything.
+pub fn dialog_matches(grid: &str, tool: &str, detail: &str, worktree: Option<&Path>) -> bool {
+    let needle = squash(&shown_detail(detail.trim(), worktree));
+    if needle.is_empty() || titles(tool).is_empty() {
+        return false;
+    }
+    let all = non_blank(grid);
+    let offset = all.len().saturating_sub(BOTTOM_ROWS);
+    let Some(question) = dialog_start(&all[offset..]).map(|i| i + offset) else {
         return false;
     };
-    if detail.is_empty() {
-        return true;
+    let from = question.saturating_sub(BOX_ROWS);
+    let Some(title) = (from..question).rev().find(|&i| ALL_TITLES.contains(&all[i].trim())) else {
+        return false;
+    };
+    if !titles(tool).contains(&all[title].trim()) || all[title + 1..question].iter().any(|l| is_question(l)) {
+        return false;
     }
-    // The tool box sits right above the question: search up to 15 lines before it.
-    let from = start.saturating_sub(15);
-    let hay = squash(&lines[from..=start].join("\n"));
-    let head: String = squash(detail).chars().take(30).collect();
-    let name = detail.starts_with('/').then(|| detail.rsplit('/').next().unwrap_or("")).filter(|n| !n.is_empty());
-    hay.contains(&head) || name.is_some_and(|n| hay.contains(&squash(n)))
+    let mut acc = String::new();
+    for line in &all[title + 1..question] {
+        acc.push_str(&squash(line));
+        if acc == needle {
+            return true;
+        }
+        if !needle.starts_with(&acc) {
+            return false;
+        }
+    }
+    false
 }
 
 /// Last `n` non-blank lines.
@@ -136,6 +214,7 @@ pub fn tail(grid: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     // Real grid excerpts (vt100-rendered, Claude Code 2.1.285, S3 run 1).
     const DIALOG: &str = "\
@@ -232,15 +311,91 @@ mod tests {
         assert!(!has_manual_mode_footer(TRUST));
     }
 
+    const WT_DIR: &str = "/Users/u/.mirante/worktrees/app/feat";
+
     #[test]
     fn dialog_matches_the_request_detail() {
-        assert!(dialog_matches(DIALOG, "touch s3-allowed.txt"));
-        assert!(!dialog_matches(DIALOG, "rm -rf /"));
-        assert!(dialog_matches(EDIT_DIALOG, "/Users/u/.mirante/worktrees/app/feat/src/main.rs"));
-        assert!(dialog_matches(DIALOG, ""));
-        assert!(!dialog_matches(IDLE, "touch s3-denied.txt"));
+        assert!(dialog_matches(DIALOG, "Bash", "touch s3-allowed.txt", None));
+        assert!(!dialog_matches(DIALOG, "Bash", "rm -rf /", None));
+        assert!(dialog_matches(
+            EDIT_DIALOG,
+            "Edit",
+            "/Users/u/.mirante/worktrees/app/feat/src/main.rs",
+            Some(Path::new(WT_DIR))
+        ));
+        assert!(!dialog_matches(IDLE, "Bash", "touch s3-denied.txt", None));
         let wrapped = "Bash command\n  cargo test --workspace --all-\n  features -- --nocapture\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
-        assert!(dialog_matches(wrapped, "cargo test --workspace --all-features -- --nocapture"));
+        assert!(dialog_matches(wrapped, "Bash", "cargo test --workspace --all-features -- --nocapture", None));
+    }
+
+    #[test]
+    fn a_command_sharing_a_long_prefix_is_another_request() {
+        let shown = "Bash command\n  cargo test --workspace --all-features -- --nocapture && rm -rf ~\nRun tests\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+        // The first 30+ characters are the same: still not this request.
+        assert!(!dialog_matches(shown, "Bash", "cargo test --workspace --all-features -- --nocapture", None));
+        assert!(!dialog_matches(DIALOG, "Bash", "touch s3", None), "a prefix of the command is not the command");
+    }
+
+    #[test]
+    fn the_same_file_name_in_another_directory_is_another_request() {
+        assert!(!dialog_matches(
+            EDIT_DIALOG,
+            "Edit",
+            "/Users/u/.mirante/worktrees/app/feat/tests/main.rs",
+            Some(Path::new(WT_DIR))
+        ));
+        assert!(!dialog_matches(
+            EDIT_DIALOG,
+            "Edit",
+            "/Users/u/.mirante/worktrees/app/feat/main.rs",
+            Some(Path::new(WT_DIR))
+        ));
+        assert!(!dialog_matches(EDIT_DIALOG, "Edit", "/elsewhere/src/main.rs", Some(Path::new(WT_DIR))));
+        // Relative paths are compared as they are.
+        assert!(dialog_matches(EDIT_DIALOG, "Edit", "src/main.rs", Some(Path::new(WT_DIR))));
+    }
+
+    #[test]
+    fn an_empty_detail_never_matches() {
+        assert!(!dialog_matches(DIALOG, "Bash", "", None));
+        assert!(!dialog_matches(DIALOG, "Bash", " \n ", None));
+    }
+
+    #[test]
+    fn the_dialog_title_must_be_the_requests_tool() {
+        assert!(!dialog_matches(DIALOG, "Edit", "touch s3-allowed.txt", None));
+        assert!(!dialog_matches(EDIT_DIALOG, "Bash", "src/main.rs", Some(Path::new(WT_DIR))));
+        assert!(!dialog_matches(DIALOG, "mcp__srv__run", "touch s3-allowed.txt", None), "unknown tools never match");
+    }
+
+    #[test]
+    fn a_stale_card_never_matches_the_dialog_shown_now() {
+        // Card A ("touch a") is still pending in the hub while Claude shows dialog B.
+        let b = "⏺ Bash(touch a)\n  ⎿  done\n Bash command\n   touch b\n   Create b\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel";
+        assert!(!dialog_matches(b, "Bash", "touch a", None));
+        assert!(dialog_matches(b, "Bash", "touch b", None));
+    }
+
+    #[test]
+    fn the_footer_must_be_at_the_very_bottom() {
+        // A dialog quoted in the conversation, with live output and the prompt below it.
+        let quoted = format!("{DIALOG}\n  more output\n❯ \n  ⏸ manual mode on");
+        assert!(!has_permission_prompt(&quoted) && !dialog_open(&quoted));
+        assert_eq!(option_key(&quoted, "Yes"), None);
+        let trust = format!("{TRUST}\n❯ \n  ⏸ manual mode on");
+        assert!(!is_trust_dialog(&trust));
+        // One status line below the footer is still a live dialog.
+        assert!(has_permission_prompt(&format!("{DIALOG}\n  ⏵⏵ status")));
+    }
+
+    #[test]
+    fn other_cursor_glyphs_mark_options_too() {
+        let alt = "Bash command\n  ls\nDo you want to proceed?\n› 1. Yes\n  2. No\nEsc to cancel";
+        assert_eq!(option_key(alt, "Yes"), Some('1'));
+        assert!(has_any_dialog(alt));
+        let gt = "Would you like to proceed?\n> 1. Yes, and auto-accept edits\n  2. No\nEsc to cancel";
+        assert!(has_any_dialog(gt) && dialog_open(gt));
+        assert!(has_input_prompt("› \n"));
     }
 
     #[test]

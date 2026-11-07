@@ -7,18 +7,30 @@
 //!   `Ready` needs the `SessionStart` hook, the input prompt, no dialog, and a screen that
 //!   stayed unchanged for `ready_stable` (the "manual mode on" footer skips the wait).
 //!   There is no time-based fallback: an unknown startup screen keeps the session booting.
-//! - Messages are typed by one typist thread, one at a time: a bracketed paste, a pause,
-//!   Enter. Right before the paste AND right before Enter the typist checks again that no
-//!   dialog is on screen and that the hub holds no pending permission for the session:
-//!   a dialog can appear between `send` and the keystrokes, and typed text would answer it.
-//!   A message stopped that way is handed back (`DeliveryAborted`); stopped after the
-//!   paste, the input line is cleared with Ctrl-U (never Enter, Esc or a digit, which a
-//!   dialog would take as an answer).
-//! - Interrupt is Esc; permission answers type the digit of the exact "Yes" / "No" option
-//!   of the dialog that matches the request.
-//! - Stop ends the whole process tree (SIGTERM, grace, SIGKILL; see `proctree`).
-//! - A `--resume` whose process exits within `resume_window` reports `ResumeFailed`; a
-//!   fresh start is the user's call.
+//!   After `boot_limit` the watcher keeps polling, slower, and reports (a `boot_waiting`
+//!   step) what readiness still waits for.
+//! - Everything typed goes through one typist thread, one thing at a time: messages, Esc,
+//!   permission and trust answers.
+//! - A message is a bracketed paste, a pause, Enter. Right before the paste AND right
+//!   before Enter the typist checks again that no dialog is on screen and that the hub holds
+//!   no pending permission for the session: a dialog can appear between `send` and the
+//!   keystrokes, and typed text would answer it. A message stopped that way is handed back
+//!   (`DeliveryAborted`). Stopped after the paste, nothing more is typed then (a dialog may
+//!   be taking keys); the pasted text is left in the input box and cleared (Ctrl-E Ctrl-U,
+//!   one more Ctrl-U per pasted line) right before the next paste, once nothing blocks
+//!   typing, so the requeued message is never sent twice. Never Enter, Esc or a digit.
+//! - A blocked `send` is `NotNow`, its reason starting with `hold` (a permission request is
+//!   pending) or `dialog` (a dialog is on screen). Once nothing blocks any more, the driver
+//!   reports `DialogClosed` so the hub delivers what it requeued.
+//! - Permission answers: the digit of the exact "Yes" / "No" option of the dialog that is
+//!   exactly the request's (tool title and the whole command or path; see
+//!   `screen::dialog_matches`). Checked when asked AND again by the typist right before the
+//!   key, on the screen as it is then; if the dialog changed, nothing is typed and the
+//!   answer fails (`NoDialog`). Trust answers are re-checked the same way.
+//! - Stop ends the whole process tree (SIGTERM, grace, SIGKILL; see `proctree`), also what
+//!   an agent that already exited left behind (see `pty`).
+//! - A `--resume` whose process exits within `resume_window`, before `SessionStart` or
+//!   `Ready`, reports `ResumeFailed`; a fresh start is the user's call.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -34,8 +46,12 @@ use super::pty::{PtyProcess, PtySpec};
 use super::{screen, Attachment, Driver, DriverError, DriverEvent, Sink};
 
 const ESC: &[u8] = b"\x1b";
+/// Ctrl-E: end of the line in the input box.
+const END_OF_LINE: u8 = 0x05;
 /// Ctrl-U: clears the input line. Not an answer to any dialog.
-const CLEAR_LINE: &[u8] = b"\x15";
+const CLEAR_LINE: u8 = 0x15;
+/// How long an answer may wait for the typist (it may be finishing a message).
+const ANSWER_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeTiming {
@@ -49,12 +65,16 @@ pub struct ClaudeTiming {
     pub tail_poll: Duration,
     /// SIGTERM to SIGKILL on stop.
     pub stop_grace: Duration,
-    /// The boot watcher gives up after this long (the session stays `Booting`).
+    /// After this long without `Ready` the boot watcher reports what it waits for and polls
+    /// slower (the session stays `Booting`).
     pub boot_limit: Duration,
     /// How long the input prompt must stay unchanged before `Ready` (no footer fast path).
     pub ready_stable: Duration,
     /// A resumed process that exits sooner than this failed to resume.
     pub resume_window: Duration,
+    /// After `Ready`: how often the screen and the hold flag are checked for a dialog that
+    /// closed (`DialogClosed`).
+    pub monitor: Duration,
 }
 
 impl Default for ClaudeTiming {
@@ -68,15 +88,22 @@ impl Default for ClaudeTiming {
             boot_limit: Duration::from_secs(600),
             ready_stable: Duration::from_millis(500),
             resume_window: Duration::from_secs(3),
+            monitor: Duration::from_millis(250),
         }
     }
 }
 
+type Reply = mpsc::Sender<Result<(), DriverError>>;
+
 enum Typing {
     /// (the message as given, the bytes to type before Enter)
     Message(String, Vec<u8>),
-    /// Keys for a dialog or the TUI (answers, Esc): typed as they are.
+    /// Keys for the TUI (Esc): typed as they are.
     Keys(Vec<u8>),
+    /// A permission answer, checked against the screen right before its key is typed.
+    Answer { detail: String, tool: String, label: &'static str, deadline: Instant, reply: Reply },
+    /// "Yes, I trust this folder", checked against the screen right before its key is typed.
+    Trust { deadline: Instant, reply: Reply },
 }
 
 pub struct ClaudeDriver {
@@ -84,6 +111,8 @@ pub struct ClaudeDriver {
     sink: Sink,
     typist: Mutex<mpsc::Sender<Typing>>,
     timing: ClaudeTiming,
+    /// The worktree (paths in dialogs are shown relative to it).
+    cwd: PathBuf,
     tail_path: Mutex<Option<PathBuf>>,
     /// Bumped to stop the current tail thread (new path, stop, exit).
     tail_gen: Arc<AtomicU64>,
@@ -91,46 +120,114 @@ pub struct ClaudeDriver {
     started: Arc<AtomicBool>,
     /// `Ready` was reported: messages may be typed; the trust prompt is no longer looked for.
     ready: Arc<AtomicBool>,
+    /// Set when the driver is stopped or dropped: the screen watcher ends.
+    gone: Arc<AtomicBool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Why typing must not happen now, if it must not.
+/// Why typing must not happen now, if it must not: `hold: …` or `dialog: …`.
 fn blocked(pty: &PtyProcess, sink: &Sink) -> Option<&'static str> {
     if sink.held() {
-        Some("a permission request is pending")
+        Some("hold: a permission request is pending")
     } else if screen::dialog_open(&pty.grid()) {
-        Some("a dialog is open on the agent's screen")
+        Some("dialog: a dialog is open on the agent's screen")
     } else {
         None
     }
 }
 
-fn type_message(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming, text: String, bytes: &[u8]) {
+/// Clears what an aborted paste of `lines` lines left in the input box: Ctrl-E, Ctrl-U,
+/// then one more Ctrl-U per line. The exact sequence Claude Code needs for a multi-line
+/// input is to be confirmed in the Task 21 real run.
+pub fn clear_input(lines: usize) -> Vec<u8> {
+    let mut out = vec![END_OF_LINE, CLEAR_LINE];
+    out.extend(std::iter::repeat_n(CLEAR_LINE, lines.max(1)));
+    out
+}
+
+/// Types one message. `dirty`: lines an earlier aborted paste left in the input box.
+/// `owed` is set when a message is handed back: the screen watcher then reports
+/// `DialogClosed` as soon as nothing blocks typing, even if it never saw the block.
+fn type_message(
+    pty: &PtyProcess,
+    sink: &Sink,
+    timing: ClaudeTiming,
+    text: String,
+    bytes: &[u8],
+    dirty: &mut Option<usize>,
+    owed: &AtomicBool,
+) {
     std::thread::sleep(timing.pre_type);
     if let Some(why) = blocked(pty, sink) {
         sink.emit(DriverEvent::DeliveryAborted { text, reason: format!("{why}; nothing was typed") });
+        // After the event: the hub must have requeued it before it hears `DialogClosed`.
+        owed.store(true, Ordering::SeqCst);
         return;
     }
-    if pty.write(bytes).is_err() {
+    let mut keys = dirty.take().map(clear_input).unwrap_or_default();
+    keys.extend_from_slice(bytes);
+    if pty.write(&keys).is_err() {
         sink.emit(DriverEvent::DeliveryAborted { text, reason: "the agent's terminal is closed".into() });
         return;
     }
     std::thread::sleep(timing.type_pause);
     if let Some(why) = blocked(pty, sink) {
-        let _ = pty.write(CLEAR_LINE);
-        let reason = format!("{why} before Enter; the typed text was cleared, not sent");
+        // Nothing more now: a dialog may be taking keys. The leftover is cleared before the
+        // next paste, once nothing blocks typing.
+        *dirty = Some(paste::line_count(&text));
+        let reason =
+            format!("{why} before Enter; nothing was submitted (the pasted text is cleared before the next message)");
         sink.emit(DriverEvent::DeliveryAborted { text, reason });
+        owed.store(true, Ordering::SeqCst);
         return;
     }
     let _ = pty.write(b"\r");
 }
 
+/// The answer key for the request, from the screen as it is now.
+fn answer_key(grid: &str, tool: &str, detail: &str, label: &str, cwd: &Path) -> Result<char, DriverError> {
+    if !screen::has_permission_prompt(grid) {
+        return Err(DriverError::NoDialog("no permission dialog on screen".into()));
+    }
+    if !screen::dialog_matches(grid, tool, detail, Some(cwd)) {
+        return Err(DriverError::NoDialog(
+            "the dialog on screen is not exactly this request; answer it in `mirante attach`".into(),
+        ));
+    }
+    screen::option_key(grid, label)
+        .ok_or_else(|| DriverError::NoDialog(format!("the dialog has no plain \"{label}\" option")))
+}
+
+fn trust_key(grid: &str) -> Result<char, DriverError> {
+    screen::trust_key(grid)
+        .ok_or_else(|| DriverError::NoDialog(format!("no trust dialog with a \"{}\" option", screen::TRUST_YES)))
+}
+
+/// Types `key` when `check` still finds it on the screen right now, before `deadline`.
+fn type_checked(
+    pty: &PtyProcess,
+    sink: &Sink,
+    what: &str,
+    deadline: Instant,
+    check: impl FnOnce(&str) -> Result<char, DriverError>,
+) -> Result<(), DriverError> {
+    let r = if Instant::now() >= deadline {
+        Err(DriverError::Failed(format!("the {what} waited too long to be typed; nothing was typed")))
+    } else {
+        check(&pty.grid()).and_then(|key| Ok(pty.write(&[key as u8])?))
+    };
+    if let Err(e) = &r {
+        sink.emit(DriverEvent::Step(json!({ "type": "answer_aborted", "what": what, "error": e.to_string() })));
+    }
+    r
+}
+
 impl ClaudeDriver {
     /// Spawns `spec`. `resuming`: the launch passes `--resume` (an exit within
-    /// `resume_window` is then reported as `ResumeFailed`).
+    /// `resume_window`, before `SessionStart` or `Ready`, is then reported as `ResumeFailed`).
     pub fn spawn(
         spec: PtySpec,
         sink: Sink,
@@ -138,12 +235,16 @@ impl ClaudeDriver {
         resuming: bool,
     ) -> Result<Arc<ClaudeDriver>, DriverError> {
         let tail_gen = Arc::new(AtomicU64::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let (exit_sink, exit_gen) = (sink.clone(), tail_gen.clone());
+        let (exit_started, exit_ready) = (started.clone(), ready.clone());
         let born = Instant::now();
         let pty = PtyProcess::spawn(&spec, move |code| {
             exit_gen.fetch_add(1, Ordering::SeqCst);
             let after = born.elapsed();
-            if resuming && after < timing.resume_window {
+            let came_up = exit_started.load(Ordering::SeqCst) || exit_ready.load(Ordering::SeqCst);
+            if resuming && after < timing.resume_window && !came_up {
                 let reason = format!(
                     "claude exited {:.1} s after --resume (exit code {code:?}); its conversation may be gone",
                     after.as_secs_f32()
@@ -153,47 +254,106 @@ impl ClaudeDriver {
             exit_sink.emit(DriverEvent::Exited { code });
         })?;
         let (tx, rx) = mpsc::channel::<Typing>();
-        let (typist_pty, typist_sink) = (pty.clone(), sink.clone());
+        let owed = Arc::new(AtomicBool::new(false));
+        let (typist_pty, typist_sink, cwd, typist_owed) = (pty.clone(), sink.clone(), spec.cwd.clone(), owed.clone());
         std::thread::spawn(move || {
+            let mut dirty = None;
             for t in rx {
                 match t {
-                    Typing::Message(text, bytes) => type_message(&typist_pty, &typist_sink, timing, text, &bytes),
+                    Typing::Message(text, bytes) => {
+                        type_message(&typist_pty, &typist_sink, timing, text, &bytes, &mut dirty, &typist_owed)
+                    }
                     Typing::Keys(k) => {
                         let _ = typist_pty.write(&k);
+                    }
+                    Typing::Answer { detail, tool, label, deadline, reply } => {
+                        let r = type_checked(&typist_pty, &typist_sink, "permission answer", deadline, |g| {
+                            answer_key(g, &tool, &detail, label, &cwd)
+                        });
+                        let _ = reply.send(r);
+                    }
+                    Typing::Trust { deadline, reply } => {
+                        let r = type_checked(&typist_pty, &typist_sink, "trust answer", deadline, trust_key);
+                        let _ = reply.send(r);
                     }
                 }
             }
         });
-        let started = Arc::new(AtomicBool::new(false));
-        let ready = Arc::new(AtomicBool::new(false));
+        let gone = Arc::new(AtomicBool::new(false));
         let driver = Arc::new(ClaudeDriver {
             pty: pty.clone(),
             sink: sink.clone(),
             typist: Mutex::new(tx),
             timing,
+            cwd: spec.cwd.clone(),
             tail_path: Mutex::new(None),
             tail_gen,
             started: started.clone(),
             ready: ready.clone(),
+            gone: gone.clone(),
         });
-        std::thread::spawn(move || watch_boot(&pty, &sink, timing, &started, &ready));
+        std::thread::spawn(move || {
+            if watch_boot(&pty, &sink, timing, &started, &ready, &gone) {
+                watch_dialogs(&pty, &sink, timing, &gone, &owed);
+            }
+        });
         Ok(driver)
     }
 
     fn type_(&self, t: Typing) -> Result<(), DriverError> {
         lock(&self.typist).send(t).map_err(|_| DriverError::Failed("typist stopped".into()))
     }
+
+    /// Hands a checked answer to the typist and waits for it to be typed (or refused).
+    fn type_answer(&self, make: impl FnOnce(Instant, Reply) -> Typing) -> Result<(), DriverError> {
+        let (reply, result) = mpsc::channel();
+        let deadline = Instant::now() + ANSWER_WAIT;
+        self.type_(make(deadline, reply))?;
+        result
+            .recv_timeout(ANSWER_WAIT + Duration::from_secs(1))
+            .map_err(|_| DriverError::Failed("the answer was not typed in time".into()))?
+    }
+}
+
+/// What readiness still waits for, in words.
+fn waiting_for(grid: &str, started: bool, since: Duration, timing: ClaudeTiming) -> Vec<&'static str> {
+    let mut w = Vec::new();
+    if !started {
+        w.push("the SessionStart hook");
+    }
+    if screen::is_trust_dialog(grid) {
+        w.push("your answer to the trust prompt (mirante trust)");
+    } else if screen::dialog_open(grid) {
+        w.push("a dialog on the agent's screen to close (mirante attach)");
+    }
+    if !screen::has_manual_mode_footer(grid) {
+        if !screen::has_input_prompt(grid) {
+            w.push("the input prompt");
+        } else if since < timing.ready_stable {
+            w.push("the screen to settle");
+        }
+    }
+    w
 }
 
 /// Reports `TrustPrompt` when the trust dialog shows (once per appearance, only before the
 /// first `Ready`) and `Ready` once: `SessionStart` seen, no dialog, and either the
 /// "manual mode on" footer or an input prompt on a screen unchanged for `ready_stable`.
-/// Never answers anything itself.
-fn watch_boot(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming, started: &AtomicBool, ready: &AtomicBool) {
+/// After `boot_limit` it polls ten times slower and reports what it waits for (again when
+/// that changes). Never answers anything itself. True once `Ready` was reported.
+fn watch_boot(
+    pty: &PtyProcess,
+    sink: &Sink,
+    timing: ClaudeTiming,
+    started: &AtomicBool,
+    ready: &AtomicBool,
+    gone: &AtomicBool,
+) -> bool {
     let start = Instant::now();
     let mut trust_shown = false;
+    let mut reported: Option<Vec<&'static str>> = None;
     let (mut last, mut since) = (String::new(), Instant::now());
-    while !pty.exited() && start.elapsed() < timing.boot_limit {
+    while !pty.exited() && !gone.load(Ordering::SeqCst) {
         let grid = pty.grid();
         if grid != last {
             last = grid.clone();
@@ -211,19 +371,47 @@ fn watch_boot(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming, started: &Ato
             if started.load(Ordering::SeqCst) && !screen::dialog_open(&grid) && settled {
                 ready.store(true, Ordering::SeqCst);
                 sink.emit(DriverEvent::Boot(BootState::Ready));
-                return;
+                return true;
             }
         }
-        std::thread::sleep(timing.tick);
+        let late = start.elapsed() >= timing.boot_limit;
+        if late {
+            let w = waiting_for(&grid, started.load(Ordering::SeqCst), since.elapsed(), timing);
+            if reported.as_ref() != Some(&w) {
+                sink.emit(DriverEvent::Step(json!({
+                    "type": "boot_waiting",
+                    "after_s": start.elapsed().as_secs(),
+                    "waiting_for": w,
+                })));
+                reported = Some(w);
+            }
+        }
+        std::thread::sleep(if late { timing.tick * 10 } else { timing.tick });
+    }
+    false
+}
+
+/// After `Ready`: reports `DialogClosed` each time typing stops being blocked (a dialog
+/// left the screen, or the hold was released), and once nothing blocks after a message was
+/// handed back (`owed`), so the hub can deliver what it requeued.
+fn watch_dialogs(pty: &PtyProcess, sink: &Sink, timing: ClaudeTiming, gone: &AtomicBool, owed: &AtomicBool) {
+    let mut was_blocked = false;
+    while !pty.exited() && !gone.load(Ordering::SeqCst) {
+        let now = blocked(pty, sink).is_some();
+        if !now && (was_blocked || owed.swap(false, Ordering::SeqCst)) {
+            sink.emit(DriverEvent::DialogClosed);
+        }
+        was_blocked = now;
+        std::thread::sleep(timing.monitor);
     }
 }
 
 impl Drop for ClaudeDriver {
     fn drop(&mut self) {
         self.tail_gen.fetch_add(1, Ordering::SeqCst);
-        if !self.pty.exited() {
-            self.pty.kill_tree(Duration::from_millis(200));
-        }
+        self.gone.store(true, Ordering::SeqCst);
+        // Also after an exit: what the agent left behind goes too.
+        self.pty.kill_tree(Duration::from_millis(200));
     }
 }
 
@@ -232,8 +420,8 @@ impl Driver for ClaudeDriver {
         if !self.ready.load(Ordering::SeqCst) {
             return Err(DriverError::NotNow("Claude is not ready yet (starting, or at the trust prompt)".into()));
         }
-        if blocked(&self.pty, &self.sink).is_some() {
-            return Err(DriverError::Failed("a dialog is open on the agent's screen".into()));
+        if let Some(why) = blocked(&self.pty, &self.sink) {
+            return Err(DriverError::NotNow(why.into()));
         }
         let bytes = paste::typed_message(text).map_err(DriverError::Failed)?;
         self.type_(Typing::Message(text.to_string(), bytes))
@@ -243,34 +431,25 @@ impl Driver for ClaudeDriver {
         self.type_(Typing::Keys(ESC.to_vec()))
     }
 
-    fn answer_permission(&self, detail: &str, allow: bool) -> Result<(), DriverError> {
-        let grid = self.pty.grid();
-        if !screen::has_permission_prompt(&grid) {
-            return Err(DriverError::NoDialog("no permission dialog on screen".into()));
-        }
-        if !screen::dialog_matches(&grid, detail) {
-            return Err(DriverError::NoDialog(
-                "the dialog on screen is for another request; answer it in `mirante attach`".into(),
-            ));
-        }
+    fn answer_permission(&self, detail: &str, tool: &str, allow: bool) -> Result<(), DriverError> {
         let label = if allow { "Yes" } else { "No" };
-        let key = screen::option_key(&grid, label)
-            .ok_or_else(|| DriverError::NoDialog(format!("the dialog has no plain \"{label}\" option")))?;
-        self.type_(Typing::Keys(vec![key as u8]))
+        // Checked now for a quick answer, and again by the typist right before the key.
+        answer_key(&self.pty.grid(), tool, detail, label, &self.cwd)?;
+        let (detail, tool) = (detail.to_string(), tool.to_string());
+        self.type_answer(|deadline, reply| Typing::Answer { detail, tool, label, deadline, reply })
     }
 
     fn trust(&self, accept: bool) -> Result<(), DriverError> {
         if self.ready.load(Ordering::SeqCst) {
             return Err(DriverError::NoDialog("the session is past its trust prompt".into()));
         }
-        let key = screen::trust_key(&self.pty.grid())
-            .ok_or_else(|| DriverError::NoDialog(format!("no trust dialog with a \"{}\" option", screen::TRUST_YES)))?;
+        trust_key(&self.pty.grid())?;
         if !accept {
             let (pty, grace) = (self.pty.clone(), self.timing.stop_grace);
             std::thread::spawn(move || pty.kill_tree(grace));
             return Ok(());
         }
-        self.type_(Typing::Keys(vec![key as u8]))
+        self.type_answer(|deadline, reply| Typing::Trust { deadline, reply })
     }
 
     fn dialog_open(&self) -> bool {
@@ -341,10 +520,10 @@ impl Driver for ClaudeDriver {
 
     fn stop(&self) {
         self.tail_gen.fetch_add(1, Ordering::SeqCst);
-        if !self.pty.exited() {
-            self.pty.kill_tree(self.timing.stop_grace);
-            self.pty.wait_exit(Duration::from_secs(2));
-        }
+        self.gone.store(true, Ordering::SeqCst);
+        // Also after an exit: what the agent left behind (see `PtyProcess::kill_tree`).
+        self.pty.kill_tree(self.timing.stop_grace);
+        self.pty.wait_exit(Duration::from_secs(2));
     }
 
     fn session_started(&self) {
@@ -373,6 +552,7 @@ mod tests {
             boot_limit: Duration::from_secs(10),
             ready_stable: Duration::from_millis(150),
             resume_window: Duration::from_secs(3),
+            monitor: Duration::from_millis(20),
         }
     }
 
@@ -542,7 +722,51 @@ mod tests {
     }
 
     #[test]
-    fn a_permission_pending_before_enter_clears_the_line_instead_of_submitting() {
+    fn a_requeued_message_is_not_duplicated_the_line_is_cleared_before_the_next_paste() {
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let pasted = paste::bracketed("go on");
+        // Ctrl-E Ctrl-U, then one more Ctrl-U per line of the aborted paste; then the paste again.
+        let want = [b"\x05\x15\x15".to_vec(), pasted.clone(), b"\r".to_vec()].concat();
+        let f = fake_with(
+            &format!(
+                "{READY}; dd bs=1 count={} >/dev/null 2>&1; printf 'pasted'; stty min 0 time 30; \
+                 dd bs=1 count={} of={} 2>/dev/null; printf ' done'; sleep 5",
+                pasted.len(),
+                want.len(),
+                out.display()
+            ),
+            ClaudeTiming { type_pause: Duration::from_millis(800), ..fast() },
+            false,
+        );
+        ready(&f);
+        f.d.send("go on").unwrap();
+        wait_grid(&f.d, "pasted");
+        f.hold.store(true, Ordering::SeqCst);
+        let ev = next(&f.rx, |e| matches!(e, DriverEvent::DeliveryAborted { .. }));
+        assert!(matches!(ev, DriverEvent::DeliveryAborted { ref reason, .. } if reason.contains("before Enter")));
+        // Nothing is typed while held (not even Ctrl-U: a dialog may be about to take keys).
+        let blocked = f.d.send("more").unwrap_err();
+        assert!(matches!(blocked, DriverError::NotNow(ref m) if m.starts_with("hold")), "{blocked:?}");
+        std::thread::sleep(Duration::from_millis(300));
+        f.hold.store(false, Ordering::SeqCst);
+        // The hub hands the requeued message back: the leftover is cleared first.
+        f.d.send("go on").unwrap();
+        wait_grid(&f.d, " done");
+        assert_eq!(std::fs::read(&out).unwrap(), want, "{:?}", String::from_utf8_lossy(&std::fs::read(&out).unwrap()));
+    }
+
+    #[test]
+    fn a_blocked_send_is_not_now_and_says_why() {
+        let f = fake(&format!("{READY}; sleep 5"));
+        ready(&f);
+        f.d.pty.mirror(DIALOG);
+        let e = f.d.send("x").unwrap_err();
+        assert!(matches!(e, DriverError::NotNow(ref m) if m.starts_with("dialog")), "{e:?}");
+    }
+
+    #[test]
+    fn an_answer_whose_dialog_changed_before_it_was_typed_types_nothing() {
         let pasted = paste::bracketed("go on");
         let f = fake_with(
             &format!(
@@ -554,28 +778,55 @@ mod tests {
             false,
         );
         ready(&f);
+        // The typist is busy (between the paste and Enter) when the answer is asked for.
         f.d.send("go on").unwrap();
         wait_grid(&f.d, "pasted");
-        f.hold.store(true, Ordering::SeqCst);
-        let ev = next(&f.rx, |e| matches!(e, DriverEvent::DeliveryAborted { .. }));
-        assert!(matches!(ev, DriverEvent::DeliveryAborted { ref reason, .. } if reason.contains("before Enter")));
-        // Ctrl-U (octal 025), never Enter.
-        wait_grid(&f.d, "next:[025]");
-        assert!(matches!(f.d.send("more"), Err(DriverError::Failed(_))));
+        f.d.pty.mirror(DIALOG);
+        let d = f.d.clone();
+        let answer = std::thread::spawn(move || d.answer_permission("touch x", "Bash", true));
+        std::thread::sleep(Duration::from_millis(150));
+        // Before the typist gets to it, another dialog replaced the one that was asked about.
+        f.d.pty.mirror(b"\x1b[2J\x1b[H Bash command\r\n   rm -rf ~\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n Esc to cancel\r\n");
+        let r = answer.join().unwrap();
+        assert!(matches!(r, Err(DriverError::NoDialog(_))), "{r:?}");
+        next(&f.rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "answer_aborted"));
+        wait_grid(&f.d, "next:[]");
     }
 
     #[test]
-    fn permission_answer_types_the_exact_option_for_the_matching_dialog() {
-        let dialog = "printf '\\033[2J\\033[H Bash command\\r\\n   touch x\\r\\n Do you want to proceed?\\r\\n \\342\\235\\257 1. Yes\\r\\n   2. Yes, and always allow access to /w\\r\\n   3. No\\r\\n Esc to cancel\\r\\n'";
-        let f = fake(&format!(
-            "{READY}; sleep 1; {dialog}; k=$(dd bs=1 count=1 2>/dev/null); printf '\\r\\npicked:%s' \"$k\"; sleep 5"
-        ));
+    fn a_closed_dialog_or_a_released_hold_is_reported() {
+        let f = fake(&format!("{READY}; sleep 5"));
         ready(&f);
-        wait_grid(&f.d, "Do you want to proceed?");
-        assert!(f.d.dialog_open());
-        assert!(matches!(f.d.answer_permission("rm -rf /", true), Err(DriverError::NoDialog(_))));
-        f.d.answer_permission("touch x", false).unwrap();
-        wait_grid(&f.d, "picked:3");
+        f.d.pty.mirror(DIALOG);
+        std::thread::sleep(Duration::from_millis(100));
+        f.d.pty.mirror(b"\x1b[2J\x1b[H> \r\n  manual mode on\r\n");
+        next(&f.rx, |e| *e == DriverEvent::DialogClosed);
+        f.hold.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        f.hold.store(false, Ordering::SeqCst);
+        next(&f.rx, |e| *e == DriverEvent::DialogClosed);
+    }
+
+    #[test]
+    fn boot_keeps_watching_after_the_limit_and_says_what_it_waits_for() {
+        let f = fake_with(
+            &format!("{READY}; sleep 10"),
+            ClaudeTiming { boot_limit: Duration::from_millis(200), ..fast() },
+            false,
+        );
+        let ev = next(&f.rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "boot_waiting"));
+        let DriverEvent::Step(v) = ev else { unreachable!() };
+        assert!(v["waiting_for"].to_string().contains("SessionStart"), "{v}");
+        // Readiness still arrives after the limit.
+        ready(&f);
+    }
+
+    #[test]
+    fn a_resumed_session_that_started_and_then_exited_did_not_fail_to_resume() {
+        let f = fake_with("sleep 0.6; exit 3", fast(), true);
+        f.d.session_started();
+        let ev = next(&f.rx, |e| matches!(e, DriverEvent::ResumeFailed { .. } | DriverEvent::Exited { .. }));
+        assert_eq!(ev, DriverEvent::Exited { code: Some(3) });
     }
 
     #[test]

@@ -123,11 +123,13 @@ impl RealFactory {
         let settings = req.paths.session_dir(&req.task.id).join("claude-settings.json");
         write_private(&settings, &settings_json(&hook.to_string_lossy(), &[]).to_string())?;
         let (pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env())?;
+        let driver = ClaudeDriver::spawn(pty, sink.clone(), ClaudeTiming::default(), req.resume.is_some())?;
         if let Some(id) = pinned {
-            // Known before Claude starts: a crash during boot can still be resumed.
+            // Known before Claude prints anything: a crash during boot can still be resumed.
+            // Only once the process exists: a failed spawn leaves nothing to resume.
             sink.emit(DriverEvent::NativeId(id));
         }
-        Ok(ClaudeDriver::spawn(pty, sink, ClaudeTiming::default(), req.resume.is_some())?)
+        Ok(driver)
     }
 
     fn codex(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {

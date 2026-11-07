@@ -171,7 +171,7 @@ impl Hub {
                 HubError::Conflict(format!("permission request {} has no pending approval in the agent", p.id))
             })?,
         };
-        driver.answer_permission(&key, a.allow)?;
+        driver.answer_permission(&key, &p.tool, a.allow)?;
         let answered = match st.store.answer_permission(&p.id, status) {
             Ok(answered) => answered,
             Err(e) => {
@@ -300,7 +300,7 @@ mod tests {
         let id = p[0].request.id.clone();
         let a = k.hub.answer_permission(AnswerPermission { id: id[id.len() - 6..].into(), allow: true }).unwrap();
         assert_eq!(a.status, PermissionStatus::AllowedOnce);
-        assert_eq!(k.calls(), vec!["answer:touch x:true".to_string()]);
+        assert_eq!(k.calls(), vec!["answer:touch x:Bash:true".to_string()]);
         assert_eq!(k.hub.get_task(&t.id).unwrap().task.status, Status::Working);
         assert!(matches!(k.hub.answer_permission(AnswerPermission { id, allow: false }), Err(HubError::Conflict(_))));
     }
@@ -357,7 +357,7 @@ mod tests {
         });
         let id = k.hub.permissions().unwrap()[0].request.id.clone();
         k.hub.answer_permission(AnswerPermission { id, allow: false }).unwrap();
-        assert_eq!(k.calls(), vec!["answer:7:false".to_string()]);
+        assert_eq!(k.calls(), vec!["answer:7:command:false".to_string()]);
         assert!(k.hub.lock().live[&t.id].perm_keys.is_empty());
     }
 

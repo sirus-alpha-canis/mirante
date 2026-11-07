@@ -5,9 +5,15 @@
 //! attached clients get, so a client terminal never answers a second time (a second reply
 //! would arrive as typed input).
 //!
+//! Two more kinds of request are stripped from the stream without an answer, because a
+//! client terminal would answer them as typed input: OSC 52 clipboard reads
+//! (`ESC]52;<sel>;?`, the reply carries the user's clipboard) and DCS requests (`ESC P $ q`
+//! DECRQSS, `ESC P + q` XTGETTCAP). Clipboard writes and other DCS strings pass through.
+//!
 //! The parser keeps state across reads: a query split between two chunks (`ESC[` then
 //! `6n`) is held back and completed with the next chunk. Only bytes that are still a prefix
-//! of a known query are held (at most 7); everything else passes through byte for byte.
+//! of a known query are held (a few dozen at most); a DCS request body is dropped as it
+//! streams, up to its terminator. Everything else passes through byte for byte.
 
 /// A query the agent sent to its terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +52,43 @@ const QUERIES: [(&[u8], Query); 8] = [
 /// What a partial match at the end of the input could still become.
 enum Match {
     Full(Query, usize),
+    /// A request to drop whole (an OSC 52 clipboard read) of this length.
+    Strip(usize),
+    /// A DCS request: drop this many bytes, then its body up to the terminator.
+    SkipBody(usize),
     Prefix,
     No,
+}
+
+const DCS_REQUESTS: [&[u8]; 2] = [b"\x1bP$q", b"\x1bP+q"];
+const OSC52: &[u8] = b"\x1b]52;";
+/// Longest OSC 52 selection parameter considered (`c`, `p`, `s`, `0`..`7`, combinations).
+const OSC52_SELECTION: usize = 16;
+
+/// `ESC]52;<sel>;?` + BEL / ST at the start of `buf`.
+fn osc52_read(buf: &[u8]) -> Match {
+    if buf.len() < OSC52.len() {
+        return if OSC52.starts_with(buf) { Match::Prefix } else { Match::No };
+    }
+    if !buf.starts_with(OSC52) {
+        return Match::No;
+    }
+    let mut j = OSC52.len();
+    while j < buf.len() && buf[j].is_ascii_alphanumeric() && j - OSC52.len() < OSC52_SELECTION {
+        j += 1;
+    }
+    let rest = &buf[j..];
+    let want: [&[u8]; 2] = [b";?\x07", b";?\x1b\\"];
+    for w in want {
+        if rest.starts_with(w) {
+            return Match::Strip(j + w.len());
+        }
+    }
+    if want.iter().any(|w| w.starts_with(rest)) {
+        Match::Prefix
+    } else {
+        Match::No
+    }
 }
 
 fn match_at(buf: &[u8]) -> Match {
@@ -61,6 +102,19 @@ fn match_at(buf: &[u8]) -> Match {
             prefix = true;
         }
     }
+    for pat in DCS_REQUESTS {
+        if buf.starts_with(pat) {
+            return Match::SkipBody(pat.len());
+        }
+        if buf.len() < pat.len() && pat.starts_with(buf) {
+            prefix = true;
+        }
+    }
+    match osc52_read(buf) {
+        Match::Strip(n) => return Match::Strip(n),
+        Match::Prefix => prefix = true,
+        _ => {}
+    }
     if prefix {
         Match::Prefix
     } else {
@@ -68,9 +122,20 @@ fn match_at(buf: &[u8]) -> Match {
     }
 }
 
+/// Where the parser is inside a DCS request body being dropped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    #[default]
+    No,
+    Body,
+    /// Saw ESC inside the body: `\` ends it.
+    Esc,
+}
+
 #[derive(Debug, Default)]
 pub struct TermQueries {
     held: Vec<u8>,
+    skip: Skip,
 }
 
 impl TermQueries {
@@ -82,6 +147,24 @@ impl TermQueries {
         let mut plain = Vec::new();
         let mut i = 0;
         while i < buf.len() {
+            match self.skip {
+                Skip::No => {}
+                Skip::Body => {
+                    self.skip = match buf[i] {
+                        0x07 => Skip::No,
+                        0x1b => Skip::Esc,
+                        _ => Skip::Body,
+                    };
+                    i += 1;
+                    continue;
+                }
+                Skip::Esc => {
+                    // ESC \ is the terminator; ESC anything else aborts the string too.
+                    self.skip = Skip::No;
+                    i += 1;
+                    continue;
+                }
+            }
             if buf[i] != 0x1b {
                 plain.push(buf[i]);
                 i += 1;
@@ -93,6 +176,11 @@ impl TermQueries {
                         out.push(Piece::Bytes(std::mem::take(&mut plain)));
                     }
                     out.push(Piece::Query(q));
+                    i += len;
+                }
+                Match::Strip(len) => i += len,
+                Match::SkipBody(len) => {
+                    self.skip = Skip::Body;
                     i += len;
                 }
                 Match::Prefix => {
@@ -214,5 +302,29 @@ mod tests {
             got.extend(bytes(&t.feed(chunk)));
         }
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn clipboard_reads_and_dcs_requests_never_reach_a_client() {
+        // A client terminal would answer them as typed input (OSC 52 read: the clipboard).
+        let mut t = TermQueries::default();
+        let p = t.feed(b"a\x1b]52;c;?\x07b\x1b]52;;?\x1b\\c\x1bP$qm\x1b\\d\x1bP+q544e;636f\x07e");
+        assert_eq!(bytes(&p), b"abcde".to_vec());
+        // Clipboard writes and other DCS strings pass through.
+        let write = b"\x1b]52;c;aGVsbG8=\x07\x1bPq#0;2;0;0;0\x1b\\";
+        assert_eq!(bytes(&t.feed(write)), write.to_vec());
+    }
+
+    #[test]
+    fn stripped_sequences_split_across_reads_are_still_stripped() {
+        let mut t = TermQueries::default();
+        let mut got = Vec::new();
+        for chunk in
+            [&b"x\x1b]5"[..], b"2;c", b";", b"?", b"\x1b", b"\\y\x1bP", b"$", b"q long", b" body", b"\x1b", b"\\z"]
+        {
+            got.extend(bytes(&t.feed(chunk)));
+        }
+        assert_eq!(got, b"xyz".to_vec());
+        assert!(t.flush().is_empty());
     }
 }

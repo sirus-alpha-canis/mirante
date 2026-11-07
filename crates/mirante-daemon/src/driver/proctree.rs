@@ -46,15 +46,29 @@ mod sys {
     }
 
     pub fn children(pid: i32) -> Vec<i32> {
-        if pid <= 0 {
+        list(pid, |pid, buf, bytes| {
+            // SAFETY: the buffer holds `bytes` bytes.
+            unsafe { libc::proc_listchildpids(pid, buf, bytes) }
+        })
+    }
+
+    pub fn group_members(pgid: i32) -> Vec<i32> {
+        list(pgid, |pgid, buf, bytes| {
+            // SAFETY: the buffer holds `bytes` bytes.
+            unsafe { libc::proc_listpgrppids(pgid, buf, bytes) }
+        })
+    }
+
+    /// A pid list from a `proc_list*pids` call (which returns a count of pids).
+    fn list(id: i32, call: impl Fn(i32, *mut c_void, libc::c_int) -> libc::c_int) -> Vec<i32> {
+        if id <= 0 {
             return Vec::new();
         }
         let mut cap = 64usize;
         loop {
             let mut buf = vec![0 as libc::pid_t; cap];
             let bytes = (cap * size_of::<libc::pid_t>()) as libc::c_int;
-            // SAFETY: the buffer holds `cap` pids and its size in bytes is passed.
-            let n = unsafe { libc::proc_listchildpids(pid, buf.as_mut_ptr() as *mut c_void, bytes) };
+            let n = call(id, buf.as_mut_ptr() as *mut c_void, bytes);
             if n < 0 {
                 return Vec::new();
             }
@@ -92,13 +106,21 @@ mod sys {
         stat(pid).map(|s| s.2)
     }
 
-    pub fn children(pid: i32) -> Vec<i32> {
+    fn all_where(keep: impl Fn((char, i32, i32, u64)) -> bool) -> Vec<i32> {
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Vec::new();
         };
         dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-            .filter(|c| stat(*c).is_some_and(|s| s.1 == pid))
+            .filter(|c| stat(*c).is_some_and(&keep))
             .collect()
+    }
+
+    pub fn children(pid: i32) -> Vec<i32> {
+        all_where(|s| s.1 == pid)
+    }
+
+    pub fn group_members(pgid: i32) -> Vec<i32> {
+        all_where(|s| s.2 == pgid)
     }
 }
 
@@ -114,6 +136,11 @@ pub fn alive(p: Proc) -> bool {
 
 pub fn pgid(pid: i32) -> Option<i32> {
     sys::pgid(pid)
+}
+
+/// Processes whose process group is `pgid` (unverified pids).
+pub fn group_members(pgid: i32) -> Vec<i32> {
+    sys::group_members(pgid)
 }
 
 /// Direct children of `pid` (unverified pids; see [`descendants`]).
@@ -173,11 +200,32 @@ pub struct KillReport {
     pub survivors: Vec<Proc>,
 }
 
+/// The root's group belongs to the tree (see [`signal_tree`]).
+fn group_ours(root: Proc, known: &[Proc], pinned: bool) -> bool {
+    root.pid > 1 && (pinned || alive(root) || known.iter().any(|p| alive(*p) && pgid(p.pid) == Some(root.pid)))
+}
+
+/// Adds the live members of the root's group, when the group is the tree's: a member
+/// nobody walked yet (its parent is gone, the root is a zombie) is then tracked and given
+/// the grace period, not just hit by the group signal.
+fn adopt_group(root: Proc, known: &mut Vec<Proc>, pinned: bool) {
+    if !group_ours(root, known, pinned) {
+        return;
+    }
+    for pid in group_members(root.pid) {
+        if let Some(p) = proc_of(pid).filter(|p| p.pid != root.pid && p.pid > 1) {
+            if !known.contains(&p) {
+                known.push(p);
+            }
+        }
+    }
+}
+
 /// Signals `sig` to the root's process group (when the group still provably belongs to
-/// this tree) and to every known process of the tree that is still the same process.
-fn signal_tree(root: Proc, known: &[Proc], sig: i32, s: &dyn Signaler) -> usize {
-    let group_ours = alive(root) || known.iter().any(|p| alive(*p) && pgid(p.pid) == Some(root.pid));
-    if group_ours && root.pid > 1 {
+/// this tree: the root is alive, or `pinned`, or a known member is still in it) and to
+/// every known process of the tree that is still the same process.
+fn signal_tree(root: Proc, known: &[Proc], pinned: bool, sig: i32, s: &dyn Signaler) -> usize {
+    if group_ours(root, known, pinned) {
         s.signal_group(root.pid, sig);
     }
     let mut n = 0;
@@ -195,12 +243,38 @@ fn signal_tree(root: Proc, known: &[Proc], sig: i32, s: &dyn Signaler) -> usize 
 /// told too), then SIGKILL to whatever is left, then a verify pass. Never signals a
 /// process that is not (by pid AND start time) part of the tree.
 pub fn kill_tree(root: Proc, grace: Duration, s: &dyn Signaler) -> KillReport {
+    kill_tree_with(root, &[], false, grace, s)
+}
+
+/// [`kill_tree`] for a root that may already have exited: `snapshot` is an earlier walk of
+/// its descendants (the ones that left its group are found by nothing else once their
+/// parent is gone), each signaled only while it is still the same process (pid AND start
+/// time). The group is signaled while it provably belongs to the tree: `root_pinned` (the
+/// caller holds the exited root unreaped, so its pid, and with it the group id, cannot be
+/// reused) or a snapshot member still in it.
+pub fn kill_tree_with(
+    root: Proc,
+    snapshot: &[Proc],
+    root_pinned: bool,
+    grace: Duration,
+    s: &dyn Signaler,
+) -> KillReport {
     let mut known: Vec<Proc> = descendants(root);
-    let mut report = KillReport { terminated: signal_tree(root, &known, libc::SIGTERM, s), ..Default::default() };
+    for p in snapshot {
+        if *p != root && !known.contains(p) && alive(*p) {
+            known.push(*p);
+        }
+    }
+    let pinned = root_pinned && root.pid > 1;
+    adopt_group(root, &mut known, pinned);
+    let mut report =
+        KillReport { terminated: signal_tree(root, &known, pinned, libc::SIGTERM, s), ..Default::default() };
     let deadline = Instant::now() + grace;
     loop {
         // Newly forked processes get SIGTERM too.
-        let mut fresh = Vec::new();
+        let before = known.len();
+        adopt_group(root, &mut known, pinned);
+        let mut fresh: Vec<Proc> = known.drain(before..).collect();
         for p in std::iter::once(root).chain(known.clone()) {
             if alive(p) {
                 for d in descendants(p) {
@@ -235,7 +309,7 @@ pub fn kill_tree(root: Proc, grace: Duration, s: &dyn Signaler) -> KillReport {
                 }
             }
         }
-        let n = signal_tree(root, &known, libc::SIGKILL, s);
+        let n = signal_tree(root, &known, pinned, libc::SIGKILL, s);
         report.killed += n;
         if n == 0 {
             break;
@@ -348,5 +422,57 @@ mod tests {
         assert!(rec.calls.lock().unwrap().is_empty(), "{:?}", rec.calls.lock().unwrap());
         assert_eq!((r.terminated, r.killed), (0, 0));
         assert!(alive(me));
+    }
+
+    #[test]
+    fn a_root_that_already_exited_still_has_its_leftovers_ended_from_the_snapshot() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        // Leaves one child in its group and one that left the group, then exits.
+        let script = format!(
+            "sleep 60 & echo $! > {p}; perl -e 'setpgrp(0,0); sleep 60' & echo $! >> {p}; sleep 0.5; exit 0",
+            p = pids.display()
+        );
+        let (root, reaper) = spawn_group(&script);
+        let mut snapshot = Vec::new();
+        wait_until("both children in the snapshot", || {
+            snapshot = descendants(root);
+            snapshot.len() >= 2
+        });
+        reaper.join().unwrap();
+        assert!(!alive(root));
+        let left: Vec<i32> =
+            std::fs::read_to_string(&pids).unwrap().lines().filter_map(|l| l.trim().parse().ok()).collect();
+        assert!(left.iter().all(|p| proc_of(*p).is_some()), "the children outlive their parent");
+        // A plain kill_tree finds nothing below a gone root.
+        assert_eq!(kill_tree(root, Duration::ZERO, &Kill).terminated, 0);
+        let r = kill_tree_with(root, &snapshot, false, Duration::from_secs(1), &Kill);
+        assert!(r.survivors.is_empty(), "{r:?}");
+        for p in left {
+            wait_until("the leftover gone", || proc_of(p).is_none());
+        }
+    }
+
+    #[test]
+    fn a_pinned_group_is_walked_so_a_child_forked_on_sigterm_is_caught() {
+        use std::os::unix::process::CommandExt;
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let (pidfile, ready) = (dir.path().join("forked.pid"), dir.path().join("ready"));
+        // The root leaves a child in its group and exits at once (a zombie: not reaped yet).
+        // On SIGTERM the child forks a sleeper out of the group and keeps running.
+        let script = format!(
+            "sh -c 'trap \"perl -e \\\"setpgrp(0,0); sleep 60\\\" & echo \\$! > {p}\" TERM; touch {r}; while :; do sleep 0.1; done' & exit 0",
+            p = pidfile.display(),
+            r = ready.display()
+        );
+        let mut child = Command::new("/bin/sh").args(["-c", &script]).process_group(0).spawn().unwrap();
+        let root = proc_of(child.id() as i32).expect("just started");
+        wait_until("the trap set", || ready.exists());
+        // Nothing walked it before: the snapshot is empty.
+        let r = kill_tree_with(root, &[], true, Duration::from_secs(1), &Kill);
+        assert!(r.survivors.is_empty(), "{r:?}");
+        let forked: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        wait_until("the sleeper forked on SIGTERM gone", || proc_of(forked).is_none());
+        child.wait().unwrap();
     }
 }

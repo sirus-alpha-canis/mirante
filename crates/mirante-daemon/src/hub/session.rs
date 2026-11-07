@@ -322,6 +322,8 @@ impl State {
                 }
                 self.event(Some(task_id), "message_requeued", json!({ "text": text, "reason": reason }))
             }
+            // Typing is unblocked again: deliver what was requeued.
+            DriverEvent::DialogClosed => self.kick(task_id),
             DriverEvent::ResumeFailed { reason } => {
                 let payload = json!({
                     "session_id": session_id,
@@ -435,6 +437,10 @@ impl Hub {
                 let attached = match st.live.get_mut(&task.id).filter(|l| l.session_id == session_id) {
                     Some(l) => {
                         l.driver = Some(driver.clone());
+                        if l.saw_session_start {
+                            // The hook arrived while the agent was being spawned.
+                            driver.session_started();
+                        }
                         true
                     }
                     None => false,
@@ -600,6 +606,19 @@ impl Hub {
     /// the native session id is known) from another native session, is only logged.
     pub fn apply_hook_envelope(&self, e: HookEnvelope) -> Result<()> {
         let mut st = self.lock();
+        let r = st.apply_hook_locked(e);
+        if r.is_err() {
+            // Whatever was applied before the error may have opened or settled a card: the
+            // hold flags must follow (publish syncs them and sends what was persisted).
+            st.publish();
+        }
+        r
+    }
+}
+
+impl State {
+    fn apply_hook_locked(&mut self, e: HookEnvelope) -> Result<()> {
+        let st = self;
         if let Some(id) = &e.event_id {
             if !st.seen_hooks.insert(id) {
                 return Ok(());
@@ -635,6 +654,9 @@ impl Hub {
         if ev.hook_event_name == "SessionStart" {
             if let Some(d) = live.driver.clone() {
                 d.session_started();
+            }
+            if let Some(l) = st.live.get_mut(&p.task) {
+                l.saw_session_start = true;
             }
         }
         // Stamped with this very Mirante session: Claude's own session id may change under
@@ -673,7 +695,9 @@ impl Hub {
         st.publish();
         Ok(())
     }
+}
 
+impl Hub {
     /// Applies one driver event. Events of a session that is no longer live are ignored.
     pub fn handle_driver_event(&self, session_id: &str, event: DriverEvent) {
         let mut st = self.lock();
@@ -1481,5 +1505,86 @@ mod tests {
         let a =
             compact(&json!({"type": "assistant", "message": {"stop_reason": "end_turn", "content": "big"}})).unwrap();
         assert_eq!(a, json!({"type": "assistant", "message": {"stop_reason": "end_turn"}}));
+    }
+
+    #[test]
+    fn a_session_start_seen_while_the_driver_spawns_reaches_it_once_attached() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "a").task;
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *k.factory.spawn_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let (hub, id) = (k.hub.clone(), t.id.clone());
+        let starter = std::thread::spawn(move || hub.start_session(StartSession { task: id, prompt: None }, false));
+        entered.recv().unwrap();
+        // The hook beats the spawn: no driver to tell yet.
+        k.hook(&t.id, json!({"hook_event_name": "SessionStart", "session_id": "nat-1", "source": "startup"}));
+        assert!(!k.calls().contains(&"session_started".to_string()));
+        release.send(()).unwrap();
+        starter.join().unwrap().unwrap();
+        assert_eq!(k.calls().iter().filter(|c| *c == "session_started").count(), 1);
+    }
+
+    #[test]
+    fn a_closed_dialog_redelivers_the_requeued_message() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hub.send(SendMessage { task: t.id.clone(), text: "go".into(), mode: SendMode::Queue }).unwrap();
+        assert_eq!(k.calls(), vec!["send:go".to_string()]);
+        k.emit(DriverEvent::DeliveryAborted { text: "go".into(), reason: "dialog: a dialog is open".into() });
+        assert_eq!(k.calls().len(), 1, "nothing is retried while the dialog is up");
+        k.emit(DriverEvent::DialogClosed);
+        assert_eq!(k.calls(), vec!["send:go".to_string(), "send:go".to_string()]);
+        assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 0);
+    }
+
+    #[test]
+    fn a_blocked_driver_send_is_a_conflict_that_says_why() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        *k.factory.driver.send_error.lock().unwrap() =
+            Some(DriverError::NotNow("hold: a permission request is pending".into()));
+        let e = k.hub.send(SendMessage { task: t.id.clone(), text: "x".into(), mode: SendMode::Steer }).unwrap_err();
+        let rpc: mirante_ipc::rpc::RpcError = e.into();
+        assert_eq!(rpc.code, mirante_ipc::rpc::code::CONFLICT);
+        assert!(rpc.message.starts_with("hold"), "{}", rpc.message);
+    }
+
+    #[test]
+    fn a_hook_that_fails_midway_still_brings_the_hold_flags_up_to_date() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        let sink = k.factory.last_sink();
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.hook(&t.id, perm("t1", "ls"));
+        assert!(sink.held());
+        {
+            // The card is settled and the session ended behind the hub's back (no publish):
+            // the flag is stale, and the next card cannot be stored.
+            let mut st = k.hub.lock();
+            let id = st.store.pending_permissions(&t.id).unwrap()[0].id.clone();
+            st.store.answer_permission(&id, PermissionStatus::Denied).unwrap();
+            let session = st.live[&t.id].session_id.clone();
+            st.store.end_session(&session).unwrap();
+        }
+        assert!(sink.held());
+        let r = k.hub.apply_hook(HookParams { task: t.id.clone(), payload: perm("t2", "pwd").to_string(), ts_ms: 0 });
+        assert!(r.is_err());
+        assert!(!sink.held(), "the error path must sync the hold flags too");
+    }
+
+    #[test]
+    fn a_native_id_emitted_before_a_failed_spawn_is_not_kept() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "a").task;
+        *k.factory.emit_then_fail.lock().unwrap() = Some(DriverEvent::NativeId("nat-never".into()));
+        assert!(k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).is_err());
+        k.drain();
+        let conv = k.hub.lock().store.latest_conversation(&t.id).unwrap().unwrap();
+        assert_eq!(conv.native_session_id, None);
+        *k.factory.emit_then_fail.lock().unwrap() = None;
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        assert!(!r.resumed, "nothing to resume: the process never ran");
     }
 }

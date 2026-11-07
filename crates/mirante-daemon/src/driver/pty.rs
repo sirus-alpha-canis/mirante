@@ -3,7 +3,15 @@
 //!   [`PtyProcess::kill_tree`] ends it with everything it started ([`proctree::kill_tree`]).
 //! - Terminal queries in the output (cursor position, device attributes, status, colors)
 //!   are answered by the daemon, attached or not, and stripped from what attached clients
-//!   get ([`termq`]): one answer, never two.
+//!   get ([`termq`]): one answer, never two. The answers go through their own thread: the
+//!   reader never waits for the input side (a big paste blocked on an agent that is not
+//!   reading would otherwise stop the reader, the agent would block on its output, and
+//!   neither would move again).
+//! - Exit: the process is seen exiting without being reaped (`waitid` with `WNOWAIT`), so
+//!   its pid, and with it its process group id, stays reserved while what it left behind is
+//!   ended: its group, and every process of the descendant snapshot (refreshed while it
+//!   runs) that is still the same process. Only then is it reaped and the exit reported. A
+//!   stop or drop after the exit uses the same snapshot.
 //! - Output fans out to attached clients over bounded queues. A client that falls behind
 //!   gets a full repaint; a new client starts from a repaint that also restores the input
 //!   modes (bracketed paste, cursor keys, mouse) the agent switched on.
@@ -34,11 +42,46 @@ pub struct PtySpec {
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// Input is written in chunks of this size (the lock is held for the whole message, so
+/// nothing interleaves with it).
+const WRITE_CHUNK: usize = 4096;
+/// How often the descendant snapshot is refreshed while the agent runs.
+const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
+/// SIGTERM → SIGKILL grace for what an agent left behind when it exited on its own.
+const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
+/// Most processes the snapshot remembers.
+const SNAPSHOT_MAX: usize = 4096;
+
+/// `pid` (our child) has exited and is not reaped yet. Does not reap it.
+fn exited_unreaped(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `info` is a plain C struct the kernel fills; WNOWAIT leaves the child unreaped.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+    r == 0 && si_pid(&info) == pid
+}
+
+#[cfg(target_os = "macos")]
+fn si_pid(info: &libc::siginfo_t) -> i32 {
+    info.si_pid
+}
+
+#[cfg(target_os = "linux")]
+fn si_pid(info: &libc::siginfo_t) -> i32 {
+    // SAFETY: filled by waitid for a child state change.
+    unsafe { info.si_pid() }
+}
+
 pub struct PtyProcess {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Writer,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     root: Option<Proc>,
+    /// Every process seen below the root while it ran (still-running ones only).
+    snapshot: Arc<Mutex<Vec<Proc>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Lock order: `fanout`, then `parser` (the reader and `attach` both follow it, so a
     /// new client's repaint and its first live bytes never overlap or leave a gap).
@@ -69,8 +112,14 @@ fn repaint_of(screen: &vt100::Screen) -> Vec<u8> {
     out
 }
 
-/// One chunk of agent output: mirror it, answer its queries, fan it out.
-fn pump(chunk_pieces: Vec<Piece>, parser: &Mutex<vt100::Parser>, fanout: &Mutex<Fanout>, writer: &Writer) {
+/// One chunk of agent output: mirror it, answer its queries (queued for the answer thread,
+/// never written here), fan it out.
+fn pump(
+    chunk_pieces: Vec<Piece>,
+    parser: &Mutex<vt100::Parser>,
+    fanout: &Mutex<Fanout>,
+    answers: &mpsc::Sender<Vec<u8>>,
+) {
     let mut f = lock(fanout);
     let mut live = Vec::new();
     for piece in chunk_pieces {
@@ -81,8 +130,7 @@ fn pump(chunk_pieces: Vec<Piece>, parser: &Mutex<vt100::Parser>, fanout: &Mutex<
             }
             Piece::Query(q) => {
                 let cursor = lock(parser).screen().cursor_position();
-                let mut w = lock(writer);
-                let _ = w.write_all(&termq::answer(q, cursor)).and_then(|()| w.flush());
+                let _ = answers.send(termq::answer(q, cursor));
             }
         }
     }
@@ -123,9 +171,18 @@ impl PtyProcess {
             writer: writer.clone(),
             child: Mutex::new(child),
             root,
+            snapshot: Arc::default(),
             parser: parser.clone(),
             fanout: fanout.clone(),
             exited: Arc::new(AtomicBool::new(false)),
+        });
+        let (answers, answer_rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            // Ends when the reader drops its sender (end of output).
+            for a in answer_rx {
+                let mut w = lock(&writer);
+                let _ = w.write_all(&a).and_then(|()| w.flush());
+            }
         });
         std::thread::spawn(move || {
             let mut queries = TermQueries::default();
@@ -135,11 +192,11 @@ impl PtyProcess {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                pump(queries.feed(&buf[..n]), &parser, &fanout, &writer);
+                pump(queries.feed(&buf[..n]), &parser, &fanout, &answers);
             }
             let rest = queries.flush();
             if !rest.is_empty() {
-                pump(vec![Piece::Bytes(rest)], &parser, &fanout, &writer);
+                pump(vec![Piece::Bytes(rest)], &parser, &fanout, &answers);
             }
             // End of output: close every attached stream.
             *lock(&fanout) = Fanout::default();
@@ -147,10 +204,22 @@ impl PtyProcess {
         let weak: Weak<PtyProcess> = Arc::downgrade(&p);
         let exited = p.exited.clone();
         std::thread::spawn(move || {
+            let mut walked = std::time::Instant::now() - SNAPSHOT_EVERY;
             let code = loop {
                 let Some(p) = weak.upgrade() else {
                     return;
                 };
+                if let Some(root) = p.root {
+                    if walked.elapsed() >= SNAPSHOT_EVERY {
+                        walked = std::time::Instant::now();
+                        p.refresh_snapshot(root);
+                    }
+                    if exited_unreaped(root.pid) {
+                        // The zombie pins the pid and the group id: end what it left, then reap.
+                        let snapshot = p.snapshot();
+                        proctree::kill_tree_with(root, &snapshot, true, LEFTOVER_GRACE, &proctree::Kill);
+                    }
+                }
                 let status = lock(&p.child).try_wait();
                 drop(p);
                 match status {
@@ -165,10 +234,32 @@ impl PtyProcess {
         Ok(p)
     }
 
+    /// Adds the root's current descendants to the snapshot and forgets the ones that ended.
+    fn refresh_snapshot(&self, root: Proc) {
+        let now = proctree::descendants(root);
+        let mut snap = lock(&self.snapshot);
+        snap.retain(|p| proctree::alive(*p));
+        for p in now {
+            if !snap.contains(&p) && snap.len() < SNAPSHOT_MAX {
+                snap.push(p);
+            }
+        }
+    }
+
+    /// The processes seen below the agent that are still running.
+    pub fn snapshot(&self) -> Vec<Proc> {
+        lock(&self.snapshot).iter().copied().filter(|p| proctree::alive(*p)).collect()
+    }
+
+    /// Writes `bytes` in chunks, holding the input lock for all of them (nothing else is
+    /// typed in between). Query answers never wait on this lock in the reader.
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         let mut w = lock(&self.writer);
-        w.write_all(bytes)?;
-        w.flush()
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            w.write_all(chunk)?;
+            w.flush()?;
+        }
+        Ok(())
     }
 
     /// The screen as plain text, one line per row.
@@ -214,10 +305,18 @@ impl PtyProcess {
         self.root
     }
 
-    /// Ends the agent and every process below it: SIGTERM, `grace`, SIGKILL, verify.
+    /// Ends the agent and every process below it: SIGTERM, `grace`, SIGKILL, verify. Also
+    /// after the agent exited: whatever of the descendant snapshot is still the same process
+    /// (and its group, while the unreaped root still pins the group id).
     pub fn kill_tree(&self, grace: Duration) -> KillReport {
         match self.root {
-            Some(root) => proctree::kill_tree(root, grace, &proctree::Kill),
+            Some(root) => {
+                let snapshot = self.snapshot();
+                // Held so the exit watcher cannot reap the root while its group is signaled.
+                let _child = lock(&self.child);
+                let pinned = exited_unreaped(root.pid);
+                proctree::kill_tree_with(root, &snapshot, pinned, grace, &proctree::Kill)
+            }
             None => {
                 let _ = lock(&self.child).kill();
                 KillReport::default()
@@ -246,10 +345,8 @@ impl PtyProcess {
 
 impl Drop for PtyProcess {
     fn drop(&mut self) {
-        let running = !matches!(lock(&self.child).try_wait(), Ok(Some(_)));
-        if running {
-            self.kill_tree(Duration::from_millis(200));
-        }
+        // Also when the agent already exited: what it left behind goes too.
+        self.kill_tree(Duration::from_millis(200));
         let _ = lock(&self.child).wait();
     }
 }
@@ -344,5 +441,75 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!proctree::alive(root));
         assert!(kids.iter().all(|k| !proctree::alive(*k)), "{kids:?}");
+    }
+
+    fn pids_in(file: &std::path::Path) -> Vec<i32> {
+        std::fs::read_to_string(file).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect()
+    }
+
+    #[test]
+    fn an_agent_that_exits_on_its_own_takes_its_background_children_along() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        // One child stays in the agent's group, one leaves it; then the agent exits.
+        let script = format!(
+            "sleep 60 & echo $! > {p}; perl -e 'setpgrp(0,0); sleep 60' & echo $! >> {p}; sleep 1; exit 0",
+            p = pids.display()
+        );
+        let (tx, rx) = mpsc::channel();
+        let p = PtyProcess::spawn(&sh(&script), move |c| tx.send(c).unwrap()).unwrap();
+        wait_for("both children", || pids_in(&pids).len() == 2);
+        let kids = pids_in(&pids);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Some(0));
+        // By the time the exit is reported its leftovers are gone.
+        for k in kids {
+            wait_for("the leftover gone", || proctree::proc_of(k).is_none());
+        }
+        assert!(p.exited());
+    }
+
+    #[test]
+    fn kill_tree_after_the_root_exited_still_ends_what_it_left() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let pids = dir.path().join("pids");
+        let p = PtyProcess::spawn(
+            &sh(&format!("perl -e 'setpgrp(0,0); sleep 60' & echo $! > {}; sleep 30", pids.display())),
+            |_| {},
+        )
+        .unwrap();
+        wait_for("the child", || pids_in(&pids).len() == 1);
+        let kid = pids_in(&pids)[0];
+        wait_for("the snapshot", || p.snapshot().iter().any(|k| k.pid == kid));
+        // The root dies by a signal nobody sent through Mirante; the child it left survives
+        // until the exit handling (or a stop / drop) ends it.
+        let root = p.root().unwrap();
+        unsafe { libc::kill(root.pid, libc::SIGKILL) };
+        wait_for("the exit", || p.exited());
+        p.kill_tree(Duration::from_millis(200));
+        wait_for("the leftover gone", || proctree::proc_of(kid).is_none());
+    }
+
+    #[test]
+    fn the_reader_never_waits_for_a_blocked_writer() {
+        // The agent does not read its input for a while, asks the terminal for the cursor
+        // position, then writes a lot, then reads its input until a second of silence (the
+        // tty may drop input it had no room for, so the byte count is not checked). Meanwhile a big paste is being written: it blocks
+        // until the agent reads. The query answer must not wait behind the paste (the old
+        // reader did, stopped reading output, and the agent blocked on its output forever).
+        let big = vec![b'x'; 256 * 1024];
+        let p = PtyProcess::spawn(
+            &sh("stty raw -echo; sleep 0.5; printf '\\033[6n'; head -c 400000 /dev/zero | tr '\\0' 'y'; \
+                 stty min 0 time 10; cat > /dev/null; printf '\\r\\nDONE'; sleep 5"),
+            |_| {},
+        )
+        .unwrap();
+        let p2 = p.clone();
+        let writer = std::thread::spawn(move || p2.write(&big));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !p.grid().contains("DONE") {
+            assert!(Instant::now() < deadline, "deadlock: the agent never finished:\n{}", p.grid());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        writer.join().unwrap().unwrap();
     }
 }

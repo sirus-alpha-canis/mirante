@@ -15,6 +15,8 @@ pub struct FakeDriver {
     pub attached: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// What `root()` reports (memory sampling tests set it).
     pub root: Mutex<Option<Proc>>,
+    /// When set, `send` fails with this error (after recording the call).
+    pub send_error: Mutex<Option<DriverError>>,
 }
 
 impl FakeDriver {
@@ -30,17 +32,20 @@ impl FakeDriver {
 impl Driver for FakeDriver {
     fn send(&self, text: &str) -> Result<(), DriverError> {
         self.record(format!("send:{text}"));
-        Ok(())
+        match self.send_error.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
     fn interrupt(&self) -> Result<(), DriverError> {
         self.record("interrupt".into());
         Ok(())
     }
-    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError> {
+    fn answer_permission(&self, key: &str, tool: &str, allow: bool) -> Result<(), DriverError> {
         if self.fail_answers.load(Ordering::SeqCst) {
             return Err(DriverError::NoDialog("fake".into()));
         }
-        self.record(format!("answer:{key}:{allow}"));
+        self.record(format!("answer:{key}:{tool}:{allow}"));
         Ok(())
     }
     fn trust(&self, accept: bool) -> Result<(), DriverError> {
@@ -98,6 +103,8 @@ pub struct FakeFactory {
     /// When set, the next `spawn` reports on the first channel that it started, then blocks
     /// until the second one yields (or closes).
     pub spawn_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    /// When set, `spawn` emits this event through the sink, then fails.
+    pub emit_then_fail: Mutex<Option<DriverEvent>>,
 }
 
 impl FakeFactory {
@@ -122,6 +129,10 @@ impl DriverFactory for Arc<FakeFactory> {
         }
         if let Some(e) = self.fail_with.lock().unwrap().clone() {
             return Err(e);
+        }
+        if let Some(ev) = self.emit_then_fail.lock().unwrap().clone() {
+            sink.emit(ev);
+            return Err(DriverError::Failed("spawn failed after emitting".into()));
         }
         self.sinks.lock().unwrap().push(sink);
         Ok(self.driver.clone())

@@ -128,6 +128,9 @@ pub(crate) struct Live {
     pub(crate) usage: Option<String>,
     /// Since when the status is `Idle` (the memory guard's idle hibernation and leak check).
     pub(crate) idle_since: Option<Instant>,
+    /// This session's `SessionStart` hook was seen (told to the driver once it is attached,
+    /// when the hook beat the spawn).
+    pub(crate) saw_session_start: bool,
 }
 
 /// Events queued per subscriber. One that falls this far behind is dropped (its stream
@@ -193,6 +196,7 @@ impl Live {
             hold: Arc::default(),
             usage: None,
             idle_since: Some(Instant::now()),
+            saw_session_start: false,
         }
     }
 }

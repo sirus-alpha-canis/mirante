@@ -875,7 +875,7 @@ impl Driver for CodexDriver {
         self.queue(Work::Interrupt(turn))
     }
 
-    fn answer_permission(&self, key: &str, allow: bool) -> Result<(), DriverError> {
+    fn answer_permission(&self, key: &str, _tool: &str, allow: bool) -> Result<(), DriverError> {
         let mut s = lock(&self.shared);
         let (id, method, params) =
             s.approvals.remove(key).ok_or_else(|| DriverError::NoDialog(format!("no pending approval {key}")))?;
@@ -1153,9 +1153,9 @@ mod tests {
         );
         let ev = next_event(&rx, status_to(Status::NeedsYou));
         assert!(matches!(ev, DriverEvent::Status { turn_open: true, .. }));
-        d.answer_permission("41", true).unwrap();
+        d.answer_permission("41", "command", true).unwrap();
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 41, "result": {"decision": "accept"}}));
-        assert!(matches!(d.answer_permission("41", true), Err(DriverError::NoDialog(_))));
+        assert!(matches!(d.answer_permission("41", "command", true), Err(DriverError::NoDialog(_))));
         next_event(&rx, status_to(Status::Working));
         // Request id 0, then resolved by the server (e.g. answered elsewhere).
         fake.send(json!({"jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
@@ -1167,7 +1167,7 @@ mod tests {
             DriverEvent::PermissionResolved { key: "0".into() }
         );
         next_event(&rx, status_to(Status::Working));
-        assert!(matches!(d.answer_permission("0", false), Err(DriverError::NoDialog(_))));
+        assert!(matches!(d.answer_permission("0", "command", false), Err(DriverError::NoDialog(_))));
         // A request still open when its turn ends is withdrawn too.
         fake.send(json!({"jsonrpc": "2.0", "id": "r7", "method": "item/fileChange/requestApproval",
             "params": {"threadId": "th-1", "turnId": "tu-1", "itemId": "f1", "startedAtMs": 1}}));
