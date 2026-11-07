@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The cockpit window: native notifications, and opening GitHub pull-request pages in the browser. Nothing else (no fs, shell, http).",
+  "windows": ["main"],
+  "permissions": [
+    "notification:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://github.com/*" }]
+    }
+  ]
+}
