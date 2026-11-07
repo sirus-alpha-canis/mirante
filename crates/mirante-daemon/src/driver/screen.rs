@@ -92,9 +92,9 @@ fn is_box_top(l: &str, width: usize) -> bool {
         && n * 100 >= width * BORDER_SHARE
 }
 
-/// The input prompt (a cursor line that is not a numbered option).
+/// The input prompt (a cursor line that is not a numbered option, nor a trust option).
 fn is_input_prompt(l: &str) -> bool {
-    starts_with_cursor(l) && option(l).is_none()
+    starts_with_cursor(l) && option(l).is_none() && trust_option(l).is_none()
 }
 
 /// In the bottom rows: the index of the last permission-dialog header (`Do you want to …?`)
@@ -140,13 +140,42 @@ pub fn option_key(grid: &str, label: &str) -> Option<char> {
 }
 
 pub const TRUST_YES: &str = "Yes, I trust this folder";
+pub const TRUST_NO: &str = "No, exit";
 
-/// The digit of the trust dialog's exact "Yes, I trust this folder" option, when the
-/// dialog is live: that option and a key-hint footer below it at the very bottom.
-pub fn trust_key(grid: &str) -> Option<char> {
+/// The key that moves the trust dialog toward "Yes, I trust this folder".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustKey {
+    /// A numbered dialog: the digit of the exact option (accepted without Enter).
+    Digit(char),
+    /// The real 2.1.285 dialog (no digits): the cursor is on "No, exit", right above the
+    /// "Yes" option. Down moves it to "Yes".
+    Down,
+    /// The real 2.1.285 dialog with the cursor on "Yes, I trust this folder": Enter accepts.
+    Enter,
+}
+
+/// `(cursor on it, label)` of an unnumbered trust option line.
+fn trust_option(l: &str) -> Option<(bool, &str)> {
+    let label = l.trim().trim_start_matches(CURSORS).trim();
+    (label == TRUST_YES || label == TRUST_NO).then_some((starts_with_cursor(l), label))
+}
+
+/// The key toward "Yes, I trust this folder" when the trust dialog is live: that option
+/// and a key-hint footer below it at the very bottom. Numbered: its digit. Unnumbered (the
+/// real 2.1.285 dialog): "No, exit" right above "Yes", "Yes" right above the footer, and
+/// the cursor on one of them (Down from "No", Enter on "Yes").
+pub fn trust_key(grid: &str) -> Option<TrustKey> {
     let lines = bottom(grid);
     let footer = footer_at_bottom(&lines, |l| is_footer(l) || l.contains("Enter to confirm"))?;
-    lines[..footer].iter().rev().find_map(|l| option(l).filter(|(_, t)| *t == TRUST_YES).map(|(d, _)| d))
+    if let Some(d) = lines[..footer].iter().rev().find_map(|l| option(l).filter(|(_, t)| *t == TRUST_YES).map(|(d, _)| d)) {
+        return Some(TrustKey::Digit(d));
+    }
+    let (yes, no) = (footer.checked_sub(1)?, footer.checked_sub(2)?);
+    match (trust_option(lines[no])?, trust_option(lines[yes])?) {
+        ((false, TRUST_NO), (true, TRUST_YES)) => Some(TrustKey::Enter),
+        ((true, TRUST_NO), (false, TRUST_YES)) => Some(TrustKey::Down),
+        _ => None,
+    }
 }
 
 /// Claude's workspace-trust dialog (new folder) is live. Its default option is "No, exit".
@@ -457,13 +486,62 @@ mod tests {
     #[test]
     fn the_trust_dialog_is_the_exact_option_with_a_footer() {
         assert!(is_trust_dialog(TRUST));
-        assert_eq!(trust_key(TRUST), Some('2'));
+        assert_eq!(trust_key(TRUST), Some(TrustKey::Digit('2')));
         assert!(dialog_open(TRUST));
         // The question quoted in the conversation is not the dialog.
         let prose = "❯ Do you trust the files in this folder? asked the README\n  Yes, I trust this folder\n❯ \n  ⏸ manual mode on";
         assert!(!is_trust_dialog(prose));
         // Without a footer below the option there is no live dialog.
         assert!(!is_trust_dialog(" ❯ 1. No, exit\n   2. Yes, I trust this folder"));
+    }
+
+    /// The real trust dialog of Claude Code 2.1.285 (Task 21 live run, 120 columns): its
+    /// options carry no digits, "No, exit" comes first and holds the cursor, and a digit
+    /// typed into it does nothing. Only Down then Enter accepts it.
+    const REAL_TRUST: &str = "\
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /Users/u/.mirante/worktrees/app/feat
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+";
+    const REAL_TRUST_ON_YES: &str = "\
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+   No, exit
+ ❯ Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+";
+
+    #[test]
+    fn the_real_unnumbered_trust_dialog_is_found_and_answered_by_moving_the_cursor() {
+        assert!(is_trust_dialog(REAL_TRUST) && dialog_open(REAL_TRUST));
+        assert_eq!(trust_key(REAL_TRUST), Some(TrustKey::Down));
+        assert!(is_trust_dialog(REAL_TRUST_ON_YES));
+        assert_eq!(trust_key(REAL_TRUST_ON_YES), Some(TrustKey::Enter));
+        assert_eq!(trust_key(TRUST), Some(TrustKey::Digit('2')));
+        // Its options are not an input prompt.
+        assert!(!has_input_prompt(REAL_TRUST) && !has_input_prompt(REAL_TRUST_ON_YES));
+        // Without the footer right below, or with the options apart, there is no dialog.
+        assert!(!is_trust_dialog(" ❯ No, exit\n   Yes, I trust this folder\n❯ \n  ⏸ manual mode on"));
+        assert!(!is_trust_dialog(" ❯ No, exit\n   something else\n   Yes, I trust this folder\n Enter to confirm"));
+        assert!(!is_trust_dialog("   Yes, I trust this folder\n Enter to confirm · Esc to cancel"));
+        // Neither option selected: nothing to type.
+        assert_eq!(trust_key("   No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel"), None);
     }
 
     #[test]
