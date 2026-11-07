@@ -19,6 +19,9 @@ fn main() -> Result<()> {
         Some("timeline") => {
             let log = args.get(1).context("usage: spike timeline <hooks.jsonl> [task-id]")?;
             let events = hook::load_events(&util::read_jsonl(Path::new(log))?, args.get(2).map(String::as_str));
+            if events.is_empty() {
+                println!("0 events for that task id");
+            }
             for t in status::timeline(&events) {
                 println!("{:>14}  {:<18} -> {:?}", t.ts_ms, t.event, t.status);
             }
