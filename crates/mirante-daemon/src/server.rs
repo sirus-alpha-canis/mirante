@@ -249,6 +249,10 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         method::PERMISSION_ANSWER => out(hub.answer_permission(params(p)?)),
         method::HOOK_EVENT => out(hub.apply_hook_envelope(params(p)?).map(|()| json!({}))),
         method::DAEMON_STATUS => out(Ok(hub.status())),
+        method::SESSION_HIBERNATE => out(hub.hibernate(&params::<TaskRef>(p)?.task)),
+        method::SESSION_WAKE => out(hub.wake(&params::<TaskRef>(p)?.task)),
+        method::DAEMON_DOCTOR => out(hub.doctor()),
+        method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }

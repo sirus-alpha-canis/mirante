@@ -74,6 +74,8 @@ impl Hub {
             // (a `!` bash-mode line, a multi-line slash command).
             crate::driver::paste::typed_message(&m.text).map_err(HubError::Invalid)?;
         }
+        // Memory is tight: queued messages wait for the guard (an explicit steer still goes).
+        let paused = st.mem.paused;
         let l = st.live.get_mut(&task.id).ok_or_else(|| {
             HubError::Conflict(format!("task {} has no live session: mirante resume {}", task.branch, task.branch))
         })?;
@@ -89,7 +91,7 @@ impl Hub {
                 }
                 ready
             }
-            SendMode::Queue => ready && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
+            SendMode::Queue => ready && !paused && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
         };
         if !now {
             l.queue.push_back(m.text.clone());

@@ -23,6 +23,9 @@ usage: mirante <command>
   resume <task> [--trust] [--fresh]
                          restart the agent on its native session (context kept);
                          --fresh starts a new conversation instead (your explicit choice)
+  hibernate <task>       end an idle agent to free memory (resumable; never one waiting on you)
+  wake <task> [--trust]  resume a hibernated task on its native conversation
+  doctor [--kill <pid>]  orphan processes / checkouts and memory; --kill asks, then kills one orphan
   archive <task>         remove the worktree (branch kept) and hide the task
   daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade
@@ -82,6 +85,16 @@ pub enum Cmd {
     },
     Archive {
         task: String,
+    },
+    Hibernate {
+        task: String,
+    },
+    Wake {
+        task: String,
+        trust: bool,
+    },
+    Doctor {
+        kill: Option<i32>,
     },
     Daemon(DaemonCmd),
     Help,
@@ -197,6 +210,22 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             Ok(Cmd::Resume { task: one(&p, "task")?, trust: has("--trust"), fresh: has("--fresh") })
         }
         "archive" => Ok(Cmd::Archive { task: one(&split(rest, none, none)?, "task")? }),
+        "hibernate" => Ok(Cmd::Hibernate { task: one(&split(rest, none, none)?, "task")? }),
+        "wake" => {
+            let p = split(rest, none, &["--trust"])?;
+            Ok(Cmd::Wake { task: one(&p, "task")?, trust: !p.bools.is_empty() })
+        }
+        "doctor" => {
+            let p = split(rest, &["--kill"], none)?;
+            if !p.positional.is_empty() {
+                return Err("doctor takes no arguments".into());
+            }
+            let kill = match p.values.get("--kill") {
+                Some(v) => Some(v.parse::<i32>().map_err(|_| format!("--kill needs a pid, got {v}"))?),
+                None => None,
+            };
+            Ok(Cmd::Doctor { kill })
+        }
         "daemon" => match one(&split(rest, none, none)?, "start|stop|restart|status")?.as_str() {
             "start" => Ok(Cmd::Daemon(DaemonCmd::Start)),
             "stop" => Ok(Cmd::Daemon(DaemonCmd::Stop)),
@@ -267,6 +296,11 @@ mod tests {
         assert_eq!(p("daemon status").unwrap(), Cmd::Daemon(DaemonCmd::Status));
         assert_eq!(p("daemon restart").unwrap(), Cmd::Daemon(DaemonCmd::Restart));
         assert_eq!(p("watch").unwrap(), Cmd::Watch);
+        assert_eq!(p("hibernate feat").unwrap(), Cmd::Hibernate { task: "feat".into() });
+        assert_eq!(p("wake feat --trust").unwrap(), Cmd::Wake { task: "feat".into(), trust: true });
+        assert_eq!(p("doctor").unwrap(), Cmd::Doctor { kill: None });
+        assert_eq!(p("doctor --kill 4242").unwrap(), Cmd::Doctor { kill: Some(4242) });
+        assert_eq!(p("doctor --kill x").unwrap_err(), "--kill needs a pid, got x");
         assert!(p("stop").is_err());
         assert!(p("stop a b").is_err());
         assert!(p("ls --bogus").is_err());

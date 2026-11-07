@@ -91,6 +91,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let report = hub.recover()?;
     eprintln!("mirante-daemon: recovered {report:?}");
     let pump = hub.spawn_pump(rx);
+    // The memory guard: measure and act (nothing is limited up front; see hub::memory).
+    // `MIRANTE_MEMGUARD=off` disables it (tests that must not depend on this machine's memory).
+    if std::env::var("MIRANTE_MEMGUARD").as_deref() != Ok("off") {
+        let sampler = mirante_daemon::memguard::os_sampler();
+        let budget = std::env::var("MIRANTE_MEM_BUDGET_MB").ok();
+        let idle = std::env::var("MIRANTE_IDLE_HIBERNATE_MIN").ok();
+        let cfg = mirante_daemon::hub::memory::config_from(sampler.system().total, budget.as_deref(), idle.as_deref());
+        eprintln!("mirante-daemon: memory budget per session {}", mirante_daemon::hub::memory::human(cfg.budget));
+        hub.spawn_memguard(sampler, cfg);
+    }
     watch_pump(pump, paths.socket());
     let listener = server::bind(&paths.socket())?;
     eprintln!("mirante-daemon: pid {} listening on {}", std::process::id(), paths.socket().display());

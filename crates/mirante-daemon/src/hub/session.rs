@@ -87,6 +87,10 @@ impl State {
         if l.boot != BootState::Ready || status != Status::Idle || l.queue.is_empty() || l.delivering() {
             return Ok(());
         }
+        if self.mem.paused {
+            // Memory is tight: queued messages wait (the guard kicks again when it eases).
+            return Ok(());
+        }
         let Some(driver) = l.driver.clone() else {
             return Ok(());
         };
@@ -379,6 +383,12 @@ impl Hub {
             if st.live.contains_key(&task.id) {
                 return Err(HubError::Conflict(format!("task {} already has a live session", task.branch)));
             }
+            if st.mem.paused {
+                return Err(HubError::Conflict(
+                    "memory is tight: new sessions wait until it eases (mirante watch / mirante doctor)".into(),
+                ));
+            }
+            st.mem.hibernated.remove(&task.id);
             // Resume continues the latest conversation; a plain start opens a fresh one
             // unless the latest never got a native id (nothing to lose).
             let latest = st.store.latest_conversation(&task.id)?;

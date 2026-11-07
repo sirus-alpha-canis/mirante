@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
+pub mod memory;
 pub mod messages;
 pub mod session;
 
@@ -125,6 +126,8 @@ pub(crate) struct Live {
     pub(crate) hold: Arc<AtomicBool>,
     /// Codex quota / token usage, as the driver last reported it.
     pub(crate) usage: Option<String>,
+    /// Since when the status is `Idle` (the memory guard's idle hibernation and leak check).
+    pub(crate) idle_since: Option<Instant>,
 }
 
 /// Events queued per subscriber. One that falls this far behind is dropped (its stream
@@ -189,6 +192,7 @@ impl Live {
             transcript: Vec::new(),
             hold: Arc::default(),
             usage: None,
+            idle_since: Some(Instant::now()),
         }
     }
 }
@@ -201,6 +205,8 @@ pub(crate) struct State {
     pub(crate) subscribers: Vec<mpsc::SyncSender<Event>>,
     /// Recently applied hook `event_id`s (a hook may deliver and also spool one event).
     pub(crate) seen_hooks: session::SeenHooks,
+    /// The memory guard's last view, pause flag and hibernated tasks.
+    pub(crate) mem: memory::MemShared,
 }
 
 pub struct Hub {
@@ -276,6 +282,8 @@ impl State {
             queued: live.map_or(0, |l| l.queue.len()),
             detail: live.and_then(|l| l.detail.clone()),
             usage: live.and_then(|l| l.usage.clone()),
+            memory: live.and(self.mem.sessions.get(&task.id)).map(memory::mem_view),
+            hibernated: self.mem.hibernated.contains(&task.id),
             task,
         })
     }
@@ -292,10 +300,11 @@ impl State {
             return Ok(());
         }
         self.store.set_status(task_id, cur, to, cause)?;
-        if cur == Status::Idle {
-            if let Some(l) = self.live.get_mut(task_id) {
+        if let Some(l) = self.live.get_mut(task_id) {
+            if cur == Status::Idle {
                 l.delivery_in_flight = None;
             }
+            l.idle_since = (to == Status::Idle).then(Instant::now);
         }
         Ok(())
     }
@@ -360,6 +369,7 @@ impl Hub {
                 last_seq,
                 subscribers: Vec::new(),
                 seen_hooks: session::SeenHooks::default(),
+                mem: memory::MemShared::default(),
             }),
             worktrees: WorktreeManager::new(&paths.worktrees()),
             paths,
@@ -519,6 +529,7 @@ impl Hub {
             boot_id: st.store.boot_id().to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             live_sessions: st.live.len(),
+            memory: st.mem.system.clone(),
         }
     }
 }

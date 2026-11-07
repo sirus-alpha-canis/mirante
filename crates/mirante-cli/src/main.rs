@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use mirante_core::model::{PermissionRequest, Status};
 use mirante_ipc::types::{
-    method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, ListParams,
-    PermissionView, ResizeParams, SendMessage, SendMode, SendResult, Snapshot, StartResult, StartSession,
-    SubscribeParams, TaskRef, TaskView, TrustAnswer,
+    method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, DoctorReport,
+    KillOrphan, ListParams, OrphanView, PermissionView, ResizeParams, SendMessage, SendMode, SendResult, Snapshot,
+    StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, Paths};
 use serde_json::{json, Value};
@@ -182,7 +182,7 @@ fn attach(paths: &Paths, task: &str) -> Res {
     Ok(())
 }
 
-fn board(tasks: &[TaskView], seen: &mut HashMap<String, Status>, color: bool) {
+fn board(tasks: &[TaskView], memory: Option<&SystemView>, seen: &mut HashMap<String, Status>, color: bool) {
     // Bell only when a task newly needs the user.
     let bell = tasks
         .iter()
@@ -190,7 +190,11 @@ fn board(tasks: &[TaskView], seen: &mut HashMap<String, Status>, color: bool) {
     seen.clear();
     seen.extend(tasks.iter().map(|v| (v.task.id.clone(), v.task.status)));
     print!("\x1b[2J\x1b[H");
-    println!("mirante watch  (Ctrl-C to quit)\n");
+    println!("mirante watch  (Ctrl-C to quit)");
+    match memory {
+        Some(m) => println!("{}\n", render::memory_line(m)),
+        None => println!(),
+    }
     print!("{}", render::tasks_table(tasks, color));
     if bell {
         print!("\x07");
@@ -213,7 +217,8 @@ fn watch(paths: &Paths) -> Res {
             let mut q = Client::connect(&paths.socket())?;
             q.set_timeout(Some(Duration::from_secs(10)))?;
             let tasks = if snap.resumed { q.call(method::TASK_LIST, ListParams::default())? } else { snap.tasks };
-            board(&tasks, &mut seen, color);
+            let memory = |q: &mut Client| q.call::<DaemonStatus>(method::DAEMON_STATUS, json!({})).ok()?.memory;
+            board(&tasks, memory(&mut q).as_ref(), &mut seen, color);
             resume = SubscribeParams { since_seq: Some(snap.seq), boot_id: Some(snap.boot_id) };
             // The stream is only a hint: every event triggers a fresh snapshot.
             while let Some(n) = sub.next_notification()? {
@@ -221,7 +226,7 @@ fn watch(paths: &Paths) -> Res {
                     resume = SubscribeParams { since_seq: Some(seq), boot_id: Some(boot.to_string()) };
                 }
                 let tasks: Vec<TaskView> = q.call(method::TASK_LIST, ListParams::default())?;
-                board(&tasks, &mut seen, color);
+                board(&tasks, memory(&mut q).as_ref(), &mut seen, color);
             }
             Ok(())
         })();
@@ -349,6 +354,32 @@ fn run(cmd: Cmd) -> Res {
                 println!("note: no native session id was recorded; this is a fresh conversation");
             }
             boot_flow(&mut c, r, trust)?;
+        }
+        Cmd::Hibernate { task } => {
+            let v: TaskView = client(&paths)?.call(method::SESSION_HIBERNATE, TaskRef { task })?;
+            println!("{} hibernated (mirante wake {} resumes it)", render::short(&v.task.id), v.task.branch);
+        }
+        Cmd::Wake { task, trust } => {
+            let mut c = client(&paths)?;
+            let r: StartResult = c.call(method::SESSION_WAKE, TaskRef { task })?;
+            boot_flow(&mut c, r, trust)?;
+        }
+        Cmd::Doctor { kill: None } => {
+            let d: DoctorReport = client(&paths)?.call(method::DAEMON_DOCTOR, json!({}))?;
+            print!("{}", render::doctor_report(&d));
+        }
+        Cmd::Doctor { kill: Some(pid) } => {
+            let mut c = client(&paths)?;
+            let d: DoctorReport = c.call(method::DAEMON_DOCTOR, json!({}))?;
+            let o = d.orphan_processes.into_iter().find(|o| o.pid == pid).ok_or_else(|| {
+                format!("pid {pid} is not an orphan in Mirante's worktrees (mirante doctor lists them)")
+            })?;
+            if !ask(&format!("kill pid {} ({})? [y/N] ", o.pid, o.argv))? {
+                println!("left running");
+                return Ok(());
+            }
+            let k: OrphanView = c.call(method::DAEMON_KILL_ORPHAN, KillOrphan { pid: o.pid, start: o.start })?;
+            println!("killed pid {}", k.pid);
         }
         Cmd::Archive { task } => {
             let v: TaskView = client(&paths)?.call(method::TASK_ARCHIVE, TaskRef { task })?;

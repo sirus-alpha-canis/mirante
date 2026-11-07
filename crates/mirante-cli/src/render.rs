@@ -1,6 +1,6 @@
 //! Plain-text tables. Colors only on a terminal (`color` = stdout is a tty).
 use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
-use mirante_ipc::types::{BootState, PermissionView, TaskView};
+use mirante_ipc::types::{BootState, DoctorReport, MemView, PermissionView, SystemView, TaskView};
 
 /// Last 8 characters of an id (UUID v7 prefixes are time-based and collide; suffixes do not).
 pub fn short(id: &str) -> &str {
@@ -60,6 +60,7 @@ fn paint(s: Status, text: &str, color: bool) -> String {
 
 fn note(v: &TaskView) -> String {
     let state = match (v.boot, &v.detail) {
+        _ if v.hibernated => Some("hibernated: mirante wake".to_string()),
         _ if v.task.lifecycle == Lifecycle::Archiving => Some("archiving".to_string()),
         (Some(BootState::TrustPrompt), _) => Some("trust prompt: mirante resume / attach".to_string()),
         (Some(BootState::Booting), _) => Some("starting".to_string()),
@@ -74,12 +75,13 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         return "no tasks (mirante new <repo> --agent claude|codex --branch <name> <goal>)\n".into();
     }
     let mut out = format!(
-        "{}  {}  {}  {}  {}  {}  {}  {}\n",
+        "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
         fit("ID", 8),
         fit("BRANCH", 22),
         fit("AGENT", 6),
         fit("MODE", 10),
         fit("STATUS", 9),
+        fit("MEM", 11),
         fit("NEEDS", 5),
         fit("Q", 2),
         "TITLE"
@@ -90,16 +92,77 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         let note = note(v);
         let title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
         out.push_str(&format!(
-            "{}  {}  {}  {}  {}  {}  {}  {}\n",
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
             fit(short(&v.task.id), 8),
             fit(&v.task.branch, 22),
             fit(v.task.agent.as_str(), 6),
             fit(mode_label(v.task.agent), 10),
             paint(v.task.status, &fit(status_label(v.task.status), 9), color),
+            fit(&v.memory.as_ref().map(mem_cell).unwrap_or_default(), 11),
             fit(&needs, 5),
             fit(&queued, 2),
             title
         ));
+    }
+    out
+}
+
+/// Bytes as "1.5G" / "512M".
+pub fn bytes(n: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if n >= GIB {
+        format!("{:.1}G", n as f64 / GIB as f64)
+    } else {
+        format!("{}M", n >> 20)
+    }
+}
+
+/// "1.2G/4.0G", with "!" past the soft share and "!!" past the budget.
+pub fn mem_cell(m: &MemView) -> String {
+    let mark = match m.state.as_str() {
+        "soft" => "!",
+        "hard" => "!!",
+        _ => "",
+    };
+    format!("{}/{}{mark}", bytes(m.bytes), bytes(m.budget))
+}
+
+/// The `watch` header line about the machine's memory.
+pub fn memory_line(s: &SystemView) -> String {
+    let paused = if s.paused { " · new sessions and queued messages paused" } else { "" };
+    format!(
+        "memory: {} · free {} of {} · swap {}/{}{paused}",
+        s.level,
+        bytes(s.free),
+        bytes(s.total),
+        bytes(s.swap_used),
+        bytes(s.swap_total)
+    )
+}
+
+pub fn doctor_report(d: &DoctorReport) -> String {
+    let mut out = String::new();
+    match &d.memory {
+        Some(m) => out.push_str(&format!("{}\n", memory_line(m))),
+        None => out.push_str("memory: not sampled yet\n"),
+    }
+    if d.orphan_processes.is_empty() {
+        out.push_str("orphan processes: none\n");
+    } else {
+        out.push_str("orphan processes (parent gone, inside Mirante's worktrees):\n");
+        for o in &d.orphan_processes {
+            let cwd = o.cwd.as_deref().unwrap_or("?");
+            out.push_str(&format!("  pid {}  cwd {}  {}\n", o.pid, cwd, o.argv));
+        }
+        out.push_str("kill one (asks first): mirante doctor --kill <pid>\n");
+    }
+    if d.orphan_worktrees.is_empty() {
+        out.push_str("orphan checkouts: none\n");
+    } else {
+        out.push_str("orphan checkouts (no task owns them; Mirante never deletes them):\n");
+        for w in &d.orphan_worktrees {
+            out.push_str(&format!("  {w}\n"));
+        }
     }
     out
 }
@@ -173,6 +236,8 @@ mod tests {
             queued: 0,
             detail: detail.map(String::from),
             usage: None,
+            memory: None,
+            hibernated: false,
         }
     }
 
@@ -214,6 +279,43 @@ mod tests {
         assert!(task_detail(&v, &[]).contains("mode:      auto-edits (edits and commands inside the worktree"));
         v.task.lifecycle = Lifecycle::Archiving;
         assert!(tasks_table(&[v], false).contains("[archiving · 5h 42% · 31k tokens]"));
+    }
+
+    #[test]
+    fn memory_shows_per_task_in_watch_and_in_doctor() {
+        let mut v = view(Status::Idle, 0, None);
+        v.memory = Some(MemView { bytes: 3 << 30, peak: 3 << 30, budget: 4 << 30, state: "soft".into() });
+        let t = tasks_table(&[v.clone()], false);
+        assert!(t.lines().next().unwrap().contains("MEM") && t.contains("3.0G/4.0G!"), "{t}");
+        v.memory = None;
+        v.hibernated = true;
+        v.live = false;
+        assert!(tasks_table(&[v], false).contains("[hibernated: mirante wake]"));
+        let s = SystemView {
+            level: "elevated".into(),
+            total: 16 << 30,
+            free: 512 << 20,
+            swap_used: 9 << 30,
+            swap_total: 10 << 30,
+            paused: true,
+        };
+        assert_eq!(
+            memory_line(&s),
+            "memory: elevated · free 512M of 16.0G · swap 9.0G/10.0G · new sessions and queued messages paused"
+        );
+        let d = DoctorReport {
+            orphan_processes: vec![mirante_ipc::types::OrphanView {
+                pid: 4242,
+                start: 1,
+                cwd: Some("/w/app/feat".into()),
+                argv: "node server.js".into(),
+            }],
+            orphan_worktrees: vec![],
+            memory: Some(s),
+        };
+        let r = doctor_report(&d);
+        assert!(r.contains("pid 4242  cwd /w/app/feat  node server.js") && r.contains("mirante doctor --kill <pid>"));
+        assert!(r.contains("orphan checkouts: none"));
     }
 
     #[test]

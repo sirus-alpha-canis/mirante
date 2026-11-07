@@ -23,6 +23,14 @@ pub mod method {
     pub const HOOK_EVENT: &str = "hook.event";
     pub const DAEMON_STATUS: &str = "daemon.status";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
+    /// Ends an idle session to free memory, keeping it resumable ([`super::TaskRef`]).
+    pub const SESSION_HIBERNATE: &str = "session.hibernate";
+    /// Resumes a hibernated session ([`super::TaskRef`]; result: [`super::StartResult`]).
+    pub const SESSION_WAKE: &str = "session.wake";
+    /// Orphan processes / checkouts and memory ([`super::DoctorReport`]).
+    pub const DAEMON_DOCTOR: &str = "daemon.doctor";
+    /// Kills one orphan the user picked from `daemon.doctor` ([`super::KillOrphan`]).
+    pub const DAEMON_KILL_ORPHAN: &str = "daemon.kill_orphan";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
 }
@@ -64,6 +72,61 @@ pub struct TaskView {
     /// Codex quota / token usage while live, e.g. "5h 42% · week 9% · 31k tokens".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<String>,
+    /// Memory of the live session's process tree, once sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemView>,
+    /// The session was hibernated to free memory (`mirante wake` resumes it).
+    #[serde(default)]
+    pub hibernated: bool,
+}
+
+/// One live session's memory: the summed footprint of its process tree (macOS:
+/// `phys_footprint`, what Activity Monitor shows), its peak, its budget and where it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemView {
+    pub bytes: u64,
+    pub peak: u64,
+    pub budget: u64,
+    /// "ok", "soft" (past the soft share of the budget) or "hard" (past the budget).
+    pub state: String,
+}
+
+/// The machine's memory as the daemon's guard sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemView {
+    /// "normal", "elevated" or "critical".
+    pub level: String,
+    pub total: u64,
+    pub free: u64,
+    pub swap_used: u64,
+    pub swap_total: u64,
+    /// New sessions and queued deliveries wait while memory is tight.
+    pub paused: bool,
+}
+
+/// A process left behind by an agent: parent gone (ppid 1), working directory or command
+/// line inside Mirante's worktrees. Shown by `mirante doctor`; killed only on request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanView {
+    pub pid: i32,
+    /// Start time; with the pid it names exactly this process.
+    pub start: u64,
+    pub cwd: Option<String>,
+    pub argv: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub orphan_processes: Vec<OrphanView>,
+    /// Checkouts under the worktree root that no task owns (never deleted by Mirante).
+    pub orphan_worktrees: Vec<String>,
+    pub memory: Option<SystemView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KillOrphan {
+    pub pid: i32,
+    pub start: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +293,9 @@ pub struct DaemonStatus {
     pub boot_id: String,
     pub version: String,
     pub live_sessions: usize,
+    /// The memory guard's view (absent from older daemons and before the first sample).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<SystemView>,
 }
 #[cfg(test)]
 mod tests {
@@ -261,6 +327,8 @@ mod tests {
             queued: 0,
             detail: None,
             usage: None,
+            memory: Some(MemView { bytes: 1, peak: 2, budget: 3, state: "ok".into() }),
+            hibernated: false,
         };
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["id"], "t1");
@@ -281,6 +349,9 @@ mod tests {
         assert!(serde_json::to_value(&e).unwrap().get("session").is_none());
         let r: ResizeParams = serde_json::from_value(json!({"task": "t", "rows": 30, "cols": 100})).unwrap();
         assert_eq!((r.rows, r.cols), (30, 100));
+        let d: DaemonStatus =
+            serde_json::from_value(json!({"pid": 1, "boot_id": "b", "version": "0.1.0", "live_sessions": 0})).unwrap();
+        assert_eq!(d.memory, None);
     }
 
     #[test]
