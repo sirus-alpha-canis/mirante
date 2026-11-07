@@ -170,21 +170,22 @@ pub fn approval_response(method: &str, params: &Value, allow: bool) -> Value {
     }
 }
 
-/// The v2 one-time "no" for a request, and a note when it is not plain `decline`. Codex
-/// 0.167 lists `availableDecisions` without `"decline"` (`["accept", {…amendment}, "cancel"]`)
-/// although it accepts it; the listed deny-equivalent (`"cancel"`, which also ends the turn)
-/// is sent then, so Mirante never relies on an unlisted answer. With no list, `decline`.
+/// The v2 one-time "no" for a request: always `decline`, and a note when Codex listed
+/// `availableDecisions` without it or any other non-`cancel` deny option. Codex 0.167 lists
+/// `["accept", {…amendment}, "cancel"]` yet accepts `decline` live; `cancel` would end the
+/// whole turn, so Mirante never sends it for a one-time deny.
 pub fn deny_decision(params: &Value) -> (&'static str, Option<&'static str>) {
     let Some(list) = params["availableDecisions"].as_array() else {
         return ("decline", None);
     };
-    let has = |d: &str| list.iter().any(|v| v.as_str() == Some(d));
-    if has("decline") {
+    let name = |v: &Value| -> Option<String> {
+        v.as_str().map(str::to_string).or_else(|| v.as_object().and_then(|o| o.keys().next().cloned()))
+    };
+    let denies = list.iter().filter_map(name).any(|d| d == "decline" || (d != "cancel" && !d.starts_with("accept")));
+    if denies {
         ("decline", None)
-    } else if has("cancel") {
-        ("cancel", Some("\"decline\" is not in availableDecisions: sent \"cancel\""))
     } else {
-        ("decline", Some("availableDecisions lists neither \"decline\" nor \"cancel\": sent \"decline\""))
+        ("decline", Some("availableDecisions lists no \"decline\": sent \"decline\" (Codex accepts it; \"cancel\" would end the turn)"))
     }
 }
 
@@ -1183,7 +1184,7 @@ impl Driver for CodexDriver {
         }
         let mut out = Vec::new();
         if let (false, Some(note)) = (allow, deny_decision(&params).1) {
-            out.push(DriverEvent::Step(json!({ "type": "deny_decision", "method": method, "note": note })));
+            out.push(DriverEvent::Step(json!({ "type": "deny_decision_unlisted", "method": method, "note": note })));
         }
         match params["grantRoot"].as_str().filter(|_| allow) {
             Some(root) => {
@@ -1193,9 +1194,6 @@ impl Driver for CodexDriver {
                 out.push(DriverEvent::Sandbox(sandbox_summary(&s.sandbox_policy, &s.granted_roots)));
             }
             None if allow => s.output("[allowed once]\r\n"),
-            None if deny_decision(&params).0 == "cancel" => {
-                s.output("[denied: cancel, Codex's listed \"no\", also ends the turn]\r\n")
-            }
             None => s.output("[denied]\r\n"),
         }
         let t = s.engine.apply(&CodexInput::ApprovalAnswered(key.to_string()), Instant::now());
@@ -1495,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deny_of_the_live_command_shape_sends_the_listed_cancel_and_logs_it() {
+    fn a_deny_of_the_live_command_shape_sends_decline_and_logs_it_unlisted() {
         let (d, mut fake, rx, _) = setup(None);
         fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
         fake.send(json!({"jsonrpc": "2.0", "id": 1, "method": "item/commandExecution/requestApproval",
@@ -1506,9 +1504,9 @@ mod tests {
                 "availableDecisions": ["accept", {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["touch", "/tmp/x"]}}, "cancel"]}}));
         next_event(&rx, |e| matches!(e, DriverEvent::PermissionRequested { .. }));
         d.answer_permission("n:1", "command", None, false, None).unwrap();
-        assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 1, "result": {"decision": "cancel"}}));
-        let step = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "deny_decision"));
-        assert!(matches!(step, DriverEvent::Step(ref v) if v["note"].as_str().unwrap().contains("cancel")));
+        assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": 1, "result": {"decision": "decline"}}));
+        let step = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "deny_decision_unlisted"));
+        assert!(matches!(step, DriverEvent::Step(ref v) if v["note"].as_str().unwrap().contains("decline")));
     }
 
     #[test]
@@ -1541,25 +1539,30 @@ mod tests {
     }
 
     #[test]
-    fn a_deny_follows_the_decisions_codex_lists() {
-        // Live shape (Codex 0.167.0): no "decline" listed.
+    fn a_deny_is_always_decline_never_cancel() {
+        // Live shape (Codex 0.167.0): no "decline" listed, yet Codex accepts it; "cancel" ends the turn.
         let live = json!({"kind": "command", "itemId": "exec-1", "command": "/bin/zsh -lc 'touch /x'",
             "availableDecisions": ["accept", {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["touch", "/x"]}}, "cancel"]});
         let m = "item/commandExecution/requestApproval";
-        assert_eq!(deny_decision(&live), ("cancel", Some("\"decline\" is not in availableDecisions: sent \"cancel\"")));
-        assert_eq!(approval_response(m, &live, false), json!({"decision": "cancel"}));
+        let (d, note) = deny_decision(&live);
+        assert_eq!(d, "decline");
+        assert!(note.is_some_and(|n| n.contains("no \"decline\"")), "{note:?}");
+        assert_eq!(approval_response(m, &live, false), json!({"decision": "decline"}));
         assert_eq!(approval_response(m, &live, true), json!({"decision": "accept"}));
-        // Listed: used as is.
+        // Listed: decline, no note.
         let listed = json!({"availableDecisions": ["accept", "decline", "cancel"]});
         assert_eq!(approval_response(m, &listed, false), json!({"decision": "decline"}));
         assert_eq!(deny_decision(&listed), ("decline", None));
-        // No list (older Codex, file changes): decline.
+        // Another non-cancel deny option listed: still decline, no note.
+        let other = json!({"availableDecisions": ["accept", {"declineWithReason": {}}, "cancel"]});
+        assert_eq!(deny_decision(&other), ("decline", None));
+        // No list (older Codex, file changes): decline, no note.
         assert_eq!(
             approval_response("item/fileChange/requestApproval", &json!({}), false),
             json!({"decision": "decline"})
         );
         assert_eq!(deny_decision(&json!({})), ("decline", None));
-        // A list with neither: decline still, and said.
+        // Only cancel or accept listed: decline, and said.
         let odd = json!({"availableDecisions": ["accept"]});
         assert_eq!(approval_response(m, &odd, false), json!({"decision": "decline"}));
         assert!(deny_decision(&odd).1.is_some());
