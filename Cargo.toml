@@ -4,5 +4,6 @@ members = [
     "crates/mirante-core",
     "crates/mirante-ipc",
     "crates/mirante-hook",
+    "crates/mirante-daemon",
 ]
 resolver = "2"

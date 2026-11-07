@@ -230,6 +230,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante-daemon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mirante-core",
+ "mirante-ipc",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "vt100",
+]
+
+[[package]]
 name = "mirante-hook"
 version = "0.1.0"
 dependencies = [
