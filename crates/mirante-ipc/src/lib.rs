@@ -2,8 +2,11 @@
 //! newline-delimited JSON-RPC 2.0 over a Unix socket, the parameter and result types, and
 //! the on-disk layout under `~/.mirante`. Synchronous std I/O only.
 pub mod paths;
+pub mod rpc;
+pub mod types;
 
 pub use paths::Paths;
+pub use rpc::RpcError;
 
 /// A short unique directory under `/tmp`, removed on drop. Unix socket paths are limited to
 /// ~104 bytes on macOS, so tests must not use the long per-user temp dir.
