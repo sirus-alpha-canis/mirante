@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 license = "Apache-2.0"
 
+[[bin]]
+name = "mirante"
+path = "src/main.rs"
+
 [dependencies]
 mirante-core = { path = "../mirante-core" }
 mirante-ipc = { path = "../mirante-ipc" }
