@@ -5,7 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
-use crate::model::{new_id, now_ms, AgentKind, Event, Lifecycle, NewTask, PermissionStatus, Status, Task};
+use crate::model::{
+    new_id, now_ms, AgentKind, Conversation, Event, Lifecycle, NewTask, PermissionStatus, Session, Status, Task, Turn,
+};
 
 /// Embedded, ordered schema migrations. `PRAGMA user_version` records the last applied one.
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/0001_init.sql"))];
@@ -404,5 +406,342 @@ mod task_tests {
         s.append_event(None, "boot", &json!({})).unwrap();
         assert!(s.conn.execute("UPDATE events SET kind = 'x'", []).is_err());
         assert!(s.conn.execute("DELETE FROM events", []).is_err());
+    }
+}
+
+const SESSION_COLUMNS: &str = "id, task_id, conversation_id, started_at, ended_at, transcript_path, transcript_offset";
+
+fn session_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        conversation_id: r.get(2)?,
+        started_at: r.get(3)?,
+        ended_at: r.get(4)?,
+        transcript_path: r.get(5)?,
+        transcript_offset: r.get::<_, i64>(6)? as u64,
+    })
+}
+
+fn conversation_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
+    Ok(Conversation { id: r.get(0)?, task_id: r.get(1)?, native_session_id: r.get(2)?, created_at: r.get(3)? })
+}
+
+fn turn_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
+    Ok(Turn { id: r.get(0)?, session_id: r.get(1)?, idx: r.get(2)?, started_at: r.get(3)?, ended_at: r.get(4)? })
+}
+
+fn load_session(conn: &Connection, id: &str) -> Result<Session> {
+    conn.query_row(&format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"), [id], session_from_row)
+        .optional()?
+        .ok_or_else(|| CoreError::NotFound { kind: "session", id: id.to_string() })
+}
+
+impl Store {
+    pub fn create_conversation(&mut self, task_id: &str) -> Result<Conversation> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_task(&tx, task_id)?;
+        let c =
+            Conversation { id: new_id(), task_id: task_id.to_string(), native_session_id: None, created_at: now_ms() };
+        tx.execute(
+            "INSERT INTO conversations (id, task_id, native_session_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+            params![c.id, c.task_id, c.created_at],
+        )?;
+        insert_event(&tx, &self.boot_id, Some(task_id), "conversation_created", &json!({ "conversation_id": c.id }))?;
+        tx.commit()?;
+        Ok(c)
+    }
+
+    /// Records the agent's own session id (from `SessionStart`) so the task can `--resume`.
+    pub fn set_native_session_id(&mut self, conversation_id: &str, native_session_id: &str) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task_id: String = tx
+            .query_row("SELECT task_id FROM conversations WHERE id = ?1", [conversation_id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound { kind: "conversation", id: conversation_id.to_string() })?;
+        tx.execute(
+            "UPDATE conversations SET native_session_id = ?2 WHERE id = ?1",
+            params![conversation_id, native_session_id],
+        )?;
+        insert_event(
+            &tx,
+            &self.boot_id,
+            Some(&task_id),
+            "native_session_id",
+            &json!({ "conversation_id": conversation_id, "native_session_id": native_session_id }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_conversation(&self, task_id: &str) -> Result<Option<Conversation>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, task_id, native_session_id, created_at FROM conversations
+                 WHERE task_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [task_id],
+                conversation_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Starts a process activation. Per-task lock: fails with `TaskBusy` while another session
+    /// of the task is live (also enforced by a partial unique index). A `Created` task becomes
+    /// `Active`; an `Archived` task cannot start sessions.
+    pub fn start_session(&mut self, task_id: &str, conversation_id: &str) -> Result<Session> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_task(&tx, task_id)?;
+        if task.lifecycle == Lifecycle::Archived {
+            return Err(CoreError::InvalidTransition { kind: "session", from: "archived".into(), to: "live".into() });
+        }
+        let busy: Option<String> = tx
+            .query_row("SELECT id FROM sessions WHERE task_id = ?1 AND ended_at IS NULL", [task_id], |r| r.get(0))
+            .optional()?;
+        if busy.is_some() {
+            return Err(CoreError::TaskBusy(task_id.to_string()));
+        }
+        let s = Session {
+            id: new_id(),
+            task_id: task_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            started_at: now_ms(),
+            ended_at: None,
+            transcript_path: None,
+            transcript_offset: 0,
+        };
+        tx.execute(
+            &format!("INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 0)"),
+            params![s.id, s.task_id, s.conversation_id, s.started_at],
+        )?;
+        if task.lifecycle == Lifecycle::Created {
+            tx.execute(
+                "UPDATE tasks SET lifecycle = 'active', updated_at = ?2 WHERE id = ?1",
+                params![task_id, now_ms()],
+            )?;
+            insert_event(
+                &tx,
+                &self.boot_id,
+                Some(task_id),
+                "lifecycle",
+                &json!({ "from": "created", "to": "active" }),
+            )?;
+        }
+        insert_event(
+            &tx,
+            &self.boot_id,
+            Some(task_id),
+            "session_started",
+            &json!({ "session_id": s.id, "conversation_id": conversation_id }),
+        )?;
+        tx.commit()?;
+        Ok(s)
+    }
+
+    /// Ends a session (releases the per-task lock) and closes any turn still open in it.
+    pub fn end_session(&mut self, session_id: &str) -> Result<Session> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let s = load_session(&tx, session_id)?;
+        if s.ended_at.is_none() {
+            let now = now_ms();
+            tx.execute("UPDATE sessions SET ended_at = ?2 WHERE id = ?1", params![session_id, now])?;
+            tx.execute(
+                "UPDATE turns SET ended_at = ?2 WHERE session_id = ?1 AND ended_at IS NULL",
+                params![session_id, now],
+            )?;
+            insert_event(&tx, &self.boot_id, Some(&s.task_id), "session_ended", &json!({ "session_id": session_id }))?;
+        }
+        let s = load_session(&tx, session_id)?;
+        tx.commit()?;
+        Ok(s)
+    }
+
+    pub fn live_session(&self, task_id: &str) -> Result<Option<Session>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE task_id = ?1 AND ended_at IS NULL"),
+                [task_id],
+                session_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn get_session(&self, id: &str) -> Result<Session> {
+        load_session(&self.conn, id)
+    }
+
+    /// Persists where the transcript tailer is. Not audited: it moves on every poll.
+    pub fn set_transcript(&mut self, session_id: &str, path: &str, offset: u64) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE sessions SET transcript_path = ?2, transcript_offset = ?3 WHERE id = ?1",
+            params![session_id, path, offset as i64],
+        )?;
+        if n == 0 {
+            return Err(CoreError::NotFound { kind: "session", id: session_id.to_string() });
+        }
+        Ok(())
+    }
+
+    pub fn start_turn(&mut self, session_id: &str) -> Result<Turn> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let s = load_session(&tx, session_id)?;
+        let idx: i64 =
+            tx.query_row("SELECT COALESCE(MAX(idx), 0) + 1 FROM turns WHERE session_id = ?1", [session_id], |r| {
+                r.get(0)
+            })?;
+        let t = Turn { id: new_id(), session_id: session_id.to_string(), idx, started_at: now_ms(), ended_at: None };
+        tx.execute(
+            "INSERT INTO turns (id, session_id, idx, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![t.id, t.session_id, t.idx, t.started_at],
+        )?;
+        insert_event(
+            &tx,
+            &self.boot_id,
+            Some(&s.task_id),
+            "turn_started",
+            &json!({ "session_id": session_id, "turn_id": t.id, "idx": idx }),
+        )?;
+        tx.commit()?;
+        Ok(t)
+    }
+
+    pub fn end_turn(&mut self, turn_id: &str) -> Result<Turn> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let t = tx
+            .query_row(
+                "SELECT id, session_id, idx, started_at, ended_at FROM turns WHERE id = ?1",
+                [turn_id],
+                turn_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound { kind: "turn", id: turn_id.to_string() })?;
+        if t.ended_at.is_none() {
+            let task_id = load_session(&tx, &t.session_id)?.task_id;
+            tx.execute("UPDATE turns SET ended_at = ?2 WHERE id = ?1", params![turn_id, now_ms()])?;
+            insert_event(
+                &tx,
+                &self.boot_id,
+                Some(&task_id),
+                "turn_ended",
+                &json!({ "turn_id": turn_id, "idx": t.idx }),
+            )?;
+        }
+        let t = tx.query_row(
+            "SELECT id, session_id, idx, started_at, ended_at FROM turns WHERE id = ?1",
+            [turn_id],
+            turn_from_row,
+        )?;
+        tx.commit()?;
+        Ok(t)
+    }
+
+    pub fn turns(&self, session_id: &str) -> Result<Vec<Turn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, idx, started_at, ended_at FROM turns WHERE session_id = ?1 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map([session_id], turn_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn task_and_conversation(s: &mut Store) -> (Task, Conversation) {
+        let t = s.create_task(sample_task("feat-a")).unwrap();
+        let c = s.create_conversation(&t.id).unwrap();
+        (t, c)
+    }
+
+    #[test]
+    fn native_session_id_survives_reopen() {
+        let dir = TempDir::new("store-native");
+        let path = dir.path().join("m.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let (t, c) = task_and_conversation(&mut s);
+        s.set_native_session_id(&c.id, "claude-sess-1").unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        let latest = s.latest_conversation(&t.id).unwrap().unwrap();
+        assert_eq!(latest.native_session_id.as_deref(), Some("claude-sess-1"));
+    }
+
+    #[test]
+    fn per_task_lock_allows_one_live_session() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (t, c) = task_and_conversation(&mut s);
+        let first = s.start_session(&t.id, &c.id).unwrap();
+        assert!(matches!(s.start_session(&t.id, &c.id), Err(CoreError::TaskBusy(id)) if id == t.id));
+        assert_eq!(s.live_session(&t.id).unwrap().unwrap().id, first.id);
+        s.end_session(&first.id).unwrap();
+        assert!(s.live_session(&t.id).unwrap().is_none());
+        let second = s.start_session(&t.id, &c.id).unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    #[test]
+    fn unique_index_backs_the_lock_even_without_the_check() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (t, c) = task_and_conversation(&mut s);
+        s.start_session(&t.id, &c.id).unwrap();
+        let raw = s.conn.execute(
+            "INSERT INTO sessions (id, task_id, conversation_id, started_at) VALUES ('x', ?1, ?2, 0)",
+            params![t.id, c.id],
+        );
+        assert!(raw.is_err());
+    }
+
+    #[test]
+    fn first_session_activates_the_task_and_archived_tasks_cannot_start() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (t, c) = task_and_conversation(&mut s);
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        assert_eq!(s.get_task(&t.id).unwrap().lifecycle, Lifecycle::Active);
+        s.end_session(&sess.id).unwrap();
+        s.transition_lifecycle(&t.id, Lifecycle::Archived).unwrap();
+        let err = s.start_session(&t.id, &c.id).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidTransition { kind: "session", .. }), "{err}");
+    }
+
+    #[test]
+    fn turns_are_numbered_and_closed_by_end_session() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (t, c) = task_and_conversation(&mut s);
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        let t1 = s.start_turn(&sess.id).unwrap();
+        assert!(s.end_turn(&t1.id).unwrap().ended_at.is_some());
+        let t2 = s.start_turn(&sess.id).unwrap();
+        assert_eq!((t1.idx, t2.idx), (1, 2));
+        s.end_session(&sess.id).unwrap();
+        assert!(s.turns(&sess.id).unwrap().iter().all(|t| t.ended_at.is_some()));
+        let kinds: Vec<String> = s.task_events(&t.id).unwrap().into_iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "task_created",
+                "conversation_created",
+                "lifecycle",
+                "session_started",
+                "turn_started",
+                "turn_ended",
+                "turn_started",
+                "session_ended"
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_offset_persists() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (t, c) = task_and_conversation(&mut s);
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        s.set_transcript(&sess.id, "/home/u/.claude/projects/x/s.jsonl", 4096).unwrap();
+        let got = s.get_session(&sess.id).unwrap();
+        assert_eq!(got.transcript_path.as_deref(), Some("/home/u/.claude/projects/x/s.jsonl"));
+        assert_eq!(got.transcript_offset, 4096);
+        assert!(matches!(s.set_transcript("nope", "/x", 0), Err(CoreError::NotFound { .. })));
     }
 }
