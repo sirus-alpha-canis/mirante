@@ -8,6 +8,7 @@ pub mod model;
 pub mod status;
 pub mod store;
 pub mod transcript_tail;
+pub mod worktree;
 
 pub use error::{CoreError, Result};
 
