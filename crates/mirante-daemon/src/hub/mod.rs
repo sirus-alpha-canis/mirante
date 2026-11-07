@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
+pub mod messages;
 pub mod session;
 
 pub type Result<T> = std::result::Result<T, HubError>;
