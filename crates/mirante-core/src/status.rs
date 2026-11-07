@@ -886,8 +886,19 @@ pub fn is_slash_command(prompt: &str) -> bool {
     name_len > 0 && rest[name_len..].chars().next().is_none_or(char::is_whitespace)
 }
 
-/// `Some(subtype)` for the transcript's authoritative turn-end lines.
+/// What Claude Code (2.1.285) writes, as the whole text of a user line, when Esc stops a
+/// turn that was streaming text: no Stop hook and no `turn_duration` follow (Task 21 live
+/// run). The deny path's "[Request interrupted by user for tool use]" is not this line:
+/// that turn is closed by its `turn_duration`.
+pub const INTERRUPTED: &str = "[Request interrupted by user]";
+
+/// `Some(kind)` for the transcript's authoritative turn-end lines: the `system`
+/// `turn_duration` / `stop_hook_summary` lines, and `interrupted` for the user line that is
+/// exactly [`INTERRUPTED`].
 pub fn turn_end_kind(v: &Value) -> Option<&str> {
+    if v["type"] == "user" {
+        return first_text(&v["message"]["content"]).filter(|t| t.trim() == INTERRUPTED).map(|_| "interrupted");
+    }
     if v["type"] != "system" {
         return None;
     }
@@ -1057,6 +1068,35 @@ mod fusion_tests {
             vec![Transition { from: Status::NeedsYou, to: Status::Idle, cause: "transcript:turn_duration".into() }]
         );
         assert!(!e.turn_open());
+    }
+
+    /// Task 21 live run (2.1.285): Esc while Claude streams a text answer writes only the
+    /// user line "[Request interrupted by user]": no Stop hook, no `turn_duration`. The
+    /// turn must still end, or the board says `working` until the next turn's Stop.
+    #[test]
+    fn an_interrupted_text_turn_is_closed_by_the_interrupt_line() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[hook("SessionStart"), hook("UserPromptSubmit")]);
+        assert_eq!(e.status(), Status::Working);
+        let t = e.apply_all(&[
+            prompt(),
+            tx(json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "um\ndois\ntrês"}]}})),
+            tx(json!({"type": "user", "interruptedMessageId": "msg_1", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}})),
+        ]);
+        assert_eq!(
+            t,
+            vec![Transition { from: Status::Working, to: Status::Idle, cause: "transcript:interrupted".into() }]
+        );
+        assert!(!e.turn_open());
+        // A `turn_duration` after it (if a version writes one) is the second end line of a
+        // closed turn: nothing changes.
+        assert_eq!(e.apply(&system("turn_duration")), None);
+        // A side agent's interrupt line never ends the main turn.
+        let mut e = StatusEngine::new();
+        e.apply_all(&[hook("UserPromptSubmit"), prompt()]);
+        let side = tx(json!({"type": "user", "isSidechain": true, "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}));
+        assert_eq!(e.apply(&side), None);
+        assert_eq!(e.status(), Status::Working);
     }
 
     /// S3 mismatch 2 (run 2): a PreToolUse with the same session id arrives ~1.7s after
