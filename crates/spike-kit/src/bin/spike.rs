@@ -32,6 +32,10 @@ fn main() -> Result<()> {
             let u = transcript::sum_transcript(&util::read_jsonl(Path::new(path))?, args.get(2).map(String::as_str));
             println!("{u:?} total={}", u.total());
         }
+        Some("classify-transcript") => {
+            let path = args.get(1).context("usage: spike classify-transcript <transcript.jsonl>")?;
+            println!("{:?}", delivery::classify_transcript(&util::read_jsonl(Path::new(path))?));
+        }
         Some(cmd @ ("classify-stream" | "classify-codex")) => {
             let log = args.get(1).context("missing <log.jsonl>")?;
             let marker = args.get(2).map(String::as_str).unwrap_or("BANANA");
@@ -43,7 +47,7 @@ fn main() -> Result<()> {
             };
             println!("{d:?}");
         }
-        _ => bail!("commands: settings | timeline | usage | classify-stream | classify-codex"),
+        _ => bail!("commands: settings | timeline | usage | classify-transcript | classify-stream | classify-codex"),
     }
     Ok(())
 }

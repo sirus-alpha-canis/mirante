@@ -53,6 +53,64 @@ pub fn classify_hooks(events: &[LoggedEvent]) -> Delivery {
     }
 }
 
+/// Interactive Claude Code transcript (`~/.claude/projects/<cwd>/<session>.jsonl`).
+///
+/// Rule, derived from real 2.1.285 transcripts (Task 8 / 8b):
+/// - A message typed while a turn runs is logged as
+///   `{"type":"queue-operation","operation":"enqueue","content":<text>}`.
+/// - Taken mid-turn (steered): `{"type":"queue-operation","operation":"remove",
+///   "reason":"absorbed_mid_turn","commandUuid":...}`, then an attachment
+///   `{"type":"queued_command","prompt":<text>}`, then the assistant reacts in the same turn.
+/// - Taken after the turn (queued): `{"type":"queue-operation","operation":"dequeue"}` (no
+///   content), then a new `{"type":"user","origin":{"kind":"human"},"promptSource":"queued"}`.
+/// - A turn is over at its final assistant line (`message.stop_reason == "end_turn"`), then
+///   `{"type":"system","subtype":"stop_hook_summary"}` / `"turn_duration"`. A typed prompt
+///   (`type:"user"` with `origin.kind:"human"`; tool results have no `origin`) starts a turn.
+///
+/// Positions are FILE ORDER, not `timestamp`: lines are appended as things happen, but
+/// timestamps are not monotonic (an assistant line had a timestamp 4s older than the
+/// enqueue before it; a `dequeue` carried a later timestamp than the system lines after it).
+///
+/// Classification: take the first `enqueue` that happens inside a running turn (after a
+/// human prompt and before that turn's end; headless `-p` also logs enqueue/dequeue for its
+/// initial prompt while idle). None → `Inconclusive`. Then the first `remove`/`dequeue`
+/// after it: none → `Never`; before the running turn's end (or no end at all) → `Steered`;
+/// otherwise → `Queued`.
+pub fn classify_transcript(lines: &[Value]) -> Delivery {
+    let is_prompt = |v: &Value| v["type"] == "user" && v["origin"]["kind"] == "human";
+    let is_turn_end = |v: &Value| {
+        (v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")
+            || (v["type"] == "system" && (v["subtype"] == "stop_hook_summary" || v["subtype"] == "turn_duration"))
+    };
+    let is_op = |v: &Value, ops: &[&str]| {
+        v["type"] == "queue-operation" && v["operation"].as_str().is_some_and(|o| ops.contains(&o))
+    };
+
+    let mut in_turn = false;
+    let mut enqueue = None;
+    for (i, v) in lines.iter().enumerate() {
+        if is_prompt(v) {
+            in_turn = true;
+        } else if is_turn_end(v) {
+            in_turn = false;
+        } else if in_turn && is_op(v, &["enqueue"]) {
+            enqueue = Some(i);
+            break;
+        }
+    }
+    let Some(enqueue) = enqueue else {
+        return Delivery::Inconclusive;
+    };
+    let after = &lines[enqueue + 1..];
+    let Some(taken) = after.iter().position(|v| is_op(v, &["remove", "dequeue"])) else {
+        return Delivery::Never;
+    };
+    match after.iter().position(|v| is_turn_end(v) || is_prompt(v)) {
+        Some(end) if end < taken => Delivery::Queued,
+        _ => Delivery::Steered,
+    }
+}
+
 /// Headless stream-json log ({ts, dir, line}): did an assistant message containing
 /// `marker` appear before the first `result` event?
 pub fn classify_stream(log: &[Value], marker: &str) -> Delivery {
@@ -120,6 +178,113 @@ mod tests {
                 tool_name: None,
             },
         }
+    }
+
+    // Minimal, anonymized shapes of real Claude Code 2.1.285 transcript lines (Task 8).
+    fn prompt(text: &str) -> Value {
+        json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "typed",
+               "message": {"role": "user", "content": text}})
+    }
+    fn tool_use() -> Value {
+        json!({"type": "assistant", "message": {"stop_reason": "tool_use",
+               "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash"}]}})
+    }
+    fn tool_result() -> Value {
+        json!({"type": "user", "message": {"role": "user",
+               "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "passo-1"}]}})
+    }
+    fn queue(op: &str) -> Value {
+        json!({"type": "queue-operation", "operation": op, "content": "BANANA please"})
+    }
+    fn removed(reason: &str) -> Value {
+        json!({"type": "queue-operation", "operation": "remove", "content": "BANANA please",
+               "reason": reason, "commandUuid": "c1"})
+    }
+    fn answer(text: &str) -> Value {
+        json!({"type": "assistant", "message": {"stop_reason": "end_turn",
+               "content": [{"type": "text", "text": text}]}})
+    }
+    fn turn_end() -> Vec<Value> {
+        vec![
+            json!({"type": "system", "subtype": "stop_hook_summary"}),
+            json!({"type": "system", "subtype": "turn_duration", "durationMs": 10763}),
+        ]
+    }
+
+    #[test]
+    fn transcript_remove_before_turn_end_is_steered() {
+        // Real order from Task 8: enqueue, tool_use, remove, tool_result, queued_command, answer, turn end.
+        let mut t = vec![prompt("run five steps"), tool_use(), tool_result(), queue("enqueue"), tool_use()];
+        t.extend([removed("absorbed_mid_turn"), tool_result()]);
+        t.push(json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "BANANA please"}}));
+        t.push(answer("BANANA"));
+        t.extend(turn_end());
+        assert_eq!(classify_transcript(&t), Delivery::Steered);
+    }
+
+    #[test]
+    fn transcript_dequeue_after_end_turn_is_queued() {
+        // Real order from a Task 8b probe (tool-less turn): the `dequeue` line is written
+        // BEFORE the system turn-end lines, but after the end_turn assistant line.
+        let t = vec![
+            prompt("list 60 fruits"),
+            queue("enqueue"),
+            answer("1. apple ..."),
+            json!({"type": "queue-operation", "operation": "dequeue"}),
+            json!({"type": "system", "subtype": "stop_hook_summary"}),
+            json!({"type": "system", "subtype": "turn_duration"}),
+            json!({"type": "user", "origin": {"kind": "human"}, "promptSource": "queued",
+                   "message": {"role": "user", "content": "BANANA please"}}),
+            answer("BANANA"),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Queued);
+    }
+
+    #[test]
+    fn transcript_enqueue_while_idle_is_not_mid_run() {
+        // Headless `claude -p` logs enqueue+dequeue for the initial prompt before any turn.
+        let t = vec![
+            queue("enqueue"),
+            json!({"type": "queue-operation", "operation": "dequeue"}),
+            prompt("say hi"),
+            answer("hi"),
+            json!({"type": "system", "subtype": "stop_hook_summary"}),
+        ];
+        assert_eq!(classify_transcript(&t), Delivery::Inconclusive);
+    }
+
+    #[test]
+    fn transcript_remove_after_next_human_prompt_is_queued() {
+        // No system line, but a new typed prompt also ends the turn that was running.
+        let t = vec![prompt("one"), queue("enqueue"), answer("done"), prompt("two"), removed("dequeued")];
+        assert_eq!(classify_transcript(&t), Delivery::Queued);
+    }
+
+    #[test]
+    fn transcript_tool_result_user_line_does_not_end_the_turn() {
+        let t = vec![prompt("one"), tool_use(), queue("enqueue"), tool_result(), removed("absorbed_mid_turn")];
+        assert_eq!(classify_transcript(&t), Delivery::Steered);
+    }
+
+    #[test]
+    fn transcript_enqueued_but_never_removed_is_never() {
+        let mut t = vec![prompt("one"), queue("enqueue"), answer("done")];
+        t.extend(turn_end());
+        assert_eq!(classify_transcript(&t), Delivery::Never);
+    }
+
+    #[test]
+    fn transcript_without_enqueue_is_inconclusive() {
+        let mut t = vec![prompt("one"), answer("done")];
+        t.extend(turn_end());
+        assert_eq!(classify_transcript(&t), Delivery::Inconclusive);
+    }
+
+    #[test]
+    fn transcript_remove_before_enqueue_is_ignored() {
+        let mut t = vec![removed("dequeued"), prompt("one"), queue("enqueue"), answer("done")];
+        t.extend(turn_end());
+        assert_eq!(classify_transcript(&t), Delivery::Never);
     }
 
     #[test]

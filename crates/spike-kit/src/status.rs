@@ -11,12 +11,19 @@ pub enum Status {
     Ended,
 }
 
+/// Text of the Notification Claude Code sends after ~60s without input (2.1.285:
+/// "Claude is waiting for your input"). The agent is idle, it does not need you.
+pub const IDLE_NOTIFICATION: &str = "waiting for your input";
+
 /// Deterministic mapping from one hook event to the task status. Unknown or
 /// neutral events (SubagentStop, PreCompact, anything new) keep the current status.
 pub fn next_status(current: Option<Status>, ev: &HookEvent) -> Option<Status> {
     match ev.hook_event_name.as_str() {
         "SessionStart" => Some(Status::Idle),
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(Status::Working),
+        "Notification" if ev.message.as_deref().is_some_and(|m| m.contains(IDLE_NOTIFICATION)) => {
+            Some(Status::Idle)
+        }
         "PermissionRequest" | "Notification" => Some(Status::NeedsYou),
         "Stop" => Some(Status::Idle),
         "SessionEnd" => Some(Status::Ended),
@@ -60,6 +67,24 @@ mod tests {
             message: None,
             tool_name: None,
         }
+    }
+
+    fn notification(message: &str) -> HookEvent {
+        HookEvent { message: Some(message.into()), ..ev("Notification") }
+    }
+
+    #[test]
+    fn idle_notification_maps_to_idle() {
+        let n = notification("Claude is waiting for your input");
+        assert_eq!(next_status(Some(Status::Idle), &n), Some(Status::Idle));
+        assert_eq!(next_status(Some(Status::Working), &n), Some(Status::Idle));
+    }
+
+    #[test]
+    fn other_notifications_map_to_needs_you() {
+        let n = notification("Claude needs your permission to use Bash");
+        assert_eq!(next_status(Some(Status::Working), &n), Some(Status::NeedsYou));
+        assert_eq!(next_status(Some(Status::Working), &ev("Notification")), Some(Status::NeedsYou));
     }
 
     fn logged(ts: u64, name: &str) -> LoggedEvent {

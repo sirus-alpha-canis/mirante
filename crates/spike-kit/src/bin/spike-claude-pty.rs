@@ -224,6 +224,14 @@ fn steer(cwd: &str, settings: &str, hooks_log: &Path, delay: u64) -> Result<()> 
     println!("task: {task}  screen: {}", out.display());
     print_timeline(&events);
     println!("mid-run delivery (pty+hooks): {:?}", delivery::classify_hooks(&events));
+    match events.iter().rev().find_map(|e| e.event.transcript_path.clone()) {
+        Some(path) => {
+            let lines = util::read_jsonl(Path::new(&path))?;
+            println!("transcript: {path}");
+            println!("mid-run delivery (transcript): {:?}", delivery::classify_transcript(&lines));
+        }
+        None => println!("mid-run delivery (transcript): no transcript_path in hook payloads"),
+    }
     Ok(())
 }
 

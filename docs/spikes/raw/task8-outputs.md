@@ -328,3 +328,71 @@ Resume this session with:
 claude --resume d5337bcd-f634-4f77-98bb-d637c1115225
 ```
 
+
+## Task 8b: transcript-based steer classification
+
+Rule (see `delivery::classify_transcript` doc comment): first `queue-operation` `enqueue` inside a running
+turn; first `remove`/`dequeue` after it; Steered if that comes before the running turn's end (assistant
+`stop_reason: end_turn`, or `system` `stop_hook_summary`/`turn_duration`, or a new `origin.kind: human`
+prompt), in FILE order (timestamps are not monotonic).
+
+### Re-run steer (delay 6)
+
+```
+task: steer-1794069531846  screen: ~/.mirante-spike/hooks.steer-1794069531846.screen.txt
+ 1794069532475  SessionStart       -> Idle
+ 1794069538334  UserPromptSubmit   -> Working
+ 1794069545872  Stop               -> Idle
+mid-run delivery (pty+hooks): Steered
+transcript: ~/.claude/projects/-Users-pedrohenriquecandidoferreira--mirante-spike-sandbox/5155665d-3d44-454b-9b27-dcada1e7ca88.jsonl
+mid-run delivery (transcript): Steered
+```
+
+Transcript key lines (file index, type, operation/reason, subtype, timestamp, stop_reason, origin, attachment):
+```
+ 7 user            -                          16:38:58.326Z  origin=human (typed prompt)
+25 assistant       -                          16:39:01.110Z  stop=tool_use
+26 queue-operation enqueue                    16:39:04.691Z
+27 queue-operation remove absorbed_mid_turn   16:39:04.955Z
+28 user            -                          16:39:04.936Z  (tool_result)
+30 attachment      queued_command             16:39:04.690Z
+37 assistant       -                          16:39:05.837Z  stop=end_turn
+38 system          stop_hook_summary          16:39:05.873Z
+39 system          turn_duration              16:39:05.877Z
+```
+
+### Probe: message typed during a tool-less turn (one-off PTY script, task `queued-probe`)
+
+1st prompt: list 60 fruits without tools; 2nd ("Agora responda apenas a palavra BANANA.") typed 3s later.
+The hook classifier gets it WRONG (UserPromptSubmit fires at enqueue, before the 1st Stop); the
+transcript classifier is right:
+
+```
+$ spike timeline ~/.mirante-spike/hooks.jsonl queued-probe
+ 1794069409116  SessionStart       -> Idle
+ 1794069415033  UserPromptSubmit   -> Working
+ 1794069420733  Stop               -> Idle
+ 1794069479544  SessionEnd         -> Ended
+mid-run delivery (hooks): Steered
+events: SessionStart 409116, UserPromptSubmit 415033, UserPromptSubmit 418456, Stop 420733, Stop 422222, SubagentStop 423597, SessionEnd 479544
+$ spike classify-transcript .../56681b9f-c21f-4a27-ac52-dc55b34af67e.jsonl
+Queued
+```
+
+Transcript key lines: note `dequeue` (no content/reason) written BEFORE the system turn-end lines but
+after the `end_turn` assistant line, and with a LATER timestamp than those system lines:
+```
+ 7 user            origin=human promptSource=typed   16:36:55.024Z
+25 queue-operation enqueue                           16:36:58.433Z
+26 assistant       stop=end_turn (thinking block)     16:36:56.129Z
+27 assistant       stop=end_turn (the list)           16:37:00.694Z
+29 queue-operation dequeue                           16:37:00.744Z
+30 system          stop_hook_summary                 16:37:00.734Z
+31 system          turn_duration                     16:37:00.736Z
+33 user            origin=human promptSource=queued  16:37:00.751Z
+40 assistant       stop=end_turn  "BANANA"           16:37:02.186Z
+```
+
+All sandbox transcripts reclassified: Task 8 steer runs (1e4ea089, 8f316db0) Steered; queued probe
+(56681b9f) Queued; resume sessions (574f5d47, d5337bcd) Inconclusive (no queueing); headless
+`claude -p` step 3 (f81ee767) Inconclusive (its enqueue/dequeue happen while idle, not mid-turn).
