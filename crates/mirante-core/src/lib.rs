@@ -4,6 +4,7 @@
 pub mod agent_bin;
 pub mod claude_launch;
 pub mod delivery;
+pub mod dna;
 pub mod error;
 pub mod git;
 pub mod hook;
