@@ -97,6 +97,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // request a dialog is, so by default Claude cards are answered in the terminal.
     hub.set_claude_inline_answers(inline_answers(std::env::var("MIRANTE_CLAUDE_INLINE_ANSWERS").ok().as_deref()));
     eprintln!("mirante-daemon: claude inline answers {}", if hub.claude_inline_answers() { "on" } else { "off" });
+    // Auto-resume: the person's setting, unless `MIRANTE_AUTO_RESUME=off` says no for this
+    // daemon (tests that restart a daemon and check what stays ended).
+    hub.load_settings();
+    if mirante_daemon::hub::resume::env_says_off(std::env::var("MIRANTE_AUTO_RESUME").ok().as_deref()) {
+        hub.set_auto_resume(false);
+    }
+    eprintln!("mirante-daemon: auto-resume {}", if hub.auto_resume_enabled() { "on" } else { "off" });
     let hub = Arc::new(hub);
     let report = hub.recover()?;
     eprintln!("mirante-daemon: recovered {report:?}");
@@ -104,7 +111,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     hub.spawn_miner();
     // The memory guard: measure and act (nothing is limited up front; see hub::memory).
     // `MIRANTE_MEMGUARD=off` disables it (tests that must not depend on this machine's memory).
-    if std::env::var("MIRANTE_MEMGUARD").as_deref() != Ok("off") {
+    let memguard = std::env::var("MIRANTE_MEMGUARD").as_deref() != Ok("off");
+    if memguard {
         let sampler = mirante_daemon::memguard::os_sampler();
         let budget = std::env::var("MIRANTE_MEM_BUDGET_MB").ok();
         let idle = std::env::var("MIRANTE_IDLE_HIBERNATE_MIN").ok();
@@ -114,6 +122,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     watch_pump(pump, paths.socket());
     let listener = server::bind(&paths.socket())?;
+    // Sessions the daemon ended come back, one at a time, while memory allows: after the
+    // socket is bound, so their hooks reach this daemon instead of the spool.
+    hub.spawn_auto_resume(report.resume.clone(), memguard);
     eprintln!("mirante-daemon: pid {} listening on {}", std::process::id(), paths.socket().display());
     let socket = paths.socket();
     let on_shutdown: server::OnShutdown = Arc::new(move || {

@@ -28,6 +28,7 @@ pub(crate) mod evidence;
 pub mod memory;
 pub mod messages;
 pub mod queue;
+pub mod resume;
 pub mod session;
 pub mod skills;
 
@@ -320,6 +321,8 @@ pub struct Hub {
     /// Mirante types Claude permission answers (off by default; see
     /// [`Hub::set_claude_inline_answers`]).
     pub(crate) claude_inline: AtomicBool,
+    /// Resume the sessions the daemon itself ended when it starts again (see [`resume`]).
+    pub(crate) auto_resume: AtomicBool,
     /// DNA: one refresh at a time per repo (taken before, never while holding, the hub lock).
     pub(crate) dna_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Skills: where `ssh-keygen` and the ssh host aliases are.
@@ -496,6 +499,7 @@ impl Hub {
             events: tx,
             boot_timeout: Duration::from_secs(45),
             claude_inline: AtomicBool::new(false),
+            auto_resume: AtomicBool::new(true),
             dna_gates: Mutex::default(),
             skill_conf: Mutex::default(),
             skill_sigs: Mutex::default(),
@@ -749,6 +753,7 @@ impl Hub {
             live_sessions: st.live.len(),
             memory: st.mem.system.clone(),
             claude_inline_answers: self.claude_inline_answers(),
+            auto_resume: Some(self.auto_resume_enabled()),
         }
     }
 }

@@ -52,6 +52,11 @@ impl Paths {
         self.home.join("hook-spool.jsonl")
     }
 
+    /// The person's settings (auto-resume), written by `daemon.settings`.
+    pub fn settings(&self) -> PathBuf {
+        self.home.join("settings.json")
+    }
+
     pub fn worktrees(&self) -> PathBuf {
         self.home.join("worktrees")
     }

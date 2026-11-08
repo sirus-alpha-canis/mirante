@@ -749,6 +749,17 @@ skills for their own task (skill_propose)."
     }
 }
 
+/// What `daemon stop` says about the sessions it ends: auto-resume brings them back when the
+/// daemon starts again (the running daemon's setting), else `mirante resume`.
+fn stop_note(c: &mut Client) -> &'static str {
+    let auto = c.call::<DaemonStatus>(method::DAEMON_STATUS, json!({})).ok().and_then(|s| s.auto_resume);
+    if auto == Some(true) {
+        "sessions ended; they resume when the daemon starts again (auto-resume)"
+    } else {
+        "sessions ended; mirante resume <task> restores them"
+    }
+}
+
 fn run(cmd: Cmd) -> Res {
     let paths = Paths::from_env()?;
     let color = term::is_tty(1);
@@ -778,17 +789,19 @@ fn run(cmd: Cmd) -> Res {
         Cmd::Daemon(DaemonCmd::Stop) => match Client::connect(&paths.socket()) {
             Ok(mut c) => {
                 c.set_timeout(Some(Duration::from_secs(60)))?;
+                let back = stop_note(&mut c);
                 let _: Value = c.call(method::DAEMON_SHUTDOWN, json!({}))?;
-                println!("stopped (sessions ended; mirante resume <task> restores them)");
+                println!("stopped ({back})");
             }
             Err(_) => println!("not running"),
         },
         Cmd::Daemon(DaemonCmd::Restart) => {
             if let Ok(mut c) = Client::connect(&paths.socket()) {
                 c.set_timeout(Some(Duration::from_secs(60)))?;
+                let back = stop_note(&mut c);
                 let _: Value = c.call(method::DAEMON_SHUTDOWN, json!({}))?;
                 daemon_ctl::wait_stopped(&paths, Duration::from_secs(10))?;
-                println!("stopped (sessions ended; mirante resume <task> restores them)");
+                println!("stopped ({back})");
             }
             let mut c = daemon_ctl::start_daemon(&paths)?;
             c.set_timeout(Some(Duration::from_secs(10)))?;

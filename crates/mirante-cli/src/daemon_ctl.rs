@@ -141,7 +141,8 @@ pub fn version_warning(daemon: &DaemonStatus, mine: &str) -> Option<String> {
         0 => format!("{head}; no sessions are live: run `mirante daemon restart`"),
         n => format!(
             "{head}; {n} live session(s): run `mirante daemon restart` when they are done \
-             (it ends them; `mirante resume <task>` brings them back)"
+             (it ends them; the new daemon resumes them on their conversations when auto-resume \
+             is on, else `mirante resume <task>` brings them back)"
         ),
     })
 }
@@ -239,12 +240,14 @@ mod tests {
             live_sessions: live,
             memory: None,
             claude_inline_answers: false,
+            auto_resume: None,
         };
         assert_eq!(version_warning(&st("0.1.0", 0), "0.1.0"), None);
         let idle = version_warning(&st("0.0.9", 0), "0.1.0").unwrap();
         assert!(idle.contains("v0.0.9") && idle.contains("v0.1.0") && idle.contains("mirante daemon restart"));
         let busy = version_warning(&st("0.0.9", 2), "0.1.0").unwrap();
         assert!(busy.contains("2 live session(s)") && busy.contains("when they are done"));
+        assert!(busy.contains("resumes them on their conversations when auto-resume is on"), "{busy}");
     }
 
     #[test]

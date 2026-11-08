@@ -44,6 +44,9 @@ pub mod method {
     pub const DAEMON_DOCTOR: &str = "daemon.doctor";
     /// Kills one orphan the user picked from `daemon.doctor` ([`super::KillOrphan`]).
     pub const DAEMON_KILL_ORPHAN: &str = "daemon.kill_orphan";
+    /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
+    /// [`super::DaemonSettings`]). A person only.
+    pub const DAEMON_SETTINGS: &str = "daemon.settings";
     /// Tenants (normalized origin owners) with learning state and counts (`{}` →
     /// `Vec<`[`super::TenantView`]`>`).
     pub const SKILL_TENANTS: &str = "skill.tenants";
@@ -529,6 +532,24 @@ pub struct DaemonStatus {
     /// Off (the default): Claude cards are answered in the terminal (`mirante attach`).
     #[serde(default)]
     pub claude_inline_answers: bool,
+    /// Sessions the daemon ended (restart, crash) are resumed when it starts again
+    /// (`daemon.settings`). Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<bool>,
+}
+
+/// `daemon.settings` parameters: each one given is changed (and persisted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<bool>,
+}
+
+/// The daemon's settings (`<home>/settings.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSettings {
+    /// Resume the sessions the daemon itself ended (shutdown, crash) when it starts again.
+    pub auto_resume: bool,
 }
 #[cfg(test)]
 mod tests {

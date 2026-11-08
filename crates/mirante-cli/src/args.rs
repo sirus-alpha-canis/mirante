@@ -73,7 +73,9 @@ usage: mirante <command>
                          propose a skill folder (SKILL.md + text files) for review
   skills lint <SKILL.md> offline lint; exits 1 on an error finding, 3 when it could not run
   daemon start|stop|restart|status
-                         restart: stop (ends live sessions) then start, e.g. after an upgrade
+                         restart: stop (ends live sessions) then start, e.g. after an upgrade;
+                         the new daemon resumes them unless auto-resume is off
+                         (MIRANTE_AUTO_RESUME=off, or the cockpit's setting)
 
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
 <repo> defaults to the git checkout of the current directory.

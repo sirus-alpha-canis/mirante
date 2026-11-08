@@ -25,6 +25,9 @@ struct Env {
     log: PathBuf,
     /// The daemon types Claude answers (`MIRANTE_CLAUDE_INLINE_ANSWERS=1`).
     inline: bool,
+    /// Sessions the daemon ended come back when it starts again (off unless a test asks:
+    /// most restart tests check what stays ended).
+    auto_resume: bool,
 }
 
 impl Env {
@@ -42,7 +45,7 @@ impl Env {
             assert!(Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
         }
         let log = dir.path().join("fake-claude.log");
-        Env { dir, home, repo, log, inline: false }
+        Env { dir, home, repo, log, inline: false, auto_resume: false }
     }
 
     /// A daemon with Claude inline answers on.
@@ -62,6 +65,11 @@ impl Env {
             .env("FAKE_CLAUDE_LOG", &self.log)
             // Results must not depend on this machine's memory pressure.
             .env("MIRANTE_MEMGUARD", "off");
+        if !self.auto_resume {
+            c.env("MIRANTE_AUTO_RESUME", "off");
+        } else {
+            c.env_remove("MIRANTE_AUTO_RESUME");
+        }
         if self.inline {
             c.env("MIRANTE_CLAUDE_INLINE_ANSWERS", "1");
         } else {
@@ -281,6 +289,36 @@ fn a_daemon_killed_mid_turn_ends_the_session_on_restart_and_resume_works() {
     assert!(out.contains("ready (resumed)"), "{out}");
     let sid = pinned_id(&env.log);
     assert!(std::fs::read_to_string(&env.log).unwrap().lines().last().unwrap().contains(&format!("--resume {sid}")));
+}
+
+#[test]
+fn a_daemon_restart_resumes_live_sessions_but_not_stopped_ones() {
+    let mut env = Env::new();
+    env.auto_resume = true;
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "keep", "say", "hi"]);
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "halt", "say", "hi"]);
+    wait_until("both ready", || env.task("keep").live && env.task("halt").live);
+    wait_until("native ids", || std::fs::read_to_string(&env.log).unwrap_or_default().lines().count() >= 2);
+    env.ok(&["stop", "halt"]);
+    let launches = std::fs::read_to_string(&env.log).unwrap().lines().count();
+    let out = env.ok(&["daemon", "restart"]);
+    assert!(out.contains("they resume when the daemon starts again") && out.contains("started"), "{out}");
+    wait_until("keep resumed", || env.task("keep").live);
+    let log = std::fs::read_to_string(&env.log).unwrap();
+    let after: Vec<&str> = log.lines().skip(launches).collect();
+    assert_eq!(after.len(), 1, "one launch after the restart: {after:?}");
+    assert!(after[0].contains("--resume"), "{}", after[0]);
+    assert!(!env.task("halt").live, "a session the person stopped stays stopped");
+    wait_until("session.auto_resumed", || env.events().iter().any(|e| e["kind"] == "session.auto_resumed"));
+    // The setting turns it off, and says so in daemon.status.
+    let s: Value = env.client().call(method::DAEMON_SETTINGS, json!({ "auto_resume": false })).unwrap();
+    assert_eq!(s["auto_resume"], false);
+    let st: DaemonStatus = env.client().call(method::DAEMON_STATUS, json!({})).unwrap();
+    assert_eq!(st.auto_resume, Some(false));
+    assert!(env.ok(&["daemon", "restart"]).contains("mirante resume <task> restores them"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!env.task("keep").live, "auto-resume off: nothing comes back");
 }
 
 #[test]

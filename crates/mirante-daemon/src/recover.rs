@@ -50,6 +50,9 @@ pub struct Recovery {
     pub archives_abandoned: usize,
     /// Checkouts under the worktree root that no task owns (reported, never deleted).
     pub orphan_worktrees: Vec<String>,
+    /// Tasks whose last session the daemon itself ended (shutdown, or found live after a
+    /// crash): what auto-resume brings back (see `hub::resume`).
+    pub resume: Vec<String>,
 }
 
 /// What one spool line did.
@@ -74,6 +77,14 @@ impl Hub {
                 }
                 Ok(false) => {}
                 Err(e) => st.log_error(Some(&task.id), "recovery: hibernation mark", &e),
+            }
+            let active = matches!(task.lifecycle, Lifecycle::Active | Lifecycle::Created);
+            match st.store.task_events(&task.id) {
+                Ok(events) if active && crate::hub::resume::ended_by_daemon(&events) => {
+                    report.resume.push(task.id.clone())
+                }
+                Ok(_) => {}
+                Err(e) => st.log_error(Some(&task.id), "recovery: auto-resume", &e),
             }
             if task.lifecycle == Lifecycle::Archiving {
                 if let Err(e) = self.finish_archive(&mut st, &task, &mut report) {
