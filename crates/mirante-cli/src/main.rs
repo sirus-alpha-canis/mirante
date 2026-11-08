@@ -11,16 +11,16 @@ use std::time::Duration;
 use mirante_core::model::{PermissionRequest, Status};
 use mirante_ipc::rpc::code;
 use mirante_ipc::types::{
-    method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, DoctorReport,
-    EditQueued, KillOrphan, ListParams, OrphanView, PermissionView, QueueRef, QueuedMessage, QueuedRef, ReorderQueue,
-    ResizeParams, SendMessage, SendMode, SendResult, Snapshot, StartResult, StartSession, SubscribeParams, SystemView,
-    TaskRef, TaskView, TrustAnswer,
+    method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, DnaProposals, DnaReview,
+    DoctorReport, EditQueued, KillOrphan, ListParams, OrphanView, PermissionView, ProposalView, QueueRef,
+    QueuedMessage, QueuedRef, ReorderQueue, ResizeParams, SendMessage, SendMode, SendResult, Snapshot, StartResult,
+    StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
-use mirante_cli::args::{self, Cmd, DaemonCmd, QueueCmd, USAGE};
-use mirante_cli::{daemon_ctl, render, term};
+use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, USAGE};
+use mirante_cli::{confirm, daemon_ctl, render, term};
 
 type Res = Result<(), Box<dyn Error>>;
 
@@ -289,6 +289,27 @@ fn watch(paths: &Paths) -> Res {
     }
 }
 
+/// `mirante memory accept|reject`: the typed confirmation happens on the controlling
+/// terminal, which is checked before the daemon is contacted; the daemon refuses
+/// Mirante-launched agents on its side.
+fn memory(paths: &Paths, m: MemoryCmd) -> Res {
+    let MemoryCmd::Review { id, accept, title, note } = m;
+    let mut tty = confirm::DevTty::open()?;
+    let mut c = client(paths)?;
+    let query = DnaProposals { id: Some(id.clone()), status: Some("all".into()), ..Default::default() };
+    let found: Vec<ProposalView> = c.call(method::DNA_PROPOSALS, query)?;
+    let p = found.into_iter().next().ok_or_else(|| format!("no proposal {id}"))?;
+    let word = if accept { "accept" } else { "reject" };
+    confirm::typed(&mut tty, &render::proposal(&p, title.as_deref()), word)?;
+    let review = DnaReview { id, accept, title, body: None, note };
+    let d: ProposalView = c.call(method::DNA_REVIEW, review)?;
+    match d.slug {
+        Some(slug) => println!("accepted: .mirante/memory/{slug}.md written in {} (not committed)", d.repo),
+        None => println!("rejected {}", render::short(&d.id)),
+    }
+    Ok(())
+}
+
 fn run(cmd: Cmd) -> Res {
     let paths = Paths::from_env()?;
     let color = term::is_tty(1);
@@ -439,6 +460,7 @@ fn run(cmd: Cmd) -> Res {
             let k: OrphanView = c.call(method::DAEMON_KILL_ORPHAN, KillOrphan { pid: o.pid, start: o.start })?;
             println!("killed pid {}", k.pid);
         }
+        Cmd::Memory(m) => memory(&paths, m)?,
         Cmd::Archive { task } => {
             let v: TaskView = client(&paths)?.call(method::TASK_ARCHIVE, TaskRef { task })?;
             println!("{} archived (branch {} kept)", render::short(&v.task.id), v.task.branch);

@@ -365,3 +365,27 @@ fn hibernate_wake_and_doctor_from_the_cli() {
     let doctor = env.ok(&["doctor"]);
     assert!(doctor.contains("orphan processes: none") && doctor.contains("orphan checkouts: none"), "{doctor}");
 }
+
+/// `mirante memory accept|reject` asks on the controlling terminal: without one (here:
+/// `setsid`, like an agent's tool call or a pipe) it refuses before contacting the daemon.
+#[test]
+fn memory_review_without_a_terminal_is_refused_before_the_daemon() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    for verb in ["accept", "reject"] {
+        let mut cmd = env.cmd(&bin("mirante"));
+        cmd.args(["memory", verb, "0193b7c2-0000-7000-8000-000000000000"]).stdin(Stdio::null());
+        // SAFETY: setsid is async-signal-safe; it detaches the child from any terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(err.contains("/dev/tty") && err.contains("cockpit"), "{err}");
+    }
+    assert!(!env.home.join("daemon.sock").exists(), "the daemon was never started");
+}

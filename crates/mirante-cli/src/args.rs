@@ -32,6 +32,9 @@ usage: mirante <command>
   wake <task> [--trust]  resume a hibernated task on its native conversation
   doctor [--kill <pid>]  orphan processes / checkouts and memory; --kill asks, then kills one orphan
   archive <task>         remove the worktree (branch kept) and hide the task
+  memory accept <proposal> [--title <t>] [--note <why>] | memory reject <proposal> [--note <why>]
+                         decide a memory proposal; you type the verb on this terminal to
+                         confirm (Mirante-launched agents are refused)
   daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade
 
@@ -44,6 +47,12 @@ pub enum QueueCmd {
     Edit { task: String, n: usize, text: String },
     Rm { task: String, n: usize },
     Mv { task: String, n: usize, to: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryCmd {
+    /// Accept (writes the note, optionally retitled) or reject a proposal.
+    Review { id: String, accept: bool, title: Option<String>, note: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +120,7 @@ pub enum Cmd {
         kill: Option<i32>,
     },
     Daemon(DaemonCmd),
+    Memory(MemoryCmd),
     Help,
 }
 
@@ -172,6 +182,19 @@ fn task_and_text(p: &Parsed, what: &str) -> Result<(String, String), String> {
 /// A 1-based queue position.
 fn position(v: &str) -> Result<usize, String> {
     v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{v} is not a queue position (1 = next)"))
+}
+
+fn memory(args: &[String]) -> Result<MemoryCmd, String> {
+    let (op, rest) = args.split_first().ok_or("memory accept|reject <proposal>")?;
+    let accept = match op.as_str() {
+        "accept" => true,
+        "reject" => false,
+        other => return Err(format!("unknown memory command {other} (accept, reject)")),
+    };
+    let flags: &[&str] = if accept { &["--title", "--note"] } else { &["--note"] };
+    let p = split(rest, flags, &[])?;
+    let id = one(&p, "proposal")?;
+    Ok(MemoryCmd::Review { id, accept, title: p.values.get("--title").cloned(), note: p.values.get("--note").cloned() })
 }
 
 fn queue(args: &[String]) -> Result<QueueCmd, String> {
@@ -257,6 +280,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             Ok(Cmd::Say { task, text, queue: !p.bools.is_empty() })
         }
         "queue" => queue(rest).map(Cmd::Queue),
+        "memory" => memory(rest).map(Cmd::Memory),
         "perms" => Ok(Cmd::Perms),
         "allow" | "deny" => Ok(Cmd::Answer { id: one(&split(rest, none, none)?, "perm")?, allow: sub == "allow" }),
         "interrupt" => Ok(Cmd::Interrupt { task: one(&split(rest, none, none)?, "task")? }),
@@ -356,6 +380,26 @@ mod tests {
         assert_eq!(p("queue mv feat 1").unwrap_err(), "missing <to>");
         assert_eq!(p("queue rm feat 1 2").unwrap_err(), "queue rm takes 2 arguments");
         assert_eq!(p("queue pop feat").unwrap_err(), "unknown queue command pop (ls, edit, rm, mv)");
+    }
+
+    #[test]
+    fn memory_review_commands() {
+        assert_eq!(
+            p("memory accept p1 --title Better --note ok").unwrap(),
+            Cmd::Memory(MemoryCmd::Review {
+                id: "p1".into(),
+                accept: true,
+                title: Some("Better".into()),
+                note: Some("ok".into())
+            })
+        );
+        assert_eq!(
+            p("memory reject p1").unwrap(),
+            Cmd::Memory(MemoryCmd::Review { id: "p1".into(), accept: false, title: None, note: None })
+        );
+        assert_eq!(p("memory reject p1 --title x").unwrap_err(), "unknown option --title");
+        assert_eq!(p("memory accept").unwrap_err(), "missing <proposal>");
+        assert_eq!(p("memory forget p1").unwrap_err(), "unknown memory command forget (accept, reject)");
     }
 
     #[test]

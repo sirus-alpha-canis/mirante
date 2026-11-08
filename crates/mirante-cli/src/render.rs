@@ -1,6 +1,39 @@
 //! Plain-text tables. Colors only on a terminal (`color` = stdout is a tty).
 use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
-use mirante_ipc::types::{BootState, DoctorReport, MemView, PermissionView, SystemView, TaskView};
+use mirante_ipc::types::{BootState, DoctorReport, MemView, PermissionView, ProposalView, SystemView, TaskView};
+
+/// A proposal as the review prompt shows it: status, title (or the person's new title),
+/// kind, origin, redactions, cited code and body. Control characters are stripped (the text
+/// came from an agent and goes to a terminal).
+pub fn proposal(p: &ProposalView, new_title: Option<&str>) -> String {
+    use mirante_core::dna::untrusted::line;
+    let mut out = format!("Proposal {} ({}, {} from {})\n", p.id, p.status, p.kind, p.origin);
+    out.push_str(&format!("  title: {}\n", line(&p.title, 200)));
+    if let Some(t) = new_title {
+        out.push_str(&format!("  new title: {}\n", line(t, 200)));
+    }
+    if p.redactions > 0 {
+        out.push_str(&format!("  redactions: {} secret(s) masked\n", p.redactions));
+    }
+    for a in &p.anchors {
+        let symbol = a.symbol.as_deref().map(|s| format!(" ({})", line(s, 100))).unwrap_or_default();
+        out.push_str(&format!(
+            "  cites: {}:{}-{}{symbol} @ {}\n",
+            line(&a.path, 300),
+            a.start,
+            a.end,
+            &a.commit[..a.commit.len().min(7)]
+        ));
+    }
+    out.push('\n');
+    for l in p.body.lines().take(40) {
+        out.push_str(&format!("  | {}\n", line(l, 300)));
+    }
+    if p.body.lines().count() > 40 {
+        out.push_str("  | …\n");
+    }
+    out
+}
 
 /// Last 8 characters of an id (UUID v7 prefixes are time-based and collide; suffixes do not).
 pub fn short(id: &str) -> &str {
@@ -240,6 +273,24 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
 mod tests {
     use super::*;
     use mirante_core::model::{PermissionStatus, Task};
+
+    #[test]
+    fn a_proposal_prompt_shows_what_is_decided_without_terminal_controls() {
+        let p: ProposalView = serde_json::from_value(serde_json::json!({
+            "id": "0193b7c2-5f1e-7c3a-9a10-3f2b8d1e4c55", "repo": "/r", "task_id": null, "origin": "agent",
+            "title": "Use <b>\u{1b}[2J", "kind": "gotcha", "body": "line one\n\u{1b}]0;pwned\u{7}two\n",
+            "anchors": [{"path": "src/a.rs", "start": 1, "end": 3,
+                "commit": "50ea8cc255941e739b13cdbe2c937abca0319834", "fingerprint": "0123456789abcdef"}],
+            "redactions": 2, "status": "pending", "slug": null, "decision_note": "",
+            "created_at": 1, "decided_at": null
+        }))
+        .unwrap();
+        let s = proposal(&p, Some("Better"));
+        assert!(!s.contains('\u{1b}') && !s.contains('\u{7}'), "{s:?}");
+        assert!(s.contains("title: Use <b>[2J") && s.contains("new title: Better"), "{s}");
+        assert!(s.contains("redactions: 2") && s.contains("cites: src/a.rs:1-3 @ 50ea8cc"), "{s}");
+        assert!(s.contains("  | line one\n  | ]0;pwnedtwo\n"), "{s}");
+    }
 
     fn view(status: Status, needs: usize, detail: Option<&str>) -> TaskView {
         TaskView {
