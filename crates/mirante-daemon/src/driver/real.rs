@@ -183,6 +183,39 @@ pub fn prepare_append_log(path: &Path, cap: u64) -> std::io::Result<()> {
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
+/// How often a running Codex's stderr log is checked against [`STDERR_LOG_CAP`].
+const STDERR_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Cuts a log a running process appends to (it keeps its descriptor): past `cap` bytes
+/// the content is copied to `<path>.1` (0600, replacing the older one) and the file is
+/// emptied in place, so the process's next appends start it again. `true` when it was cut.
+pub fn trim_log_if_over(path: &Path, cap: u64) -> std::io::Result<bool> {
+    if !std::fs::metadata(path).is_ok_and(|m| m.len() > cap) {
+        return Ok(false);
+    }
+    let mut old = path.as_os_str().to_owned();
+    old.push(".1");
+    let old = std::path::PathBuf::from(old);
+    let _ = std::fs::remove_file(&old);
+    let mut to = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&old)?;
+    std::io::copy(&mut std::fs::File::open(path)?, &mut to)?;
+    std::fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
+    Ok(true)
+}
+
+/// Checks `log` every [`STDERR_LOG_EVERY`] while `driver` lives ([`trim_log_if_over`]).
+fn watch_stderr_log<T: ?Sized + Send + Sync + 'static>(log: std::path::PathBuf, driver: std::sync::Weak<T>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(STDERR_LOG_EVERY);
+        if driver.upgrade().is_none() {
+            return;
+        }
+        if let Err(e) = trim_log_if_over(&log, STDERR_LOG_CAP) {
+            eprintln!("mirante-daemon: cutting {}: {e}", log.display());
+        }
+    });
+}
+
 /// A random (version 4) UUID, lowercase `8-4-4-4-12`, from `/dev/urandom`.
 pub fn new_uuid_v4() -> std::io::Result<String> {
     let mut b = [0u8; 16];
@@ -393,6 +426,8 @@ impl RealFactory {
             sink,
             CodexTiming::default(),
         )?;
+        // Codex holds its stderr for the whole session: the log is cut while it runs too.
+        watch_stderr_log(log, Arc::downgrade(&d));
         Ok(d)
     }
 }
@@ -441,6 +476,26 @@ mod tests {
         let old = log.with_file_name("codex-stderr.log.1");
         assert_eq!(std::fs::read_to_string(&old).unwrap().len(), 150);
         assert_eq!(std::fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// Codex keeps its stderr open for the whole session: a growing log is cut while it
+    /// runs (copied to `.1`, then emptied in place; the agent's appends land at the start).
+    #[test]
+    fn a_running_agent_s_stderr_log_is_cut_in_place() {
+        let d = TestDir::new();
+        let log = d.path().join("sessions/t1/codex-stderr.log");
+        prepare_append_log(&log, 100).unwrap();
+        let mut agent = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        agent.write_all(&[b'x'; 150]).unwrap();
+        assert!(!trim_log_if_over(&log, 200).unwrap());
+        assert!(trim_log_if_over(&log, 100).unwrap());
+        assert_eq!(std::fs::read(log.with_file_name("codex-stderr.log.1")).unwrap().len(), 150);
+        agent.write_all(b"after\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "after\n");
+        assert_eq!(
+            std::fs::metadata(log.with_file_name("codex-stderr.log.1")).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
