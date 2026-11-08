@@ -6,7 +6,9 @@
 //! a key; [`SshKeygen`] is the one implementation. It runs `/usr/bin/ssh-keygen` (or
 //! `$MIRANTE_SSH_KEYGEN`; never looked up on `PATH`) with a cleared environment
 //! (`PATH=/usr/bin:/bin` only: no `SSH_AUTH_SOCK`, no agent), stdin piped (no tty, no
-//! prompt), and a 10 s timeout after which it is killed.
+//! prompt), in its own process group, and a 10 s timeout covering its exit and the end of
+//! its output, after which the group is killed (a process that left the group and still
+//! holds the pipes is no longer waited for).
 //!
 //! Layout under the Mirante home: `keys/` (0700) holds `skills_ed25519`, its `.pub` and
 //! `allowed_signers` (`mirante-local namespaces="mirante-skill" <public key>`), all 0600;
@@ -172,47 +174,62 @@ impl SshKeygen {
             cmd.current_dir(&self.tmp);
         }
         let mut child = cmd.spawn().map_err(|e| sign_err(format!("cannot run {}: {e}", self.bin.display())))?;
-        let mut stdin = child.stdin.take();
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        let input = input.to_vec();
-        let (status, out, err) = std::thread::scope(|s| {
-            s.spawn(move || {
-                if let Some(mut w) = stdin.take() {
-                    let _ = w.write_all(&input);
-                }
+        let pgid = child.id() as libc::pid_t;
+        // The writer and readers are detached: a process the binary started can hold the
+        // pipes open past its exit (even outside its process group, after a setsid), and
+        // joining a reader would then wait for it. They report on a channel instead, and
+        // whatever has not reported by the deadline is a timeout.
+        if let Some(mut w) = child.stdin.take() {
+            let input = input.to_vec();
+            std::thread::spawn(move || {
+                let _ = w.write_all(&input);
             });
-            let out = s.spawn(move || {
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+        let read = |r: Option<Box<dyn Read + Send>>, is_out: bool, max: u64| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
                 let mut b = Vec::new();
-                if let Some(r) = stdout.as_mut() {
-                    let _ = r.take(1 << 20).read_to_end(&mut b);
+                if let Some(r) = r {
+                    let _ = r.take(max).read_to_end(&mut b);
                 }
-                b
+                let _ = tx.send((is_out, b));
             });
-            let err = s.spawn(move || {
-                let mut b = Vec::new();
-                if let Some(r) = stderr.as_mut() {
-                    let _ = r.take(64 * 1024).read_to_end(&mut b);
+        };
+        read(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>), true, 1 << 20);
+        read(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>), false, 64 * 1024);
+        drop(tx);
+        let timed_out = || {
+            // SAFETY: plain syscall; the group is the child's own (process_group(0)).
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            sign_err(format!("{} timed out", self.bin.display()))
+        };
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Ok(st),
+                Ok(None) if Instant::now() >= deadline => {
+                    let e = timed_out();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(e);
                 }
-                b
-            });
-            let deadline = Instant::now() + self.timeout;
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(st)) => break Ok(st),
-                    Ok(None) if Instant::now() >= deadline => {
-                        // SAFETY: plain syscall; the group is the child's own (process_group(0)).
-                        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break Err(sign_err(format!("{} timed out", self.bin.display())));
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                    Err(e) => break Err(e.into()),
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => break Err(e.into()),
+            }
+        };
+        let (mut out, mut err) = (None, None);
+        if status.is_ok() {
+            while out.is_none() || err.is_none() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok((true, b)) => out = Some(b),
+                    Ok((false, b)) => err = Some(b),
+                    Err(_) => return Err(timed_out()),
                 }
-            };
-            (status, out.join().unwrap_or_default(), err.join().unwrap_or_default())
-        });
+            }
+        }
+        let (out, err) = (out.unwrap_or_default(), err.unwrap_or_default());
         let status = status?;
         if !status.success() {
             let why = String::from_utf8_lossy(&err);
@@ -432,5 +449,25 @@ mod tests {
         let missing = SshKeygen::at(d.path(), &d.path().join("nope"));
         assert!(matches!(missing.sign(b"m\n"), Err(SkillError::Sign(_))));
         assert!(SshKeygen::ensure_key_with(d.path(), &d.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn a_process_left_holding_the_pipes_does_not_hang_the_caller() {
+        let d = TempDir::new("sk-pipes");
+        let sig = "echo '-----BEGIN SSH SIGNATURE-----'\necho 'eA=='\necho '-----END SSH SIGNATURE-----'\n";
+        let mut scripts = vec![format!("{sig}sleep 30 &\nexit 0\n")];
+        // One that also leaves the process group (setsid), where a group kill cannot reach.
+        if Path::new("/usr/bin/perl").exists() {
+            scripts.push(format!("{sig}/usr/bin/perl -e 'use POSIX; POSIX::setsid(); sleep 30' &\nexit 0\n"));
+        }
+        for script in scripts {
+            let bin = fake(d.path(), &script);
+            let mut k = SshKeygen::at(d.path(), &bin);
+            k.timeout = Duration::from_millis(500);
+            let t = Instant::now();
+            let r = k.sign(b"m\n");
+            assert!(t.elapsed() < Duration::from_secs(5), "{script}: took {:?}", t.elapsed());
+            assert!(matches!(&r, Err(SkillError::Sign(e)) if e.contains("timed out")), "{script}: {r:?}");
+        }
     }
 }
