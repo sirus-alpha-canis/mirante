@@ -909,6 +909,9 @@ pub struct SkillView {
     pub versions: Vec<u32>,
     /// E.g. a personal skill learned in a client's tasks.
     pub warnings: Vec<String>,
+    /// The version folder on disk: a person re-adopts a changed one with `skill.add {dir}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1102,6 +1105,10 @@ pub struct TaskSkills {
     pub learning: bool,
     /// False while the task's origin waits for a person's confirmation (no skills).
     pub confirmed: bool,
+    /// While unconfirmed: the checkout's live origin as the task saw it (`origin` is the
+    /// pinned one). `skill.confirm_origin` takes either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<String>,
     pub active: Vec<TaskSkill>,
     pub refused: Vec<RefusedSkill>,
     /// Why no skill applies at all (no origin, unconfirmed origin, no ssh-keygen).

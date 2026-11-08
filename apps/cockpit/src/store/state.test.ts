@@ -304,3 +304,51 @@ describe("repo memory (dna.*) events", () => {
     expect(reduce(s, { type: "dnaKey", path: "/tmp/app", key: "/private/tmp/app" })).toBe(s);
   });
 });
+
+describe("skills (skill.*) events", () => {
+  it("proposed, decided, changed, mined, learning and origin events bump skillsVersion", () => {
+    let s = connected();
+    expect(s.skillsVersion).toBe(0);
+    const kinds = ["skill.proposed", "skill.decided", "skill.changed", "skill.mined", "skill.learning", "skill.origin_confirmed", "skill.origin_pinned"];
+    kinds.forEach((k, i) => {
+      s = reduce(s, { type: "event", event: ev(6 + i, null, k, {}) });
+    });
+    expect(s.skillsVersion).toBe(kinds.length);
+    s = reduce(s, { type: "event", event: ev(20, "t1", "status", { to: "working" }) });
+    expect(s.skillsVersion).toBe(kinds.length);
+  });
+
+  it("injected, refused, unavailable and used bump the task's skill version and record what its session got", () => {
+    let s = connected();
+    s = reduce(s, { type: "event", event: ev(6, "t1", "skill.injected", { session_id: "s1", names: ["a", "b"] }) });
+    s = reduce(s, { type: "event", event: ev(7, "t1", "skill.refused", { session_id: "s1", name: "c", reason: "modified on disk: SKILL.md" }) });
+    expect(s.skillTaskVersion.t1).toBe(2);
+    expect(s.sessionSkills.t1).toEqual({ session: "s1", names: ["a", "b"], refused: [{ name: "c", reason: "modified on disk: SKILL.md" }] });
+    // A new session starts over.
+    s = reduce(s, { type: "event", event: ev(8, "t1", "skill.injected", { session_id: "s2", names: ["a"] }) });
+    expect(s.sessionSkills.t1).toEqual({ session: "s2", names: ["a"], refused: [] });
+    s = reduce(s, { type: "event", event: ev(9, "t1", "skill.used", { session_id: "s2", name: "a", version: 1 }) });
+    expect(s.skillTaskVersion.t1).toBe(4);
+  });
+
+  it("history replays what the session got", () => {
+    const s = reduce(connected(), {
+      type: "history",
+      taskId: "t1",
+      events: [ev(2, "t1", "skill.refused", { session_id: "s1", name: "c", reason: "over budget" }), ev(1, "t1", "skill.injected", { session_id: "s1", names: ["a"] })],
+    });
+    expect(s.sessionSkills.t1).toEqual({ session: "s1", names: ["a"], refused: [{ name: "c", reason: "over budget" }] });
+  });
+
+  it("skill events have feed lines", () => {
+    const line = (kind: string, p: Record<string, unknown>) => feedItem(ev(1, "t1", kind, p))?.text;
+    expect(line("skill.injected", { session_id: "s", names: ["a", "b"] })).toBe("skills given to this session: a, b");
+    expect(line("skill.refused", { session_id: "s", name: "c", reason: "modified on disk: SKILL.md" })).toBe("skill c refused: modified on disk: SKILL.md");
+    expect(line("skill.unavailable", { reason: "no origin" })).toBe("no skills: no origin");
+    expect(line("skill.used", { session_id: "s", name: "a", version: 2 })).toBe("skill a used");
+    expect(line("skill.proposed", { id: "p", name: "x", origin: "agent" })).toBe("proposed skill: x (awaiting review)");
+    expect(line("skill.decided", { id: "p", accepted: true, name: "x", version: 2 })).toBe("skill proposal accepted as x v2");
+    expect(line("skill.decided", { id: "p", accepted: false, name: "x", version: null })).toBe("skill proposal rejected");
+    expect(line("step", { type: "skills_failed", error: "disk full" })).toBe("skills not given to this session: disk full");
+  });
+});

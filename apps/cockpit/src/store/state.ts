@@ -69,6 +69,20 @@ export interface State {
    * that repo's memory (`DnaStatus.repo`: git's top level, canonical), learned from
    * `dna.status` replies. `dna.*` events name the key. */
   dnaKeys: Record<string, string>;
+  /** Skills: bumped on library, proposal, learning and origin events, so skills views
+   * refetch (skills are global; their keys are tenants, not repos). */
+  skillsVersion: number;
+  /** Per task: bumped on its `skill.injected` / `refused` / `unavailable` / `used`. */
+  skillTaskVersion: Record<string, number>;
+  /** Per task: what its latest session was given (from its `skill.injected` and
+   * `skill.refused` events). */
+  sessionSkills: Record<string, SessionSkills>;
+}
+
+export interface SessionSkills {
+  session: string;
+  names: string[];
+  refused: { name: string; reason: string }[];
 }
 
 export const FEED_CAP = 300;
@@ -86,7 +100,48 @@ export const initialState: State = {
   historyErrors: {},
   dnaVersion: {},
   dnaKeys: {},
+  skillsVersion: 0,
+  skillTaskVersion: {},
+  sessionSkills: {},
 };
+
+/** Events after which skills views (library, proposals, tenants, a task's chip) refetch. */
+const SKILLS_REFETCH = new Set([
+  "skill.proposed",
+  "skill.decided",
+  "skill.changed",
+  "skill.mined",
+  "skill.learning",
+  "skill.origin_confirmed",
+  "skill.origin_pinned",
+]);
+/** Events about one task's session skills. */
+const SKILL_TASK = new Set(["skill.injected", "skill.refused", "skill.unavailable", "skill.used"]);
+
+type SkillSlice = Pick<State, "skillsVersion" | "skillTaskVersion" | "sessionSkills">;
+
+function skillEffect(state: SkillSlice, e: DaemonEvent): SkillSlice {
+  // Only the slice: callers spread it over the whole state.
+  const s: SkillSlice = { skillsVersion: state.skillsVersion, skillTaskVersion: state.skillTaskVersion, sessionSkills: state.sessionSkills };
+  if (SKILLS_REFETCH.has(e.kind)) return { ...s, skillsVersion: s.skillsVersion + 1 };
+  const id = e.task_id;
+  if (!id || !SKILL_TASK.has(e.kind)) return s;
+  const p = e.payload ?? {};
+  const skillTaskVersion = { ...s.skillTaskVersion, [id]: (s.skillTaskVersion[id] ?? 0) + 1 };
+  const session = str(p.session_id);
+  const cur = s.sessionSkills[id];
+  let sessionSkills = s.sessionSkills;
+  if (e.kind === "skill.injected") {
+    const names = Array.isArray(p.names) ? p.names.map(str) : [];
+    sessionSkills = { ...sessionSkills, [id]: { session, names, refused: [] } };
+  } else if (e.kind === "skill.refused") {
+    const base = cur && cur.session === session ? cur : { session, names: [], refused: [] };
+    const refused = [...base.refused.filter((r) => r.name !== str(p.name)), { name: str(p.name), reason: str(p.reason) }];
+    sessionSkills = { ...sessionSkills, [id]: { ...base, refused } };
+  }
+  return { ...s, skillTaskVersion, sessionSkills };
+}
+
 
 /** Events that change what memory views show. */
 const DNA_REFETCH = new Set(["dna.indexed", "dna.changed", "dna.proposed", "dna.decided"]);
@@ -154,6 +209,8 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
           return { ...base, kind: "command", text: `$ ${str(p.command)}`, ok: p.exit_code === 0 };
         case "agent_message":
           return { ...base, kind: "agent_message", text: str(p.text) };
+        case "skills_failed":
+          return { ...base, kind: "system", text: `skills not given to this session: ${str(p.error)}` };
         default:
           return { ...base, kind: "system", text: [str(p.type), str(p.error)].filter(Boolean).join(": ") };
       }
@@ -199,6 +256,24 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       return { ...base, kind: "system", text: p.accepted === true ? `memory proposal accepted as ${str(p.slug)}` : "memory proposal rejected" };
     case "dna.unavailable":
       return { ...base, kind: "system", text: str(p.reason) || "repo memory is off for this session" };
+    case "skill.injected": {
+      const names = Array.isArray(p.names) ? p.names.map(str) : [];
+      return { ...base, kind: "system", text: `skills given to this session: ${names.join(", ")}` };
+    }
+    case "skill.refused":
+      return { ...base, kind: "system", text: `skill ${str(p.name)} refused: ${str(p.reason)}` };
+    case "skill.unavailable":
+      return { ...base, kind: "system", text: `no skills: ${str(p.reason)}` };
+    case "skill.used":
+      return { ...base, kind: "system", text: `skill ${str(p.name)} used` };
+    case "skill.proposed":
+      return { ...base, kind: "system", text: `proposed skill: ${str(p.name)} (awaiting review)` };
+    case "skill.decided":
+      return {
+        ...base,
+        kind: "system",
+        text: p.accepted === true ? `skill proposal accepted as ${str(p.name)} v${str(p.version)}` : "skill proposal rejected",
+      };
     default:
       return isMemoryEvent(e.kind) ? { ...base, kind: "system", text: describeMemoryEvent(e.kind, p) } : null;
   }
@@ -364,6 +439,7 @@ export function reduce(s: State, a: Action): State {
         memory,
         queues: queueEffect(s.queues, e),
         dnaVersion: dnaEffect(s.dnaVersion, tasks, e),
+        ...skillEffect(s, e),
       };
     }
     case "task":
@@ -406,7 +482,12 @@ export function reduce(s: State, a: Action): State {
       let perms = s.perms;
       let permRev = s.permRev;
       const items: FeedItem[] = [];
+      let skills: Pick<SkillSlice, "sessionSkills"> = s;
       for (const e of [...a.events].sort((x, y) => x.seq - y.seq)) {
+        // Only what the task's session got (library events are not history to replay).
+        if (SKILL_TASK.has(e.kind) && e.task_id === a.taskId) {
+          skills = { sessionSkills: skillEffect({ ...s, ...skills }, e).sessionSkills };
+        }
         const next = permEffect(perms, e, permRev + 1);
         if (next !== perms) permRev++;
         perms = next;
@@ -414,7 +495,7 @@ export function reduce(s: State, a: Action): State {
         if (item) items.push(item);
       }
       const { [a.taskId]: _cleared, ...historyErrors } = s.historyErrors;
-      return { ...s, feed: addFeed(s.feed, a.taskId, items), perms, permRev, historyErrors };
+      return { ...s, feed: addFeed(s.feed, a.taskId, items), perms, permRev, historyErrors, sessionSkills: skills.sessionSkills };
     }
     case "queue":
       return { ...s, queues: { ...s.queues, [a.taskId]: a.list } };

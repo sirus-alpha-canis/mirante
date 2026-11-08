@@ -34,6 +34,19 @@ export interface TaskView {
   memory?: MemView | null;
   /** Hibernated to free memory; `session.wake` resumes it. */
   hibernated?: boolean;
+  /** `task.create`'s answer only: the origin fixed for the task's skills. */
+  origin?: CreatedOrigin | null;
+}
+
+/** `mirante_ipc::types::CreatedOrigin`. */
+export interface CreatedOrigin {
+  /** The normalized origin key (`host/path`, or `local/<hash>`). */
+  origin: string;
+  tenant: string;
+  /** The live origin when it is not confirmed: no skills until a person confirms it. */
+  observed?: string | null;
+  /** This task pinned the checkout's origin (its first, a person's). */
+  pinned?: boolean;
 }
 
 export interface MemView {
@@ -257,6 +270,171 @@ export interface TaskMemoryContext {
   proposals: ProposalView[];
 }
 
+// Skills, `mirante_ipc::types::Skill*` and `mirante_core::skills::*`. Skill and proposal
+// text (bodies, descriptions, evidence, bundled files) is data from agents or from disk:
+// render it as text nodes only, never as HTML or Markdown.
+
+/** `TenantView`. */
+export interface TenantView {
+  tenant: string;
+  learning: boolean;
+  tasks: number;
+  /** Skills scoped to this tenant (org or repo). */
+  skills: number;
+}
+
+/** `personal`, `org:<prefix>` or `repo:<key>`. */
+export type ScopeText = string;
+export type Activation = "always" | "on_demand";
+
+/** `SkillSummary`. `verified`: the current version on disk is the one a person accepted. */
+export interface SkillSummary {
+  name: string;
+  version: number;
+  scope: ScopeText;
+  activation: Activation | string;
+  /** "active" or "retired". */
+  status: string;
+  description: string;
+  /** Sent back as `expect_hash` by `skill.action`. */
+  manifest_hash: string;
+  verified: boolean;
+  reason?: string | null;
+  injected_30d: number;
+  used_30d: number;
+  updated_at: number;
+}
+
+/** `mirante_core::skills::format::Manifest`. */
+export interface SkillManifest {
+  format: string;
+  name: string;
+  version: number;
+  description: string;
+  activation: Activation | string;
+  agents: string[];
+  scope: { kind: string; value: string };
+  files: { path: string; sha256: string; bytes: number }[];
+  parent: string | null;
+  provenance: { source: string; task: string | null; proposal: string | null; learned_in?: string | null };
+  signer: { principal: string; key: string };
+  created: string;
+}
+
+export interface SkillFileView {
+  path: string;
+  text: string;
+}
+
+/** `SkillView`: one version; text only when that version verifies. */
+export interface SkillView extends SkillSummary {
+  shown_version: number;
+  manifest: SkillManifest | null;
+  skill_md: string;
+  files: SkillFileView[];
+  versions: number[];
+  warnings: string[];
+  /** The version folder on disk (a re-review imports it with `skill.add`). Absent from
+   * older daemons. */
+  dir?: string | null;
+}
+
+/** `mirante_core::skills::lint::Finding`. */
+export interface Finding {
+  rule: string;
+  severity: "error" | "warn";
+  file: string;
+  /** 1-based; 0 for the whole field. */
+  line: number;
+  message: string;
+}
+
+export interface EvidenceItem {
+  task: string;
+  text: string;
+}
+
+export interface ProposalFile {
+  path: string;
+  text: string;
+}
+
+/** `SkillProposalView` (`mirante_core::skills::index::SkillProposal` + warnings). */
+export interface SkillProposalView {
+  id: string;
+  /** "miner", "agent", "cli" or "import". */
+  origin: string;
+  task_id: string | null;
+  tenant: string;
+  /** "new" or "edit". */
+  kind: string;
+  name: string;
+  /** For an edit: the manifest hash of the version it edits. */
+  base_hash: string | null;
+  scope: ScopeText;
+  activation: Activation | string;
+  description: string;
+  body: string;
+  files: ProposalFile[];
+  evidence: EvidenceItem[];
+  fingerprint: string | null;
+  lint: Finding[];
+  redactions: number;
+  status: "pending" | "accepted" | "rejected" | string;
+  version: number | null;
+  decision_note: string;
+  created_at: number;
+  decided_at: number | null;
+  warnings: string[];
+}
+
+export interface SkillEdits {
+  name?: string;
+  description?: string;
+  body?: string;
+  scope?: ScopeText;
+  activation?: Activation;
+}
+
+export type SkillActionKind = "retire" | "restore" | "rescope" | "rollback";
+
+/** `SkillMined`. */
+export interface SkillMined {
+  tenant: string;
+  proposed: number;
+  updated: number;
+  skipped: number;
+}
+
+export interface TaskSkill {
+  name: string;
+  version: number;
+  activation: Activation | string;
+  scope: ScopeText;
+}
+
+/** `TaskSkills`: what the task's next session would get, resolved now. */
+export interface TaskSkills {
+  tenant: string;
+  origin: string;
+  learning: boolean;
+  /** False while the task's origin waits for a person's confirmation (no skills). */
+  confirmed: boolean;
+  /** The checkout's live origin while it differs from the pinned one (unconfirmed). */
+  observed?: string | null;
+  active: TaskSkill[];
+  refused: { name: string; reason: string }[];
+  unavailable?: string | null;
+}
+
+/** `OriginConfirmed`. */
+export interface OriginConfirmed {
+  origin: string;
+  tenant: string;
+  cleared: number;
+  warning?: string | null;
+}
+
 export type StreamMsg =
   | { type: "connected"; snapshot: Snapshot }
   | { type: "event"; event: DaemonEvent }
@@ -321,4 +499,16 @@ export const M = {
   dnaProposals: "dna.proposals",
   dnaReview: "dna.review",
   dnaNoteAction: "dna.note_action",
+  skillTenants: "skill.tenants",
+  skillLearn: "skill.learn",
+  skillList: "skill.list",
+  skillGet: "skill.get",
+  skillTaskSkills: "skill.task_skills",
+  skillConfirmOrigin: "skill.confirm_origin",
+  skillLint: "skill.lint",
+  skillMine: "skill.mine",
+  skillAdd: "skill.add",
+  skillProposals: "skill.proposals",
+  skillReview: "skill.review",
+  skillAction: "skill.action",
 } as const;
