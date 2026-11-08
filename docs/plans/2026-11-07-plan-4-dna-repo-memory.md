@@ -9,7 +9,7 @@
 - **Daemon index.** The daemon keeps a regenerable index in its existing SQLite: notes, anchors and their state, links, and an FTS5 table. It also keeps two tables that cannot be regenerated: the proposal queue and a trust ledger of content hashes that a person accepted.
 - **Pure core.** All format, anchor, staleness, safe-write and labeling logic is a pure library in `mirante-core::dna`. It is testable with a temp git repo and needs no daemon. That also lets `mirante memory check` run offline, which becomes the "Memory CI" wedge.
 - **Agent access.** Agents reach memory through a new stdio MCP binary, `mirante-mcp`. It talks to the daemon over the existing 0600 socket and offers three tools: `memory_search`, `memory_get`, `memory_propose`.
-- **Per-task injection.** The daemon injects the MCP server per task, scoped like the hooks: Claude gets `--mcp-config <session_dir>/mcp.json`, Codex gets `-c mcp_servers.mirante.*`. Injection happens only for repos where memory was explicitly enabled. Nothing is written to `~/.claude` or `~/.codex`.
+- **Per-task injection.** The daemon injects the MCP server per task, scoped like the hooks: Claude gets `--mcp-config <session_dir>/mcp.json`, Codex gets `-c mcp_servers.mirante-memory.*`. The server is named `mirante-memory`, not `mirante`, so a same-named server in the user's own Claude or Codex config is unlikely to collide (Batch C review). Injection happens only for repos where memory was explicitly enabled. Nothing is written to `~/.claude` or `~/.codex`.
 - **Review gate.** Proposals land in a review queue. Only a person, through the cockpit or the CLI, accepts them. Mirante-launched agents are refused: the daemon recognizes them by process tree, env marker and worktree cwd, and refuses a caller it cannot check (Decision 6).
 
 **Tech Stack:**
@@ -73,8 +73,9 @@ All frontend commands use `pnpm --dir apps/cockpit …`.
     - Title, body and symbol are redacted before storage, and the proposal records `redactions: n`. The review card shows that count.
     - Anchors into sensitive paths are refused, ignoring ASCII case: `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `*.kdbx`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `credentials`, `.npmrc`, `.netrc`, `.pypirc`, `.git-credentials`, and anything under `.git/`, `.mirante/`, `.aws/`, `.ssh/` or `.gnupg/`; so are paths with any control character.
 11. **Claude tool permissions.**
-    - `mcp__mirante__memory_search` and `mcp__mirante__memory_get` go in the per-task `--settings` `permissions.allow`. They are read-only over local data.
+    - `mcp__mirante-memory__memory_search` and `mcp__mirante-memory__memory_get` go in the per-task `--settings` `permissions.allow`. They are read-only over local data. Claude keeps a hyphen in a server name as is in tool ids (`mcp__<server>__<tool>`, e.g. `mcp__cmux-cua__click`), and rules split on `__` only.
     - `memory_propose` is not pre-allowed. Claude asks once per call, and the result still goes to review.
+    - Codex has no per-call approval for `memory_propose` in Mirante's setup (no per-tool approval setting is passed; checklist C records what Codex does in auto-edits mode). That is acceptable: a proposal is never memory until a person accepts it in the review queue.
     - This is open question 1 below.
 
 ### The note format
@@ -1129,13 +1130,14 @@ pub struct GraphLink { pub src: String, pub dst: String, pub dangling: bool }
 }
 #[test] fn memory_read_tools_are_pre_allowed_and_propose_is_not() {
     let s = settings_json("/h", &memory_allow());
-    assert_eq!(s["permissions"]["allow"], json!(["mcp__mirante__memory_search", "mcp__mirante__memory_get"]));
+    assert_eq!(s["permissions"]["allow"], json!(["mcp__mirante-memory__memory_search", "mcp__mirante-memory__memory_get"]));
 }
 // real.rs
 #[test] fn codex_mcp_args_are_toml_overrides() {
     let a = codex_mcp_args(Path::new("/opt/m/mirante-mcp"), "t1", Path::new("/h/.mirante"));
-    assert_eq!(a, ["-c", "mcp_servers.mirante.command=\"/opt/m/mirante-mcp\"",
-                   "-c", "mcp_servers.mirante.env={MIRANTE_TASK_ID=\"t1\",MIRANTE_HOME=\"/h/.mirante\"}"]);
+    assert_eq!(a, ["-c", "mcp_servers.mirante-memory.command=\"/opt/m/mirante-mcp\"",
+                   "-c", "mcp_servers.mirante-memory.args=[]",
+                   "-c", "mcp_servers.mirante-memory.env={MIRANTE_TASK_ID=\"t1\",MIRANTE_HOME=\"/h/.mirante\"}"]);
 }
 #[test] fn toml_strings_escape_quotes_and_backslashes() { /* path with " and \ */ }
 // hub/session.rs
@@ -1171,7 +1173,9 @@ cargo build -p mirante-mcp
 
 - [ ] **Step 6: Commit** `feat(daemon): per-task memory MCP for Claude (--mcp-config) and Codex (-c), only for enabled repos`.
 
-  > **As built (Batch C).** The MCP server's environment also carries the `MIRANTE_TASK` marker (in `mcp.json` and in Codex's `-c mcp_servers.mirante.env`), so the server process and anything it starts are recognized as a Mirante-launched agent (Decision 6) even though the agent's client launches it. `codex_mcp_args` returns `Result<Vec<String>, String>`: a path or value with a control character cannot be TOML-escaped safely and is refused rather than passed. The binary is resolved through `DriverFactory::memory_server()` (default `real::mcp_bin()`), so the fake factory can answer in tests without a real binary. The `-c` overrides reach `CodexDriver::spawn` through `ChildEnv.args` (next to `remove` and `set`), not a new positional parameter.
+  > **As built (Batch C).** The MCP server's environment also carries the `MIRANTE_TASK` marker (in `mcp.json` and in Codex's `-c mcp_servers.mirante-memory.env`), so the server process and anything it starts are recognized as a Mirante-launched agent (Decision 6) even though the agent's client launches it. `codex_mcp_args` returns `Result<Vec<String>, String>`: a path or value with a control character cannot be TOML-escaped safely and is refused rather than passed. The binary is resolved through `DriverFactory::memory_server()` (default `real::mcp_bin()`), so the fake factory can answer in tests without a real binary. The `-c` overrides reach `CodexDriver::spawn` through `ChildEnv.args` (next to `remove` and `set`), not a new positional parameter.
+
+  > **Batch C review.** The server is renamed `mirante-memory` (Claude tool ids `mcp__mirante-memory__memory_*`). `-c` overrides merge into the user's `config.toml`, so Codex also gets `-c mcp_servers.mirante-memory.args=[]` (verified on codex-cli 0.167.0 with `codex mcp get mirante-memory --json`); other keys of a same-named user entry (`url`, `cwd`, tool filters) cannot be removed with `-c`, and the distinct name makes that collision unlikely. When memory is off for a session, `write_claude_config` removes a previous session's `mcp.json` from the session dir.
 
 ### Task 14: CLI `mirante memory …` (with an offline `check` for CI)
 
@@ -1409,7 +1413,7 @@ it("nodes are keyboard reachable and have accessible names", async () => { /* ro
 
 - [ ] **Step 1: Write the checklist.** It covers:
   - **A. Enable.** `mirante memory enable` on a scratch repo; README created; `git status` shows only `.mirante/memory/README.md`; nothing changed in `~/.claude` or `~/.codex` (check `git -C ~/.claude status` / `ls -la ~/.codex/config.toml` mtime before and after).
-  - **B. Claude.** Dispatch a task. In the terminal, `/mcp` lists `mirante` connected with 3 tools. `memory_search` runs without a permission dialog. `memory_propose` raises one dialog, which you answer in the terminal. The proposal appears in the Review queue.
+  - **B. Claude.** Dispatch a task. In the terminal, `/mcp` lists `mirante-memory` connected with 3 tools. `memory_search` runs without a permission dialog. `memory_propose` raises one dialog, which you answer in the terminal. The proposal appears in the Review queue.
   - **C. Codex.** Dispatch a Codex task. The agent can call `memory_search`. Record whether Codex asks approval for MCP tools in auto-edits mode.
   - **D. Review.** Accept with an edited title, and the file appears in the checkout. Reject leaves no file. Try `dna.review` from inside an agent shell (`mirante memory accept <id>` typed by the agent through Bash): it is refused (no terminal, or FORBIDDEN: "Mirante-launched agents are refused"); so is `nc -U ~/.mirante/daemon.sock` from a detached `setsid` process the agent started. Accept from a signed cockpit build works (its environment is readable to the daemon).
   - **E. Staleness.** Change cited lines on the checkout and commit. Brain marks the note stale, and the file is unchanged. Confirm is refused while stale; Retire keeps the file. Move code: the note shows relocated, and Confirm re-anchors.
@@ -1451,7 +1455,7 @@ it("nodes are keyboard reachable and have accessible names", async () => { /* ro
 
 - **Same-uid socket.** An agent that runs arbitrary shell, which Claude only does after the user allows it, can connect to the daemon socket. The guard (Decision 6) refuses Mirante-launched agents: a process in a live session's tree, one carrying the `MIRANTE_TASK` env marker (which survives double forks, `setsid`, tmux and daemon restarts), one whose controlling terminal is a live agent PTY, one working in a worktree, and any peer it cannot check (gone, pid reused, environment or cwd unreadable, including Apple platform binaries such as `nc -U`). What still evades it: an agent that scrubs its environment (`env -i`), leaves the tree, the worktree and its terminal (`setsid`), and connects with a non-platform binary. The CLI's typed confirmation does not stop that either: it is an intent check, not a boundary. The trust ledger still shows anything that bypassed review as **unreviewed** only if its file content changed; an accepted proposal is by definition reviewed. Document this in the security notes. The real fix, a per-connection capability from the app, is out of P4 scope.
 - **Hidden environments.** macOS hides the environment of platform binaries; if a signed, hardened-runtime cockpit build also hid its environment from the daemon, the cockpit's own review calls would be refused as unverified. Checklist D must try Accept from a signed build.
-- **Codex MCP approvals in auto-edits mode** are unverified live. Codex may ask approval for each MCP call, which would arrive as cards; this is acceptable but noisy. Checklist C records the behavior. `enabled_tools` can restrict the tool set if needed.
+- **Codex MCP approvals in auto-edits mode** are unverified live. Codex may ask approval for each MCP call, which would arrive as cards; this is acceptable but noisy. Or it may ask for none: Mirante sets no per-tool approval, so `memory_propose` may run without a per-call prompt in Codex (unlike Claude). Proposals still go to the review queue, so nothing becomes memory without a person. Checklist C records the behavior. `enabled_tools` can restrict the tool set if needed.
 - **`--mcp-config` is variadic** in Claude's CLI. Task 13 pins that only `--flag value` pairs follow it.
 - **Squash merges** make task-branch commits unreachable after gc. Those anchors become `unverifiable` until confirmed. Confirm re-anchors to HEAD when the text is found, so this is a one-click fix.
 - **Lazy refresh** runs git on read calls. The worst case for a large memory is one `rev-parse` and one `git diff --name-only` per distinct cited commit, plus one `cat-file --batch-check` and one `cat-file --batch` for all blobs. Measure in checklist E. If it is slow, cache per (commit, HEAD).

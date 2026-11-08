@@ -146,8 +146,11 @@ pub fn settings_json(hook_cmd: &str, allow: &[String]) -> Value {
     json!({ "hooks": Value::Object(hooks), "permissions": { "allow": allow } })
 }
 
-/// Name of Mirante's MCP server in an agent's config (tool ids `mcp__mirante__<tool>`).
-pub const MCP_SERVER: &str = "mirante";
+/// Name of Mirante's MCP server in an agent's config. Claude's tool ids are
+/// `mcp__mirante-memory__<tool>` (a hyphen is kept as is in tool ids and permission rules).
+/// Not plain `mirante`, so a server of that name in the user's own Claude or Codex config
+/// is less likely to collide with it (Codex merges `-c` overrides into a same-named entry).
+pub const MCP_SERVER: &str = "mirante-memory";
 
 /// The per-task MCP config passed with `claude --mcp-config <file>`: one stdio server,
 /// `mirante-mcp` at `bin`, scoped to `task` and to the daemon under `home`, carrying the
@@ -404,12 +407,12 @@ mod tests {
     #[test]
     fn mcp_json_scopes_the_server_to_the_task() {
         let v = mcp_json(Path::new("/opt/m/mirante-mcp"), "t1", Path::new("/h/.mirante"));
-        assert_eq!(v["mcpServers"]["mirante"]["type"], "stdio");
-        assert_eq!(v["mcpServers"]["mirante"]["command"], "/opt/m/mirante-mcp");
-        assert_eq!(v["mcpServers"]["mirante"]["args"], json!([]));
-        assert_eq!(v["mcpServers"]["mirante"]["env"]["MIRANTE_TASK_ID"], "t1");
-        assert_eq!(v["mcpServers"]["mirante"]["env"]["MIRANTE_HOME"], "/h/.mirante");
-        assert_eq!(v["mcpServers"]["mirante"]["env"]["MIRANTE_TASK"], "t1");
+        assert_eq!(v["mcpServers"]["mirante-memory"]["type"], "stdio");
+        assert_eq!(v["mcpServers"]["mirante-memory"]["command"], "/opt/m/mirante-mcp");
+        assert_eq!(v["mcpServers"]["mirante-memory"]["args"], json!([]));
+        assert_eq!(v["mcpServers"]["mirante-memory"]["env"]["MIRANTE_TASK_ID"], "t1");
+        assert_eq!(v["mcpServers"]["mirante-memory"]["env"]["MIRANTE_HOME"], "/h/.mirante");
+        assert_eq!(v["mcpServers"]["mirante-memory"]["env"]["MIRANTE_TASK"], "t1");
         assert_eq!(v["mcpServers"].as_object().unwrap().len(), 1);
     }
 
@@ -430,7 +433,10 @@ mod tests {
     #[test]
     fn memory_read_tools_are_pre_allowed_and_propose_is_not() {
         let s = settings_json("/h", &memory_allow());
-        assert_eq!(s["permissions"]["allow"], json!(["mcp__mirante__memory_search", "mcp__mirante__memory_get"]));
+        assert_eq!(
+            s["permissions"]["allow"],
+            json!(["mcp__mirante-memory__memory_search", "mcp__mirante-memory__memory_get"])
+        );
         assert!(!memory_allow().iter().any(|t| t.contains("propose")));
     }
 }

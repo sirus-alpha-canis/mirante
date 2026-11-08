@@ -321,7 +321,7 @@ pub struct SpawnRequest {
     pub resume: Option<String>,
     pub paths: Paths,
     /// The `mirante-mcp` binary to give this session as its memory server (Claude:
-    /// `--mcp-config`, Codex: `-c mcp_servers.mirante.*`). Set only for repos whose memory
+    /// `--mcp-config`, Codex: `-c mcp_servers.mirante-memory.*`). Set only for repos whose memory
     /// was explicitly enabled; `None` launches the agent exactly as before.
     pub mcp: Option<std::path::PathBuf>,
 }

@@ -15,7 +15,7 @@
 //!
 //! Repo memory (only for repos where it was enabled, `SpawnRequest::mcp`): Claude gets
 //! `--mcp-config <session dir>/mcp.json` and the read-only memory tools pre-allowed in its
-//! settings; Codex gets `-c mcp_servers.mirante.*` overrides. Per task, never global.
+//! settings; Codex gets `-c mcp_servers.mirante-memory.*` overrides. Per task, never global.
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -87,11 +87,18 @@ pub fn toml_str(s: &str) -> Result<String, String> {
 /// The per-task memory server for `codex app-server`, as `-c` config overrides (nothing is
 /// written to `~/.codex`). Codex hands an MCP server only a few variables of its own
 /// environment, so the task, the daemon's home and the agent marker go in `env`.
+///
+/// `-c` merges into the user's `config.toml`: `args` is set (empty) so a same-named user
+/// entry's arguments cannot reach the binary. Other keys of such an entry (`url`, `cwd`,
+/// tool filters) cannot be removed with `-c`; the distinct server name makes that
+/// collision unlikely.
 pub fn codex_mcp_args(bin: &Path, task: &str, home: &Path) -> Result<Vec<String>, String> {
     let (bin, task, home) = (toml_str(&bin.to_string_lossy())?, toml_str(task)?, toml_str(&home.to_string_lossy())?);
     Ok(vec![
         "-c".to_string(),
         format!("mcp_servers.{MCP_SERVER}.command={bin}"),
+        "-c".to_string(),
+        format!("mcp_servers.{MCP_SERVER}.args=[]"),
         "-c".to_string(),
         format!("mcp_servers.{MCP_SERVER}.env={{{TASK_ENV}={task},{HOME_ENV}={home},{AGENT_ENV}={task}}}"),
     ])
@@ -99,7 +106,7 @@ pub fn codex_mcp_args(bin: &Path, task: &str, home: &Path) -> Result<Vec<String>
 
 /// Writes Claude's per-task config into the session dir: the settings (hook for every
 /// event; the memory read tools pre-allowed when memory is on) and, when `req.mcp` is set,
-/// `mcp.json`. Returns their paths.
+/// `mcp.json`; otherwise a previous session's `mcp.json` is removed. Returns their paths.
 pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(PathBuf, Option<PathBuf>)> {
     let dir = req.paths.session_dir(&req.task.id);
     let settings = dir.join("claude-settings.json");
@@ -112,6 +119,10 @@ pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(
             Some(path)
         }
         None => {
+            match std::fs::remove_file(dir.join("mcp.json")) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
             write_private(&settings, &settings_json(&hook, &[]).to_string())?;
             None
         }
@@ -396,9 +407,11 @@ mod tests {
             a,
             [
                 "-c",
-                "mcp_servers.mirante.command=\"/opt/m/mirante-mcp\"",
+                "mcp_servers.mirante-memory.command=\"/opt/m/mirante-mcp\"",
                 "-c",
-                "mcp_servers.mirante.env={MIRANTE_TASK_ID=\"t1\",MIRANTE_HOME=\"/h/.mirante\",MIRANTE_TASK=\"t1\"}"
+                "mcp_servers.mirante-memory.args=[]",
+                "-c",
+                "mcp_servers.mirante-memory.env={MIRANTE_TASK_ID=\"t1\",MIRANTE_HOME=\"/h/.mirante\",MIRANTE_TASK=\"t1\"}"
             ]
         );
     }
@@ -408,7 +421,7 @@ mod tests {
         assert_eq!(toml_str(r#"/a "b"\c"#).unwrap(), r#""/a \"b\"\\c""#);
         assert!(toml_str("a\nb").is_err() && toml_str("a\u{7f}").is_err() && toml_str("\u{1b}[2J").is_err());
         let a = codex_mcp_args(Path::new("/x/o\"brien/mirante-mcp"), "t1", Path::new("/h")).unwrap();
-        assert_eq!(a[1], "mcp_servers.mirante.command=\"/x/o\\\"brien/mirante-mcp\"");
+        assert_eq!(a[1], "mcp_servers.mirante-memory.command=\"/x/o\\\"brien/mirante-mcp\"");
         assert!(codex_mcp_args(Path::new("/x\ny/mirante-mcp"), "t1", Path::new("/h")).is_err());
     }
 
@@ -429,13 +442,13 @@ mod tests {
         assert_eq!(mcp, req.paths.session_dir("task-1").join("mcp.json"));
         assert_eq!(std::fs::metadata(&mcp).unwrap().permissions().mode() & 0o777, 0o600);
         let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
-        assert_eq!(m["mcpServers"]["mirante"]["command"], "/opt/m/mirante-mcp");
-        assert_eq!(m["mcpServers"]["mirante"]["env"]["MIRANTE_TASK_ID"], "task-1");
-        assert_eq!(m["mcpServers"]["mirante"]["env"]["MIRANTE_HOME"], d.path().join("home").to_str().unwrap());
+        assert_eq!(m["mcpServers"]["mirante-memory"]["command"], "/opt/m/mirante-mcp");
+        assert_eq!(m["mcpServers"]["mirante-memory"]["env"]["MIRANTE_TASK_ID"], "task-1");
+        assert_eq!(m["mcpServers"]["mirante-memory"]["env"]["MIRANTE_HOME"], d.path().join("home").to_str().unwrap());
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
             s["permissions"]["allow"],
-            serde_json::json!(["mcp__mirante__memory_search", "mcp__mirante__memory_get"])
+            serde_json::json!(["mcp__mirante-memory__memory_search", "mcp__mirante-memory__memory_get"])
         );
 
         // The full launch: `--mcp-config` followed only by `--flag value` pairs.
@@ -444,6 +457,12 @@ mod tests {
         assert_eq!(spec.args[i + 1], mcp.to_str().unwrap());
         assert_eq!((spec.args.len() - i) % 2, 0, "{:?}", spec.args);
         assert!(spec.args[i + 2..].iter().step_by(2).all(|a| a.starts_with("--")), "{:?}", spec.args);
+
+        // Memory turned off before the next start: no stale mcp.json is left to load.
+        req.mcp = None;
+        let (_, mcp_again) = write_claude_config(&req, hook).unwrap();
+        assert_eq!(mcp_again, None);
+        assert!(!mcp.exists(), "the previous session's mcp.json was removed");
     }
 
     #[test]

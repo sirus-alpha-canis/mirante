@@ -1765,7 +1765,7 @@ mod tests {
         let argv = dir.path().join("argv");
         let bin = fake_app_server(dir.path(), &format!("printf '%s\\n' \"$@\" > {}\nsleep 60", argv.display()));
         let (tx, _rx) = mpsc::channel();
-        let args = ["-c".to_string(), "mcp_servers.mirante.command=\"/m\"".to_string()];
+        let args = ["-c".to_string(), "mcp_servers.mirante-memory.command=\"/m\"".to_string()];
         let env = ChildEnv { args: &args, ..ChildEnv::default() };
         let cwd = dir.path().to_string_lossy().into_owned();
         let d =
@@ -1775,7 +1775,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         d.stop();
-        assert_eq!(std::fs::read_to_string(&argv).unwrap(), "app-server\n-c\nmcp_servers.mirante.command=\"/m\"\n");
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap(),
+            "app-server\n-c\nmcp_servers.mirante-memory.command=\"/m\"\n"
+        );
     }
 
     #[test]
