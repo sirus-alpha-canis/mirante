@@ -173,6 +173,9 @@ pub struct UsageCounts {
     pub refused: usize,
 }
 
+/// How long `skill_usage` rows are kept (60 days): pruned as sessions are recorded.
+pub const USAGE_RETENTION_MS: i64 = 60 * 24 * 3600 * 1000;
+
 const SKILL_COLUMNS: &str =
     "name, current_version, manifest_hash, scope_kind, scope_value, activation, agents, status, description, updated_at";
 const PROPOSAL_COLUMNS: &str = "id, origin, task_id, tenant, kind, name, base_hash, scope_kind, scope_value, \
@@ -771,13 +774,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|u| !u.text.is_empty()).collect())
     }
 
-    /// For each task, the skills ever injected into its sessions (by name, sorted).
-    pub fn skill_injected_by_task(&self) -> Result<HashMap<String, Vec<String>>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT task_id, name FROM skill_usage WHERE kind = 'injected' ORDER BY task_id, name")?;
+    /// For each of `tenant`'s tasks, the skills injected into its sessions since `since`
+    /// (ms), by name, sorted.
+    pub fn skill_injected_by_task(&self, tenant: &str, since: i64) -> Result<HashMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT u.task_id, u.name FROM skill_usage u JOIN task_origins o ON o.task_id = u.task_id
+             WHERE o.tenant = ?1 AND u.kind = 'injected' AND u.ts_ms >= ?2 ORDER BY u.task_id, u.name",
+        )?;
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        for row in stmt.query_map(params![tenant, since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (task, name) = row?;
             out.entry(task).or_default().push(name);
         }
@@ -785,17 +790,24 @@ impl Store {
     }
 
     /// What a new session got: `injected` (name, version) and `refused` (name, version,
-    /// reason), as usage rows plus `skill.injected { session_id, names }` (when any) and one
-    /// `skill.refused { session_id, name, reason }` each, in one transaction.
+    /// reason), as usage rows plus `skill.injected { session_id, names }` (when any), one
+    /// `skill.refused { session_id, name, reason }` each, and `skill.unavailable { reason }`
+    /// when no skill could apply, in one transaction. Usage older than
+    /// [`USAGE_RETENTION_MS`] is pruned in it.
     pub fn skill_record_session(
         &mut self,
         session: &str,
         task: &str,
         injected: &[(String, u32)],
         refused: &[(String, u32, String)],
+        unavailable: Option<&str>,
     ) -> Result<()> {
         let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM skill_usage WHERE ts_ms < ?1", [now_ms() - USAGE_RETENTION_MS])?;
+        if let Some(reason) = unavailable {
+            insert_event(&tx, &boot, Some(task), "skill.unavailable", &json!({ "reason": reason }))?;
+        }
         for (name, version) in injected {
             insert_usage(&tx, session, task, name, *version, "injected", "")?;
         }
@@ -812,11 +824,22 @@ impl Store {
         Ok(())
     }
 
-    /// Records that the agent of `session` loaded the skill `name` (`skill.used`), when that
-    /// skill was injected into that session; false (nothing recorded) otherwise.
+    /// Records that the agent of `session` loaded the skill `name` (`skill.used`), once per
+    /// session and skill, when that skill was injected into that session; false (nothing
+    /// recorded) otherwise.
     pub fn skill_record_used(&mut self, session: &str, task: &str, name: &str) -> Result<bool> {
         let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seen = tx
+            .query_row(
+                "SELECT 1 FROM skill_usage WHERE session_id = ?1 AND name = ?2 AND kind = 'used'",
+                params![session, name],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if seen.is_some() {
+            return Ok(false);
+        }
         let version: Option<u32> = tx
             .query_row(
                 "SELECT version FROM skill_usage WHERE session_id = ?1 AND name = ?2 AND kind = 'injected'
@@ -1234,10 +1257,13 @@ mod tests {
     fn usage_counts_by_skill_and_window() {
         let mut s = Store::open_in_memory().unwrap();
         let t = task(&mut s, "g");
-        s.skill_record_session("s1", &t, &[("a".into(), 1), ("b".into(), 2)], &[("c".into(), 1, "over budget".into())])
-            .unwrap();
-        s.skill_record_session("s2", &t, &[("a".into(), 1)], &[]).unwrap();
+        origin(&mut s, &t, "github.com/acme/api", "github.com/acme");
+        let refused = [("c".into(), 1, "over budget".into())];
+        s.skill_record_session("s1", &t, &[("a".into(), 1), ("b".into(), 2)], &refused, None).unwrap();
+        s.skill_record_session("s2", &t, &[("a".into(), 1)], &[], None).unwrap();
         assert!(s.skill_record_used("s1", &t, "a").unwrap());
+        // One `used` per session and skill, however often the agent loads it.
+        assert!(!s.skill_record_used("s1", &t, "a").unwrap());
         assert!(!s.skill_record_used("s1", &t, "c").unwrap(), "refused, never injected");
         assert!(!s.skill_record_used("s9", &t, "a").unwrap(), "not injected in that session");
         let c = s.skill_usage_counts(0).unwrap();
@@ -1245,9 +1271,34 @@ mod tests {
         assert_eq!(c["b"], UsageCounts { injected: 1, used: 0, refused: 0 });
         assert_eq!(c["c"], UsageCounts { injected: 0, used: 0, refused: 1 });
         assert!(s.skill_usage_counts(crate::model::now_ms() + 60_000).unwrap().is_empty());
-        let by_task = s.skill_injected_by_task().unwrap();
+        let by_task = s.skill_injected_by_task("github.com/acme", 0).unwrap();
         assert_eq!(by_task[&t], vec!["a".to_string(), "b".to_string()]);
+        // Only the tenant's tasks, within the window.
+        assert!(s.skill_injected_by_task("github.com/other", 0).unwrap().is_empty());
+        assert!(s.skill_injected_by_task("github.com/acme", crate::model::now_ms() + 60_000).unwrap().is_empty());
         let ev: Vec<String> = kinds(&s).into_iter().filter(|k| k.starts_with("skill.")).collect();
-        assert_eq!(ev, ["skill.injected", "skill.refused", "skill.injected", "skill.used"]);
+        assert_eq!(ev, ["skill.origin_pinned", "skill.injected", "skill.refused", "skill.injected", "skill.used"]);
+    }
+
+    /// No skill applies: `skill.unavailable` is written with the session's (empty) usage.
+    /// Usage older than 60 days is pruned as sessions are recorded.
+    #[test]
+    fn record_session_writes_unavailable_and_prunes_old_usage() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = task(&mut s, "g");
+        let old = crate::model::now_ms() - USAGE_RETENTION_MS - 1000;
+        s.conn
+            .execute(
+                "INSERT INTO skill_usage (session_id, task_id, name, version, kind, detail, ts_ms)
+                 VALUES ('s0', ?1, 'a', 1, 'injected', '', ?2)",
+                params![t, old],
+            )
+            .unwrap();
+        s.skill_record_session("s1", &t, &[], &[], Some("no origin")).unwrap();
+        let ev = s.events_since(0, 100).unwrap();
+        let un = ev.iter().find(|e| e.kind == "skill.unavailable").unwrap();
+        assert_eq!((un.payload["reason"].as_str(), un.task_id.as_deref()), (Some("no origin"), Some(t.as_str())));
+        let left: i64 = s.conn.query_row("SELECT COUNT(*) FROM skill_usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "the 61-day-old row is gone");
     }
 }

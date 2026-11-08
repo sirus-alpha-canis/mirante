@@ -1072,7 +1072,7 @@ impl Hub {
             })?;
             let mut taken: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
             taken.extend(pending.into_iter().map(|p| p.name));
-            (st.store.skill_history(tenant, since)?, rows, st.store.skill_injected_by_task()?, taken)
+            (st.store.skill_history(tenant, since)?, rows, st.store.skill_injected_by_task(tenant, since)?, taken)
         };
         let active: Vec<ActiveSkill> = rows
             .iter()
@@ -1276,13 +1276,9 @@ impl Hub {
             }
         };
         let mut st = self.lock();
-        if let Some(reason) = &r.unavailable {
-            if let Err(e) = st.event(Some(&task.id), "skill.unavailable", serde_json::json!({ "reason": reason })) {
-                st.log_error(Some(&task.id), "skill.unavailable", &e);
-            }
-        }
         let injected = r.injected_names();
-        if let Err(e) = st.store.skill_record_session(session_id, &task.id, &injected, &r.refused) {
+        let unavailable = r.unavailable.as_deref();
+        if let Err(e) = st.store.skill_record_session(session_id, &task.id, &injected, &r.refused, unavailable) {
             st.log_error(Some(&task.id), "skill usage", &e);
         }
         st.publish();
