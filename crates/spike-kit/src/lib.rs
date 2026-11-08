@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod codex;
 pub mod delivery;
 pub mod hook;
