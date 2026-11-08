@@ -165,6 +165,37 @@ impl Git {
     pub fn output(&self) -> io::Result<Output> {
         self.command().output()
     }
+
+    /// [`Git::output`], killed after `limit` (`ErrorKind::TimedOut`): for reads a person
+    /// waits on (a huge or hung repository must not hold the caller forever).
+    pub fn output_timeout(&self, limit: std::time::Duration) -> io::Result<Output> {
+        use std::io::Read;
+        let mut child = self.command().stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let drain = |r: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut r) = r {
+                    let _ = r.read_to_end(&mut buf);
+                }
+                buf
+            })
+        };
+        let out = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+        let err = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+        let deadline = std::time::Instant::now() + limit;
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, format!("git took longer than {limit:?}")));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+    }
 }
 
 /// Names of the filter drivers `dir`'s config defines (any scope git reads there).
@@ -194,6 +225,15 @@ mod tests {
     fn plain(dir: &Path, args: &[&str]) {
         let ok = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(ok.status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn output_timeout_kills_a_slow_git_and_returns_a_fast_one() {
+        let ok = Git::global().arg("version").output_timeout(std::time::Duration::from_secs(20)).unwrap();
+        assert!(ok.status.success() && String::from_utf8_lossy(&ok.stdout).starts_with("git version"));
+        // A zero limit stands for a git that takes too long: it is killed, never awaited.
+        let e = Git::global().arg("version").output_timeout(std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
