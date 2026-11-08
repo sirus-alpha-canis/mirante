@@ -305,6 +305,10 @@ fn a_daemon_restart_resumes_live_sessions_but_not_stopped_ones() {
     let out = env.ok(&["daemon", "restart"]);
     assert!(out.contains("they resume when the daemon starts again") && out.contains("started"), "{out}");
     wait_until("keep resumed", || env.task("keep").live);
+    // The task is live before the agent process has written its launch line.
+    wait_until("the resumed agent launched", || {
+        std::fs::read_to_string(&env.log).unwrap_or_default().lines().count() > launches
+    });
     let log = std::fs::read_to_string(&env.log).unwrap();
     let after: Vec<&str> = log.lines().skip(launches).collect();
     assert_eq!(after.len(), 1, "one launch after the restart: {after:?}");
