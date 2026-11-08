@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
 use mirante_ipc::types::{
-    method, AttachParams, AttachResult, ListParams, QueueRef, QueuedRef, SubscribeParams, TaskRef,
+    method, AttachParams, AttachResult, DnaContextParams, ListParams, QueueRef, QueuedRef, SubscribeParams, TaskRef,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -312,17 +312,20 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),
         method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, caller)),
         method::DNA_DISABLE => out(hub.dna_disable(&params(p)?, caller)),
-        method::DNA_GRAPH => out(hub.dna_graph(&params(p)?)),
-        method::DNA_SEARCH => out(hub.dna_search(params(p)?)),
-        method::DNA_GET => out(hub.dna_get(params(p)?)),
+        method::DNA_GRAPH => out(hub.dna_graph_in(hub.view_for(caller, false), &params(p)?)),
+        method::DNA_SEARCH => out(hub.dna_search_in(hub.view_for(caller, false), params(p)?)),
+        method::DNA_GET => out(hub.dna_get_in(hub.view_for(caller, false), params(p)?)),
         method::DNA_CHECK => out(hub.dna_check(&params(p)?)),
         method::DNA_PROPOSE => out(hub.dna_propose(caller, params(p)?)),
         method::DNA_PROPOSALS => {
             let q = if p.is_null() { Default::default() } else { params(p)? };
-            out(hub.dna_proposals(q))
+            out(hub.dna_proposals_in(hub.view_for(caller, false), q))
         }
         method::DNA_REVIEW => out(hub.dna_review(caller, params(p)?)),
-        method::DNA_TASK_CONTEXT => out(hub.dna_task_context(&params::<TaskRef>(p)?.task)),
+        method::DNA_TASK_CONTEXT => {
+            let q: DnaContextParams = params(p)?;
+            out(hub.dna_task_context_in(hub.view_for(caller, q.for_agent), &q.task))
+        }
         method::DNA_NOTE_ACTION => out(hub.dna_note_action(caller, params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
@@ -514,6 +517,37 @@ mod tests {
         let (a, _b) = UnixStream::pair().unwrap();
         let me = crate::driver::proctree::proc_of(std::process::id() as i32).unwrap();
         assert_eq!(caller_of(&a), Caller::Peer(me));
+    }
+
+    #[test]
+    fn dna_reads_give_agents_the_escaped_view_and_people_the_raw_one() {
+        use crate::hub::dna::tests::{commit_in, note_text, write_note, Peer};
+        let k = Kit::new();
+        commit_in(&k.repo, "src/a.rs", crate::hub::dna::tests::CODE);
+        dispatch(&k.hub, method::DNA_ENABLE, json!({"repo": k.repo})).unwrap();
+        write_note(&k.repo, "n", &note_text(&k.repo, "Use <b> here", "Body <i>.", "src/a.rs", 2, 4));
+        let t = k.create(AgentKind::Claude, "ctx").task;
+        commit_in(&t.worktree_path, "src/a.rs", &format!("{}// more\n", crate::hub::dna::tests::CODE));
+        let title = |v: &Value| v[0]["title"].as_str().unwrap().to_string();
+        let search = json!({"repo": k.repo, "query": "use"});
+        assert_eq!(title(&dispatch(&k.hub, method::DNA_SEARCH, search.clone()).unwrap()), "Use <b> here");
+        // A Mirante-launched agent gets the agent view, whatever it asks for.
+        let agent = Peer::spawn(&[("MIRANTE_TASK", &t.id)], k.dir.path());
+        let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_SEARCH, search).unwrap();
+        assert_eq!(title(&v), "Use &lt;b> here");
+        let get = json!({"repo": k.repo, "slug": "n"});
+        let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_GET, get.clone()).unwrap();
+        assert!(v["body"].as_str().unwrap().contains("Body &lt;i>."), "{v}");
+        let v = dispatch(&k.hub, method::DNA_GET, get).unwrap();
+        assert!(v["body"].as_str().unwrap().contains("Body <i>."), "{v}");
+        // task_context: for_agent asks for the agent view explicitly.
+        let ctx = |for_agent: bool| {
+            let v = dispatch(&k.hub, method::DNA_TASK_CONTEXT, json!({"task": t.id, "for_agent": for_agent})).unwrap();
+            v["relevant"][0]["title"].as_str().unwrap().to_string()
+        };
+        assert_eq!((ctx(false), ctx(true)), ("Use <b> here".to_string(), "Use &lt;b> here".to_string()));
+        let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_TASK_CONTEXT, json!({"task": t.id})).unwrap();
+        assert_eq!(v["relevant"][0]["title"], "Use &lt;b> here");
     }
 
     #[test]

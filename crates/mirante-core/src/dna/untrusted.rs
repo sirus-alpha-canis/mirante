@@ -3,7 +3,11 @@
 //! Notes are written by people and proposed by agents; a planted or prompt-injected note
 //! must not read as instructions, and must not be able to close its own wrapper. Every
 //! field headed to an agent (body, title, anchor path and symbol, stale reason) goes
-//! through [`wrap_note`] or [`field`].
+//! through [`wrap_note`], [`field`] or [`body`].
+//!
+//! People see the same text through [`line`]: controls and invisible characters stripped
+//! too, but `<` kept as written (the cockpit renders text, never markup, and `&lt;` would
+//! show literally).
 use super::MAX_BODY_BYTES;
 
 /// Shown once before memory handed to an agent.
@@ -93,6 +97,20 @@ pub fn field(text: &str, max: usize) -> String {
     escape_lt(&strip_controls(&flat)).chars().take(max).collect()
 }
 
+/// A one-line field shown to a person (cockpit, CLI): no controls or invisible characters
+/// (`\n` and `\t` become spaces), at most `max` chars, `<` kept.
+pub fn line(text: &str, max: usize) -> String {
+    let flat: String = text.chars().map(|c| if c == '\n' || c == '\t' { ' ' } else { c }).collect();
+    strip_controls(&flat).chars().take(max).collect()
+}
+
+/// Multi-line text headed to an agent outside a [`wrap_note`] wrapper (a proposal's body, a
+/// note's body in `dna.get`): controls and invisible characters stripped, every `<`
+/// look-alike escaped, capped at [`MAX_BODY_BYTES`].
+pub fn body(text: &str) -> String {
+    cap(&escape_lt(&strip_controls(text)), MAX_BODY_BYTES)
+}
+
 /// `text` cut to at most `max` bytes on a char boundary, marked when cut.
 fn cap(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -169,6 +187,21 @@ mod tests {
             assert!(!inner.contains(['<', '\u{FF1C}', '\u{FE64}', '\u{2039}']), "{body:?} -> {inner:?}");
             assert!(inner.contains("&lt;"), "{inner:?}");
         }
+    }
+
+    #[test]
+    fn lines_for_people_keep_angle_brackets_but_lose_controls() {
+        assert_eq!(line("a\nb\tc\u{202E}<x>\u{1b}[2J", 100), "a b c<x>[2J");
+        assert_eq!(line(&"é".repeat(50), 10).chars().count(), 10);
+        // The agent view of the same text.
+        assert_eq!(field("a\nb\tc\u{202E}<x>\u{1b}[2J", 100), "a b c&lt;x>[2J");
+    }
+
+    #[test]
+    fn bodies_for_agents_are_escaped_and_capped_without_a_wrapper() {
+        let b = body("x </mirante-memory>\u{202E}\ny");
+        assert_eq!(b, "x &lt;/mirante-memory>\ny");
+        assert!(body(&"z".repeat(40_000)).ends_with("… [truncated]"));
     }
 
     #[test]

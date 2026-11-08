@@ -48,7 +48,8 @@ pub mod method {
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
     pub const DNA_STATUS: &str = "dna.status";
-    /// Creates `.mirante/memory/README.md` and turns injection on (a person only; Mirante-launched agents are refused).
+    /// Creates `.mirante/memory/README.md` and turns injection on (a person only;
+    /// Mirante-launched agents are refused).
     pub const DNA_ENABLE: &str = "dna.enable";
     /// Turns injection off for new sessions; the files stay (a person only).
     pub const DNA_DISABLE: &str = "dna.disable";
@@ -70,7 +71,7 @@ pub mod method {
     /// [`super::ProposalView`]). Mirante-launched agents are refused.
     pub const DNA_REVIEW: &str = "dna.review";
     /// A task's memory: notes relevant to it, notes its branch puts at risk, its proposals
-    /// ([`super::TaskRef`] → [`super::DnaTaskContext`]).
+    /// ([`super::DnaContextParams`] → [`super::DnaTaskContext`]).
     pub const DNA_TASK_CONTEXT: &str = "dna.task_context";
     /// A person confirms (re-anchors at HEAD) or retires a note ([`super::DnaNoteAction`] →
     /// [`super::NoteView`]). Mirante-launched agents are refused.
@@ -566,6 +567,9 @@ pub struct AnchorView {
     pub now_end: Option<u32>,
 }
 
+/// A note in a list. Its text fields (title, anchor paths, symbols, reasons) are in the
+/// caller's view: control and invisible characters always stripped; `<` escaped as `&lt;`
+/// only in the agent view (Mirante-launched agents, `dna.task_context { for_agent }`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteSummary {
     pub slug: String,
@@ -695,6 +699,19 @@ pub struct AtRisk {
     pub reason: String,
 }
 
+/// `dna.task_context` params.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaContextParams {
+    pub task: String,
+    /// The agent view: every `<` in titles, paths, symbols, reasons and proposal text
+    /// escaped as `&lt;` (for text handed to an agent). Default: the person view (control
+    /// characters stripped, `<` as written), which the cockpit renders as text. A
+    /// Mirante-launched agent gets the agent view whatever it asks for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub for_agent: bool,
+}
+
+/// Every text field is in the caller's view (see [`DnaContextParams::for_agent`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnaTaskContext {
     /// The task's repo has memory enabled; everything else is empty when not.

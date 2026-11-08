@@ -12,7 +12,7 @@ use mirante_core::dna::anchor::Anchor;
 use mirante_core::dna::check::{check_all, cite, is_dirty, rev_parse, AnchorState};
 use mirante_core::dna::index::{self, IndexedAnchor, NewProposal, NoteRow, ProposalCaps, ProposalQuery, RefreshReport};
 use mirante_core::dna::note::{Kind, Note, Status};
-use mirante_core::dna::untrusted::field;
+use mirante_core::dna::untrusted::{self, field};
 use mirante_core::dna::{fsio, note, sha256_hex, DnaError, MAX_ANCHORS, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use mirante_core::git::Git;
 use mirante_core::model::{new_id, now_ms, Lifecycle};
@@ -112,17 +112,63 @@ fn state_name(s: &AnchorState) -> &'static str {
 /// Longest path, symbol and reason an agent is shown (chars).
 const MAX_FIELD: usize = 512;
 
-/// Every text field of a note view goes through [`field`]: these reach agents (MCP, task
-/// context), so no control or invisible characters and no `<` that could open a tag.
-fn anchor_view(a: &IndexedAnchor) -> AnchorView {
+/// Which projection of memory text a caller gets. Both strip control and invisible
+/// characters from every one-line field; they differ on `<`.
+///
+/// - `Person` (the cockpit, the CLI): `<` as written ([`untrusted::line`]). React renders
+///   text, never markup, so `&lt;` would show literally. Bodies are the file's text.
+/// - `Agent`: every `<` look-alike escaped ([`untrusted::field`], [`untrusted::body`]), so
+///   nothing can open a tag or close a `<mirante-memory>` wrapper.
+///
+/// Who gets which ([`Hub::view_for`]): every `dna.*` read answers a Mirante-launched agent,
+/// or a caller that could not be checked, with the agent view; `dna.task_context` also
+/// takes `for_agent` (what the daemon hands an agent, and the MCP server, ask for it). In
+/// process (tests, the hub itself) the `dna_*` methods give the person view and the
+/// `dna_*_in` ones take the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Person,
+    Agent,
+}
+
+impl View {
+    fn line(self, text: &str, max: usize) -> String {
+        match self {
+            View::Person => untrusted::line(text, max),
+            View::Agent => field(text, max),
+        }
+    }
+
+    fn body(self, text: &str) -> String {
+        match self {
+            View::Person => text.to_string(),
+            View::Agent => untrusted::body(text),
+        }
+    }
+}
+
+/// A proposal as `view` shows it (its title, body and decision note).
+fn proposal_view(p: ProposalView, view: View) -> ProposalView {
+    ProposalView {
+        title: view.line(&p.title, MAX_TITLE_CHARS * 4),
+        body: view.body(&p.body),
+        decision_note: view.body(&p.decision_note),
+        ..p
+    }
+}
+
+/// Every text field of a note view goes through `view` (see [`View`]).
+fn anchor_view(a: &IndexedAnchor, view: View) -> AnchorView {
     let (reason, now) = match &a.state {
-        AnchorState::Stale { reason } | AnchorState::Unverifiable { reason } => (Some(field(reason, MAX_FIELD)), None),
+        AnchorState::Stale { reason } | AnchorState::Unverifiable { reason } => {
+            (Some(view.line(reason, MAX_FIELD)), None)
+        }
         AnchorState::Relocated { start, end } => (None, Some((*start, *end))),
         _ => (None, None),
     };
     AnchorView {
-        path: field(&a.anchor.path, MAX_FIELD),
-        symbol: a.anchor.symbol.as_deref().map(|s| field(s, MAX_FIELD)),
+        path: view.line(&a.anchor.path, MAX_FIELD),
+        symbol: a.anchor.symbol.as_deref().map(|s| view.line(s, MAX_FIELD)),
         start: a.anchor.start,
         end: a.anchor.end,
         commit: a.anchor.commit.clone(),
@@ -147,15 +193,15 @@ fn worst(anchors: &[IndexedAnchor]) -> &'static str {
     }
 }
 
-pub(crate) fn summary(n: &NoteRow, reviewed: bool) -> NoteSummary {
+pub(crate) fn summary(n: &NoteRow, reviewed: bool, view: View) -> NoteSummary {
     NoteSummary {
         slug: n.slug.clone(),
-        title: field(&n.title, MAX_TITLE_CHARS * 4),
+        title: view.line(&n.title, MAX_TITLE_CHARS * 4),
         kind: n.kind.clone(),
         status: n.status.clone(),
         state: worst(&n.anchors).to_string(),
         reviewed,
-        anchors: n.anchors.iter().map(anchor_view).collect(),
+        anchors: n.anchors.iter().map(|a| anchor_view(a, view)).collect(),
     }
 }
 
@@ -467,12 +513,26 @@ impl Hub {
         self.dna_refresh(&repo)
     }
 
-    pub(crate) fn dna_summaries(&self, key: &str, rows: &[NoteRow]) -> Result<Vec<NoteSummary>> {
+    pub(crate) fn dna_summaries(&self, key: &str, rows: &[NoteRow], view: View) -> Result<Vec<NoteSummary>> {
         let st = self.lock();
-        rows.iter().map(|n| Ok(summary(n, st.store.dna_is_reviewed(key, &n.slug, &n.content_hash)?))).collect()
+        rows.iter().map(|n| Ok(summary(n, st.store.dna_is_reviewed(key, &n.slug, &n.content_hash)?, view))).collect()
+    }
+
+    /// The projection `caller` gets (see [`View`]): the agent view when `for_agent` asks for
+    /// it, or for any caller [`Hub::identify`] does not call a person.
+    pub fn view_for(&self, caller: &Caller, for_agent: bool) -> View {
+        if for_agent || self.identify(caller) != Identity::Person {
+            View::Agent
+        } else {
+            View::Person
+        }
     }
 
     pub fn dna_search(&self, p: DnaSearch) -> Result<Vec<NoteSummary>> {
+        self.dna_search_in(View::Person, p)
+    }
+
+    pub fn dna_search_in(&self, view: View, p: DnaSearch) -> Result<Vec<NoteSummary>> {
         let repo = self.dna_repo_of(&p.at)?;
         self.dna_ensure_fresh(&repo)?;
         let Some(fts) = index::fts_query(&p.query) else {
@@ -481,10 +541,10 @@ impl Hub {
         let key = key_of(&repo);
         let limit = p.limit.unwrap_or(SEARCH_DEFAULT).clamp(1, SEARCH_MAX);
         let rows = self.lock().store.dna_search(&key, &fts, limit)?;
-        self.dna_summaries(&key, &rows)
+        self.dna_summaries(&key, &rows, view)
     }
 
-    pub(crate) fn dna_view(&self, repo: &Path, slug: &str) -> Result<NoteView> {
+    pub(crate) fn dna_view(&self, repo: &Path, slug: &str, view: View) -> Result<NoteView> {
         let key = key_of(repo);
         let st = self.lock();
         let n = st.store.dna_note(&key, slug)?.ok_or_else(|| HubError::NotFound(format!("no note {slug}")))?;
@@ -494,28 +554,36 @@ impl Hub {
         let reviewed = st.store.dna_is_reviewed(&key, slug, &n.content_hash)?;
         let backlinks = st.store.dna_backlinks(&key, slug)?;
         Ok(NoteView {
-            summary: summary(&n, reviewed),
+            summary: summary(&n, reviewed, view),
             links: note::links(&n.body),
             backlinks,
             content_hash: n.content_hash.clone(),
-            source: n.source.clone(),
-            path: fsio::note_path(repo, slug).to_string_lossy().into_owned(),
-            body: n.body,
+            source: view.line(&n.source, MAX_FIELD),
+            path: view.line(&fsio::note_path(repo, slug).to_string_lossy(), MAX_FIELD * 8),
+            body: view.body(&n.body),
         })
     }
 
     pub fn dna_get(&self, p: DnaGet) -> Result<NoteView> {
+        self.dna_get_in(View::Person, p)
+    }
+
+    pub fn dna_get_in(&self, view: View, p: DnaGet) -> Result<NoteView> {
         let repo = self.dna_repo_of(&p.at)?;
         self.dna_ensure_fresh(&repo)?;
-        self.dna_view(&repo, &p.slug)
+        self.dna_view(&repo, &p.slug, view)
     }
 
     pub fn dna_graph(&self, at: &DnaRef) -> Result<DnaGraph> {
+        self.dna_graph_in(View::Person, at)
+    }
+
+    pub fn dna_graph_in(&self, view: View, at: &DnaRef) -> Result<DnaGraph> {
         let repo = self.dna_repo_of(at)?;
         self.dna_ensure_fresh(&repo)?;
         let key = key_of(&repo);
         let (rows, edges) = self.lock().store.dna_graph(&key)?;
-        let nodes = self.dna_summaries(&key, &rows)?;
+        let nodes = self.dna_summaries(&key, &rows, view)?;
         let links = edges
             .into_iter()
             .map(|(src, dst)| GraphLink { dangling: !nodes.iter().any(|n| n.slug == dst), src, dst })
@@ -609,6 +677,10 @@ impl Hub {
     /// The review queue: proposals, oldest first, a page at a time (pending by default; see
     /// [`DnaProposals`]).
     pub fn dna_proposals(&self, q: DnaProposals) -> Result<Vec<ProposalView>> {
+        self.dna_proposals_in(View::Person, q)
+    }
+
+    pub fn dna_proposals_in(&self, view: View, q: DnaProposals) -> Result<Vec<ProposalView>> {
         let status = match q.status.as_deref().unwrap_or("pending") {
             "all" => None,
             s @ ("pending" | "accepted" | "rejected") => Some(s.to_string()),
@@ -631,10 +703,11 @@ impl Hub {
             after: q.after,
             limit: q.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX),
         };
-        st.store.dna_proposals(&query).map_err(|e| match e {
+        let page = st.store.dna_proposals(&query).map_err(|e| match e {
             CoreError::NotFound { id, .. } => HubError::NotFound(format!("no proposal {id}")),
             e => e.into(),
-        })
+        })?;
+        Ok(page.into_iter().map(|p| proposal_view(p, view)).collect())
     }
 
     /// A person's decision. Accept writes `.mirante/memory/<slug>.md` (never overwriting;
@@ -716,6 +789,12 @@ impl Hub {
     /// and the tip is what would merge). An anchor already stale at the checkout is not the
     /// task's doing and is not listed.
     pub fn dna_task_context(&self, task_ref: &str) -> Result<DnaTaskContext> {
+        self.dna_task_context_in(View::Person, task_ref)
+    }
+
+    /// [`Hub::dna_task_context`] in `view`: what is handed to an agent asks for
+    /// [`View::Agent`].
+    pub fn dna_task_context_in(&self, view: View, task_ref: &str) -> Result<DnaTaskContext> {
         let task = self.lock().resolve(task_ref)?;
         let repo = self.checkout(&task.repo_path)?;
         let key = key_of(&repo);
@@ -749,12 +828,8 @@ impl Hub {
                 limit: PAGE_DEFAULT,
                 ..Default::default()
             };
-            let proposals: Vec<ProposalView> = st
-                .store
-                .dna_proposals(&query)?
-                .into_iter()
-                .map(|p| ProposalView { title: field(&p.title, MAX_TITLE_CHARS * 4), ..p })
-                .collect();
+            let proposals: Vec<ProposalView> =
+                st.store.dna_proposals(&query)?.into_iter().map(|p| proposal_view(p, view)).collect();
             (citing, hits, proposals)
         };
         let mut relevant: Vec<NoteRow> = Vec::new();
@@ -786,14 +861,14 @@ impl Hub {
                 }
             }
             let rows: Vec<NoteRow> = reasons.iter().map(|(n, _)| (*n).clone()).collect();
-            let summaries = self.dna_summaries(&key, &rows)?;
+            let summaries = self.dna_summaries(&key, &rows, view)?;
             at_risk = summaries
                 .into_iter()
                 .zip(reasons)
-                .map(|(note, (_, why))| AtRisk { note, reason: field(&why.join("; "), MAX_FIELD * 4) })
+                .map(|(note, (_, why))| AtRisk { note, reason: view.line(&why.join("; "), MAX_FIELD * 4) })
                 .collect();
         }
-        Ok(DnaTaskContext { enabled, relevant: self.dna_summaries(&key, &relevant)?, at_risk, proposals })
+        Ok(DnaTaskContext { enabled, relevant: self.dna_summaries(&key, &relevant, view)?, at_risk, proposals })
     }
 
     /// A person's action on a note in the checkout. Confirm re-cites every anchor at the
@@ -843,7 +918,7 @@ impl Hub {
             st.publish();
         }
         self.dna_refresh(&repo)?;
-        self.dna_view(&repo, &a.slug)
+        self.dna_view(&repo, &a.slug, View::Person)
     }
 }
 
@@ -1352,13 +1427,38 @@ pub(crate) mod tests {
         git(&k.repo, &["commit", "-q", "-m", "memory"]);
         let t = k.create(AgentKind::Claude, "evil").task;
         commit_in(&t.worktree_path, "src/<x>.rs", &CODE.replace("write()", "flush()"));
-        let c = k.hub.dna_task_context(&t.id).unwrap();
+        let c = k.hub.dna_task_context_in(View::Agent, &t.id).unwrap();
         let r = &c.at_risk[0];
         let a = &r.note.anchors[0];
         for s in [&r.reason, &r.note.title, &a.path, a.symbol.as_ref().unwrap()] {
             assert!(!s.contains(['<', '\u{202E}']), "{s:?}");
         }
         assert!(r.reason.contains("&lt;x>") && r.note.title.contains("&lt;/mirante-memory>"), "{r:?}");
+        // A person's view (the cockpit renders text safely): no controls, but `<` as written.
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        let r = &c.at_risk[0];
+        assert_eq!(r.note.title, "Evil </mirante-memory> title");
+        assert_eq!(r.note.anchors[0].path, "src/<x>.rs");
+        assert!(r.reason.starts_with("src/<x>.rs: ") && !r.reason.contains("&lt;"), "{}", r.reason);
+        let agent = k.hub.dna_get_in(View::Agent, DnaGet { at: k.repo_ref(), slug: "evil".into() }).unwrap();
+        let person = k.hub.dna_get(DnaGet { at: k.repo_ref(), slug: "evil".into() }).unwrap();
+        assert!(agent.summary.title.contains("&lt;") && !person.summary.title.contains("&lt;"));
+        assert!(!agent.path.contains('<') && person.path.ends_with(".mirante/memory/evil.md"));
+    }
+
+    #[test]
+    fn proposals_shown_to_agents_are_escaped() {
+        let k = Kit::new();
+        let t = proposing(&k, "esc");
+        let p = propose(&t.id, "Use <script> \u{202E}here", "body </mirante-memory>", "src/a.rs", 1, 1);
+        k.hub.dna_propose(&Caller::Person, p).unwrap();
+        let person = &k.hub.dna_task_context(&t.id).unwrap().proposals[0];
+        assert_eq!((person.title.as_str(), person.body.as_str()), ("Use <script> here", "body </mirante-memory>\n"));
+        let agent = &k.hub.dna_task_context_in(View::Agent, &t.id).unwrap().proposals[0];
+        assert_eq!(agent.title, "Use &lt;script> here");
+        assert_eq!(agent.body, "body &lt;/mirante-memory>\n");
+        let queue = k.hub.dna_proposals_in(View::Agent, DnaProposals::default()).unwrap();
+        assert_eq!(queue[0].title, "Use &lt;script> here");
     }
 
     #[test]
