@@ -4,6 +4,7 @@ import { CommandBar, type Command } from "./components/CommandBar";
 import { Detail } from "./components/Detail";
 import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
+import { Skills } from "./components/Skills";
 import { type Env, EnvContext } from "./env";
 import { notificationsFor, shouldNotify } from "./lib/notify";
 import { type DaemonStatus, M, type TaskView } from "./lib/protocol";
@@ -14,7 +15,7 @@ import { useCockpitState } from "./store/cockpit";
 import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
 import type { State } from "./store/state";
 
-export type Mode = "home" | "detail" | "grid" | "brain";
+export type Mode = "home" | "detail" | "grid" | "brain" | "skills";
 
 export const STATUS_POLL_MS = 5000;
 
@@ -31,7 +32,7 @@ export const NOTIFY_BATCH_MS = 250;
 /** The task ids whose card, tile or detail is on screen in this mode. */
 export function visibleTasks(s: State, mode: Mode, project: string | null, taskId: string | null): Set<string> {
   // The brain shows notes, no task: every task that starts needing you is off screen.
-  if (mode === "brain") return new Set();
+  if (mode === "brain" || mode === "skills") return new Set();
   if (mode === "detail") return new Set(taskId ? [taskId] : []);
   if (mode === "grid") return new Set(gridTasks(s).map((t) => t.id));
   return new Set(Object.values(s.tasks).filter((t) => t.repo_path === project && t.lifecycle !== "archived").map((t) => t.id));
@@ -233,6 +234,7 @@ export function App({ env }: { env: Env }) {
         },
       },
       { id: "review", label: "Review memory", run: () => openReview() },
+      { id: "skills", label: "Go to Skills", run: () => setMode("skills") },
       { id: "theme", label: `Theme: ${nextTheme(theme)}`, hint: hints.theme, run: () => setTheme(nextTheme) },
       ...projs.map((p) => ({
         id: `p-${p.path}`,
@@ -273,6 +275,9 @@ export function App({ env }: { env: Env }) {
             <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
               Brain <kbd>{hints.brain}</kbd>
             </button>
+            <button aria-pressed={mode === "skills"} onClick={() => setMode("skills")}>
+              Skills
+            </button>
           </nav>
           <button className="btn btn-small" onClick={() => setPalette(true)}>
             Commands <kbd>{hints.palette}</kbd>
@@ -290,6 +295,7 @@ export function App({ env }: { env: Env }) {
             onReposChanged={setRepos}
             onOpen={open}
             onReview={openReview}
+            onSkills={() => setMode("skills")}
             status={status}
             draft={draft}
             onDraft={setDraft}
@@ -306,6 +312,7 @@ export function App({ env }: { env: Env }) {
         )}
         {mode === "grid" && <Grid onOpen={open} status={status} />}
         {mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
+        {mode === "skills" && <Skills />}
         {palette && (
           <CommandBar
             commands={commands}

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -298,6 +298,19 @@ describe("App", () => {
     expect([...visibleTasks(s, "home", "/x", null)]).toEqual(["b"]);
     expect([...visibleTasks(s, "detail", null, "a")]).toEqual(["a"]);
     expect([...visibleTasks(s, "brain", "/x", "a")]).toEqual([]);
+    expect([...visibleTasks(s, "skills", "/x", "a")]).toEqual([]);
+  });
+
+  it("the Skills view opens from the nav and the command bar", async () => {
+    setup({ "skill.tenants": [], "skill.list": [], "skill.proposals": [] });
+    const nav = () => within(screen.getByRole("navigation", { name: "Views" })).getByRole("button", { name: "Skills" });
+    await userEvent.click(nav());
+    expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Home/ }));
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    await userEvent.type(screen.getByRole("combobox"), "Go to Skills{Enter}");
+    expect(nav()).toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
   });
 
   it("⌘B toggles the brain and back; the command bar opens it and the review queue", async () => {

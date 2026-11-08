@@ -17,6 +17,8 @@ export function Home(props: {
   onOpen(taskId: string, tab?: "Terminal"): void;
   /** Opens the memory review queue of a project. */
   onReview?(path: string): void;
+  /** Opens the Skills view (its review queue when proposals wait). */
+  onSkills?(): void;
   status: DaemonStatus | null;
   draft: string;
   onDraft(v: string): void;
@@ -55,6 +57,7 @@ export function Home(props: {
         onReposChanged={props.onReposChanged}
         onMention={mention}
         onReview={props.onReview}
+        onSkills={props.onSkills}
         status={props.status}
       />
       <main className="feed" aria-label="Project feed">

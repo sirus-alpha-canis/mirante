@@ -280,3 +280,15 @@ textarea.dna-input { resize: vertical; font-family: var(--mono); font-size: 12.5
 .brain-node.node-hit circle { stroke: var(--work); stroke-width: 3; }
 .brain-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0; margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .brain-legend svg { vertical-align: middle; }
+
+/* Skills */
+.warn { color: var(--needs); margin: 4px 0 0; overflow-wrap: anywhere; }
+.tag-on { color: var(--review); border-color: var(--review); }
+.skill-row { text-align: left; display: block; width: 100%; }
+.skill-row[aria-pressed="true"] .dna-title { color: var(--accent); }
+.skill-refused { color: var(--needs); font-weight: 600; }
+.skill-panel { display: grid; gap: 4px; }
+.skill-panel h3 { margin: 0; overflow-wrap: anywhere; }
+.skill-body { margin: 6px 0; font-size: 12.5px; }
+.skill-refusal { border-left: 3px solid var(--needs); padding-left: 8px; }
+.skill-tenant p { margin: 4px 0; max-width: 70ch; }

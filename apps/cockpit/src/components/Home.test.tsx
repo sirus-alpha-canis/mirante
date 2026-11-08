@@ -7,8 +7,8 @@ import { REPOS_KEY } from "../lib/repos";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 
-/** Calls other than the rail's repo-memory status reads. */
-const sent = (h: ReturnType<typeof makeEnv>) => h.calls.filter(([m]) => !m.startsWith("dna."));
+/** Calls other than the rail's repo-memory and skills reads. */
+const sent = (h: ReturnType<typeof makeEnv>) => h.calls.filter(([m]) => !m.startsWith("dna.") && !m.startsWith("skill."));
 import { projects } from "../store/select";
 import { Home } from "./Home";
 
@@ -30,11 +30,13 @@ function Harness({
   status = null,
   opened = [],
   registry = ["/repos/shop"],
+  onSkills,
 }: {
   env: ReturnType<typeof makeEnv>["env"];
   status?: DaemonStatus | null;
   opened?: Opened;
   registry?: string[];
+  onSkills?(): void;
 }) {
   const [draft, setDraft] = useState("");
   const [repos, setRepos] = useState(registry);
@@ -45,6 +47,7 @@ function Harness({
       onProject={() => {}}
       onReposChanged={setRepos}
       onOpen={(id, tab) => opened.push([id, tab])}
+      onSkills={onSkills}
       status={status}
       draft={draft}
       onDraft={setDraft}
@@ -211,5 +214,24 @@ describe("Home (V3 group chat)", () => {
     const rail = screen.getByRole("navigation", { name: "Projects and agents" });
     const panel = within(rail).getByRole("region", { name: "Memory guard" });
     expect(panel).toHaveTextContent("System pressure critical · 256 MB free · new sessions paused");
+  });
+});
+
+describe("the rail's skills entry", () => {
+  it("shows how many skill proposals wait and opens the Skills view", async () => {
+    const h = makeEnv({ "skill.proposals": [{ id: "sp-1" }, { id: "sp-2" }] });
+    h.load([task("a")]);
+    let opened = 0;
+    renderWith(h.env, <Harness env={h.env} onSkills={() => opened++} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Skills (2 to review)" }));
+    expect(opened).toBe(1);
+    expect(h.calls).toContainEqual(["skill.proposals", { status: "pending", limit: 200 }]);
+  });
+
+  it("an older daemon without skills shows a plain Skills entry", async () => {
+    const h = makeEnv({ "skill.proposals": rpcError(RpcCode.METHOD_NOT_FOUND, "unknown method") });
+    h.load([task("a")]);
+    renderWith(h.env, <Harness env={h.env} onSkills={() => {}} />);
+    expect(await screen.findByRole("button", { name: "Skills" })).toBeInTheDocument();
   });
 });
