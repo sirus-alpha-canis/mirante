@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import capabilities from "../src-tauri/capabilities/default.json";
 import conf from "../src-tauri/tauri.conf.json";
+import shell from "../src-tauri/src/lib.rs?raw";
 
 describe("Tauri security baseline", () => {
   const csp = conf.app.security.csp;
@@ -35,6 +36,7 @@ describe("Tauri security baseline", () => {
     // `create: false`: Tauri does not build it from config, so `window.open` and
     // target=_blank never get a webview of their own; links go through the opener plugin.
     expect(conf.app.windows.map((w) => [w.label, w.create])).toEqual([["main", false]]);
+    expect(shell).toContain(".on_new_window(|_, _| NewWindowResponse::Deny)");
   });
 
   it("grants only notifications and opening github.com URLs", () => {

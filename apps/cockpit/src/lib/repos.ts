@@ -15,11 +15,22 @@ export function loadRepos(store: KV): string[] {
 
 export type Added = { ok: true; repos: string[] } | { ok: false; error: string };
 
+/** `raw` as one absolute path: no doubled slashes or "." segments; ".." and "~" refused. */
+export function normaliseRepoPath(raw: string): { ok: true; path: string } | { ok: false; error: string } {
+  const text = raw.trim();
+  if (text.startsWith("~")) return { ok: false, error: "'~' is not expanded here: type the full path, e.g. /Users/me/code/shop" };
+  if (!text.startsWith("/")) return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
+  const parts = text.split("/").filter((p) => p !== "" && p !== ".");
+  if (parts.includes("..")) return { ok: false, error: "use a path without '..' segments" };
+  return { ok: true, path: `/${parts.join("/")}` };
+}
+
 export function addRepo(store: KV, raw: string): Added {
-  const path = raw.trim().replace(/\/+$/, "");
-  if (!path.startsWith("/")) return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
+  const n = normaliseRepoPath(raw);
+  if (!n.ok) return n;
+  if (n.path === "/") return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
   const repos = loadRepos(store);
-  if (!repos.includes(path)) repos.push(path);
+  if (!repos.includes(n.path)) repos.push(n.path);
   store.setItem(REPOS_KEY, JSON.stringify(repos));
   return { ok: true, repos };
 }

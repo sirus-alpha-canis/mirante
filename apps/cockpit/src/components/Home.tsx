@@ -1,7 +1,7 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../env";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
-import { type Project, repoName } from "../store/select";
+import { columnOf, COLUMN_LABEL, type Column, type Project, repoName } from "../store/select";
 import { AgentCard } from "./AgentCard";
 import { Board } from "./Board";
 import { DispatchComposer } from "./DispatchComposer";
@@ -27,11 +27,23 @@ export function Home(props: {
         .sort((a, b) => a.created_at - b.created_at),
     [s.tasks, props.project],
   );
+  const composer = useRef<HTMLTextAreaElement>(null);
   const mention = (agent: AgentKind) => {
     const repo = props.project ? `${repoName(props.project)}/` : "";
     props.onDraft(`@${agent} ${repo}`);
-    setTimeout(() => document.getElementById("dispatch")?.focus(), 0);
+    composer.current?.focus();
   };
+  // One polite region says when a card changes state (not every new line on every card).
+  const [announce, setAnnounce] = useState("");
+  const columns = useRef<Map<string, Column> | null>(null);
+  useEffect(() => {
+    const now = new Map(cards.map((t) => [t.id, columnOf(t, s.feed[t.id])]));
+    const before = columns.current;
+    columns.current = now;
+    if (!before) return;
+    const changed = cards.filter((t) => before.has(t.id) && before.get(t.id) !== now.get(t.id));
+    if (changed.length > 0) setAnnounce(changed.map((t) => `${t.title}: ${COLUMN_LABEL[now.get(t.id)!]}`).join(". "));
+  }, [cards, s.feed]);
   return (
     <div className="home">
       <LeftRail
@@ -57,7 +69,10 @@ export function Home(props: {
             <AgentCard key={t.id} t={t} onOpen={props.onOpen} inlineAnswers={props.status?.claude_inline_answers ?? false} />
           ))}
         </div>
-        <DispatchComposer projects={props.projects} value={props.draft} onChange={props.onDraft} />
+        <p className="sr-only" role="status" aria-label="Agent updates">
+          {announce}
+        </p>
+        <DispatchComposer projects={props.projects} value={props.draft} onChange={props.onDraft} inputRef={composer} />
       </main>
       <Board onOpen={props.onOpen} />
     </div>

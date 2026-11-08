@@ -23,8 +23,14 @@ describe("parseDispatch", () => {
     ["@claude shop/feat/x", "say what the agent should do"],
     ["@claude shop/-rf do", "cannot start with '-'"],
     ["@claude shop/a..b do", "cannot contain '..'"],
-    ["@claude shop/x.lock do", "not a valid branch name"],
+    ["@claude shop/x.lock do", "cannot end with '.lock'"],
     ["@claude shop/a:b do", "git does not allow"],
+    ["@claude shop//x do", "cannot start with '/'"],
+    ["@claude shop/a//b do", "empty component"],
+    ["@claude shop/.hidden do", "cannot start with '.'"],
+    ["@claude shop/feat/.x do", "cannot start with '.'"],
+    ["@claude shop/a.lock/b do", "cannot end with '.lock'"],
+    ["@claude shop/@ do", "not a valid branch name"],
   ])("rejects %j", (input, msg) => {
     const r = parseDispatch(input);
     expect(r.ok).toBe(false);

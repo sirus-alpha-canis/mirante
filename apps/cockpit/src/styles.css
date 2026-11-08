@@ -107,6 +107,8 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .rail ul, .board ul, .tasklist ul { list-style: none; margin: 0; padding: 0; }
 .rail-item { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 6px; background: none; border: none; border-radius: 6px; padding: 6px 8px; cursor: pointer; text-align: left; flex-wrap: wrap; }
 .rail-item:hover, .rail-item.selected { background: var(--panel-2); }
+.rail-row { display: flex; align-items: center; gap: 2px; }
+.btn-ghost { border-color: transparent; background: none; color: var(--muted); }
 .badge { background: var(--needs); color: var(--panel); border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: 700; }
 .add-repo { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
 .add-repo input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; background: var(--bg); }

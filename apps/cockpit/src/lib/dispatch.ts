@@ -16,12 +16,20 @@ export const DISPATCH_HELP = "@claude <repo>/<branch> <goal>  or  @codex <repo>/
 
 const AGENTS: Record<string, AgentKind> = { "@claude": "claude", "@codex": "codex" };
 
+// git check-ref-format, as far as a typed branch name needs it.
 function branchProblem(b: string): string | null {
   if (b.startsWith("-")) return "a branch cannot start with '-'";
+  if (b.startsWith("/")) return "a branch cannot start with '/'";
   if (b.includes("..")) return "a branch cannot contain '..'";
-  if (b.endsWith("/") || b.endsWith(".lock") || b.endsWith(".")) return `"${b}" is not a valid branch name`;
+  if (b === "@") return `"${b}" is not a valid branch name`;
   if (/[~^:?*[\\\x00-\x20\x7f]/.test(b)) return `"${b}" has a character git does not allow in branch names`;
-  if (b.includes("//") || b.includes("@{")) return `"${b}" is not a valid branch name`;
+  if (b.includes("@{")) return `"${b}" is not a valid branch name`;
+  if (b.endsWith("/") || b.endsWith(".")) return `"${b}" is not a valid branch name`;
+  for (const part of b.split("/")) {
+    if (part === "") return `"${b}" has an empty component (doubled '/')`;
+    if (part.startsWith(".")) return `"${b}": a component cannot start with '.'`;
+    if (part.endsWith(".lock")) return `"${b}": a component cannot end with '.lock'`;
+  }
   return null;
 }
 

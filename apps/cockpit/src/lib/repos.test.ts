@@ -15,6 +15,18 @@ describe("repo registry", () => {
     expect(removeRepo(s, "/Users/me/shop")).toEqual([]);
   });
 
+  it("normalises doubled slashes and '.' segments", () => {
+    const s = mem();
+    expect(addRepo(s, "//Users//me/./shop/.")).toEqual({ ok: true, repos: ["/Users/me/shop"] });
+  });
+
+  it("refuses '..' segments and explains '~'", () => {
+    const s = mem();
+    expect(addRepo(s, "/Users/me/../you/shop")).toEqual({ ok: false, error: expect.stringContaining("'..'") });
+    expect(addRepo(s, "~/code/shop")).toEqual({ ok: false, error: expect.stringContaining("~") });
+    expect(loadRepos(s)).toEqual([]);
+  });
+
   it("refuses relative paths and survives garbage in storage", () => {
     const s = mem();
     expect(addRepo(s, "shop")).toMatchObject({ ok: false });

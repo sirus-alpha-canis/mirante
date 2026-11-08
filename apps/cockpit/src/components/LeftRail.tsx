@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useEnv, useStore } from "../env";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
-import { addRepo } from "../lib/repos";
+import { addRepo, loadRepos, removeRepo } from "../lib/repos";
 import type { Project } from "../store/select";
 
 export function LeftRail(props: {
@@ -31,13 +31,16 @@ export function LeftRail(props: {
     setPath("");
     props.onReposChanged(r.repos);
   };
+  // Only repos added here can be removed; a task's repo stays listed while the task exists.
+  const added = new Set(loadRepos(storage));
+  const remove = (p: string) => props.onReposChanged(removeRepo(storage, p));
 
   return (
     <nav className="rail" aria-label="Projects and agents">
       <h2>Projects</h2>
       <ul>
         {props.projects.map((p) => (
-          <li key={p.path}>
+          <li key={p.path} className="rail-row">
             <button
               className={`rail-item ${props.selected === p.path ? "selected" : ""}`}
               aria-current={props.selected === p.path ? "page" : undefined}
@@ -46,11 +49,24 @@ export function LeftRail(props: {
             >
               <span>{p.name}</span>
               {p.needsYou > 0 && (
-                <span className="badge" aria-label={`${p.needsYou} need you`}>
-                  {p.needsYou}
-                </span>
+                <>
+                  <span className="badge" aria-hidden="true">
+                    {p.needsYou}
+                  </span>
+                  <span className="sr-only">, {p.needsYou} {p.needsYou === 1 ? "needs" : "need"} you</span>
+                </>
               )}
             </button>
+            {added.has(p.path) && (
+              <button
+                className="btn btn-small btn-ghost"
+                aria-label={`Remove ${p.name} from Projects`}
+                title={`Remove ${p.path} from Projects (nothing on disk changes)`}
+                onClick={() => remove(p.path)}
+              >
+                ×
+              </button>
+            )}
           </li>
         ))}
       </ul>

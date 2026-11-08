@@ -1,10 +1,11 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it } from "vitest";
-import type { DaemonStatus, TaskDiff } from "../lib/protocol";
+import { type DaemonStatus, RpcCode, type TaskDiff } from "../lib/protocol";
+import { REPOS_KEY } from "../lib/repos";
 import { ev, task } from "../test/fixtures";
-import { makeEnv, renderWith } from "../test/env";
+import { makeEnv, renderWith, rpcError } from "../test/env";
 import { projects } from "../store/select";
 import { Home } from "./Home";
 
@@ -25,18 +26,21 @@ function Harness({
   env,
   status = null,
   opened = [],
+  registry = ["/repos/shop"],
 }: {
   env: ReturnType<typeof makeEnv>["env"];
   status?: DaemonStatus | null;
   opened?: Opened;
+  registry?: string[];
 }) {
   const [draft, setDraft] = useState("");
+  const [repos, setRepos] = useState(registry);
   return (
     <Home
-      projects={projects(env.cockpit.getState(), ["/repos/shop"])}
+      projects={projects(env.cockpit.getState(), repos)}
       project="/repos/shop"
       onProject={() => {}}
-      onReposChanged={() => {}}
+      onReposChanged={setRepos}
       onOpen={(id, tab) => opened.push([id, tab])}
       status={status}
       draft={draft}
@@ -50,11 +54,13 @@ function setup(
   tasks = [task("a", { status: "working" })],
   events = [] as ReturnType<typeof ev>[],
   status: DaemonStatus | null = null,
+  registry = ["/repos/shop"],
 ) {
   const h = makeEnv(answers);
   h.load(tasks, events);
+  h.env.storage.setItem(REPOS_KEY, JSON.stringify(registry));
   const opened: Opened = [];
-  renderWith(h.env, <Harness env={h.env} status={status} opened={opened} />);
+  renderWith(h.env, <Harness env={h.env} status={status} opened={opened} registry={registry} />);
   return { ...h, opened };
 }
 
@@ -120,4 +126,79 @@ describe("Home (V3 group chat)", () => {
     expect(within(feed).queryByRole("button", { name: "Answer in terminal" })).toBeNull();
   });
 
+  it("Enter pressed twice (or auto-repeat) dispatches once", async () => {
+    const h = setup({ "task.create": () => new Promise(() => {}) });
+    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@codex shop/feat/x go{Enter}{Enter}");
+    expect(h.calls.filter(([m]) => m === "task.create")).toHaveLength(1);
+  });
+
+  it("Enter while an IME is composing does not dispatch", () => {
+    const h = setup();
+    const box = screen.getByLabelText("Dispatch an agent");
+    fireEvent.change(box, { target: { value: "@codex shop/feat/x 日本" } });
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    expect(h.calls).toEqual([]);
+  });
+
+  it("text typed while a dispatch is in flight is kept", async () => {
+    let finish: (v: unknown) => void = () => {};
+    const h = setup({ "task.create": () => new Promise((r) => (finish = r)), "session.start": { boot: "booting" } });
+    const box = screen.getByLabelText("Dispatch an agent");
+    await userEvent.type(box, "@codex shop/feat/x go{Enter}");
+    await userEvent.type(box, " and more");
+    await act(async () => finish(task("new", { branch: "feat/x" })));
+    await waitFor(() => expect(h.calls.map((c) => c[0])).toEqual(["task.create", "session.start"]));
+    expect(box).toHaveValue("@codex shop/feat/x go and more");
+  });
+
+  it("a dispatched draft is cleared once created", async () => {
+    setup({ "task.create": task("new", { branch: "feat/x" }), "session.start": { boot: "booting" } });
+    const box = screen.getByLabelText("Dispatch an agent");
+    await userEvent.type(box, "@codex shop/feat/x go{Enter}");
+    await waitFor(() => expect(box).toHaveValue(""));
+  });
+
+  it("says so when the task was created but the agent did not start", async () => {
+    setup({ "task.create": task("new", { branch: "feat/x" }), "session.start": rpcError(RpcCode.DRIVER, "codex not found") });
+    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@codex shop/feat/x go{Enter}");
+    expect(await screen.findByRole("alert")).toHaveTextContent("feat/x was created but the agent did not start");
+    expect(screen.getByRole("alert")).toHaveTextContent("codex not found");
+  });
+
+  it("an ambiguous repo name is refused without calling the daemon", async () => {
+    const h = setup({}, [task("a", { status: "working" })], [], null, ["/repos/shop", "/other/shop"]);
+    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude shop/feat/x go{Enter}");
+    expect(await screen.findByRole("alert")).toHaveTextContent('"shop" names several repos');
+    expect(h.calls).toEqual([]);
+  });
+
+  it("a mention puts the keyboard in the composer", async () => {
+    setup();
+    await userEvent.click(screen.getByRole("button", { name: /^@claude/ }));
+    expect(screen.getByLabelText("Dispatch an agent")).toHaveFocus();
+  });
+
+  it("an added repo can be removed from Projects", async () => {
+    setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
+    const rail = screen.getByRole("navigation", { name: "Projects and agents" });
+    await userEvent.click(within(rail).getByRole("button", { name: "Remove api from Projects" }));
+    expect(within(rail).queryByRole("button", { name: /^api/ })).toBeNull();
+    expect(within(rail).getByRole("button", { name: /^shop/ })).toBeInTheDocument();
+  });
+
+  it("the rail's needs-you count is read as words, the badge itself hidden", () => {
+    setup({}, [task("a", { status: "needs_you" })]);
+    const rail = screen.getByRole("navigation", { name: "Projects and agents" });
+    expect(within(rail).getByRole("button", { name: "shop, 1 needs you" })).toBeInTheDocument();
+    expect(rail.querySelector(".badge")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("one status region announces a card's change of state", () => {
+    const h = setup({}, [task("a", { status: "working" })]);
+    const region = screen.getByRole("status", { name: "Agent updates" });
+    expect(region).toHaveTextContent("");
+    act(() => h.env.cockpit.dispatch({ type: "event", event: ev(5, "a", "status", { to: "needs_you" }) }));
+    expect(region).toHaveTextContent("goal of a: Needs you");
+  });
 });
