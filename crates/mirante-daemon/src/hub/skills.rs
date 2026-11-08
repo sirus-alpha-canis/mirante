@@ -1413,6 +1413,43 @@ impl Hub {
         (!injected.is_empty()).then_some(r.injected)
     }
 
+    /// A resumed Codex thread: the skills its history holds (its first turn's, less earlier
+    /// withdrawals) that a new session would no longer get in that version (retired,
+    /// changed, rescoped away, refused), recorded as `skill.withdrawn`. Empty when nothing
+    /// changed or on an error (logged).
+    pub(crate) fn codex_withdrawals(&self, task: &Task, session_id: &str, conversation: &str) -> Vec<String> {
+        let held = match self.lock().store.skill_conversation_skills(conversation) {
+            Ok(h) => h,
+            Err(e) => {
+                self.lock().log_error(Some(&task.id), "skills of the resumed thread", &e);
+                return Vec::new();
+            }
+        };
+        if held.is_empty() {
+            return Vec::new();
+        }
+        let now = match self.resolve_skills(task) {
+            Ok(r) => r.injected_names(),
+            Err(e) => {
+                self.lock().log_error(Some(&task.id), "skills of the resumed thread", &e);
+                return Vec::new();
+            }
+        };
+        let withdrawn: Vec<String> = held
+            .into_iter()
+            .filter(|(name, version)| !now.iter().any(|(n, v)| n == name && version.is_none_or(|h| h == *v)))
+            .map(|(name, _)| name)
+            .collect();
+        if !withdrawn.is_empty() {
+            let mut st = self.lock();
+            if let Err(e) = st.store.skill_record_withdrawn(session_id, &task.id, &withdrawn) {
+                st.log_error(Some(&task.id), "skill withdrawal", &e);
+            }
+            st.publish();
+        }
+        withdrawn
+    }
+
     /// The `mirante-skills` server (`skill_propose`) for a session of `task`: only when its
     /// origin is confirmed and its client has skill learning on (the daemon would refuse
     /// every proposal otherwise), and the `mirante-mcp` binary exists.
@@ -2475,9 +2512,52 @@ pub(crate) mod tests {
         assert_eq!((usage["acme-rules"].injected, usage["everywhere"].injected), (1, 2));
     }
 
-    /// A resumed Codex thread has its skills in its history already (the first turn of the
-    /// new thread carried them): nothing is resolved, injected or recorded again. A
-    /// resumed Claude session gets them again (its plugin is rebuilt).
+    /// A resumed Codex thread keeps what its first turn gave it, except what was retired or
+    /// changed since: those are withdrawn (`skill.withdrawn`, once, and the request names
+    /// them for the driver). Nothing is injected again.
+    #[test]
+    fn a_resumed_codex_thread_withdraws_retired_and_changed_skills_once() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        let gone = install(&k, "gone", 1, Scope::org("github.com/acme"), Activation::Always, "Gone.\n");
+        install(&k, "changed", 1, Scope::org("github.com/acme"), Activation::OnDemand, "Old.\n");
+        install(&k, "kept", 1, Scope::org("github.com/acme"), Activation::Always, "Kept.\n");
+        let t = k.started(AgentKind::Codex, "c").task;
+        let (mut always, on_demand) = spawned(&k).unwrap();
+        always.sort();
+        assert_eq!((always, on_demand), (strs(&["gone", "kept"]), strs(&["changed"])));
+        k.emit(crate::driver::DriverEvent::NativeId("th-1".into()));
+        let resume = |k: &Kit| {
+            k.emit(crate::driver::DriverEvent::Exited { code: Some(0) });
+            let r = k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, true);
+            assert!(r.unwrap().resumed);
+            assert_eq!(spawned(k), None, "nothing injected again");
+            let mut w = k.factory.withdrawn.lock().unwrap().last().cloned().unwrap();
+            w.sort();
+            w
+        };
+        assert_eq!(resume(&k), Vec::<String>::new(), "nothing changed");
+        {
+            let mut st = k.hub.lock();
+            let mut row = st.store.skill_get("gone").unwrap().unwrap();
+            row.status = "retired".into();
+            st.store.skill_change(&gone, &row, None, "retire").unwrap();
+        }
+        install(&k, "changed", 2, Scope::org("github.com/acme"), Activation::OnDemand, "New.\n");
+        assert_eq!(resume(&k), strs(&["changed", "gone"]));
+        let w = k.payloads("skill.withdrawn");
+        assert_eq!(w.len(), 1);
+        let mut names: Vec<String> = serde_json::from_value(w[0]["names"].clone()).unwrap();
+        names.sort();
+        assert_eq!(names, strs(&["changed", "gone"]));
+        assert!(k.payloads("skill.injected").len() == 1, "only the thread's first session");
+        // Withdrawn once: the next resume has nothing more to take back.
+        assert_eq!(resume(&k), Vec::<String>::new());
+        assert_eq!(k.payloads("skill.withdrawn").len(), 1);
+    }
+
+    /// A resumed Claude session gets its skills again (its plugin is rebuilt).
     #[test]
     fn a_resumed_codex_thread_gets_no_skills_again_but_claude_does() {
         let Some(_) = keygen() else { return };

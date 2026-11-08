@@ -341,6 +341,10 @@ pub struct SpawnRequest {
     /// The verified skills whose scope matches the task's origin (see
     /// `Hub::skills_for`); `None` when there are none.
     pub skills: Option<InjectedSkills>,
+    /// A resumed Codex thread: the skills its history holds that were retired or changed
+    /// since (see `Hub::codex_withdrawals`); the driver tells the agent not to follow them
+    /// and removes their files. Empty otherwise.
+    pub withdrawn: Vec<String>,
 }
 
 pub trait DriverFactory: Send + Sync {

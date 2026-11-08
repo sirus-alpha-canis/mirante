@@ -22,8 +22,9 @@
 //! `--append-system-prompt-file <bundle>/always.md` for the always-on ones (inline
 //! `--append-system-prompt` when that hidden flag is refused), both before `--mcp-config`.
 //! Codex gets the bundle's first-turn item (`ChildEnv::first_turn`), sent before the goal
-//! on a new thread only. A bundle that cannot be written is reported as a step and the
-//! session starts without skills.
+//! on a new thread; a resumed thread gets instead, when the hub names any, the withdrawal
+//! of skills retired or changed since (their files removed). A bundle that cannot be
+//! written is reported as a step and the session starts without skills.
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -41,7 +42,9 @@ use mirante_ipc::types::AgentBinView;
 use super::claude::{ClaudeDriver, ClaudeTiming};
 use super::codex::{codex_env_to_scrub, ChildEnv, CodexDriver, CodexTiming};
 use super::pty::PtySpec;
-pub use super::skill_bundle::{append_file_supported, write_skill_bundle, SkillBundle};
+pub use super::skill_bundle::{
+    append_file_supported, withdraw_skills, withdrawal_item, write_skill_bundle, SkillBundle,
+};
 use super::{Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
 #[derive(Debug, Clone)]
@@ -236,6 +239,26 @@ fn codex_skill_bundle(req: &SpawnRequest, sink: &Sink) -> Option<SkillBundle> {
     }
 }
 
+/// The item Codex's first `turn/start` carries: a new thread's skills (`bundle`), or on a
+/// resume the withdrawal of `req.withdrawn` (their files removed, a `skills_withdrawn`
+/// step; a failure is a `skills_failed` step and the item is still sent).
+fn codex_first_turn(req: &SpawnRequest, bundle: Option<&SkillBundle>, sink: &Sink) -> Option<String> {
+    if req.resume.is_none() {
+        return bundle.and_then(|b| b.preamble.clone());
+    }
+    if req.withdrawn.is_empty() {
+        return None;
+    }
+    sink.emit(DriverEvent::Step(serde_json::json!({ "type": "skills_withdrawn", "names": req.withdrawn })));
+    match withdraw_skills(&req.paths, &req.task.id, &req.withdrawn) {
+        Ok(item) => item,
+        Err(e) => {
+            sink.emit(DriverEvent::Step(serde_json::json!({ "type": "skills_failed", "error": e })));
+            withdrawal_item(&req.withdrawn)
+        }
+    }
+}
+
 /// The PTY launch for `req`, and the native session id pinned for a fresh start
 /// (`None` when resuming: the id to resume is `req.resume`).
 pub fn claude_spec(
@@ -354,7 +377,8 @@ impl RealFactory {
         prepare_append_log(&log, STDERR_LOG_CAP)?;
         let env_remove = codex_env_to_scrub(parent_env());
         let bundle = codex_skill_bundle(req, &sink);
-        let first_turn = bundle.as_ref().and_then(|b| b.preamble.as_deref());
+        let first_turn = codex_first_turn(req, bundle.as_ref(), &sink);
+        let first_turn = first_turn.as_deref();
         let extra_args = codex_mcp_args(req.mcp.as_deref(), req.skills_mcp.as_deref(), &req.task.id, req.paths.home())
             .map_err(DriverError::Failed)?;
         let d = CodexDriver::spawn(
@@ -449,6 +473,7 @@ mod tests {
             mcp: None,
             skills_mcp: None,
             skills: None,
+            withdrawn: Vec::new(),
         }
     }
 
@@ -657,6 +682,38 @@ mod tests {
         assert_eq!(codex_skill_bundle(&resumed, &sink), None);
         assert!(first.dir.join("lookup-api/SKILL.md").exists(), "the first turn's paths still resolve");
     }
+    /// A resumed thread whose skills were retired or changed: their files go, the first
+    /// turn says not to follow them, and the feed gets a `skills_withdrawn` step.
+    #[test]
+    fn a_resumed_codex_thread_gets_its_withdrawals_as_the_first_turn() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.task.agent = AgentKind::Codex;
+        req.paths = Paths::new(d.path());
+        req.skills = Some(crate::driver::skill_bundle::tests::sample());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink = Sink::new("sess-42", tx);
+        let first = codex_skill_bundle(&req, &sink).unwrap();
+        assert_eq!(codex_first_turn(&req, Some(&first), &sink).as_deref(), first.preamble.as_deref());
+        let mut resumed = request(Some("th-1"));
+        resumed.task.agent = AgentKind::Codex;
+        resumed.paths = Paths::new(d.path());
+        resumed.session_id = "sess-43".into();
+        assert_eq!(codex_first_turn(&resumed, None, &sink), None, "nothing withdrawn: nothing sent");
+        resumed.withdrawn = vec!["lookup-api".into()];
+        let item = codex_first_turn(&resumed, None, &sink).expect("the withdrawal item");
+        assert!(item.contains("- lookup-api\n"), "{item}");
+        assert!(!first.dir.join("lookup-api").exists());
+        let steps: Vec<serde_json::Value> = rx
+            .try_iter()
+            .filter_map(|(_, e)| match e {
+                DriverEvent::Step(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, [serde_json::json!({"type": "skills_withdrawn", "names": ["lookup-api"]})]);
+    }
+
     #[test]
     fn codex_mcp_args_cover_both_servers() {
         let bin = Path::new("/opt/m/mirante-mcp");

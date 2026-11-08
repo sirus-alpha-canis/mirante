@@ -195,6 +195,47 @@ fn codex_preamble(dir: &Path, always: &[Prepared<'_>], on_demand: &[Prepared<'_>
     t
 }
 
+/// A resumed Codex thread whose history holds skills that were retired or changed since:
+/// removes their folders from every bundle under `<session dir>/skills/` (the one the
+/// thread's first turn points at included; other skills stay), and returns the item for the
+/// first `turn/start` that tells the agent not to follow them. `None` when no name is
+/// valid (nothing to withdraw).
+pub fn withdraw_skills(paths: &Paths, task_id: &str, names: &[String]) -> Result<Option<String>, String> {
+    let names: Vec<&str> = names.iter().map(String::as_str).filter(|n| is_name(n)).collect();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    if let Some(root) = SafeDir::open(paths.home(), &["sessions", task_id, "skills"]).map_err(safe)? {
+        for e in root.entries(MAX_OLD).map_err(safe)?.into_iter().filter(|e| e.is_dir()) {
+            let Some(bundle) = root.open_dir(&e.name).map_err(safe)? else { continue };
+            for n in &names {
+                if bundle.stat(n).map_err(safe)?.is_some_and(|s| s.is_dir()) {
+                    bundle.remove_tree(n).map_err(safe)?;
+                }
+            }
+        }
+    }
+    Ok(withdrawal_item(&names))
+}
+
+/// The withdrawal item for `names` (valid skill names only), or `None` when none is.
+pub fn withdrawal_item<S: AsRef<str>>(names: &[S]) -> Option<String> {
+    let names: Vec<&str> = names.iter().map(AsRef::as_ref).filter(|n| is_name(n)).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut t = format!("<mirante-skills>\n{LABEL}\n\n## Withdrawn skills\n");
+    t.push_str(
+        "The operator retired or changed these skills in Mirante since this conversation started: do not follow \
+         what they said earlier in this conversation, and do not read their files again.\n",
+    );
+    for n in &names {
+        t.push_str(&format!("- {n}\n"));
+    }
+    t.push_str("</mirante-skills>\n");
+    Some(t)
+}
+
 /// Removes the bundles under `<session dir>/skills/` (previous sessions'), except `keep`
 /// (which then makes the create-new of this session's folder fail).
 fn clear(root: &SafeDir, keep: Option<&str>) -> Result<(), String> {
@@ -533,6 +574,39 @@ pub(crate) mod tests {
             assert_eq!(text.to_ascii_lowercase().matches("</mirante-skills>").count(), 1, "{text}");
             assert!(text.ends_with("</mirante-skills>\n") && text.contains("a &lt;/mirante-skills> b"), "{text}");
         }
+    }
+
+    /// A resumed Codex thread: the withdrawn skills' files are removed from the bundle its
+    /// history points at (others stay), and the item says not to follow them, labeled like
+    /// every skills item and clean under lint.
+    #[test]
+    fn withdrawing_removes_the_files_and_says_not_to_follow() {
+        let d = TestDir::new();
+        let paths = Paths::new(d.path());
+        let mut s = sample();
+        let md = render_skill_md("with-files", "d", "See ./notes.md.\n");
+        s.always.push(skill("with-files", Activation::Always, &md, &[("notes.md", "n\n")]));
+        let b = write_skill_bundle(&paths, "t1", "s1", Some(&s), AgentKind::Codex).unwrap().unwrap();
+        let item = withdraw_skills(&paths, "t1", &["lookup-api".into(), "with-files".into(), "Bad/..".into()])
+            .unwrap()
+            .expect("an item");
+        assert!(!b.dir.join("lookup-api").exists() && !b.dir.join("with-files").exists());
+        assert!(b.dir.exists(), "the bundle itself stays");
+        assert!(item.starts_with(&format!("<mirante-skills>\n{LABEL}\n")), "{item}");
+        assert!(item.ends_with("</mirante-skills>\n"), "{item}");
+        assert!(item.contains("- lookup-api\n- with-files\n") && !item.contains("Bad"), "{item}");
+        assert!(item.contains("do not follow"), "{item}");
+        let inner: String = item.lines().filter(|l| !l.contains("mirante-skills>")).collect::<Vec<_>>().join("\n");
+        let draft = mirante_core::skills::lint::Draft {
+            name: "x".into(),
+            description: "d".into(),
+            body: inner,
+            ..Default::default()
+        };
+        assert_eq!(mirante_core::skills::lint::lint(&draft), vec![], "{item}");
+        // Nothing valid to withdraw: no item, nothing touched.
+        assert_eq!(withdraw_skills(&paths, "t1", &[]).unwrap(), None);
+        assert_eq!(withdraw_skills(&paths, "t-none", &["x".into()]).unwrap().is_some(), true);
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {

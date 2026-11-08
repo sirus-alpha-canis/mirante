@@ -829,7 +829,9 @@ impl Store {
         }
         if !injected.is_empty() {
             let names: Vec<&str> = injected.iter().map(|(n, _)| n.as_str()).collect();
-            insert_event(&tx, &boot, Some(task), "skill.injected", &json!({ "session_id": session, "names": names }))?;
+            let versions: Vec<u32> = injected.iter().map(|(_, v)| *v).collect();
+            let payload = json!({ "session_id": session, "names": names, "versions": versions });
+            insert_event(&tx, &boot, Some(task), "skill.injected", &payload)?;
         }
         for (name, version, reason) in refused {
             insert_usage(&tx, session, task, name, *version, "refused", reason)?;
@@ -837,6 +839,48 @@ impl Store {
             insert_event(&tx, &boot, Some(task), "skill.refused", &payload)?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The skills a conversation's agent holds in its history: what `skill.injected` gave
+    /// its sessions (a Codex thread gets them on its first turn only), less what
+    /// `skill.withdrawn` took back since, in injection order. A version is `None` when the
+    /// event predates recorded versions. Read from events (never pruned), not usage.
+    pub fn skill_conversation_skills(&self, conversation: &str) -> Result<Vec<(String, Option<u32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, payload FROM events
+             WHERE kind IN ('skill.injected', 'skill.withdrawn')
+               AND json_extract(payload, '$.session_id') IN (SELECT id FROM sessions WHERE conversation_id = ?1)
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([conversation], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut held: Vec<(String, Option<u32>)> = Vec::new();
+        for row in rows {
+            let (kind, payload) = row?;
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            let names = v["names"].as_array().cloned().unwrap_or_default();
+            for (i, n) in names.iter().enumerate() {
+                let Some(n) = n.as_str() else { continue };
+                held.retain(|(h, _)| h != n);
+                if kind == "skill.injected" {
+                    let version = v["versions"].get(i).and_then(|x| x.as_u64()).map(|x| x as u32);
+                    held.push((n.to_string(), version));
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    /// Records that `session` (a resumed conversation) withdrew `names`: `skill.withdrawn`.
+    pub fn skill_record_withdrawn(&mut self, session: &str, task: &str, names: &[String]) -> Result<()> {
+        let boot = self.boot_id().to_string();
+        insert_event(
+            &self.conn,
+            &boot,
+            Some(task),
+            "skill.withdrawn",
+            &json!({ "session_id": session, "names": names }),
+        )?;
         Ok(())
     }
 
@@ -1309,6 +1353,41 @@ mod tests {
         assert!(s.skill_injected_by_task("github.com/acme", crate::model::now_ms() + 60_000).unwrap().is_empty());
         let ev: Vec<String> = kinds(&s).into_iter().filter(|k| k.starts_with("skill.")).collect();
         assert_eq!(ev, ["skill.origin_pinned", "skill.injected", "skill.refused", "skill.injected", "skill.used"]);
+    }
+
+    /// A conversation's skills: what its first session was given (names and versions),
+    /// less what later sessions withdrew. Another conversation of the task does not count.
+    #[test]
+    fn a_conversation_s_skills_are_its_injected_set_less_withdrawals() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = task(&mut s, "g");
+        let c = s.create_conversation(&t).unwrap();
+        let first = s.start_session(&t, &c.id).unwrap();
+        assert!(s.skill_conversation_skills(&c.id).unwrap().is_empty());
+        s.skill_record_session(&first.id, &t, &[("a".into(), 1), ("b".into(), 3)], &[], None).unwrap();
+        let ev = s.events_since(0, 100).unwrap();
+        let inj = ev.iter().find(|e| e.kind == "skill.injected").unwrap();
+        assert_eq!(inj.payload["versions"], serde_json::json!([1, 3]));
+        s.end_session(&first.id).unwrap();
+        let second = s.start_session(&t, &c.id).unwrap();
+        assert_eq!(
+            s.skill_conversation_skills(&c.id).unwrap(),
+            [("a".to_string(), Some(1)), ("b".to_string(), Some(3))]
+        );
+        s.skill_record_withdrawn(&second.id, &t, &["a".to_string()]).unwrap();
+        let ev = s.events_since(0, 100).unwrap();
+        let w = ev.iter().find(|e| e.kind == "skill.withdrawn").unwrap();
+        assert_eq!(w.payload, serde_json::json!({"session_id": second.id, "names": ["a"]}));
+        assert_eq!(w.task_id.as_deref(), Some(t.as_str()));
+        assert_eq!(s.skill_conversation_skills(&c.id).unwrap(), [("b".to_string(), Some(3))]);
+        // An injected event written before versions were recorded: the version is unknown.
+        s.end_session(&second.id).unwrap();
+        let c2 = s.create_conversation(&t).unwrap();
+        let other = s.start_session(&t, &c2.id).unwrap();
+        s.append_event(Some(&t), "skill.injected", &serde_json::json!({"session_id": other.id, "names": ["z"]}))
+            .unwrap();
+        assert_eq!(s.skill_conversation_skills(&c2.id).unwrap(), [("z".to_string(), None)]);
+        assert_eq!(s.skill_conversation_skills(&c.id).unwrap(), [("b".to_string(), Some(3))]);
     }
 
     /// No skill applies: `skill.unavailable` is written with the session's (empty) usage.

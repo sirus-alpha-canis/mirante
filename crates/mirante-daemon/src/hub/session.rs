@@ -446,7 +446,7 @@ impl Hub {
     /// Starts (or, with `resume`, resumes) the task's agent. Fails with a conflict while a
     /// session is live (the per-task lock). Waits until the agent leaves `Booting`.
     pub fn start_session(&self, req: StartSession, resume: bool) -> Result<StartResult> {
-        let (task, session_id, native, sink) = {
+        let (task, session_id, native, sink, conversation_id) = {
             let mut st = self.lock();
             let task = st.resolve(&req.task)?;
             if task.lifecycle == Lifecycle::Archived {
@@ -498,15 +498,16 @@ impl Hub {
             }
             st.live.insert(task.id.clone(), live);
             st.publish();
-            (task, session.id, native, sink)
+            (task, session.id, native, sink, conversation.id)
         };
         let mcp = self.memory_server_for(&task);
         let skills_mcp = self.skills_server_for(&task);
         // A resumed Codex thread has its skills in its history (its first turn carried
-        // them); a resumed Claude session gets its plugin and always-on text again.
-        let skills = match (task.agent, &native) {
-            (AgentKind::Codex, Some(_)) => None,
-            _ => self.skills_for(&task, &session_id),
+        // them): it gets nothing again, only the withdrawal of those retired or changed
+        // since. A resumed Claude session gets its plugin and always-on text again.
+        let (skills, withdrawn) = match (task.agent, &native) {
+            (AgentKind::Codex, Some(_)) => (None, self.codex_withdrawals(&task, &session_id, &conversation_id)),
+            _ => (self.skills_for(&task, &session_id), Vec::new()),
         };
         let req = SpawnRequest {
             task: task.clone(),
@@ -516,6 +517,7 @@ impl Hub {
             mcp,
             skills_mcp,
             skills,
+            withdrawn,
         };
         match self.factory.spawn(req, sink) {
             Ok(driver) => {

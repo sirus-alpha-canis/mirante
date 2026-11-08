@@ -624,8 +624,9 @@ struct Shared {
     reap_due: Option<Vec<String>>,
     /// Abandoned command ids Codex has not reported ended yet.
     abandoned_open: HashSet<String>,
-    /// The skills item owed to the first `turn/start` of a new thread (never a resumed one,
-    /// whose history has it already); taken by that start, put back if it was refused.
+    /// The skills item owed to the first `turn/start`: a new thread's skills, or a resumed
+    /// thread's withdrawals (the factory decides which); taken by that start, put back if
+    /// it was refused.
     first_turn: Option<String>,
 }
 
@@ -954,7 +955,8 @@ pub struct ChildEnv<'a> {
     /// `-c key=value` config overrides (the per-task memory server), which `app-server`
     /// accepts after the subcommand.
     pub args: &'a [String],
-    /// The session's skills, as the leading input item of a new thread's first turn.
+    /// The leading input item of the first turn: a new thread's skills, or a resumed
+    /// thread's withdrawn skills.
     pub first_turn: Option<&'a str>,
 }
 
@@ -1010,8 +1012,8 @@ impl CodexDriver {
         CodexDriver::connect_process(reader, writer, None, cwd, resume, None, sink, timing)
     }
 
-    /// [`CodexDriver::connect`], owing `first_turn` to a new thread's first `turn/start`
-    /// (dropped when resuming).
+    /// [`CodexDriver::connect`], owing `first_turn` to the first `turn/start` (a new
+    /// thread's skills, or a resumed one's withdrawals).
     pub fn connect_with_first_turn(
         reader: impl BufRead + Send + 'static,
         writer: impl Write + Send + 'static,
@@ -1053,7 +1055,7 @@ impl CodexDriver {
             turn_baseline: None,
             reap_due: None,
             abandoned_open: HashSet::new(),
-            first_turn: if resume.is_none() { first_turn } else { None },
+            first_turn,
         }));
         let ctx = Arc::new(Ctx {
             shared: shared.clone(),
@@ -2193,9 +2195,30 @@ mod tests {
 
     #[test]
     fn resume_and_later_turns_do_not() {
-        let (d, mut fake, _rx) = setup_skills(Some("th-old"));
+        let (d, mut fake, _rx, _) = connect_full(Some("th-old"), None, |f, t| f.reply(t, thread_ok("th-1")));
+        let d = d.unwrap();
         d.send("go on").unwrap();
         assert_eq!(texts(&fake.expect("turn/start")), ["go on"]);
+    }
+
+    /// A resumed thread whose skills were retired or changed: the factory hands the
+    /// withdrawal item, and the first `turn/start` after `thread/resume` carries it once.
+    #[test]
+    fn a_resume_carries_the_withdrawal_item_on_its_first_turn_only() {
+        const WITHDRAWN: &str = "<mirante-skills>\n## Withdrawn skills\n- gone\n</mirante-skills>\n";
+        let (d, mut fake, rx, thread) =
+            connect_full(Some("th-old"), Some(WITHDRAWN), |f, t| f.reply(t, thread_ok("th-old")));
+        assert_eq!(thread["method"], "thread/resume");
+        let d = d.unwrap();
+        d.send("go on").unwrap();
+        let start = fake.expect("turn/start");
+        assert_eq!(texts(&start), [WITHDRAWN, "go on"]);
+        fake.reply(&start, json!({"turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
+        fake.notify("turn/completed", json!({"threadId": "th-old", "turn": {"id": "tu-1", "status": "completed"}}));
+        next_event(&rx, status_to(Status::Idle));
+        d.send("more").unwrap();
+        assert_eq!(texts(&fake.expect("turn/start")), ["more"]);
     }
 
     #[test]

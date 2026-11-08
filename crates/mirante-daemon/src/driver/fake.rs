@@ -157,6 +157,8 @@ pub struct FakeFactory {
     pub skill_mcps: Mutex<Vec<Option<std::path::PathBuf>>>,
     /// Every spawn request's `skills`, in order.
     pub skills: Mutex<Vec<Option<super::InjectedSkills>>>,
+    /// Every spawn request's `withdrawn`, in order.
+    pub withdrawn: Mutex<Vec<Vec<String>>>,
 }
 
 impl FakeFactory {
@@ -179,6 +181,7 @@ impl DriverFactory for Arc<FakeFactory> {
         self.mcps.lock().unwrap().push(req.mcp.clone());
         self.skill_mcps.lock().unwrap().push(req.skills_mcp.clone());
         self.skills.lock().unwrap().push(req.skills.clone());
+        self.withdrawn.lock().unwrap().push(req.withdrawn.clone());
         if self.fail.load(Ordering::SeqCst) {
             return Err(DriverError::Failed("spawn refused".into()));
         }
