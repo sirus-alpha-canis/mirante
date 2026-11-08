@@ -899,6 +899,13 @@ fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, tim
                 }
                 return Err(e);
             }
+            // It may have landed with the skills, or not: never sent again (it would be
+            // twice), and the feed says so.
+            Err(e) if prefix.is_some() => {
+                let error = e.to_string();
+                sink.emit(DriverEvent::Step(json!({ "type": "skills_maybe_lost", "error": error })));
+                return Err(e);
+            }
             other => other?,
         };
         if let Some(id) = r["turn"]["id"].as_str() {
@@ -2235,6 +2242,20 @@ mod tests {
         // Still owed to the first turn/start.
         d.send("start one").unwrap();
         assert_eq!(texts(&fake.expect("turn/start")), [SKILLS, "start one"]);
+    }
+
+    /// A first `turn/start` with no answer may or may not have landed with its skills: not
+    /// sent again (it would be twice), and the feed says the skills may be lost.
+    #[test]
+    fn a_timed_out_first_turn_says_the_skills_may_be_lost() {
+        let (d, mut fake, rx) = setup_skills(None);
+        d.send("first").unwrap();
+        assert_eq!(texts(&fake.expect("turn/start")).len(), 2);
+        let ev = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "skills_maybe_lost"));
+        let DriverEvent::Step(v) = ev else { unreachable!() };
+        assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{v}");
+        d.send("second").unwrap();
+        assert_eq!(texts(&fake.expect("turn/start")), ["second"], "not sent twice");
     }
 
     #[test]
