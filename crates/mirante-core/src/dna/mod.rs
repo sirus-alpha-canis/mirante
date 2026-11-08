@@ -4,7 +4,9 @@
 pub mod anchor;
 pub mod check;
 pub mod fsio;
+pub mod index;
 pub mod note;
+pub mod untrusted;
 
 use sha2::{Digest, Sha256};
 
