@@ -8,11 +8,9 @@ checked without an interactive session; everything else is for the founder.
 This sits on top of the cockpit checklist (`cockpit.md`): same daemon, same app, now with
 `.mirante/memory/` enabled on a repo.
 
-Setup: as in `cockpit.md` (`cargo install --path crates/mirante-daemon`,
-`crates/mirante-hook`, `crates/mirante-cli`), plus `cargo install --path crates/mirante-mcp`
-(the memory MCP server; the daemon uses `$MIRANTE_MCP_BIN`, else `mirante-mcp` next to itself). Build
-and open the app (`apps/cockpit/README.md`). The CLI, the daemon and `mirante-mcp` must be
-the same build.
+Setup: as in `cockpit.md` (`scripts/install.sh --app`, which also links `mirante-mcp`, the
+memory MCP server; the daemon uses `$MIRANTE_MCP_BIN`, else `mirante-mcp` next to itself).
+The CLI, the daemon and `mirante-mcp` must be the same build.
 
 Careful: every `mirante` command except `memory check --offline` talks to the daemon at
 `$MIRANTE_HOME` (default `~/.mirante`) and **starts one if none is running**. For
@@ -32,7 +30,7 @@ experiments, `export MIRANTE_HOME=/tmp/mh` (short: the socket path has a length 
 
 ## B. Claude
 
-- [ ] Dispatch `@claude <repo>/<branch> <goal>` on the enabled repo. In its terminal, `/mcp`
+- [ ] Dispatch a goal to the enabled repo from Home's form (agent Claude). In its terminal, `/mcp`
       lists **mirante-memory**, connected, with 3 tools: `memory_search`, `memory_get`,
       `memory_propose`.
 - [ ] Ask it to search memory: `memory_search` runs **with no permission dialog**, and so
@@ -48,7 +46,7 @@ experiments, `export MIRANTE_HOME=/tmp/mh` (short: the socket path has a length 
 
 ## C. Codex
 
-- [ ] Dispatch `@codex <repo>/<branch> <goal>` (auto-edits). Ask it to search memory: it
+- [ ] Dispatch a goal from Home's form with agent Codex (auto-edits). Ask it to search memory: it
       calls `memory_search` and gets results.
 - [ ] Record whether Codex asks approval **per MCP call** in auto-edits mode: for
       `memory_search`, for `memory_get`, for `memory_propose`. Each request would arrive as

@@ -138,7 +138,9 @@ if [ "$app" = 1 ]; then
   pnpm --dir apps/cockpit install --frozen-lockfile
   pnpm --dir apps/cockpit tauri build --bundles app
   bundle="$root/apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app"
-  [ -d "$bundle" ] && say "App: $bundle (open it, or copy it to /Applications)"
+  if [ -d "$bundle" ]; then
+    say "App: $bundle (open it, or copy it to /Applications)"
+  fi
 fi
 
 cat <<EOF

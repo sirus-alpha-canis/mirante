@@ -8,13 +8,13 @@ This sits on top of the CLI dogfood (`2026-11-07-plan-2b-dogfood.md`, results in
 `2026-11-07-plan-2b-results.md`): the same daemon, now seen through the app. Section I lists
 what that run left for the founder to try by hand.
 
-Setup: `cargo install --path crates/mirante-daemon`, `crates/mirante-hook`,
-`crates/mirante-cli`; build and open the app (`apps/cockpit/README.md`). Keep
+Setup: `scripts/install.sh --app` (the four binaries linked into `~/.local/bin`, the
+daemon started, `mirante doctor`, and the app built; see the README's Quickstart). Keep
 `mirante watch` open in a terminal the first day to compare.
 
 - [ ] The app finds `mirante-daemon` in `~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`
       or `/usr/local/bin`, then on your login shell's PATH (or at `$MIRANTE_DAEMON_BIN`):
-      `cargo install` puts it in the first. The CLI and the daemon must be the same build.
+      `install.sh` links it into `~/.local/bin`. The CLI and the daemon must be the same build.
 - [ ] Optionally point the daemon at the real agents explicitly (PATH `claude` may be a cmux
       shim; Codex lives under nvm), in your shell profile so the app sees them too:
       `export MIRANTE_CLAUDE_BIN=/opt/homebrew/bin/claude` and
@@ -34,25 +34,35 @@ Setup: `cargo install --path crates/mirante-daemon`, `crates/mirante-hook`,
 
 ## A. Start and connect
 
-- [ ] With no daemon running, the banner says it is not reachable; **Start daemon** starts it
-      and the banner disappears within 2 s.
-- [ ] First real render: home (V3) shows the rail (Projects, Agents, Memory), the project
-      feed and the board; nothing overlaps or is cut at the minimum window size (960×600)
-      and at full screen. Note anything that looks different from the prototype.
+- [ ] With no daemon running, the banner says it is not reachable and counts down to the
+      next try; **Start daemon** starts it and the banner disappears within 2 s.
+- [ ] First real render: Home is the inbox (**Needs you**, **Ready for review**, **Working**,
+      **Idle** folded away, grouped by project) with the dispatch form on top and the rail
+      (Projects, Sessions) on the left; nothing overlaps or is cut at the minimum window size
+      (960×600) and at full screen.
 - [ ] `mirante daemon restart` while the app is open: the banner shows, then the app
-      reconnects by itself; tasks and feeds are intact (no duplicate lines).
-- [ ] Quit and reopen the app: every task, its feed (last 200 events) and pending
-      permission cards are back.
+      reconnects by itself; tasks and their Steps are intact (no duplicate lines).
+- [ ] Quit and reopen the app: it reopens where you were (view, project, open task and tab);
+      every task, its steps and pending permission cards are back.
 
-## B. Dispatch (V3 home)
+## B. Dispatch (Home's form)
 
-- [ ] Add a repo by absolute path; it appears under Projects.
-- [ ] `@claude <repo>/<new-branch> <goal>` creates the worktree and starts Claude; the card
-      appears at once and moves to Working.
+- [ ] Add a repo with **Choose…** (the folder picker) or by pasting its path; it appears
+      under Projects. A missing path or a file is refused there.
+- [ ] Write a goal in Home's form: the branch chip appears as `mirante/<words-of-the-goal>`;
+      pick the agent (Claude) and the repository with the chips; ⌘↵ dispatches. The worktree
+      is created, the card appears at once under Working. The same goal again gets `-2`.
+- [ ] **edit** the branch to an existing one: it is checked out as it is.
 - [ ] A new folder: the trust card appears; **Trust folder** continues, **Decline** ends the
       session (try both, on two tasks).
-- [ ] `@codex <repo>/<branch> <goal>`: the card shows the **auto-edits** label.
-- [ ] A typo (`@claud`, missing branch, unknown repo) shows the reason and calls nothing.
+- [ ] Agent **Codex**: the card shows the **auto-edits** label.
+- [ ] The one-line form `@claude <repo>/<branch> <goal>` in the same box (typing `@` suggests
+      the agents, then the Projects); a typo (`@claud`, an unknown repo) shows the reason and
+      calls nothing.
+- [ ] **+ context** attaches a repo file and a memory note; the agent's first message lists
+      them under "Context references".
+- [ ] With two tasks waiting on you, **⌘J** opens the next one (Claude's on its Terminal tab)
+      and says where you are ("1 of 2"); Esc goes back to Home with the keyboard on that card.
 
 ## C. Permissions
 

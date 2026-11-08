@@ -364,11 +364,9 @@ mod tests {
     /// A stand-in daemon: a shell script that appends a line to `<home>/launches` and then
     /// runs `rest`.
     fn script(d: &TestDir, rest: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let p = d.path().join("fake-daemon.sh");
-        let body = format!("#!/bin/sh\necho launched >> \"$MIRANTE_HOME/launches\"\n{rest}\n");
-        std::fs::write(&p, body).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = format!("echo launched >> \"$MIRANTE_HOME/launches\"\n{rest}\n");
+        mirante_core::test_script::write_sh(&p, &body, 0o755);
         p
     }
 

@@ -6,16 +6,16 @@ telemetry.
 
 ## Run it
 
-Prerequisites: Rust (stable), Node 22.12+ and pnpm 10, Xcode command line tools (macOS).
+Install Mirante as the root [README](../../README.md#quickstart-5-minutes) says: from the
+repository root, `scripts/install.sh --app` builds and links the CLI, the daemon, the hook
+and the MCP server (into `~/.local/bin`), starts the daemon and builds this app. The
+prerequisites are there too: Rust through rustup at the version pinned in
+`rust-toolchain.toml`, Node 22.12+, pnpm 10 (pinned in `package.json`'s `packageManager`)
+and the Xcode command line tools.
+
+For work on the app itself, after `scripts/install.sh`:
 
 ```bash
-# The daemon, the hook and the CLI, once (the app finds the daemon in ~/.cargo/bin,
-# ~/.local/bin, /opt/homebrew/bin, /usr/local/bin or on your login shell's PATH, or at
-# $MIRANTE_DAEMON_BIN):
-cargo install --path crates/mirante-daemon
-cargo install --path crates/mirante-hook
-cargo install --path crates/mirante-cli
-
 pnpm --dir apps/cockpit install
 pnpm --dir apps/cockpit tauri dev
 ```

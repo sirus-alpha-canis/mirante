@@ -26,6 +26,33 @@ Early prototype. Expect rough edges and breaking changes.
 
 > Screenshots: none yet. They will be added to this section.
 
+## Quickstart (5 minutes)
+
+You need macOS with the Xcode command line tools (`xcode-select --install`, which brings
+`git`), [rustup](https://rustup.rs), and Claude Code and/or the Codex CLI installed and
+logged in. Then:
+
+```bash
+git clone https://github.com/sirus-alpha-canis/mirante.git && cd mirante
+scripts/install.sh      # builds, links into ~/.local/bin, starts the daemon, runs `mirante doctor`
+scripts/try.sh          # optional: a one-minute tour with a fake agent (no login, no quota)
+
+cd ~/code/your-repo     # any git repository with at least one commit
+mirante new . --agent claude "add a health-check endpoint"   # or --agent codex
+mirante ls              # status, and what needs you
+mirante attach mirante/add-a-health-check-endpoint          # the live terminal; Ctrl-] detaches
+```
+
+The first build takes a few minutes, and the first start of a fresh build can take about
+20 seconds while macOS scans the new binaries (`install.sh` does that first launch for you).
+`install.sh` is safe to run again after a `git pull`: it rebuilds, relinks and restarts an
+idle daemon. If `~/.local/bin` is not on your `PATH`, it says what to add to your shell
+profile.
+
+The desktop app: `scripts/install.sh --app` (also needs Node 22.12+ and pnpm 10), then open
+the `Mirante.app` it prints. `mirante help` lists every command, `mirante <command> --help`
+explains one.
+
 ## Requirements
 
 - macOS (Linux: partial, see above) with the Xcode command line tools and `git` 2.31 or newer.
@@ -43,9 +70,12 @@ Early prototype. Expect rough edges and breaking changes.
 
 ### 1. CLI, daemon, hook and MCP server
 
+`scripts/install.sh` does all of this (`--prefix <dir>` links somewhere other than
+`~/.local/bin`; `--no-start` leaves the daemon alone). By hand:
+
 ```bash
-git clone <this repo> mirante && cd mirante
-cargo build --release --workspace
+git clone https://github.com/sirus-alpha-canis/mirante.git mirante && cd mirante
+cargo build --release --locked -p mirante-cli -p mirante-daemon -p mirante-hook -p mirante-mcp
 mkdir -p ~/.local/bin
 ln -sf "$PWD"/target/release/{mirante,mirante-daemon,mirante-hook,mirante-mcp} ~/.local/bin/
 ```
@@ -67,11 +97,13 @@ export MIRANTE_CODEX_BIN=~/.nvm/versions/node/<version>/bin/codex
 Then open a new shell, so the daemon inherits them:
 
 ```bash
-mirante daemon start
+mirante daemon restart
 mirante doctor          # which agent binaries the daemon resolved, and from where
 ```
 
 ### 2. The desktop app
+
+`scripts/install.sh --app`, or by hand:
 
 ```bash
 pnpm --dir apps/cockpit install
@@ -119,8 +151,10 @@ Closing the app never ends a session, because the daemon owns them. Off macOS, �
 
 ### The CLI
 
-Every core app action has a CLI equivalent. Run `mirante` with no arguments for the full
-usage. A `<task>` is an id, a unique id suffix (4+ characters) or the branch name.
+Every core app action has a CLI equivalent. Run `mirante help` for the full usage and
+`mirante <command> --help` for one command. A `<task>` is an id, a unique id suffix (4+
+characters) or the branch name. Without `--branch`, `new` names the branch
+`mirante/<words-of-the-goal>` (`-2`, `-3`… when taken), like the app.
 
 ```bash
 mirante new . --agent claude --branch feat/login "add a login page"
@@ -136,10 +170,85 @@ mirante interrupt feat/login    # stop the current step
 mirante stop feat/login         # end the agent process (resumable)
 mirante resume feat/login       # back on its native conversation (--fresh: a new one)
 mirante hibernate feat/login    # free memory from an idle agent; `mirante wake` resumes it
-mirante archive feat/login      # remove the worktree, keep the branch
+mirante archive feat/login      # remove the worktree, keep the branch (--stop: end it first)
 mirante doctor                  # orphan processes and checkouts, memory, agent binaries
 mirante daemon start|stop|restart|status
 ```
+
+## Troubleshooting
+
+- **The first start is slow.** The first launch of a freshly built binary can take 10-20
+  seconds on macOS while it scans it (XProtect). The CLI waits up to 30 seconds and says
+  so. `scripts/install.sh` does that first launch for you.
+- **An agent is not found, or the wrong one runs.** `mirante doctor` prints the binary the
+  daemon resolved for `claude` and `codex` and where it came from. The daemon reads
+  `MIRANTE_CLAUDE_BIN`, `MIRANTE_CODEX_BIN` and `PATH` **when it starts**: after changing
+  them in your shell profile, open a new terminal and run `mirante daemon restart`.
+- **cmux (or another terminal's) shims.** A `claude` in a cmux shim directory is skipped
+  (it would inject its own hooks); `mirante doctor` says "skipped cmux shim …". Set
+  `MIRANTE_CLAUDE_BIN` to the real binary if the one it found is not the one you want.
+- **A Claude permission card says "Answer in terminal".** That is the default: screen text
+  cannot prove which request a dialog belongs to, so you answer in Claude's own terminal.
+  Click **Answer in terminal** in the app, or `mirante attach <task>` (also offered by
+  `mirante allow`), answer the dialog, then detach with **Ctrl-]**.
+- **A red "auto mode on" badge.** That Claude session left manual permission mode and
+  approves its own commands. Press Shift+Tab in its terminal until it is back to manual.
+- **New dispatches say memory is paused.** The memory guard paused new sessions and
+  queued deliveries under memory pressure; they resume when it eases. Tune it with
+  `MIRANTE_MEM_BUDGET_MB` (per-session budget), `MIRANTE_IDLE_HIBERNATE_MIN` (hibernate
+  idle sessions) or turn it off with `MIRANTE_MEMGUARD=off`, then restart the daemon.
+- **"socket path is N bytes, limit is 103".** Unix socket paths are short:
+  `MIRANTE_HOME` must be a short directory (for experiments, `/tmp/mh`).
+- **"… is not a git repository" / "has no commit yet".** A task's worktree is a branch of a
+  repository with at least one commit: `git init && git commit --allow-empty -m init`.
+- **The app does not open on another Mac.** A copied, unsigned bundle is quarantined. For
+  a build you made yourself: `xattr -dr com.apple.quarantine Mirante.app`.
+- **After a reboot nothing is running.** There is no login item (launchd agent) yet. The
+  first `mirante` command, or **Start daemon** in the app, starts the daemon, which then
+  resumes the sessions it had (auto-resume).
+- **Where are the logs?** The daemon's log is `~/.mirante/daemon.log` (rotated to
+  `daemon.log.1` past 10 MiB); each task's agent stderr is under
+  `~/.mirante/sessions/<task-id>/`; hook events that could not reach the daemon are
+  recorded in `~/.mirante/hook-lost`. `mirante --verbose <command>` adds the daemon's error
+  codes to error messages. (`MIRANTE_HOOK_LOG` is read only by the spike kit's hook, not by
+  `mirante-hook`.)
+
+## Uninstall
+
+```bash
+scripts/uninstall.sh            # stops the daemon, removes the links install.sh made
+scripts/uninstall.sh --purge    # also deletes ~/.mirante, after you type "delete"
+```
+
+`uninstall.sh` keeps `~/.mirante` (the task database and history, the skill library and
+its signing key, the task worktrees) unless you pass `--purge` and type `delete` at its
+prompt. The worktrees' branches stay in your repositories (`git worktree prune` in a repo
+forgets the removed checkouts). Repo memory notes (`<repo>/.mirante/memory/`) are your
+files and are never touched. Mirante never edits `~/.claude` or `~/.codex`, so there is
+nothing to undo there. Delete the checkout, and any copy of `Mirante.app` you made, yourself.
+
+## Environment
+
+The daemon reads these when it starts (`mirante daemon restart` after a change); the CLI
+and the app pass their own environment to a daemon they start. The app passes only `PATH`
+and `MIRANTE_*` from your login shell.
+
+| Variable | Read by | What it does |
+|---|---|---|
+| `MIRANTE_HOME` | all | Where Mirante keeps its state (default `~/.mirante`). Keep it short: the socket path must fit in about 104 bytes. |
+| `MIRANTE_CLAUDE_BIN` | daemon | The real `claude` binary (default: `PATH` without shims, then the usual install directories). |
+| `MIRANTE_CODEX_BIN` | daemon | The real `codex` binary (same search). |
+| `MIRANTE_DAEMON_BIN` | CLI, app | The `mirante-daemon` to start (default: the one next to `mirante`; the app searches `~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, then your login shell's `PATH`). |
+| `MIRANTE_HOOK_BIN` | daemon | The `mirante-hook` Claude sessions report through (default: next to the daemon). |
+| `MIRANTE_MCP_BIN` | daemon | The `mirante-mcp` server for memory and skills (default: next to the daemon). |
+| `MIRANTE_AUTO_RESUME` | daemon | `off` (or `0`, `false`, `no`): do not resume sessions when the daemon starts again. The app's setting does the same. |
+| `MIRANTE_CLAUDE_INLINE_ANSWERS` | daemon | `1`: the daemon may type a Claude permission answer itself when it has transcript evidence for that request (default: answered in the terminal). |
+| `MIRANTE_MEM_BUDGET_MB` | daemon | Per-session memory budget in MiB (default: 4 GiB or 25 % of RAM, whichever is smaller). |
+| `MIRANTE_IDLE_HIBERNATE_MIN` | daemon | Hibernate a session idle this many minutes (default: off). |
+| `MIRANTE_MEMGUARD` | daemon | `off`: no memory guard at all. |
+| `MIRANTE_SSH_KEYGEN` | daemon | The `ssh-keygen` used to sign and verify skills (default `/usr/bin/ssh-keygen`; never looked up on `PATH`). |
+| `MIRANTE_HOOK_LOG` | spike kit only | Where `crates/spike-kit`'s hook logs; `mirante-hook` does not read it. |
+| `MIRANTE_TASK`, `MIRANTE_TASK_ID`, `MIRANTE_SESSION_ID` | hook, MCP | Set by the daemon for the agents it launches. Do not set them yourself. |
 
 ## How it behaves
 
@@ -265,9 +374,19 @@ pnpm --dir apps/cockpit typecheck
 ```
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request and
-push to `main`: the workspace build, tests and both clippy passes on macOS, the core crates
-and clippy on Linux, and the app's tests, typecheck, build and Tauri crate checks. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md#checks).
+push to `main`: the workspace build, tests (e2e included) and both clippy passes on macOS,
+the core crates and clippy on Linux, the app's tests, typecheck, build and Tauri crate
+checks, `cargo deny` (licenses and advisories, [`deny.toml`](deny.toml)) for both Rust
+workspaces, and shellcheck on the scripts. On `main` it also runs a new user's path:
+`scripts/install.sh` into a temp prefix, `mirante doctor`, `scripts/try.sh --smoke` and
+`scripts/uninstall.sh`. Dependabot proposes weekly updates of the actions, crates and npm
+packages. See [`CONTRIBUTING.md`](CONTRIBUTING.md#checks).
+
+Without agents: `scripts/try.sh` runs the real daemon with the e2e tests' fake `claude`
+(`crates/mirante-cli/tests/fake-claude.sh`) in a throwaway repo and its own `MIRANTE_HOME`
+under `/tmp`, and prints what to try next; `--smoke` checks it and cleans up. For UI work
+without any daemon, the scripted fake daemon is in
+[`apps/cockpit/README.md`](apps/cockpit/README.md#without-agents-the-fake-daemon).
 
 The tests against the real agents are ignored by default. They need your logins and spend
 plan quota; see the header of `crates/mirante-daemon/tests/real_agents.rs`.

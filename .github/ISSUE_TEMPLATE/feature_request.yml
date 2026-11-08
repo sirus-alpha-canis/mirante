@@ -1,0 +1,30 @@
+name: Feature request
+description: Something Mirante should do, or do differently.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like
+      description: How it could work, from your side (CLI, app, agents).
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Anything it would change in Mirante's rules?
+      description: |
+        Mirante keeps a few invariants: everything local (no service, account or telemetry),
+        nothing auto-approved, status from hooks and protocol events (never the screen), and
+        agents never get a person's methods. Say if your idea touches one of them.
+  - type: textarea
+    id: else
+    attributes:
+      label: Alternatives and context

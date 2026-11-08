@@ -42,7 +42,7 @@ pub fn ensure_running(paths: &Paths) -> Result<(), String> {
         .filter(|p| !p.is_empty())
         .or_else(|| login("MIRANTE_DAEMON_BIN").map(OsString::from));
     let bin = find_daemon_bin(env_bin, home.as_deref(), login("PATH")).ok_or_else(|| {
-        "mirante-daemon not found: install it (cargo install --path crates/mirante-daemon) or set MIRANTE_DAEMON_BIN"
+        "mirante-daemon not found: run scripts/install.sh in the Mirante checkout, or set MIRANTE_DAEMON_BIN"
             .to_string()
     })?;
     mirante_cli::daemon_ctl::start_daemon_with_env(paths, &bin, env).map(|_| ()).map_err(|e| e.to_string())

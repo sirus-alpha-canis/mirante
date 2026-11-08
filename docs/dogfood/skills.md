@@ -8,8 +8,7 @@ without an interactive agent session; "For the founder" lists what is left for y
 This sits on top of `cockpit.md` and `memory.md`: same daemon, same app, now with skills
 (Plan 5: `docs/plans/2026-11-08-plan-5-evolving-skills.md`).
 
-Setup: as in `cockpit.md` (`cargo install --path crates/mirante-daemon`, `crates/mirante-hook`,
-`crates/mirante-cli`, `crates/mirante-mcp`); build and open the app. The CLI, the daemon and
+Setup: as in `cockpit.md` (`scripts/install.sh --app`). The CLI, the daemon and
 `mirante-mcp` must be the same build. `/usr/bin/ssh-keygen` must support `-Y sign|verify`
 (OpenSSH 8.2+; this Mac has 10.2).
 
