@@ -46,6 +46,71 @@ type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Input is written in chunks of this size (the lock is held for the whole message, so
 /// nothing interleaves with it).
 const WRITE_CHUNK: usize = 4096;
+/// Waits until `fd` is ready for `events` (`POLLOUT` / `POLLIN`); a hang-up counts as
+/// ready (the next read or write reports it). Fails with `TimedOut` at `deadline` (`None`:
+/// waits as long as it takes).
+fn wait_fd(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Option<std::time::Instant>) -> io::Result<()> {
+    loop {
+        let ms = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "the agent is not reading its input"));
+                }
+                left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+            }
+            None => -1,
+        };
+        let mut p = libc::pollfd { fd, events, revents: 0 };
+        // SAFETY: one valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut p, 1, ms) } {
+            n if n > 0 => return Ok(()),
+            0 => {}
+            _ => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Writes all of `bytes` to the master, which is non-blocking: what the PTY's input
+/// queue cannot take now waits for room (polled), until `deadline` (`None`: no limit).
+fn write_nb(
+    w: &mut (dyn Write + Send),
+    fd: Option<std::os::fd::RawFd>,
+    mut bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match w.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "the agent's terminal took nothing")),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => match fd {
+                Some(fd) => wait_fd(fd, libc::POLLOUT, deadline)?,
+                None => std::thread::sleep(Duration::from_millis(5)),
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    w.flush()
+}
+
+/// Makes the master non-blocking (its reader and writer share the descriptor): a write
+/// into a full input queue returns instead of blocking ([`write_nb`]), and the reader
+/// polls for output.
+fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor the PTY pair owns; no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// How often the descendant snapshot is refreshed while the agent runs.
 pub(super) const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
 /// SIGTERM → SIGKILL grace for what an agent left behind when it exited on its own.
@@ -79,6 +144,9 @@ fn si_pid(info: &libc::siginfo_t) -> i32 {
 pub struct PtyProcess {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Writer,
+    /// The master's descriptor (owned by `master`), polled before each input chunk so a
+    /// paste into an agent that stops reading times out ([`PtyProcess::write_within`]).
+    input_fd: Option<std::os::fd::RawFd>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     root: Option<Proc>,
     /// The PTY's terminal device, read from the root's controlling terminal at spawn.
@@ -209,9 +277,14 @@ impl PtyProcess {
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(other)?));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(nz(spec.rows), nz(spec.cols), SCROLLBACK_ROWS)));
         let fanout = Arc::new(Mutex::new(Fanout::default()));
+        let input_fd = pair.master.as_raw_fd();
+        if let Some(fd) = input_fd {
+            set_nonblocking(fd)?;
+        }
         let p = Arc::new(PtyProcess {
             master: Mutex::new(pair.master),
             writer: writer.clone(),
+            input_fd,
             child: Mutex::new(child),
             root,
             tty,
@@ -225,7 +298,7 @@ impl PtyProcess {
             // Ends when the reader drops its sender (end of output).
             for a in answer_rx {
                 let mut w = lock(&writer);
-                let _ = w.write_all(&a).and_then(|()| w.flush());
+                let _ = write_nb(&mut **w, input_fd, &a, None);
             }
         });
         std::thread::spawn(move || {
@@ -233,8 +306,19 @@ impl PtyProcess {
             let mut buf = [0u8; 8192];
             loop {
                 let n = match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => n,
+                    // The master is non-blocking: wait for output.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        match input_fd.map(|fd| wait_fd(fd, libc::POLLIN, None)) {
+                            Some(Err(_)) => break,
+                            Some(Ok(())) => {}
+                            None => std::thread::sleep(Duration::from_millis(5)),
+                        }
+                        continue;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 };
                 pump(queries.feed(&buf[..n]), &parser, &fanout, &answers);
             }
@@ -300,10 +384,19 @@ impl PtyProcess {
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         let mut w = lock(&self.writer);
         for chunk in bytes.chunks(WRITE_CHUNK) {
-            w.write_all(chunk)?;
-            w.flush()?;
+            write_nb(&mut **w, self.input_fd, chunk, None)?;
         }
         Ok(())
+    }
+
+    /// [`PtyProcess::write`] for bytes a person types or pastes in an attached terminal,
+    /// all within `timeout`. An agent that stops reading its input fills the PTY's queue;
+    /// the write then fails with `TimedOut` (the caller drops the attachment) instead of
+    /// holding the input lock, and with it every message and answer, forever.
+    pub fn write_within(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut w = lock(&self.writer);
+        write_nb(&mut **w, self.input_fd, bytes, Some(deadline))
     }
 
     /// The screen as plain text, one line per row.
@@ -435,6 +528,63 @@ mod tests {
         wait_for("echo", || p.grid().contains("got:hello"));
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Some(0));
         wait_for("exited flag", || p.exited());
+    }
+
+    /// A client attaching in the middle of a flood sees every line once, in order: its
+    /// initial screen ends where its live stream starts.
+    #[test]
+    fn attaching_during_a_flood_gives_contiguous_numbered_lines() {
+        let n = 30_000;
+        let p = PtyProcess::spawn(
+            &sh(&format!("i=0; while [ $i -lt {n} ]; do echo $i; i=$((i+1)); done; printf 'END'; sleep 5")),
+            |_| {},
+        )
+        .unwrap();
+        wait_for("the flood", || p.grid().lines().any(|l| l.trim().parse::<u32>().is_ok_and(|v| v > 500)));
+        let (_id, initial, rx) = p.attach();
+        let drained = std::thread::spawn(move || {
+            let mut live = Vec::new();
+            while let Ok(c) = rx.recv_timeout(Duration::from_secs(10)) {
+                live.extend_from_slice(&c);
+                if live[live.len().saturating_sub(c.len() + 2)..].windows(3).any(|w| w == b"END") {
+                    break;
+                }
+            }
+            live
+        });
+        let live = drained.join().unwrap();
+        let mut screen = vt100::Parser::new(nz(24), nz(80), 0);
+        screen.process(&initial);
+        let rows: Vec<String> = screen.screen().rows(0, 80).collect();
+        // The cursor's row is cut where the live stream continues it (maybe empty).
+        let (crow, ccol) = screen.screen().cursor_position();
+        let complete: Vec<&str> = rows[..crow as usize].iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+        let partial: String = rows[crow as usize].chars().take(ccol as usize).collect();
+        let text = format!("{partial}{}", String::from_utf8_lossy(&live));
+        let mut nums: Vec<u32> = complete.iter().map(|l| l.trim().parse().unwrap()).collect();
+        for l in text.split("\r\n") {
+            if let Ok(v) = l.trim().parse::<u32>() {
+                nums.push(v);
+            }
+        }
+        assert!(!text.contains('\x1b'), "a repaint interrupted the stream (the client fell behind)");
+        for w in nums.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "gap or repeat around {}", w[0]);
+        }
+        assert_eq!(nums.last(), Some(&(n - 1)));
+    }
+
+    #[test]
+    fn a_paste_into_an_agent_that_never_reads_times_out_instead_of_blocking() {
+        // Raw mode, and nothing reads stdin: the PTY's input queue fills up.
+        let p = PtyProcess::spawn(&sh("stty raw -echo; printf 'R'; sleep 30"), |_| {}).unwrap();
+        wait_for("raw mode", || p.grid().contains('R'));
+        let t0 = Instant::now();
+        let r = p.write_within(&vec![b'x'; 1 << 20], Duration::from_millis(300));
+        assert!(matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        // The input lock is free again: the session is not wedged.
+        assert!(p.writer.try_lock().is_ok());
     }
 
     #[test]

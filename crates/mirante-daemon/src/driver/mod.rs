@@ -178,6 +178,7 @@ pub struct Attachment {
 /// repaint (memory stays bounded whatever it does); the repaint carries the whole screen,
 /// so nothing it missed is lost from view.
 pub const ATTACH_QUEUE: usize = 32;
+const _: () = assert!(ATTACH_QUEUE <= 32, "at most 256 KiB queued per attached client");
 /// After a repaint that could not be queued (the client is still stalled), the next try
 /// waits this long: a repaint renders the whole screen.
 pub const REPAINT_RETRY: Duration = Duration::from_millis(50);
@@ -431,11 +432,6 @@ mod tests {
         f.repaint(b"S2");
         assert!(!f.needs_repaint());
         assert_eq!(rx.recv().unwrap(), b"S2");
-    }
-
-    #[test]
-    fn the_per_client_queue_stays_small() {
-        assert!(ATTACH_QUEUE <= 32, "{ATTACH_QUEUE} chunks of up to 8 KiB per client");
     }
 
     #[test]

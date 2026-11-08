@@ -525,6 +525,10 @@ impl Drop for ClaudeDriver {
     }
 }
 
+/// Longest an attached terminal's keystrokes or paste may wait for the agent to read them;
+/// past it the attachment is dropped (the server ends the connection).
+const ATTACHED_INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Driver for ClaudeDriver {
     fn send(&self, text: &str) -> Result<(), DriverError> {
         if !self.ready.load(Ordering::SeqCst) {
@@ -630,7 +634,8 @@ impl Driver for ClaudeDriver {
     }
 
     fn input(&self, _attachment: u64, bytes: &[u8]) -> Result<(), DriverError> {
-        Ok(self.pty.write(bytes)?)
+        // Bounded: an agent that stops reading costs the attachment, not the session.
+        Ok(self.pty.write_within(bytes, ATTACHED_INPUT_TIMEOUT)?)
     }
 
     fn detach(&self, attachment: u64) {
