@@ -719,73 +719,81 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
 
 ### Task 16: Bridge allowlist, fake daemon, security pin
 
-- [ ] **Step 1:**
+- [x] **Step 1:**
   - Extend `the_allowlist_is_exactly_these_methods` with `skill.tenants`, `skill.learn`, `skill.list`, `skill.get`, `skill.task_skills`, `skill.lint`, `skill.mine`, `skill.add`, `skill.proposals`, `skill.review`, `skill.action`.
   - Add `skill.propose` and `skill.may_review` to `refused`.
   - Extend `security.test.ts`.
-- [ ] **Step 2: Run** `cargo test -p mirante-bridge && pnpm --dir apps/cockpit test security`. Expected: FAIL.
-- [ ] **Step 3: Implement** the allowlist and canned answers: 2 tenants (1 learning), 4 skills (1 refused as modified), 3 proposals (1 miner new, 1 agent edit with a diff, 1 with a lint error).
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(bridge): allow skill.* (never skill.propose); fake daemon serves demo skills`.
+- [x] **Step 2: Run** `cargo test -p mirante-bridge && pnpm --dir apps/cockpit test security`. Expected: FAIL.
+- [x] **Step 3: Implement** the allowlist and canned answers: 2 tenants (1 learning), 4 skills (1 refused as modified), 3 proposals (1 miner new, 1 agent edit with a diff, 1 with a lint error).
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(bridge): allow skill.* (never skill.propose); fake daemon serves demo skills`.
 
 ### Task 17: Protocol, `lib/skills.ts`, `lib/lineDiff.ts`, store invalidation
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `lineDiff("a\nb\nc","a\nB\nc")` gives `[{same:"a"},{del:"b"},{add:"B"},{same:"c"}]`;
   - `scopeLabel`;
   - METHOD_NOT_FOUND means an older daemon (`{available:false}`);
   - `state.ts` bumps `skillsVersion` on `skill.proposed`, `skill.decided`, `skill.changed` and `skill.mined`;
   - feed lines for `skill.injected` / `skill.refused`.
-- [ ] **Step 2: Run** `pnpm --dir apps/cockpit test skills lineDiff state`. Expected: FAIL.
-- [ ] **Step 3: Implement** the TS mirrors, the wrappers, and an LCS diff capped at 2,000 lines.
-- [ ] **Step 4: Run** `pnpm --dir apps/cockpit test && pnpm --dir apps/cockpit typecheck`. Expected: PASS.
-- [ ] **Step 5: Commit** `feat(cockpit): skills protocol types, client calls, line diff and store invalidation`.
+- [x] **Step 2: Run** `pnpm --dir apps/cockpit test skills lineDiff state`. Expected: FAIL.
+- [x] **Step 3: Implement** the TS mirrors, the wrappers, and an LCS diff capped at 2,000 lines.
+- [x] **Step 4: Run** `pnpm --dir apps/cockpit test && pnpm --dir apps/cockpit typecheck`. Expected: PASS.
+- [x] **Step 5: Commit** `feat(cockpit): skills protocol types, client calls, line diff and store invalidation`.
 
 ### Task 18: Skills view (mode `"skills"`)
 
 **Files:** `components/Skills.tsx` (+ test). Modify `App.tsx` (`Mode` adds `"skills"`; `visibleTasks` returns an empty set), `LeftRail.tsx` ("Skills (n to review)"), `CommandBar.tsx` ("Go to Skills", "Review skills").
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `lists skills grouped Personal / org / repo with activation, version, verified badge and 30-day usage`;
   - `a refused skill shows why and offers Re-review` (calls `skill.add` with its folder);
   - `tenant learning toggles are explicit and explain what is read` ("Mirante reads your goals, messages and denied permissions in this client's tasks, on this machine only");
   - `Find repeated instructions runs skill.mine and shows counts`;
   - `retire, rescope and rollback pass expect_hash`;
   - `SKILL.md renders as text only` (no `<img>` from the body).
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** test + typecheck. Expected: PASS.
-- [ ] **Step 5: Commit** `feat(cockpit): Skills view (library by scope, verification, usage, learning per client)`.
+- [x] **Step 2: Run.** Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** test + typecheck. Expected: PASS.
+- [x] **Step 5: Commit** `feat(cockpit): Skills view (library by scope, verification, usage, learning per client)`.
 
 ### Task 19: Proposal review
 
 **Files:** `components/SkillProposals.tsx` (+ test).
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `miner card shows N tasks and up to 5 redacted examples`;
   - `edit proposal shows a line diff against the current version`;
   - `lint errors disable Accept; editing re-lints (debounced skill.lint) and re-enables`;
   - `choosing personal shows the cross-client warning`;
   - `accept sends edits once; CONFLICT (moved base) reloads the diff; FORBIDDEN explains`;
   - `Refine with agent only offers tasks of the same tenant and queues an "Operator request:" message`.
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement.** Nothing is auto-accepted.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(cockpit): skill proposal review with diff, live lint and same-client refine`.
+- [x] **Step 2: Run.** Expected: FAIL.
+- [x] **Step 3: Implement.** Nothing is auto-accepted.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(cockpit): skill proposal review with diff, live lint and same-client refine`.
 
 ### Task 20: The per-task "skills active" indicator
 
 **Files:** `components/SkillsChip.tsx` (+ test). Modify `Detail.tsx` (header) and `AgentCard.tsx` (count).
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - the chip reads "Skills 3", or "Skills 3 · 1 refused" in the warning colour;
   - the popover lists name, version, activation, used/injected;
   - "Tenant: github.com/acme" is shown with the learning state;
   - it refetches on `skill.injected`.
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement** with `skill.task_skills`.
-- [ ] **Step 4: Run** `pnpm --dir apps/cockpit test && pnpm --dir apps/cockpit typecheck && pnpm --dir apps/cockpit build`. Expected: PASS.
-- [ ] **Step 5: Commit** `feat(cockpit): per-task skills indicator with refused skills and tenant`.
+- [x] **Step 2: Run.** Expected: FAIL.
+- [x] **Step 3: Implement** with `skill.task_skills`.
+- [x] **Step 4: Run** `pnpm --dir apps/cockpit test && pnpm --dir apps/cockpit typecheck && pnpm --dir apps/cockpit build`. Expected: PASS.
+- [x] **Step 5: Commit** `feat(cockpit): per-task skills indicator with refused skills and tenant`.
+
+> **As built (2026-11-08), Batch D.** Tasks 16–20 landed one commit each, TDD (each new test seen failing first). Verified: `pnpm test` (31 files, 330 tests), `pnpm typecheck`, `pnpm build`; `cargo test --workspace` (963 passed), `cargo clippy --workspace --all-targets -- -D warnings` with and without `--features mirante-bridge/fake`; `src-tauri` `cargo test` and `cargo clippy -- -D warnings`; `apps/cockpit/scripts/smoke.sh` after `cargo build -p mirante-bridge --features fake` and `pnpm tauri build --debug --bundles app`: `SMOKE PASS` (the app now also calls `skill.proposals` at start). The views were not eyeballed in a window beyond the smoke run (Task 21). Differences from the text above:
+> - **Task 16.** The allowlist adds `skill.tenants`, `.learn`, `.list`, `.get`, `.task_skills`, **`.confirm_origin`** (Batch B note), `.lint`, `.mine`, `.add`, `.proposals`, `.review`, `.action`, in that order; `skill.propose` and `skill.may_review` are pinned as refused (the Rust test, and `security.test.ts`, which also asserts the block never names them). CSP and capabilities unchanged. The fake daemon's skills are `crates/mirante-bridge/src/fake_skills.rs` (`cfg(any(test, feature = "fake"))`, like `fake_dna.rs`): 2 tenants (acme learning), 4 skills (`api-conventions` refused as modified on disk), 3 proposals (miner new with 3 examples, agent edit of `cargo-tests-first` with a body diff, import with a `forbidden` lint error), per-task skills (`t-claude-2` waits for its origin: `observed` differs), and review / action / learn / mine / add / confirm_origin that change that state with the daemon's refusals. `mirante-fake-daemon` also pushes `skill.injected`, `skill.refused` and `skill.proposed` events.
+> - **Task 17.** Two optional wire fields the UI needed (Rust, tested in `hub/skills.rs`): `TaskSkills.observed` (the live origin of an unconfirmed task, so the cockpit can offer both origins to `skill.confirm_origin`) and `SkillView.dir` (the version folder, for Re-review through `skill.add {dir}`; the cockpit does not know `MIRANTE_HOME`). `lib/lineDiff.ts`: common prefix and suffix cut first, then an LCS table (`Uint16Array`) on the changed middle only; past 2,000 lines a side or 1M cells the middle is one replaced block, so every line is still shown. State: one global `skillsVersion` (skills are keyed by tenant, not repo, so no `dnaKeys`-style alias map is needed), bumped on `skill.proposed` / `decided` / `changed` / `mined` / `learning` / `origin_confirmed` / `origin_pinned`; per task `skillTaskVersion` and `sessionSkills {session, names, refused, used}` from `skill.injected` / `refused` / `unavailable` / `used` (live and in history). Feed lines for those events and for the `skills_failed` step. `lib/useSkills.ts` holds the store hooks.
+> - **Task 18.** The view is reached by a **Skills** nav button, "Go to Skills" / "Review skills" in the command bar and the rail's "Skills (n to review)" (one `skill.proposals {status: pending, limit: 200}` per `skillsVersion`); **no new key chord** (view chords already wait while a field is typed in). The view's panel defaults to the review queue ("Review (n)"); selecting a skill replaces it. Re-review calls `skill.add {dir, scope, activation}` with the skill's own scope and activation. Rescope takes a typed scope, with the cross-client warning computed before sending (`lib/skills::wideningWarnings`, the daemon's rules); rollback offers the versions below the current one. Every action sends the shown `manifest_hash`; `CONFLICT` reloads the skill.
+> - **Task 19 (with the Batch C review's finding).** A card shows everything Accept approves, as text nodes: the whole body and the full text of every bundled file (`white-space: pre-wrap`, long lines wrapped, nothing cut), scope and client, the activation in words (always on: "added to the agent's system prompt in every matching session") and the daemon's plus the chosen scope's warnings in one `role="alert"` block. Content past 40 lines (or with any bundled file) has Collapse / Expand; **Accept is off while collapsed**, while lint errors stand, while a re-lint is pending (300 ms debounce), and for an edit until its diff is on screen (a `CONFLICT` reloads the diff and keeps Accept off until it is back). Tests: a 72-line body with a 400-character line and a bundled file's text are fully in the DOM; Accept off while collapsed. The body is edited in a textarea sized to its lines (Edit). A re-lint sends the SKILL.md fields to `skill.lint`; bundled files keep their findings. Refine with agent asks `skill.task_skills` of each live task and offers only those whose origin is confirmed, whose learning is on (their agent has `skill_propose`) and whose tenant is the proposal's; it queues (`mode: queue`) an `Operator request:` message with the proposal's description and body. The queue lists every client's pending proposals (200 at most, no paging).
+> - **Task 20.** The chip is in the detail header (`SkillsChip`); the agent card's count (`SkillsCount`) reads `sessionSkills` from events and makes no call. An unconfirmed task reads "Skills off: confirm origin": Keep <pinned> clears it, Use <live> re-pins the checkout for new tasks (the task itself stays without skills, and the popover says so), and the daemon's `warning` is shown. Escape inside the popover closes it and is `preventDefault`ed, so the app's Escape does not leave the detail. Dispatch shows `TaskView.origin` after `task.create` ("follows <origin> (client <tenant>), pinned for this checkout now", or "no skills until you confirm its origin" with the live one). CSS classes are `skill-chip*` (`.chip` is the task list's).
+> - **Left for Task 21:** looking at the views in the app against the fake daemon and a real one; the "used" state depends on the `Skill` hook payload Task 21 still has to capture.
 
 ---
 
