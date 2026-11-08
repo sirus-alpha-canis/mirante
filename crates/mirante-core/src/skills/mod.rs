@@ -4,6 +4,7 @@
 pub mod format;
 pub mod lint;
 pub mod origin;
+pub mod sign;
 
 /// The manifest's format tag.
 pub const FORMAT: &str = "mirante.skill/v1";
