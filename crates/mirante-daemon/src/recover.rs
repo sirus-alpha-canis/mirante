@@ -195,9 +195,11 @@ fn is_claimed(p: &Path) -> bool {
         .is_some_and(|mid| !mid.is_empty())
 }
 
-/// Texts queued (`message_queued`) during session `session_id` of `task_id` and never sent
-/// (no later `message_sent` with the same text), in queue order. The queue lives in memory:
-/// a crash loses it.
+/// Texts queued (`message_queued`) during session `session_id` of `task_id` and never sent,
+/// in queue order. The queue lives in memory: a crash loses it, so it is rebuilt from the
+/// event log: by message id (`message_sent`, `message_requeued`, and the user's
+/// `queue_changed` edits, removals and reorders), or by text for events written before
+/// queued messages had ids.
 fn unsent_queue(st: &State, task_id: &str, session_id: &str) -> Result<Vec<String>> {
     let events = st.store.task_events(task_id)?;
     let started =
@@ -206,19 +208,55 @@ fn unsent_queue(st: &State, task_id: &str, session_id: &str) -> Result<Vec<Strin
         return Ok(Vec::new());
     };
     let text = |p: &Value| p["text"].as_str().map(str::to_string);
-    let mut queue: Vec<String> = Vec::new();
+    let id = |p: &Value| p["id"].as_str().map(str::to_string);
+    // (id, text); `None` ids come from older daemons.
+    let mut queue: Vec<(Option<String>, String)> = Vec::new();
+    let at =
+        |queue: &[(Option<String>, String)], want: &str| queue.iter().position(|(i, _)| i.as_deref() == Some(want));
     for e in &events[start + 1..] {
+        let p = &e.payload;
         match e.kind.as_str() {
-            "message_queued" => queue.extend(text(&e.payload)),
+            "message_queued" => queue.extend(text(p).map(|t| (id(p), t))),
             "message_sent" => {
-                if let Some(i) = text(&e.payload).and_then(|t| queue.iter().position(|q| *q == t)) {
+                let found = match id(p) {
+                    Some(want) => at(&queue, &want),
+                    None => text(p).and_then(|t| queue.iter().position(|(i, q)| i.is_none() && *q == t)),
+                };
+                if let Some(i) = found {
                     queue.remove(i);
                 }
             }
+            "message_requeued" => {
+                if let (Some(want), Some(t)) = (id(p), text(p)) {
+                    if at(&queue, &want).is_none() {
+                        queue.insert(0, (Some(want), t));
+                    }
+                }
+            }
+            "queue_changed" => match p["op"].as_str() {
+                Some("edited") => {
+                    if let (Some(i), Some(t)) = (id(p).and_then(|w| at(&queue, &w)), text(p)) {
+                        queue[i].1 = t;
+                    }
+                }
+                Some("removed") => {
+                    if let Some(i) = id(p).and_then(|w| at(&queue, &w)) {
+                        queue.remove(i);
+                    }
+                }
+                Some("reordered") => {
+                    let ids: Vec<&str> = p["ids"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                    let rank = |q: &(Option<String>, String)| {
+                        q.0.as_deref().and_then(|i| ids.iter().position(|x| *x == i)).unwrap_or(usize::MAX)
+                    };
+                    queue.sort_by_key(rank);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
-    Ok(queue)
+    Ok(queue.into_iter().map(|(_, t)| t).collect())
 }
 
 /// The task's last session ended in a hibernation (`memory.hibernated` /
@@ -306,7 +344,7 @@ mod tests {
     use mirante_core::model::{AgentKind, Lifecycle};
     use mirante_core::store::Store;
     use mirante_core::worktree::WorktreeManager;
-    use mirante_ipc::types::{HookEnvelope, HookParams, SendMessage, SendMode, StartSession};
+    use mirante_ipc::types::{EditQueued, HookEnvelope, HookParams, ReorderQueue, SendMessage, SendMode, StartSession};
 
     #[test]
     fn restart_ends_live_sessions_expires_permissions_and_keeps_resume_possible() {
@@ -476,6 +514,31 @@ mod tests {
         // Nothing is reported twice by a second restart.
         let (_hub3, r3) = crash_and_recover(&k);
         assert_eq!(r3.queued_dropped, 0);
+    }
+
+    #[test]
+    fn a_crash_reports_the_queue_as_edited_removed_and_reordered() {
+        let k = file_kit();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        for text in ["one", "two", "three", "two"] {
+            let m = SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Queue };
+            k.hub.send(m).unwrap();
+        }
+        let ids: Vec<String> = k.hub.list_queued(&t.id).unwrap().into_iter().map(|q| q.id).collect();
+        k.hub.edit_queued(EditQueued { id: ids[0].clone(), text: "one, edited".into() }).unwrap();
+        // The first "two" goes; the second (same text) stays.
+        k.hub.remove_queued(&ids[1]).unwrap();
+        let order = vec![ids[3].clone(), ids[2].clone(), ids[0].clone()];
+        k.hub.reorder_queued(ReorderQueue { task_id: t.id.clone(), ids: order }).unwrap();
+        // The turn ends: the new front ("two") goes out.
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        assert_eq!(k.calls().last().map(String::as_str), Some("send:two"));
+        let (hub2, r) = crash_and_recover(&k);
+        assert_eq!(r.queued_dropped, 1);
+        let ev = task_kinds(&hub2, &t.id);
+        let dropped = ev.iter().find(|e| e.kind == "queue_dropped").unwrap();
+        assert_eq!(dropped.payload["messages"], json!(["three", "one, edited"]));
     }
 
     #[test]

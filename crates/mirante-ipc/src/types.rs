@@ -20,6 +20,15 @@ pub mod method {
     /// The attached terminal changed size ([`super::ResizeParams`]).
     pub const SESSION_RESIZE: &str = "session.resize";
     pub const MESSAGE_SEND: &str = "message.send";
+    /// A live session's queued messages, next first ([`super::QueueRef`]; result:
+    /// `Vec<`[`super::QueuedMessage`]`>`).
+    pub const MESSAGE_LIST_QUEUED: &str = "message.list_queued";
+    /// Rewrites a message still in the queue ([`super::EditQueued`]; result: the queue).
+    pub const MESSAGE_EDIT: &str = "message.edit";
+    /// Takes a message out of the queue ([`super::QueuedRef`]; result: the queue).
+    pub const MESSAGE_REMOVE: &str = "message.remove";
+    /// Sets the queue's whole order ([`super::ReorderQueue`]; result: the queue).
+    pub const MESSAGE_REORDER: &str = "message.reorder";
     pub const PERMISSION_LIST: &str = "permission.list";
     pub const PERMISSION_ANSWER: &str = "permission.answer";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
@@ -196,6 +205,43 @@ pub struct SendResult {
     pub delivered: SendMode,
     /// Queue length after this call.
     pub queued: usize,
+}
+
+/// A message held in a live session's queue. `id` is stable while it waits (also when a
+/// delivery was aborted and handed it back); once it is being delivered it leaves the queue
+/// and can no longer be edited, removed or moved (`CONFLICT`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub id: String,
+    pub text: String,
+}
+
+/// `message.list_queued` / the task half of `message.reorder`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRef {
+    /// Task id or branch (like every `task` parameter).
+    #[serde(alias = "task")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditQueued {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedRef {
+    pub id: String,
+}
+
+/// The queue's new order: exactly the ids queued now, each once. A queue that changed since
+/// the client read it (a message delivered or queued meanwhile) is a `CONFLICT`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReorderQueue {
+    #[serde(alias = "task")]
+    pub task_id: String,
+    pub ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,5 +475,9 @@ mod tests {
         assert!(!l.archived);
         let m: SendMessage = serde_json::from_value(json!({"task": "t", "text": "x", "mode": "queue"})).unwrap();
         assert_eq!(m.mode, SendMode::Queue);
+        let q: QueueRef = serde_json::from_value(json!({"task_id": "t"})).unwrap();
+        assert_eq!(q, serde_json::from_value(json!({"task": "t"})).unwrap());
+        let r: ReorderQueue = serde_json::from_value(json!({"task_id": "t", "ids": ["b", "a"]})).unwrap();
+        assert_eq!(r.ids, vec!["b".to_string(), "a".to_string()]);
     }
 }

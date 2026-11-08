@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
-use mirante_ipc::types::{method, AttachParams, AttachResult, ListParams, SubscribeParams, TaskRef};
+use mirante_ipc::types::{
+    method, AttachParams, AttachResult, ListParams, QueueRef, QueuedRef, SubscribeParams, TaskRef,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -247,6 +249,10 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         method::SESSION_INTERRUPT => out(hub.interrupt(&params::<TaskRef>(p)?.task).map(|()| json!({}))),
         method::SESSION_RESIZE => out(hub.resize(params(p)?).map(|()| json!({}))),
         method::MESSAGE_SEND => out(hub.send(params(p)?)),
+        method::MESSAGE_LIST_QUEUED => out(hub.list_queued(&params::<QueueRef>(p)?.task_id)),
+        method::MESSAGE_EDIT => out(hub.edit_queued(params(p)?)),
+        method::MESSAGE_REMOVE => out(hub.remove_queued(&params::<QueuedRef>(p)?.id)),
+        method::MESSAGE_REORDER => out(hub.reorder_queued(params(p)?)),
         method::PERMISSION_LIST => out(hub.permissions()),
         method::PERMISSION_ANSWER => out(hub.answer_permission(params(p)?)),
         method::HOOK_EVENT => out(hub.apply_hook_envelope(params(p)?).map(|()| json!({}))),
@@ -405,6 +411,31 @@ mod tests {
         assert_eq!(e.code, code::INVALID_PARAMS);
         let d = dispatch(&k.hub, method::TASK_DIFF, json!({"task": "te"})).unwrap();
         assert_eq!((d["base"].as_str(), d["files"].as_array().map(Vec::len)), (Some("trunk"), Some(0)));
+    }
+
+    #[test]
+    fn the_queue_is_served_over_rpc() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "q").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        for text in ["a", "b"] {
+            dispatch(&k.hub, method::MESSAGE_SEND, json!({"task": "q", "text": text, "mode": "queue"})).unwrap();
+        }
+        let l = dispatch(&k.hub, method::MESSAGE_LIST_QUEUED, json!({"task_id": "q"})).unwrap();
+        let (a, b) = (l[0]["id"].clone(), l[1]["id"].clone());
+        let l = dispatch(&k.hub, method::MESSAGE_EDIT, json!({"id": a, "text": "a2"})).unwrap();
+        assert_eq!(l[0]["text"], "a2");
+        let l = dispatch(&k.hub, method::MESSAGE_REORDER, json!({"task_id": t.id, "ids": [b, a]})).unwrap();
+        assert_eq!((l[0]["text"].as_str(), l[1]["text"].as_str()), (Some("b"), Some("a2")));
+        let l = dispatch(&k.hub, method::MESSAGE_REMOVE, json!({"id": b})).unwrap();
+        assert_eq!(l.as_array().map(Vec::len), Some(1));
+        let e = dispatch(&k.hub, method::MESSAGE_REMOVE, json!({"id": b})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        let e = dispatch(&k.hub, method::MESSAGE_EDIT, json!({"id": a, "text": "late"})).unwrap_err();
+        assert_eq!(e.code, code::CONFLICT);
+        let e = dispatch(&k.hub, method::MESSAGE_REORDER, json!({"task_id": "q"})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
     }
 
     #[test]

@@ -98,9 +98,11 @@ impl Hub {
             SendMode::Queue => ready && !paused && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
         };
         if !now {
-            l.queue.push_back(m.text.clone());
+            let q = super::queue::Queued::new(m.text.clone());
+            let id = q.id.clone();
+            l.queue.push_back(q);
             let position = l.queue.len();
-            st.event(Some(&task.id), "message_queued", json!({ "text": m.text, "position": position }))?;
+            st.event(Some(&task.id), "message_queued", json!({ "text": m.text, "position": position, "id": id }))?;
             // An idle, ready agent with a backlog (an earlier delivery failed) takes the
             // next message now.
             st.kick(&task.id)?;
@@ -860,7 +862,7 @@ mod tests {
     fn queue_on_an_idle_agent_with_a_backlog_kicks_the_backlog() {
         let k = Kit::new();
         let t = k.started(AgentKind::Codex, "c").task;
-        k.hub.lock().live.get_mut(&t.id).unwrap().queue.push_back("old".into());
+        k.hub.lock().live.get_mut(&t.id).unwrap().queue.push_back(super::super::queue::Queued::new("old"));
         let r = send(&k, &t.id, "new", SendMode::Queue).unwrap();
         assert_eq!(r.delivered, SendMode::Queue);
         assert_eq!(k.calls(), vec!["send:old".to_string()]);

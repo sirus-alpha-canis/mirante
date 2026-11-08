@@ -26,6 +26,7 @@ use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 pub(crate) mod evidence;
 pub mod memory;
 pub mod messages;
+pub mod queue;
 pub mod session;
 
 pub type Result<T> = std::result::Result<T, HubError>;
@@ -125,7 +126,12 @@ pub(crate) struct Live {
     pub(crate) boot: BootState,
     pub(crate) detail: Option<String>,
     /// Messages held until the running turn ends (front = next).
-    pub(crate) queue: VecDeque<String>,
+    pub(crate) queue: VecDeque<queue::Queued>,
+    /// Ids of messages that left the queue to be delivered (editing them is a conflict, not
+    /// an unknown id). One that is handed back returns to the queue under its id.
+    pub(crate) left_queue: HashSet<String>,
+    /// The queued message last handed to the driver (its id, if the driver hands it back).
+    pub(crate) last_sent: Option<queue::Queued>,
     /// Where the next handed-back message goes: after the ones handed back before it (so a
     /// run of them keeps its original order), ahead of everything queued since. Reset when
     /// the queue is next delivered from.
@@ -250,6 +256,8 @@ impl Live {
             boot: BootState::Booting,
             detail: None,
             queue: VecDeque::new(),
+            left_queue: HashSet::new(),
+            last_sent: None,
             requeue_at: 0,
             perm_keys: HashMap::new(),
             dialogs: HashMap::new(),

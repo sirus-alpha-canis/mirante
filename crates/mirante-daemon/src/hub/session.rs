@@ -16,7 +16,7 @@ use mirante_ipc::types::{
 };
 use serde_json::{json, Value};
 
-use super::{DialogKey, EventRx, Hub, HubError, Live, Result, State};
+use super::{queue, DialogKey, EventRx, Hub, HubError, Live, Result, State};
 use crate::driver::{Attachment, Driver, DriverError, DriverEvent, Sink, SpawnRequest};
 
 /// How many hook `event_id`s the hub remembers for dedupe.
@@ -248,16 +248,21 @@ impl State {
         let Some(driver) = l.driver.clone() else {
             return Ok(());
         };
-        let text = l.queue.pop_front().expect("not empty");
+        // Popped and handed to the driver under the hub lock: from here the message is being
+        // delivered, and `message.edit` / `remove` / `reorder` refuse it (CONFLICT).
+        let next = l.queue.pop_front().expect("not empty");
         l.requeue_at = 0;
-        match driver.send(&text) {
+        match driver.send(&next.text) {
             Ok(()) => {
                 l.delivery_in_flight = Some(Instant::now());
-                self.event(Some(task_id), "message_sent", json!({ "mode": SendMode::Queue, "text": text }))
+                l.left_queue.insert(next.id.clone());
+                let payload = json!({ "mode": SendMode::Queue, "text": next.text, "id": next.id });
+                l.last_sent = Some(next);
+                self.event(Some(task_id), "message_sent", payload)
             }
             Err(e) => {
                 if let Some(l) = self.live.get_mut(task_id) {
-                    l.queue.push_front(text);
+                    l.queue.push_front(next);
                     l.requeue_at = 1;
                 }
                 self.event(Some(task_id), "message_failed", json!({ "error": e.to_string() }))
@@ -309,7 +314,8 @@ impl State {
             }
         }
         if !live.queue.is_empty() {
-            self.event(Some(task_id), "queue_dropped", json!({ "messages": live.queue }))?;
+            let texts: Vec<&str> = live.queue.iter().map(|q| q.text.as_str()).collect();
+            self.event(Some(task_id), "queue_dropped", json!({ "messages": texts }))?;
         }
         self.set_status(task_id, Status::Ended, cause)
     }
@@ -480,16 +486,34 @@ impl State {
                 Ok(())
             }
             DriverEvent::DeliveryAborted { text, reason } => {
+                let mut id = None;
                 if let Some(l) = self.live.get_mut(task_id) {
                     if let Some(i) = l.steers.iter().rposition(|s| *s == text) {
                         l.steers.remove(i);
                     }
+                    // A queued message comes back under its id (editable again); a steer
+                    // joins the queue as a new message.
+                    let back = match l.last_sent.take() {
+                        Some(q) if q.text == text => {
+                            l.left_queue.remove(&q.id);
+                            q
+                        }
+                        other => {
+                            l.last_sent = other;
+                            queue::Queued::new(text.clone())
+                        }
+                    };
+                    id = Some(back.id.clone());
                     let at = l.requeue_at.min(l.queue.len());
-                    l.queue.insert(at, text.clone());
+                    l.queue.insert(at, back);
                     l.requeue_at = at + 1;
                     l.delivery_in_flight = None;
                 }
-                self.event(Some(task_id), "message_requeued", json!({ "text": text, "reason": reason }))
+                let mut payload = json!({ "text": text, "reason": reason });
+                if let Some(id) = id {
+                    payload["id"] = json!(id);
+                }
+                self.event(Some(task_id), "message_requeued", payload)
             }
             // Typing is unblocked again: deliver what was requeued.
             DriverEvent::DialogClosed => self.kick(task_id),
@@ -600,7 +624,7 @@ impl Hub {
             let mut live = Live::new(&session.id, task.agent, native.clone());
             live.hold = sink.hold_flag();
             if let Some(p) = req.prompt.filter(|p| !p.trim().is_empty()) {
-                live.queue.push_back(p);
+                live.queue.push_back(queue::Queued::new(p));
             }
             st.live.insert(task.id.clone(), live);
             st.publish();
@@ -1802,11 +1826,14 @@ mod tests {
         {
             let st = k.hub.lock();
             let l = &st.live[&t.id];
-            assert_eq!(l.queue.iter().cloned().collect::<Vec<_>>(), vec!["steer me".to_string(), "later".to_string()]);
+            let q: Vec<&str> = l.queue.iter().map(|q| q.text.as_str()).collect();
+            assert_eq!(q, ["steer me", "later"]);
             assert!(l.steers.is_empty());
         }
         let ev = kinds_payloads(&k, &t.id, "message_requeued");
-        assert_eq!(ev, vec![json!({"text": "steer me", "reason": "a dialog appeared"})]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!((&ev[0]["text"], &ev[0]["reason"]), (&json!("steer me"), &json!("a dialog appeared")));
+        assert!(ev[0]["id"].is_string(), "a requeued message has an id: {ev:?}");
         // At the turn end the requeued message goes out first.
         k.hook(&t.id, json!({"hook_event_name": "Stop"}));
         assert_eq!(k.calls().last().map(String::as_str), Some("send:steer me"));
@@ -1826,7 +1853,7 @@ mod tests {
         }
         {
             let st = k.hub.lock();
-            let q: Vec<String> = st.live[&t.id].queue.iter().cloned().collect();
+            let q: Vec<String> = st.live[&t.id].queue.iter().map(|q| q.text.clone()).collect();
             assert_eq!(q, ["one", "two", "three", "later"]);
         }
         for _ in 0..4 {
