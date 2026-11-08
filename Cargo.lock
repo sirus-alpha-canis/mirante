@@ -334,6 +334,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirante-mcp"
+version = "0.1.0"
+dependencies = [
+ "mirante-core",
+ "mirante-ipc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nix"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

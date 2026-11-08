@@ -7,5 +7,6 @@ members = [
     "crates/mirante-daemon",
     "crates/mirante-cli",
     "crates/mirante-bridge",
+    "crates/mirante-mcp",
 ]
 resolver = "2"
