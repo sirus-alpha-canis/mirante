@@ -12,6 +12,12 @@
 //!   its per-client queue overflows, and it sends a repaint instead of the backlog. While
 //!   stopped it still reads a little every `stall_every`, so the daemon (which cuts off a
 //!   client whose writes block for 5 s) keeps the stream.
+//! - A frontend that acks nothing for long (a frozen webview) gets at most
+//!   [`DISCARD_PAST`] bytes: the trickle read past that is dropped. Once it acks again the
+//!   bridge re-attaches (a fresh daemon stream at the PTY's current size) and hands over
+//!   [`RESET`] then that stream's replay, so its screen is whole again.
+//! - [`Attachments::close`] may be called from an output callback (the reader's own
+//!   thread): it does not wait for that thread.
 //!
 //! Writes never hold the map's lock: each attachment has its own writer lock, and a write
 //! that a stalled daemon does not take within the write timeout fails with
@@ -47,6 +53,12 @@ const BURST_READ: usize = 4096;
 const STALL_READ: usize = 4096;
 /// Default `stall_every`: well inside the daemon's 5 s stream write timeout.
 pub const STALL_READ_EVERY: Duration = Duration::from_secs(1);
+/// A frontend this far behind (unacked) is taken as frozen: what the trickle still reads
+/// is dropped (its screen is then stale), and once it acks again the bridge re-attaches.
+pub const DISCARD_PAST: usize = 2 * MAX_UNACKED;
+/// Sent before a re-attach's repaint: a full terminal reset (RIS), so the daemon's replay
+/// (scrollback, then the screen) lands on a fresh terminal, as on a first attach.
+pub const RESET: &[u8] = b"\x1bc";
 
 /// Output handed over and not acked yet, shared by the reader thread and `ack`/`close`.
 #[derive(Default)]
@@ -82,6 +94,10 @@ impl Flow {
         }
     }
 
+    fn unacked(&self) -> usize {
+        self.state.lock().unwrap().unacked
+    }
+
     fn sent(&self, n: usize) {
         self.state.lock().unwrap().unacked += n;
     }
@@ -100,8 +116,9 @@ impl Flow {
 
 struct Attachment {
     writer: Arc<Mutex<UnixStream>>,
-    /// A clone of the socket for shutting it down without waiting on `writer`'s lock.
-    control: UnixStream,
+    /// A clone of the socket for shutting it down without waiting on `writer`'s lock
+    /// (swapped, with `writer`'s stream, by a re-attach).
+    control: Arc<Mutex<UnixStream>>,
     input: bool,
     flow: Arc<Flow>,
     reader: Option<JoinHandle<()>>,
@@ -158,24 +175,44 @@ fn readable_before(fd: i32, deadline: Instant) -> bool {
 }
 
 /// Reads output until the stream ends or the attachment is closed, in batches, within the
-/// flow window (see the module docs).
+/// flow window (see the module docs). A frontend past [`DISCARD_PAST`] gets nothing more;
+/// when it has room again, `reattach` opens a fresh stream (`None`: the attachment ends)
+/// and the frontend gets [`RESET`], then that stream's repaint.
 fn pump_output(
     mut reader: BufReader<UnixStream>,
     flow: &Flow,
     stall_every: Duration,
     on_output: &mut impl FnMut(Vec<u8>),
+    reattach: &mut impl FnMut() -> Option<BufReader<UnixStream>>,
 ) {
-    let fd = reader.get_ref().as_raw_fd();
+    let mut fd = reader.get_ref().as_raw_fd();
     let mut buf = vec![0u8; MAX_BATCH];
+    let mut dropped = false;
     loop {
         let Some(room) = flow.wait_room(stall_every) else {
             return;
         };
+        if room && dropped {
+            let Some(fresh) = reattach() else {
+                return;
+            };
+            reader = fresh;
+            fd = reader.get_ref().as_raw_fd();
+            dropped = false;
+            flow.sent(RESET.len());
+            on_output(RESET.to_vec());
+            continue;
+        }
         let limit = if room { MAX_BATCH } else { STALL_READ };
         let mut n = match read_some(&mut reader, &mut buf[..limit]) {
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
+        if !room && flow.unacked() >= DISCARD_PAST {
+            // Frozen frontend: keep the daemon's stream alive, drop what it says.
+            dropped = true;
+            continue;
+        }
         let mut ended = false;
         if room && n >= BURST_READ {
             let deadline = Instant::now() + COALESCE;
@@ -197,6 +234,25 @@ fn pump_output(
     }
 }
 
+/// Connects and attaches: the daemon's answer, the output reader (its replay first), the
+/// input writer (with `write_timeout`), and a clone of the socket for shutting it down.
+fn connect(
+    socket: &Path,
+    task: &str,
+    rows: u16,
+    cols: u16,
+    write_timeout: Duration,
+) -> Result<(AttachResult, BufReader<UnixStream>, UnixStream, UnixStream), BridgeError> {
+    let dis = |e: std::io::Error| BridgeError::Disconnected { message: e.to_string() };
+    let mut c = Client::connect(socket).map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
+    c.set_timeout(Some(std::time::Duration::from_secs(10))).map_err(dis)?;
+    let r: AttachResult = c.call(method::ATTACH, AttachParams { task: task.into(), rows, cols })?;
+    let (reader, writer) = c.into_raw();
+    writer.set_write_timeout(Some(write_timeout)).map_err(dis)?;
+    let control = writer.try_clone().map_err(dis)?;
+    Ok((r, reader, writer, control))
+}
+
 impl Attachments {
     pub fn with_write_timeout(write_timeout: Duration) -> Self {
         Self::with_flow(write_timeout, STALL_READ_EVERY)
@@ -216,21 +272,14 @@ impl Attachments {
         mut on_output: impl FnMut(Vec<u8>) + Send + 'static,
         on_end: impl FnOnce() + Send + 'static,
     ) -> Result<Opened, BridgeError> {
-        let mut c = Client::connect(socket).map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
-        c.set_timeout(Some(std::time::Duration::from_secs(10)))
-            .map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
-        let r: AttachResult = c.call(method::ATTACH, AttachParams { task: task.into(), rows, cols })?;
-        let (reader, writer) = c.into_raw();
-        writer
-            .set_write_timeout(Some(self.write_timeout))
-            .map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
+        let (r, reader, writer, control) = connect(socket, task, rows, cols, self.write_timeout)?;
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         // In the map before the reader runs, so its exit always finds the entry to remove.
-        let control = writer.try_clone().map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
         let flow = Arc::new(Flow::default());
+        let (writer, control) = (Arc::new(Mutex::new(writer)), Arc::new(Mutex::new(control)));
         let a = Attachment {
-            writer: Arc::new(Mutex::new(writer)),
-            control,
+            writer: writer.clone(),
+            control: control.clone(),
             input: r.input,
             flow: flow.clone(),
             reader: None,
@@ -238,8 +287,18 @@ impl Attachments {
         self.open.lock().unwrap().insert(id, a);
         let open = self.open.clone();
         let stall_every = self.stall_every;
+        let (socket, task, write_timeout) = (socket.to_path_buf(), task.to_string(), self.write_timeout);
+        // A fresh stream on the same task at the PTY's current size (0 x 0: keep it); the old
+        // one is shut, so the daemon drops its client.
+        let mut reattach = move || {
+            let (_, reader, w, c) = connect(&socket, &task, 0, 0, write_timeout).ok()?;
+            let old = std::mem::replace(&mut *control.lock().unwrap(), c);
+            let _ = old.shutdown(Shutdown::Both);
+            *writer.lock().unwrap() = w;
+            Some(reader)
+        };
         let thread = std::thread::spawn(move || {
-            pump_output(reader, &flow, stall_every, &mut on_output);
+            pump_output(reader, &flow, stall_every, &mut on_output, &mut reattach);
             // Ended (or closed): drop the entry (detaching this thread's own handle).
             let gone = open.lock().unwrap().remove(&id);
             drop(gone);
@@ -285,11 +344,14 @@ impl Attachments {
         let a = self.open.lock().unwrap().remove(&id);
         if let Some(mut a) = a {
             // Not through the writer's lock: a write stalled on it must not delay the close.
-            let _ = a.control.shutdown(Shutdown::Both);
+            let _ = a.control.lock().unwrap().shutdown(Shutdown::Both);
             // A reader stopped for want of acks wakes up and ends.
             a.flow.close();
             if let Some(t) = a.reader.take() {
-                let _ = t.join();
+                // Closed from its own reader (an output callback): it ends by itself.
+                if t.thread().id() != std::thread::current().id() {
+                    let _ = t.join();
+                }
             }
         }
     }
@@ -582,6 +644,106 @@ mod tests {
         let t0 = std::time::Instant::now();
         all.close(o.id);
         assert!(t0.elapsed() < Duration::from_secs(2), "close waited on the paused reader");
+    }
+
+    /// A daemon that answers every `attach` (recording its params), writes `INIT<n>` (the
+    /// n-th connection's repaint), then floods.
+    fn reattach_daemon(sock: &std::path::Path) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        use mirante_ipc::rpc::{read_line, write_line, Request, Response};
+        let l = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let params = Arc::new(Mutex::new(Vec::new()));
+        let p2 = params.clone();
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                let p3 = p2.clone();
+                std::thread::spawn(move || {
+                    let mut w = conn.try_clone().unwrap();
+                    let mut r = std::io::BufReader::new(conn);
+                    let req: Request = serde_json::from_str(&read_line(&mut r).unwrap().unwrap()).unwrap();
+                    let n = {
+                        let mut p = p3.lock().unwrap();
+                        p.push(req.params.clone());
+                        p.len()
+                    };
+                    write_line(&mut w, &Response::ok(req.id, json!({"input": true}))).unwrap();
+                    if w.write_all(format!("INIT{n}").as_bytes()).is_err() {
+                        return;
+                    }
+                    let chunk = vec![b'x'; 8192];
+                    while w.write_all(&chunk).is_ok() {}
+                });
+            }
+        });
+        params
+    }
+
+    /// A frozen frontend (no acks) gets at most twice the window; what the trickle reads past
+    /// that is dropped, and once acks resume the bridge re-attaches: a terminal reset, then
+    /// the daemon's fresh repaint, at the PTY's current size.
+    #[test]
+    fn a_frozen_frontend_is_bounded_then_re_attached_when_acks_resume() {
+        let d = TestDir::new();
+        let sock = d.path().join("re.sock");
+        let params = reattach_daemon(&sock);
+        let all = Arc::new(Attachments::with_flow(WRITE_TIMEOUT, Duration::from_millis(5)));
+        let got = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let g = got.clone();
+        let o = all.open(&sock, "t1", 24, 80, move |b| g.lock().unwrap().extend_from_slice(&b), || {}).unwrap();
+        // Frozen: nothing acked for a while.
+        std::thread::sleep(Duration::from_millis(1500));
+        let delivered = got.lock().unwrap().len();
+        assert!(delivered <= 2 * MAX_UNACKED + MAX_BATCH, "{delivered} bytes handed to a frozen frontend");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(got.lock().unwrap().len(), delivered, "still growing past the bound");
+        // It thaws and acks what it drew.
+        all.ack(o.id, delivered);
+        let t0 = std::time::Instant::now();
+        loop {
+            let g = got.lock().unwrap();
+            if let Some(i) = g.windows(2).position(|w| w == b"\x1bc") {
+                if g[i + 2..].starts_with(b"INIT2") {
+                    break;
+                }
+            }
+            drop(g);
+            assert!(t0.elapsed() < Duration::from_secs(5), "never re-attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let p = params.lock().unwrap().clone();
+        assert_eq!(p[1], json!({"task": "t1", "rows": 0, "cols": 0}), "the re-attach keeps the PTY's size");
+        all.close(o.id);
+    }
+
+    /// `close` from the attachment's own reader thread (an output callback) does not join
+    /// itself.
+    #[test]
+    fn closing_from_the_output_callback_does_not_deadlock() {
+        let d = TestDir::new();
+        let fake = FakeDaemon::start(&d.path().join("d.sock"));
+        let all = Arc::new(Attachments::default());
+        let (end_tx, end_rx) = mpsc::channel();
+        let me = all.clone();
+        let id = Arc::new(AtomicU32::new(0));
+        let id2 = id.clone();
+        let o = all
+            .open(
+                &fake.socket,
+                "t1",
+                24,
+                80,
+                move |_| {
+                    let n = id2.load(Ordering::SeqCst);
+                    if n != 0 {
+                        me.close(n);
+                    }
+                },
+                move || end_tx.send(()).unwrap(),
+            )
+            .unwrap();
+        id.store(o.id, Ordering::SeqCst);
+        all.write(o.id, b"ls\r").unwrap();
+        end_rx.recv_timeout(Duration::from_secs(5)).expect("the stream ended");
+        assert!(all.is_empty());
     }
 
     #[test]

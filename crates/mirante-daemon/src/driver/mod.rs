@@ -166,19 +166,25 @@ impl Sink {
 /// A live view of the agent's terminal (Claude) or event stream (Codex).
 pub struct Attachment {
     pub id: u64,
-    /// Bytes that repaint the current screen (or recent stream) before live output.
+    /// Bytes that replay the session before live output, written for a FRESH terminal:
+    /// Claude: the scrollback history, then a repaint of the current screen (input modes
+    /// included); Codex: its banners, then the recent stream. A client that re-attaches
+    /// must reset its terminal first (the bridge sends RIS, `ESC c`, before a re-attach's
+    /// replay), or the history is shown twice.
     pub initial: Vec<u8>,
     pub output: mpsc::Receiver<Vec<u8>>,
     /// Whether typed bytes reach the agent (`Driver::input`).
     pub input: bool,
 }
 
-/// Output chunks (each at most one 8 KiB read) queued per attached client: at most
-/// 256 KiB. A client that falls this far behind stops getting chunks until it is sent a
-/// repaint (memory stays bounded whatever it does); the repaint carries the whole screen,
-/// so nothing it missed is lost from view.
-pub const ATTACH_QUEUE: usize = 32;
-const _: () = assert!(ATTACH_QUEUE <= 32, "at most 256 KiB queued per attached client");
+/// Output chunks queued per attached client. A chunk is one read of the agent's output: a
+/// TUI writes many small ones (a line, a cursor move), a flood fills 8 KiB reads, so this
+/// holds at most 2 MiB per client (256 x 8 KiB), usually far less. A client that falls
+/// this far behind stops getting chunks until it is sent a repaint (memory stays bounded
+/// whatever it does); the repaint carries the whole screen, so nothing it missed is lost
+/// from view. Fewer slots would cost a client that is briefly descheduled during a burst
+/// of small writes a repaint every time.
+pub const ATTACH_QUEUE: usize = 256;
 /// After a repaint that could not be queued (the client is still stalled), the next try
 /// waits this long: a repaint renders the whole screen.
 pub const REPAINT_RETRY: Duration = Duration::from_millis(50);
@@ -308,6 +314,8 @@ pub trait Driver: Send + Sync {
     fn dialog_open(&self) -> bool;
     /// Claude: start (or switch) tailing the session transcript at `offset`.
     fn tail_transcript(&self, path: &Path, offset: u64);
+    /// A new client of the agent's terminal at `rows` x `cols` (0 x 0: the current size,
+    /// for a client re-attaching). Its [`Attachment::initial`] assumes a fresh terminal.
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError>;
     fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
     fn detach(&self, attachment: u64);

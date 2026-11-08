@@ -817,7 +817,9 @@ impl Hub {
     pub fn attach(&self, p: AttachParams) -> Result<(Arc<dyn Driver>, Attachment)> {
         let (task_id, session_id, driver) = self.live_driver(&p.task)?;
         let driver = driver.ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
-        let a = driver.attach(p.rows.max(10), p.cols.max(40))?;
+        // 0 x 0: keep the PTY's size (a client re-attaching); else at least 10 x 40.
+        let (rows, cols) = if p.rows == 0 || p.cols == 0 { (0, 0) } else { (p.rows.max(10), p.cols.max(40)) };
+        let a = driver.attach(rows, cols)?;
         let mut st = self.lock();
         // Audit the session's first attach only: a view that comes back re-attaches, and an
         // event per re-attach would be noise in the log and a refresh in every client.
@@ -1774,6 +1776,11 @@ mod tests {
         assert_eq!(a.initial, b"screen");
         assert_eq!(a.output.recv().unwrap(), b"live");
         assert!(k.calls().contains(&"attach:30x100".to_string()));
+        // 0 x 0 (a re-attach) keeps the PTY's size; any other size is clamped as before.
+        k.hub.attach(AttachParams { task: t.id.clone(), rows: 0, cols: 0 }).unwrap();
+        k.hub.attach(AttachParams { task: t.id.clone(), rows: 1, cols: 1 }).unwrap();
+        let calls = k.calls();
+        assert!(calls.contains(&"attach:0x0".to_string()) && calls.contains(&"attach:10x40".to_string()), "{calls:?}");
     }
 
     /// The cockpit re-attaches whenever a terminal view comes back: the audit keeps the

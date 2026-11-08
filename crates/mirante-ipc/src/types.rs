@@ -399,6 +399,9 @@ pub struct AnswerPermission {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachParams {
     pub task: String,
+    /// The client's terminal size; 0 x 0 keeps the agent's current size (a re-attach).
+    /// After the answer the stream starts with a replay for a fresh terminal (scrollback,
+    /// then the screen): a client re-attaching resets its terminal first.
     pub rows: u16,
     pub cols: u16,
 }

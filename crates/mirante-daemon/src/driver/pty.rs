@@ -438,6 +438,12 @@ impl PtyProcess {
         Ok(())
     }
 
+    /// The mirror grid's (rows, cols): the PTY's size.
+    pub fn size(&self) -> (u16, u16) {
+        let (r, c) = lock(&self.parser).screen().size();
+        (r.get(), c.get())
+    }
+
     pub fn subscribe(&self) -> (u64, mpsc::Receiver<Vec<u8>>) {
         lock(&self.fanout).subscribe()
     }

@@ -628,7 +628,10 @@ impl Driver for ClaudeDriver {
     }
 
     fn attach(&self, rows: u16, cols: u16) -> Result<Attachment, DriverError> {
-        self.pty.resize(rows, cols)?;
+        // 0 x 0 keeps the size (a re-attach).
+        if rows > 0 && cols > 0 {
+            self.pty.resize(rows, cols)?;
+        }
         let (id, initial, output) = self.pty.attach();
         Ok(Attachment { id, initial, output, input: true })
     }
@@ -1240,6 +1243,15 @@ mod tests {
         let g = fake("exit 3");
         let ev = next(&g.rx, |e| matches!(e, DriverEvent::ResumeFailed { .. } | DriverEvent::Exited { .. }));
         assert_eq!(ev, DriverEvent::Exited { code: Some(3) });
+    }
+
+    #[test]
+    fn a_zero_size_attach_keeps_the_pty_size() {
+        let f = fake("printf 'hello'; sleep 5");
+        wait_grid(&f.d, "hello");
+        f.d.attach(30, 100).unwrap();
+        f.d.attach(0, 0).unwrap();
+        assert_eq!(f.d.pty.size(), (30, 100));
     }
 
     #[test]
