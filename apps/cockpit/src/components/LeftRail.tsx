@@ -1,8 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useEnv, useStore } from "../env";
+import { dnaStatus } from "../lib/dna";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { addRepo, loadRepos, removeRepo } from "../lib/repos";
 import type { Project } from "../store/select";
+import { dnaRev } from "../store/state";
 import { MemoryPanel } from "./MemoryPanel";
 
 export function LeftRail(props: {
@@ -11,10 +13,27 @@ export function LeftRail(props: {
   onSelect(path: string): void;
   onReposChanged(repos: string[]): void;
   onMention(agent: AgentKind): void;
+  /** Opens the memory review queue of a project. */
+  onReview?(path: string): void;
   status: DaemonStatus | null;
 }) {
-  const { storage } = useEnv();
+  const { storage, rpc } = useEnv();
   const s = useStore();
+  // The selected project's memory proposals waiting for a person (none when its memory is
+  // off, the daemon is older, or the path is no repo).
+  const sel = props.selected;
+  const version = sel ? dnaRev(s, sel) : 0;
+  const [pending, setPending] = useState<{ path: string; n: number } | null>(null);
+  useEffect(() => {
+    if (!sel) return;
+    let live = true;
+    dnaStatus(rpc, sel)
+      .then((r) => live && setPending({ path: sel, n: r.available && r.status?.enabled ? (r.status.pending ?? 0) : 0 }))
+      .catch(() => live && setPending({ path: sel, n: 0 }));
+    return () => {
+      live = false;
+    };
+  }, [rpc, sel, version]);
   const [path, setPath] = useState("");
   const [error, setError] = useState<string | null>(null);
   const agents = useMemo(() => {
@@ -58,6 +77,16 @@ export function LeftRail(props: {
                 </>
               )}
             </button>
+            {pending?.path === p.path && pending.n > 0 && (
+              <button
+                className="btn btn-small btn-ghost dna-pending"
+                title={`Memory proposals in ${p.path} waiting for your review`}
+                disabled={!props.onReview}
+                onClick={() => props.onReview?.(p.path)}
+              >
+                {pending.n} to review
+              </button>
+            )}
             {added.has(p.path) && (
               <button
                 className="btn btn-small btn-ghost"

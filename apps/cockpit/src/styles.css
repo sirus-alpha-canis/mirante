@@ -248,3 +248,8 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .dna-link { background: none; border: none; padding: 0 2px; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; }
 .dna-actions { display: flex; gap: 6px; margin-top: 8px; }
 .dna-off p { max-width: 70ch; }
+.dna-review h2 { margin: 0 0 4px; font-size: 15px; }
+.dna-proposal { display: grid; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.dna-input { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; background: var(--bg); }
+textarea.dna-input { resize: vertical; font-family: var(--mono); font-size: 12.5px; }
+.dna-pending { color: var(--accent); white-space: nowrap; }

@@ -6,6 +6,9 @@ import { type DaemonStatus, RpcCode, type TaskDiff } from "../lib/protocol";
 import { REPOS_KEY } from "../lib/repos";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
+
+/** Calls other than the rail's repo-memory status reads. */
+const sent = (h: ReturnType<typeof makeEnv>) => h.calls.filter(([m]) => !m.startsWith("dna."));
 import { projects } from "../store/select";
 import { Home } from "./Home";
 
@@ -76,16 +79,16 @@ describe("Home (V3 group chat)", () => {
   it("dispatches @agent repo/branch goal: task.create, then session.start with the goal", async () => {
     const h = setup({ "task.create": task("new", { branch: "feat/login" }), "session.start": { boot: "booting" } });
     await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@codex shop/feat/login add a login page{Enter}");
-    await waitFor(() => expect(h.calls.map((c) => c[0])).toEqual(["task.create", "session.start"]));
-    expect(h.calls[0][1]).toEqual({ repo: "/repos/shop", agent: "codex", branch: "feat/login", goal: "add a login page" });
-    expect(h.calls[1][1]).toEqual({ task: "new", prompt: "add a login page" });
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
+    expect(sent(h)[0][1]).toEqual({ repo: "/repos/shop", agent: "codex", branch: "feat/login", goal: "add a login page" });
+    expect(sent(h)[1][1]).toEqual({ task: "new", prompt: "add a login page" });
   });
 
   it("explains a bad dispatch without calling the daemon", async () => {
     const h = setup();
     await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude web/x do it{Enter}");
     expect(await screen.findByRole("alert")).toHaveTextContent('unknown repo "web"');
-    expect(h.calls).toEqual([]);
+    expect(sent(h)).toEqual([]);
   });
 
   it("the board groups tasks into Needs you / Working / Ready for review", () => {
@@ -138,7 +141,7 @@ describe("Home (V3 group chat)", () => {
     fireEvent.change(box, { target: { value: "@codex shop/feat/x 日本" } });
     fireEvent.keyDown(box, { key: "Enter", isComposing: true });
     fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
-    expect(h.calls).toEqual([]);
+    expect(sent(h)).toEqual([]);
   });
 
   it("text typed while a dispatch is in flight is kept", async () => {
@@ -148,7 +151,7 @@ describe("Home (V3 group chat)", () => {
     await userEvent.type(box, "@codex shop/feat/x go{Enter}");
     await userEvent.type(box, " and more");
     await act(async () => finish(task("new", { branch: "feat/x" })));
-    await waitFor(() => expect(h.calls.map((c) => c[0])).toEqual(["task.create", "session.start"]));
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
     expect(box).toHaveValue("@codex shop/feat/x go and more");
   });
 
@@ -170,7 +173,7 @@ describe("Home (V3 group chat)", () => {
     const h = setup({}, [task("a", { status: "working" })], [], null, ["/repos/shop", "/other/shop"]);
     await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude shop/feat/x go{Enter}");
     expect(await screen.findByRole("alert")).toHaveTextContent('"shop" names several repos');
-    expect(h.calls).toEqual([]);
+    expect(sent(h)).toEqual([]);
   });
 
   it("a mention puts the keyboard in the composer", async () => {
