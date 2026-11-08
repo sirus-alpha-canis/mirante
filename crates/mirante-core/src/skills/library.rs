@@ -261,6 +261,23 @@ pub fn list_versions(lib: &Path, name: &str) -> Result<Vec<u32>, SkillError> {
     Ok(out)
 }
 
+/// Removes version `version` of `name` (a version just written whose acceptance the store
+/// then refused), through descriptors, under the skill's lock. A missing one is Ok.
+pub fn remove_version(lib: &Path, name: &str, version: u32) -> Result<(), SkillError> {
+    check_name(name)?;
+    let (parent, lib_name) = split_lib(lib)?;
+    let Some(dir) = SafeDir::open(parent, &[lib_name, name])? else {
+        return Ok(());
+    };
+    let _lock = dir.lock()?;
+    let target = version_dir(version);
+    if dir.stat(&target)?.is_some() {
+        dir.remove_tree(&target)?;
+        dir.sync()?;
+    }
+    Ok(())
+}
+
 /// Keeps the newest `keep` versions of `name` and removes the older ones (and staging
 /// folders a crashed write left), through descriptors, under the skill's lock. Returns the
 /// versions removed.
@@ -467,6 +484,18 @@ mod tests {
         let (_h2, lib2) = lib_dir();
         std::os::unix::fs::symlink(outside.path(), &lib2).unwrap();
         assert!(write_version(&lib2, &signer(), &bundle("c", 1)).is_err());
+    }
+
+    #[test]
+    fn remove_version_takes_back_one_version_only() {
+        let (_home, lib) = lib_dir();
+        write_version(&lib, &signer(), &bundle("a", 1)).unwrap();
+        write_version(&lib, &signer(), &bundle("a", 2)).unwrap();
+        remove_version(&lib, "a", 2).unwrap();
+        assert_eq!(list_versions(&lib, "a").unwrap(), [1]);
+        remove_version(&lib, "a", 9).unwrap();
+        remove_version(&lib, "missing", 1).unwrap();
+        assert!(remove_version(&lib, "../x", 1).is_err());
     }
 
     #[test]

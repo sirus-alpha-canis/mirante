@@ -244,7 +244,7 @@ fn recite_at_checkout(repo: &Path, anchors: &[Anchor]) -> Vec<Anchor> {
 }
 
 /// Today (UTC) as `YYYY-MM-DD`.
-fn today() -> String {
+pub(crate) fn today() -> String {
     // Howard Hinnant's civil_from_days.
     let z = now_ms().div_euclid(86_400_000) + 719_468;
     let era = z.div_euclid(146_097);

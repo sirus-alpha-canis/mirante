@@ -328,11 +328,27 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
         }
         method::DNA_NOTE_ACTION => out(hub.dna_note_action(caller, params(p)?)),
         method::DNA_MAY_REVIEW => out(hub.require_person(caller).map(|()| json!({}))),
-        method::SKILL_TENANTS => out(hub.skill_tenants()),
+        method::SKILL_TENANTS => out(hub.skill_reads(caller).and_then(|()| hub.skill_tenants())),
         method::SKILL_LEARN => out(hub.skill_learn(caller, params(p)?)),
-        method::SKILL_LIST => out(hub.skill_list(if p.is_null() { Default::default() } else { params(p)? })),
-        method::SKILL_GET => out(hub.skill_get(params(p)?)),
+        method::SKILL_LIST => {
+            let q = if p.is_null() { Default::default() } else { params(p)? };
+            out(hub.skill_reads(caller).and_then(|()| hub.skill_list(q)))
+        }
+        method::SKILL_GET => {
+            let q = params(p)?;
+            out(hub.skill_reads(caller).and_then(|()| hub.skill_get(q)))
+        }
         method::SKILL_CONFIRM_ORIGIN => out(hub.skill_confirm_origin(caller, params(p)?)),
+        method::SKILL_LINT => out(hub.skill_lint(params(p)?)),
+        method::SKILL_PROPOSE => out(hub.skill_propose(caller, params(p)?)),
+        method::SKILL_ADD => out(hub.skill_add(caller, params(p)?)),
+        method::SKILL_PROPOSALS => {
+            let q = if p.is_null() { Default::default() } else { params(p)? };
+            out(hub.skill_reads(caller).and_then(|()| hub.skill_proposals(q)))
+        }
+        method::SKILL_REVIEW => out(hub.skill_review(caller, params(p)?)),
+        method::SKILL_ACTION => out(hub.skill_action(caller, params(p)?)),
+        method::SKILL_MAY_REVIEW => out(hub.skill_may_review(caller)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
@@ -546,6 +562,25 @@ mod tests {
         let v = dispatch_from(&k.hub, &agent.caller(), method::TASK_CREATE, create).unwrap();
         let id = v["id"].as_str().unwrap().to_string();
         assert_eq!(k.hub.lock().store.skill_origin_of(&id).unwrap().unwrap().observed, None);
+        let lint = json!({"name": "x", "description": "d", "body": "sudo rm -rf /\n", "scope": "personal"});
+        let f = dispatch(&k.hub, method::SKILL_LINT, lint).unwrap();
+        assert!(f.as_array().unwrap().iter().any(|f| f["rule"] == "shell"), "{f}");
+        assert_eq!(dispatch(&k.hub, method::SKILL_MAY_REVIEW, Value::Null).unwrap(), json!({}));
+        assert_eq!(dispatch(&k.hub, method::SKILL_PROPOSALS, Value::Null).unwrap(), json!([]));
+        let propose = json!({"task": t.id, "name": "a", "description": "d", "body": "b"});
+        let pv = dispatch(&k.hub, method::SKILL_PROPOSE, propose).unwrap();
+        assert_eq!((pv["status"].as_str(), pv["warnings"].as_array().map(Vec::len)), (Some("pending"), Some(0)));
+        let e = dispatch(&k.hub, method::SKILL_ACTION, json!({"name": "a", "action": "delete", "expect_hash": "h"}));
+        assert_eq!(e.unwrap_err().code, code::INVALID_PARAMS);
+        let e = dispatch(&k.hub, method::SKILL_REVIEW, json!({"id": "nope", "accept": false})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        for m in [method::SKILL_LIST, method::SKILL_TENANTS, method::SKILL_PROPOSALS, method::SKILL_MAY_REVIEW] {
+            assert_eq!(
+                dispatch_from(&k.hub, &agent.caller(), m, Value::Null).unwrap_err().code,
+                code::FORBIDDEN,
+                "{m}"
+            );
+        }
         let off = json!({"tenant": "github.com/acme", "enabled": false});
         assert_eq!(dispatch_from(&k.hub, &agent.caller(), method::SKILL_LEARN, off).unwrap_err().code, code::FORBIDDEN);
     }

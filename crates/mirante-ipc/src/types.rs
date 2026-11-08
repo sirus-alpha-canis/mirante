@@ -58,6 +58,24 @@ pub mod method {
     /// A person confirms a checkout's origin after it changed ([`super::SkillConfirmOrigin`]
     /// → [`super::OriginConfirmed`]).
     pub const SKILL_CONFIRM_ORIGIN: &str = "skill.confirm_origin";
+    /// Pure lint of a draft ([`super::SkillLintParams`] → `Vec<`[`super::Finding`]`>`).
+    pub const SKILL_LINT: &str = "skill.lint";
+    /// A proposed skill or edit, for a person's review ([`super::SkillPropose`] →
+    /// [`super::SkillProposalView`]). An agent proposes only for its own task.
+    pub const SKILL_PROPOSE: &str = "skill.propose";
+    /// A person imports a skill folder or inline text as a proposal ([`super::SkillAdd`] →
+    /// [`super::SkillProposalView`]).
+    pub const SKILL_ADD: &str = "skill.add";
+    /// The review queue ([`super::SkillProposals`] → `Vec<`[`super::SkillProposalView`]`>`).
+    pub const SKILL_PROPOSALS: &str = "skill.proposals";
+    /// A person accepts (writes, signs and ledgers a version) or rejects a proposal
+    /// ([`super::SkillReview`] → [`super::SkillProposalView`]).
+    pub const SKILL_REVIEW: &str = "skill.review";
+    /// A person retires, restores, rescopes or rolls back a skill ([`super::SkillAction`] →
+    /// [`super::SkillView`]).
+    pub const SKILL_ACTION: &str = "skill.action";
+    /// `{}` when the caller may review skills, else `FORBIDDEN`.
+    pub const SKILL_MAY_REVIEW: &str = "skill.may_review";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -883,4 +901,131 @@ pub struct OriginConfirmed {
     pub tenant: String,
     /// Tasks of the checkout fixed to this origin that get skills again.
     pub cleared: usize,
+}
+
+/// A lint finding (`rule`, `severity`, `file`, `line`, `message`).
+pub use mirante_core::skills::lint::Finding;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillLintParams {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    /// `personal`, `org:<prefix>` or `repo:<key>`.
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPropose {
+    pub task: String,
+    /// A new skill's name (default: from the description).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The existing skill this edits (its current version is the base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    pub description: String,
+    pub body: String,
+    /// `always` (default) or `on_demand`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInline {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// `dir` (a folder with `SKILL.md` and text files; symlinks and executables refused) or
+/// `inline` text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillAdd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<SkillInline>,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<String>,
+}
+
+/// The review queue, oldest first, a page at a time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillProposals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// A task reference: only its proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// `pending` (the default), `accepted`, `rejected` or `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Default 50, at most 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// A proposal (its fields, flattened) and what the review card must say about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillProposalView {
+    #[serde(flatten)]
+    pub proposal: mirante_core::skills::index::SkillProposal,
+    /// E.g. a personal scope for text learned in a client's tasks.
+    pub warnings: Vec<String>,
+}
+
+/// A person's edits, used instead of the proposed values on accept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillEdits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillReview {
+    pub id: String,
+    pub accept: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits: Option<SkillEdits>,
+    /// Why (kept with the decision).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionKind {
+    /// Stop injecting it (the versions stay).
+    Retire,
+    Restore,
+    /// A new version with `scope`.
+    Rescope,
+    /// A new version with the content of `version`.
+    Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillAction {
+    pub name: String,
+    pub action: SkillActionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// The `manifest_hash` the person saw: refused if the skill moved on since.
+    pub expect_hash: String,
 }
