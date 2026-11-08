@@ -1,14 +1,20 @@
 //! Anchor checks against git: is the cited code still there, moved, changed or gone?
 //!
 //! Every call runs through the hardened [`Git`]: the daemon runs these in checkouts that
-//! agents can write, outside their sandbox. Paths are passed as `<commit>:<path>` object
-//! names, or with `--literal-pathspecs`, never as globs.
+//! agents can write, outside their sandbox. Anchors are validated before any of their
+//! fields reaches git; revisions follow `--end-of-options`; paths are passed as
+//! `<commit>:<path>` object names on `cat-file`'s stdin, or with `--literal-pathspecs`,
+//! never as globs. One [`check_all`] runs a fixed number of git processes: `rev-parse` per
+//! distinct cited commit, one `diff` per distinct commit, then one `cat-file --batch-check`
+//! and one `cat-file --batch` for every blob it reads.
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
+use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
-use super::anchor::{check_path, fingerprint, locate, slice, Anchor, Located};
+use super::anchor::{check_path, fingerprint, locate_with, slice, Anchor, Located};
 use super::{DnaError, MAX_CITED_FILE};
 use crate::git::Git;
 
@@ -31,12 +37,109 @@ pub struct Checked {
 
 /// Runs hardened git in `repo`; stdout on success, else `DnaError::Git` with stderr.
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, DnaError> {
+    #[cfg(test)]
+    SPAWNS.with(|n| n.set(n.get() + 1));
     let out = Git::new(repo).args(args).output().map_err(|e| DnaError::Git(format!("git: {e}")))?;
     if out.status.success() {
         Ok(out.stdout)
     } else {
         Err(DnaError::Git(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())))
     }
+}
+
+/// Runs hardened git in `repo` with `input` on stdin (written from another thread, so a
+/// large input cannot deadlock against a full stdout pipe).
+fn git_with_input(repo: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, DnaError> {
+    #[cfg(test)]
+    SPAWNS.with(|n| n.set(n.get() + 1));
+    let fail = |e: std::io::Error| DnaError::Git(format!("git: {e}"));
+    let mut cmd = Git::new(repo).args(args).command();
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(fail)?;
+    let mut stdin = child.stdin.take().ok_or_else(|| DnaError::Git("git: no stdin".into()))?;
+    let out = std::thread::scope(|s| {
+        s.spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        child.wait_with_output()
+    })
+    .map_err(fail)?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(DnaError::Git(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())))
+    }
+}
+
+fn is_full_sha(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// The text of each `(commit, path)` blob, in order: `Ok(None)` when the name does not
+/// resolve (no such path at that commit, or no such commit), an error when it is larger
+/// than [`MAX_CITED_FILE`], not a regular file, or not UTF-8. Two git processes in all:
+/// `cat-file --batch-check` for every name, then `cat-file --batch` for the blobs to read.
+fn read_blobs(repo: &Path, names: &[(String, String)]) -> Result<Vec<Result<Option<String>, DnaError>>, DnaError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = Vec::new();
+    for (commit, path) in names {
+        check_path(path)?; // no control characters: one name per line
+        if !is_full_sha(commit) {
+            return Err(DnaError::Git(format!("{commit:?} is not a full sha")));
+        }
+        input.extend_from_slice(format!("{commit}:{path}\n").as_bytes());
+    }
+    let out = git_with_input(repo, &["cat-file", "--batch-check"], input)?;
+    let headers: Vec<&[u8]> = out.split(|b| *b == b'\n').take(names.len()).collect();
+    if headers.len() != names.len() {
+        return Err(DnaError::Git("unexpected cat-file --batch-check output".into()));
+    }
+    let mut results: Vec<Result<Option<String>, DnaError>> = Vec::with_capacity(names.len());
+    let mut wanted: Vec<(usize, String, usize)> = Vec::new();
+    for (i, ((_, path), header)) in names.iter().zip(headers).enumerate() {
+        let header = String::from_utf8_lossy(header);
+        let fields: Vec<&str> = header.split(' ').collect();
+        let result = match fields[..] {
+            [sha, kind, size] if is_full_sha(sha) => match (kind, size.parse::<u64>()) {
+                ("blob", Ok(n)) if n <= MAX_CITED_FILE => {
+                    wanted.push((i, sha.to_string(), n as usize));
+                    Ok(None) // filled in below
+                }
+                ("blob", Ok(_)) => Err(DnaError::Git(format!("{path} is larger than {MAX_CITED_FILE} bytes"))),
+                _ => Err(DnaError::Git(format!("{path} is not a file"))),
+            },
+            _ if header.ends_with(" missing") => Ok(None),
+            _ => Err(DnaError::Git(format!("cannot read {path}: {header}"))),
+        };
+        results.push(result);
+    }
+    if wanted.is_empty() {
+        return Ok(results);
+    }
+    let input: Vec<u8> = wanted.iter().flat_map(|(_, sha, _)| format!("{sha}\n").into_bytes()).collect();
+    let out = git_with_input(repo, &["cat-file", "--batch"], input)?;
+    let mut rest: &[u8] = &out;
+    let short = || DnaError::Git("unexpected cat-file --batch output".into());
+    for (i, sha, size) in wanted {
+        let nl = rest.iter().position(|b| *b == b'\n').ok_or_else(short)?;
+        if !rest[..nl].starts_with(sha.as_bytes()) || rest.len() < nl + 1 + size {
+            return Err(short());
+        }
+        let body = &rest[nl + 1..nl + 1 + size];
+        rest = rest.get(nl + 2 + size..).unwrap_or_default();
+        let path = &names[i].1;
+        results[i] =
+            String::from_utf8(body.to_vec()).map(Some).map_err(|_| DnaError::Git(format!("{path} is a binary file")));
+    }
+    Ok(results)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// git processes this thread started through this module (tests count them).
+    static SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The full sha of the commit `rev` names.
@@ -61,29 +164,20 @@ fn commit_exists(repo: &Path, commit: &str) -> bool {
 /// a regular file, or it is not UTF-8.
 pub fn blob(repo: &Path, commit: &str, path: &str) -> Result<Option<String>, DnaError> {
     check_path(path)?;
-    let object = format!("{commit}:{path}");
-    let size = match git(repo, &["cat-file", "-s", &object]) {
-        Ok(out) => String::from_utf8_lossy(&out).trim().parse::<u64>().map_err(|_| DnaError::Git("bad size".into()))?,
-        Err(e) if commit_exists(repo, commit) => {
-            return if e.to_string().contains("does not exist") || e.to_string().contains("but not in") {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
-        Err(_) => return Err(DnaError::Git(format!("commit {commit} does not exist"))),
-    };
-    if size > MAX_CITED_FILE {
-        return Err(DnaError::Git(format!("{path} is larger than {MAX_CITED_FILE} bytes")));
+    let read = read_blobs(repo, &[(commit.to_string(), path.to_string())])?.pop().unwrap_or(Ok(None));
+    match read {
+        Ok(None) if !commit_exists(repo, commit) => Err(DnaError::Git(format!("commit {commit} does not exist"))),
+        other => other,
     }
-    let out = git(repo, &["cat-file", "blob", &object]).map_err(|_| DnaError::Git(format!("{path} is not a file")))?;
-    String::from_utf8(out).map(Some).map_err(|_| DnaError::Git(format!("{path} is a binary file")))
 }
 
 /// Whether `path` has uncommitted changes (or is untracked) in `worktree`.
 pub fn is_dirty(worktree: &Path, path: &str) -> Result<bool, DnaError> {
     check_path(path)?;
-    let out = git(worktree, &["--literal-pathspecs", "status", "--porcelain=v1", "-z", "--", path])?;
+    let out = git(
+        worktree,
+        &["--literal-pathspecs", "status", "--porcelain=v1", "-z", "--ignore-submodules=all", "--", path],
+    )?;
     Ok(!out.is_empty())
 }
 
@@ -115,22 +209,36 @@ pub fn cite(
     Anchor::parse(&a.render())
 }
 
-/// States of `anchors` against `rev`. One `diff --name-only -z <commit> <rev>` per distinct
-/// commit; only changed paths are read (one `cat-file` each). A commit that no longer
-/// exists → Unverifiable; a blob at its own commit whose lines do not match the fingerprint
-/// → Unverifiable ("anchor does not match its commit": the frontmatter was edited by hand).
+/// States of `anchors` against `rev`. An anchor that fails [`Anchor::validate`] is
+/// Unverifiable and never reaches git. One `diff --name-only -z <commit> <rev>` per
+/// distinct commit, then every blob read in one batch: each anchor's cited lines at its own
+/// commit (re-verified against the fingerprint, so a hand-edited anchor is Unverifiable:
+/// "anchor does not match its commit"), plus the file at `rev` for changed paths. A commit
+/// that no longer exists → Unverifiable.
 pub fn check_all(repo: &Path, rev: &str, anchors: &[Anchor]) -> Result<Vec<Checked>, DnaError> {
     let head = rev_parse(repo, rev)?;
+    let invalid: Vec<Option<String>> = anchors.iter().map(|a| a.validate().err().map(|e| e.to_string())).collect();
+    let valid = || anchors.iter().zip(&invalid).filter(|(_, e)| e.is_none()).map(|(a, _)| a);
     // Per cited commit: the paths changed between it and `head`, or None if it is gone.
     let mut changed: HashMap<&str, Option<HashSet<String>>> = HashMap::new();
-    for a in anchors {
+    for a in valid() {
         if changed.contains_key(a.commit.as_str()) {
             continue;
         }
         let paths = if commit_exists(repo, &a.commit) {
             let out = git(
                 repo,
-                &["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", &a.commit, &head],
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    "--end-of-options",
+                    &a.commit,
+                    &head,
+                ],
             )?;
             Some(
                 out.split(|b| *b == 0)
@@ -143,38 +251,72 @@ pub fn check_all(repo: &Path, rev: &str, anchors: &[Anchor]) -> Result<Vec<Check
         };
         changed.insert(&a.commit, paths);
     }
-    let mut blobs: HashMap<(String, String), Result<Option<String>, DnaError>> = HashMap::new();
-    let mut read = |commit: &str, path: &str| {
-        blobs.entry((commit.to_string(), path.to_string())).or_insert_with(|| blob(repo, commit, path)).clone()
+    // Every blob to read, once.
+    let mut names: Vec<(String, String)> = Vec::new();
+    let mut slot: HashMap<(String, String), usize> = HashMap::new();
+    let mut want = |commit: &str, path: &str| {
+        let key = (commit.to_string(), path.to_string());
+        if !slot.contains_key(&key) {
+            slot.insert(key.clone(), names.len());
+            names.push(key);
+        }
     };
+    for a in valid() {
+        if let Some(Some(paths)) = changed.get(a.commit.as_str()) {
+            want(&a.commit, &a.path);
+            if paths.contains(&a.path) {
+                want(&head, &a.path);
+            }
+        }
+    }
+    let blobs = read_blobs(repo, &names)?;
+    let read = |commit: &str, path: &str| blobs[slot[&(commit.to_string(), path.to_string())]].clone();
     let mut out = Vec::with_capacity(anchors.len());
-    for a in anchors {
-        let state = match &changed[a.commit.as_str()] {
-            None => {
+    for (a, invalid) in anchors.iter().zip(invalid) {
+        let state = match (invalid, changed.get(a.commit.as_str())) {
+            (Some(e), _) => AnchorState::Unverifiable { reason: format!("invalid anchor: {e}") },
+            (None, Some(Some(paths))) => {
+                check_one(a, paths.contains(&a.path), read(&a.commit, &a.path), || read(&head, &a.path))
+            }
+            (None, _) => {
                 AnchorState::Unverifiable { reason: format!("the cited commit {} no longer exists", short(&a.commit)) }
             }
-            Some(paths) if !paths.contains(&a.path) => match read(&a.commit, &a.path) {
-                Ok(Some(text)) if slice(&text, a.start, a.end).is_some_and(|w| fingerprint(&w) == a.fingerprint) => {
-                    AnchorState::Fresh
-                }
-                Ok(_) => AnchorState::Unverifiable {
-                    reason: format!("anchor does not match its commit {} (edited by hand?)", short(&a.commit)),
-                },
-                Err(e) => AnchorState::Unverifiable { reason: e.to_string() },
-            },
-            Some(_) => match read(&head, &a.path) {
-                Ok(None) => AnchorState::Stale { reason: "file deleted or renamed".into() },
-                Ok(Some(text)) => match locate(a, &text) {
-                    Located::Same => AnchorState::Fresh,
-                    Located::Moved { start, end } => AnchorState::Relocated { start, end },
-                    Located::Changed { reason, .. } => AnchorState::Stale { reason },
-                },
-                Err(e) => AnchorState::Stale { reason: e.to_string() },
-            },
         };
         out.push(Checked { anchor: a.clone(), state });
     }
     Ok(out)
+}
+
+/// One anchor's state from its blob at its own commit and, when the path changed, at HEAD.
+fn check_one(
+    a: &Anchor,
+    path_changed: bool,
+    at_commit: Result<Option<String>, DnaError>,
+    at_head: impl FnOnce() -> Result<Option<String>, DnaError>,
+) -> AnchorState {
+    let mismatch = || AnchorState::Unverifiable {
+        reason: format!("anchor does not match its commit {} (edited by hand?)", short(&a.commit)),
+    };
+    let cited_text = match at_commit {
+        Ok(Some(text)) => text,
+        Ok(None) => return mismatch(),
+        Err(e) => return AnchorState::Unverifiable { reason: e.to_string() },
+    };
+    let Some(cited) = slice(&cited_text, a.start, a.end).filter(|w| fingerprint(w) == a.fingerprint) else {
+        return mismatch();
+    };
+    if !path_changed {
+        return AnchorState::Fresh;
+    }
+    match at_head() {
+        Ok(None) => AnchorState::Stale { reason: "file deleted or renamed".into() },
+        Ok(Some(text)) => match locate_with(a, Some(&cited), &text) {
+            Located::Same => AnchorState::Fresh,
+            Located::Moved { start, end } => AnchorState::Relocated { start, end },
+            Located::Changed { reason, .. } => AnchorState::Stale { reason },
+        },
+        Err(e) => AnchorState::Stale { reason: e.to_string() },
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -298,6 +440,44 @@ mod tests {
         plain(&r, &["replace", &c2, &c1]);
         let rep = check_all(&r, "HEAD", &[a]).unwrap();
         assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0].state);
+    }
+
+    #[test]
+    fn an_invalid_anchor_is_unverifiable_and_never_reaches_git_argv() {
+        let r = repo_with(&[("a.rs", "x\n")]);
+        let a = cite(&r, &head(&r), "a.rs", None, 1, 1).unwrap();
+        let evil = Anchor { commit: format!("--output={}", r.join("PWNED").display()), ..a.clone() };
+        let rep = check_all(&r, "HEAD", &[evil, a]).unwrap();
+        assert!(matches!(&rep[0].state, AnchorState::Unverifiable { reason } if reason.contains("invalid")));
+        assert_eq!(rep[1].state, AnchorState::Fresh);
+        assert!(!r.join("PWNED").exists());
+    }
+
+    #[test]
+    fn check_all_reads_blobs_in_one_batch() {
+        let files: Vec<(String, String)> = (0..6).map(|i| (format!("f{i}.rs"), format!("line {i}\n"))).collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        let r = repo_with(&refs);
+        let c = head(&r);
+        let anchors: Vec<Anchor> = files.iter().map(|(p, _)| cite(&r, &c, p, None, 1, 1).unwrap()).collect();
+        commit_file(&r, "f0.rs", "changed\n");
+        SPAWNS.with(|n| n.set(0));
+        let rep = check_all(&r, "HEAD", &anchors).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }));
+        assert!(rep[1..].iter().all(|c| c.state == AnchorState::Fresh));
+        // rev-parse HEAD, rev-parse the cited commit, one diff, then one batch-check and one batch.
+        assert!(SPAWNS.with(|n| n.get()) <= 5, "{} git calls", SPAWNS.with(|n| n.get()));
+    }
+
+    #[test]
+    fn submodule_changes_do_not_make_a_path_dirty() {
+        let sub = repo_with(&[("s.rs", "s\n")]);
+        let r = repo_with(&[("a.rs", "x\n")]);
+        let url = sub.to_str().unwrap();
+        plain(&r, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", url, "sub"]);
+        plain(&r, &["commit", "-q", "-m", "sub"]);
+        std::fs::write(r.join("sub/s.rs"), "edited\n").unwrap();
+        assert!(!is_dirty(&r, "sub").unwrap());
     }
 
     #[test]
