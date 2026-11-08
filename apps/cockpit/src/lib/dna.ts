@@ -111,6 +111,11 @@ for (const [to, from] of [
   for (const c of from) FOLD[c] = to;
 }
 
+/** `c` (one lowercase character) folded to ASCII, or undefined (the daemon's `fold`). */
+export function foldChar(c: string): string | undefined {
+  return FOLD[c];
+}
+
 /** The ASCII kebab slug a `[[target]]` names: a port of the daemon's `note::slugify`
  * (both check crates/mirante-core/src/dna/link-vectors.json). */
 export function slugify(s: string): string {

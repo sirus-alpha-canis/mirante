@@ -2,6 +2,7 @@
 //! transcript tailing, git worktrees and the Claude launch config. Pure library: no PTY,
 //! no daemon, no UI.
 pub mod agent_bin;
+pub mod branch_name;
 pub mod claude_launch;
 pub mod delivery;
 pub mod dna;

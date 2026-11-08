@@ -1,0 +1,30 @@
+{
+ "_comment": "Shared vectors: mirante-core's branch_name (the CLI's `mirante new` without --branch) and the cockpit's branchFromGoal / nextFreeBranch must agree. Both test suites read this file.",
+ "branch_from_goal": [
+  ["Leia este repositório e me explique", "mirante/leia-este-repositorio-e-me-explique"],
+  ["  Ação: corrigir o 'login' (urgente!)  ", "mirante/acao-corrigir-o-login-urgente"],
+  ["refactor the payment gateway adapter so retries use exponential backoff", "mirante/refactor-the-payment-gateway-adapter-so"],
+  ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "mirante/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  ["日本語のテキスト", "mirante/task"],
+  ["   ", "mirante/task"],
+  ["", "mirante/task"],
+  ["Straße", "mirante/strasse"],
+  ["résumé", "mirante/resume"],
+  ["Fix #42: Login BUG", "mirante/fix-42-login-bug"],
+  ["ÀÉÎõü", "mirante/aeiou"],
+  ["-rf /", "mirante/rf"],
+  ["..lock", "mirante/lock"],
+  ["x.lock", "mirante/x-lock"],
+  ["@{u}", "mirante/u"],
+  ["Łódź Ørsted", "mirante/lodz-orsted"],
+  ["İstanbul", "mirante/istanbul"],
+  ["add a login page", "mirante/add-a-login-page"]
+ ],
+ "next_free": [
+  ["mirante/x", [], "mirante/x"],
+  ["mirante/x", ["mirante/x"], "mirante/x-2"],
+  ["mirante/x", ["mirante/x", "mirante/x-2"], "mirante/x-3"],
+  ["mirante/x", ["mirante/x-2"], "mirante/x"],
+  ["mirante/x", ["mirante/x", "mirante/x-3"], "mirante/x-2"]
+ ]
+}

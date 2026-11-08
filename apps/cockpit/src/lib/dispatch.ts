@@ -2,6 +2,7 @@
 // "feat/login", goal "add a login page". The repo is everything before the first "/";
 // the branch is the rest of that word (it may contain "/"; empty, as in "shop/", leaves it to
 // be named from the goal); the goal is the rest of the text.
+import { foldChar } from "./dna";
 import { t } from "./i18n";
 import type { AgentKind } from "./protocol";
 
@@ -80,15 +81,25 @@ export const BRANCH_PREFIX = "mirante/";
 const SLUG_MAX = 40;
 
 /** "Leia este repositório e me explique" -> "mirante/leia-este-repositorio-e-me-explique":
- * lowercase ASCII, accents stripped, words joined by "-", cut near 40 characters at a word
- * boundary. Nothing ASCII left (e.g. Japanese) -> "mirante/task". */
+ * lowercase ASCII, common accents folded (the daemon's fold), combining marks dropped,
+ * every other run of characters one "-", cut near 40 characters at a word boundary.
+ * Nothing left (e.g. Japanese) -> "mirante/task". A port of mirante-core's
+ * `branch_name::branch_from_goal`: both check crates/mirante-core/src/branch_name/vectors.json. */
 export function branchFromGoal(goal: string): string {
-  let slug = goal
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  let slug = "";
+  let dash = false;
+  for (const ch of goal) {
+    for (const c of ch.toLowerCase()) {
+      if (/[\u0300-\u036f]/.test(c)) continue;
+      const piece = /^[a-z0-9]$/.test(c) ? c : foldChar(c);
+      if (piece === undefined) dash = true;
+      else {
+        if (dash && slug) slug += "-";
+        dash = false;
+        slug += piece;
+      }
+    }
+  }
   if (slug.length > SLUG_MAX) {
     const cut = slug.slice(0, SLUG_MAX + 1).lastIndexOf("-");
     slug = cut > 0 ? slug.slice(0, cut) : slug.slice(0, SLUG_MAX);

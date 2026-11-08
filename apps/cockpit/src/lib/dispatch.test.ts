@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+// The CLI's own vectors (mirante-core's branch_name checks the same file).
+import branchVectorsText from "../../../../crates/mirante-core/src/branch_name/vectors.json?raw";
 import {
   AGENT_OPTIONS,
   CONTEXT_HEADER,
@@ -94,6 +96,17 @@ describe("branchFromGoal", () => {
 
   it("always yields a branch the dispatch rules accept", () => {
     for (const g of ["..lock", "-rf /", "x.lock", "@{u}", "a//b", "ÀÉÎõü"]) expect(branchProblem(branchFromGoal(g)), g).toBeNull();
+  });
+});
+
+describe("branch names shared with the CLI", () => {
+  it("branchFromGoal and nextFreeBranch match mirante-core's vectors", () => {
+    const v = JSON.parse(branchVectorsText) as {
+      branch_from_goal: [string, string][];
+      next_free: [string, string[], string][];
+    };
+    for (const [goal, want] of v.branch_from_goal) expect(branchFromGoal(goal), goal).toBe(want);
+    for (const [base, taken, want] of v.next_free) expect(nextFreeBranch(base, new Set(taken))).toBe(want);
   });
 });
 
