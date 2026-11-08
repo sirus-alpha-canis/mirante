@@ -420,6 +420,12 @@ impl State {
             }
             // Audited under its own kind: Mirante killed processes (Codex left them running).
             DriverEvent::Step(v) if v["type"] == "command_killed" => self.event(Some(task_id), "command_killed", v),
+            // The session runs without its skills: their injected usage is taken back.
+            DriverEvent::Step(v) if v["type"] == "skills_failed" => {
+                let error = v["error"].as_str().unwrap_or_default().to_string();
+                self.event(Some(task_id), "step", v)?;
+                Ok(self.store.skill_session_failed(session_id, task_id, &error)?)
+            }
             DriverEvent::Step(v) => self.event(Some(task_id), "step", v),
             DriverEvent::Exited { code } => {
                 self.event(Some(task_id), "process_exited", json!({ "session_id": session_id, "code": code }))?;

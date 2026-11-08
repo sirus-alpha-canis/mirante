@@ -26,7 +26,7 @@
 //! when no single line had it). No regex: fixed tables and small token checks.
 use serde::{Deserialize, Serialize};
 
-use super::format::{check_file_path, is_name};
+use super::format::{case_collision, check_file_path, is_name};
 use super::{MAX_BODY, MAX_DESCRIPTION, MAX_FILE, MAX_FILES, MAX_TOTAL, SKILL_MD};
 use crate::dna::untrusted;
 use crate::redact::redact_counted;
@@ -478,6 +478,10 @@ pub fn lint(d: &Draft) -> Vec<Finding> {
         if d.files.len() > MAX_FILES {
             out.push("size", Severity::Error, 0, format!("more than {MAX_FILES} bundled files"));
         }
+        if let Some(p) = case_collision(&bundled) {
+            let p = untrusted::line(p, 128);
+            out.push("refs", Severity::Error, 0, format!("{p:?}: another bundled file has the same path but for case"));
+        }
         let total = d.body.len() + d.files.iter().map(|(_, b)| b.len()).sum::<usize>();
         if total > MAX_TOTAL {
             out.push("size", Severity::Error, 0, format!("larger than {MAX_TOTAL} bytes in all"));
@@ -736,6 +740,18 @@ mod tests {
         let mut d = draft("Say it! `cargo test` first. Wow!");
         d.files.push(("notes.txt".into(), b"!`date`\n".to_vec()));
         assert!(lint(&d).is_empty(), "{:?}", lint(&d));
+    }
+
+    #[test]
+    fn bundled_paths_differing_only_by_case_are_an_error() {
+        let mut d = draft("b");
+        d.files.push(("Notes.md".into(), b"a\n".to_vec()));
+        d.files.push(("notes.md".into(), b"b\n".to_vec()));
+        let f = lint(&d);
+        assert!(
+            f.iter().any(|f| f.rule == "refs" && f.severity == Severity::Error && f.message.contains("case")),
+            "{f:?}"
+        );
     }
 
     #[test]

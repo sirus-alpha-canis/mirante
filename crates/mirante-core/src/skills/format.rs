@@ -212,6 +212,10 @@ impl Manifest {
         if !extra.windows(2).all(|w| w[0].path < w[1].path) {
             return Err(bad("extra files must be unique and in path order"));
         }
+        let paths: Vec<&str> = extra.iter().map(|f| f.path.as_str()).collect();
+        if let Some(p) = case_collision(&paths) {
+            return Err(bad(format!("{p}: another file has the same path but for case (one file on macOS)")));
+        }
         let mut total = 0u64;
         for (i, f) in self.files.iter().enumerate() {
             if i > 0 {
@@ -237,6 +241,26 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// The first of `paths` that would be the same file or folder as another on a
+/// case-insensitive file system (APFS): equal but for ASCII case, or a file named like
+/// another path's folder.
+pub fn case_collision<'a>(paths: &[&'a str]) -> Option<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dirs = std::collections::HashSet::new();
+    for p in paths {
+        let lower = p.to_ascii_lowercase();
+        let mut prefix = String::new();
+        for seg in lower.split('/').collect::<Vec<_>>().split_last().map(|(_, d)| d.to_vec()).unwrap_or_default() {
+            prefix = if prefix.is_empty() { seg.to_string() } else { format!("{prefix}/{seg}") };
+            dirs.insert(prefix.clone());
+        }
+        if !seen.insert(lower) {
+            return Some(p);
+        }
+    }
+    paths.iter().find(|p| dirs.contains(&p.to_ascii_lowercase())).copied()
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`, without `claude` or `anthropic` (reserved by Claude Code).
@@ -471,6 +495,19 @@ mod tests {
         assert!(Manifest { description: "a <b>".into(), ..m.clone() }.validate().is_err());
         assert!(Manifest { name: "claude-helper".into(), ..m.clone() }.validate().is_err());
         assert!(m.validate().is_ok());
+    }
+
+    /// macOS folders are case-insensitive: two paths that differ only by case (or a file
+    /// and a folder of the same name) would be one file on disk.
+    #[test]
+    fn extra_paths_differing_only_by_case_are_refused() {
+        let m = sample_manifest();
+        for pair in [("Reference/a.md", "reference/a.md"), ("notes.md", "notes.md/x.md"), ("A.md", "a.md")] {
+            let mut files = vec![m.files[0].clone(), FileEntry::of(pair.0, b"x\n"), FileEntry::of(pair.1, b"y\n")];
+            files[1..].sort_by(|a, b| a.path.cmp(&b.path));
+            let e = Manifest { files, ..m.clone() }.validate().unwrap_err().to_string();
+            assert!(e.contains("case"), "{pair:?}: {e}");
+        }
     }
 
     #[test]

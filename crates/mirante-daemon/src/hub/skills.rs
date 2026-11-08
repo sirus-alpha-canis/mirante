@@ -2557,6 +2557,24 @@ pub(crate) mod tests {
         assert_eq!(k.payloads("skill.withdrawn").len(), 1);
     }
 
+    /// The driver could not write the session's bundle (`skills_failed`): the session runs
+    /// without skills, so its injected usage is taken back and `skill.unavailable` says why.
+    #[test]
+    fn a_bundle_that_failed_takes_back_the_injected_usage() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "acme-rules", 1, Scope::org("github.com/acme"), Activation::Always, "Acme.\n");
+        let t = k.started(AgentKind::Claude, "t").task;
+        assert_eq!(k.hub.lock().store.skill_usage_counts(0).unwrap()["acme-rules"].injected, 1);
+        k.emit(crate::driver::DriverEvent::Step(serde_json::json!({"type": "skills_failed", "error": "disk full"})));
+        assert!(k.hub.lock().store.skill_usage_counts(0).unwrap().get("acme-rules").is_none_or(|c| c.injected == 0));
+        let un = k.payloads("skill.unavailable");
+        assert_eq!(un.len(), 1, "{un:?}");
+        assert!(un[0]["reason"].as_str().unwrap().contains("disk full"), "{un:?}");
+        assert!(k.kinds(&t.id).contains(&"step".to_string()), "the step stays in the feed");
+    }
+
     /// A resumed Claude session gets its skills again (its plugin is rebuilt).
     #[test]
     fn a_resumed_codex_thread_gets_no_skills_again_but_claude_does() {

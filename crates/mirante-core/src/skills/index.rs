@@ -871,6 +871,28 @@ impl Store {
         Ok(held)
     }
 
+    /// The driver could not write `session`'s skills: what it recorded as injected is
+    /// taken back and `skill.unavailable {session_id, reason}` says why (the earlier
+    /// `skill.injected` stays in the append-only log, followed by this). Nothing when the
+    /// session had nothing injected.
+    pub fn skill_session_failed(&mut self, session: &str, task: &str, error: &str) -> Result<()> {
+        let boot = self.boot_id().to_string();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute("DELETE FROM skill_usage WHERE session_id = ?1 AND kind = 'injected'", [session])?;
+        if n > 0 {
+            let reason = format!("the skills could not be written for this session: {error}");
+            insert_event(
+                &tx,
+                &boot,
+                Some(task),
+                "skill.unavailable",
+                &json!({ "session_id": session, "reason": reason }),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Records that `session` (a resumed conversation) withdrew `names`: `skill.withdrawn`.
     pub fn skill_record_withdrawn(&mut self, session: &str, task: &str, names: &[String]) -> Result<()> {
         let boot = self.boot_id().to_string();
