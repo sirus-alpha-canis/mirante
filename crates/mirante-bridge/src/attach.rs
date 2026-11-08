@@ -2,14 +2,19 @@
 //! ways. Output is read in a thread and handed to `on_output`; `on_end` runs once when the
 //! stream ends (agent exited, daemon gone, or [`Attachments::close`]). Window size changes
 //! go through `session.resize` (an RPC call), not through this connection.
+//!
+//! Writes never hold the map's lock: each attachment has its own writer lock, and a write
+//! that a stalled daemon does not take within the write timeout fails with
+//! [`BridgeError::Timeout`]. An attachment whose stream ended leaves the map by itself.
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use mirante_ipc::types::{method, AttachParams, AttachResult};
 use mirante_ipc::Client;
@@ -17,11 +22,18 @@ use serde::Serialize;
 
 use crate::rpc::BridgeError;
 
+/// How long typed bytes may wait for the daemon to take them.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Attachment {
-    writer: UnixStream,
+    writer: Arc<Mutex<UnixStream>>,
+    /// A clone of the socket for shutting it down without waiting on `writer`'s lock.
+    control: UnixStream,
     input: bool,
     reader: Option<JoinHandle<()>>,
 }
+
+type Open = Arc<Mutex<HashMap<u32, Attachment>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Opened {
@@ -31,13 +43,23 @@ pub struct Opened {
 }
 
 /// Open attachments by id (the frontend holds ids, never sockets).
-#[derive(Default)]
 pub struct Attachments {
     next: AtomicU32,
-    open: Mutex<HashMap<u32, Attachment>>,
+    open: Open,
+    write_timeout: Duration,
+}
+
+impl Default for Attachments {
+    fn default() -> Self {
+        Self::with_write_timeout(WRITE_TIMEOUT)
+    }
 }
 
 impl Attachments {
+    pub fn with_write_timeout(write_timeout: Duration) -> Self {
+        Attachments { next: AtomicU32::new(0), open: Arc::default(), write_timeout }
+    }
+
     pub fn open(
         &self,
         socket: &Path,
@@ -52,6 +74,15 @@ impl Attachments {
             .map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
         let r: AttachResult = c.call(method::ATTACH, AttachParams { task: task.into(), rows, cols })?;
         let (mut reader, writer) = c.into_raw();
+        writer
+            .set_write_timeout(Some(self.write_timeout))
+            .map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
+        let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        // In the map before the reader runs, so its exit always finds the entry to remove.
+        let control = writer.try_clone().map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
+        let a = Attachment { writer: Arc::new(Mutex::new(writer)), control, input: r.input, reader: None };
+        self.open.lock().unwrap().insert(id, a);
+        let open = self.open.clone();
         let thread = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -61,29 +92,43 @@ impl Attachments {
                     Ok(n) => on_output(buf[..n].to_vec()),
                 }
             }
+            // Ended (or closed): drop the entry (detaching this thread's own handle).
+            let gone = open.lock().unwrap().remove(&id);
+            drop(gone);
             on_end();
         });
-        let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
-        let a = Attachment { writer, input: r.input, reader: Some(thread) };
-        self.open.lock().unwrap().insert(id, a);
+        if let Some(a) = self.open.lock().unwrap().get_mut(&id) {
+            a.reader = Some(thread);
+        }
         Ok(Opened { id, input: r.input })
     }
 
-    /// Typed bytes. Ignored on a read-only stream; an unknown id is an error.
+    /// Typed bytes. Ignored on a read-only stream; an unknown id is an error. Only this
+    /// attachment's writer is locked while writing.
     pub fn write(&self, id: u32, bytes: &[u8]) -> Result<(), BridgeError> {
-        let mut open = self.open.lock().unwrap();
-        let a = open.get_mut(&id).ok_or_else(|| BridgeError::Protocol { message: format!("no attachment {id}") })?;
-        if !a.input {
+        let (writer, input) = {
+            let open = self.open.lock().unwrap();
+            let a = open.get(&id).ok_or_else(|| BridgeError::Protocol { message: format!("no attachment {id}") })?;
+            (a.writer.clone(), a.input)
+        };
+        if !input {
             return Ok(());
         }
-        a.writer.write_all(bytes).map_err(|e| BridgeError::Disconnected { message: e.to_string() })
+        let mut w = writer.lock().unwrap();
+        w.write_all(bytes).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => BridgeError::Timeout {
+                message: format!("the daemon did not take the input within {:?}", self.write_timeout),
+            },
+            _ => BridgeError::Disconnected { message: e.to_string() },
+        })
     }
 
     /// Detaches (the session keeps running). Unknown ids are ignored.
     pub fn close(&self, id: u32) {
         let a = self.open.lock().unwrap().remove(&id);
         if let Some(mut a) = a {
-            let _ = a.writer.shutdown(Shutdown::Both);
+            // Not through the writer's lock: a write stalled on it must not delay the close.
+            let _ = a.control.shutdown(Shutdown::Both);
             if let Some(t) = a.reader.take() {
                 let _ = t.join();
             }
@@ -154,5 +199,83 @@ mod tests {
         fake.drop_connections();
         end_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         all.close_all();
+    }
+
+    /// A daemon that answers `attach` and then never reads what is typed.
+    fn stalled_daemon(sock: &std::path::Path) {
+        use mirante_ipc::rpc::{read_line, write_line, Request, Response};
+        let l = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut w = conn.try_clone().unwrap();
+                    let mut r = std::io::BufReader::new(conn);
+                    let req: Request = serde_json::from_str(&read_line(&mut r).unwrap().unwrap()).unwrap();
+                    write_line(&mut w, &Response::ok(req.id, json!({"input": true}))).unwrap();
+                    std::thread::sleep(Duration::from_secs(30));
+                    drop(r);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_stalled_daemon_times_out_the_write_with_a_typed_error() {
+        let d = TestDir::new();
+        let sock = d.path().join("stall.sock");
+        stalled_daemon(&sock);
+        let all = Attachments::with_write_timeout(Duration::from_millis(200));
+        let o = all.open(&sock, "t1", 24, 80, |_| {}, || {}).unwrap();
+        let big = vec![b'x'; 1 << 20];
+        let started = std::time::Instant::now();
+        let err = loop {
+            if let Err(e) = all.write(o.id, &big) {
+                break e;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "the write never stalled");
+        };
+        assert!(matches!(err, BridgeError::Timeout { .. }), "{err:?}");
+        assert_eq!(serde_json::to_value(&err).unwrap()["kind"], "timeout");
+        all.close_all();
+    }
+
+    #[test]
+    fn a_stalled_write_does_not_block_other_attachments() {
+        let d = TestDir::new();
+        let sock = d.path().join("stall.sock");
+        stalled_daemon(&sock);
+        let fake = FakeDaemon::start(&d.path().join("d.sock"));
+        let all = std::sync::Arc::new(Attachments::with_write_timeout(Duration::from_secs(3)));
+        let stuck = all.open(&sock, "t1", 24, 80, |_| {}, || {}).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let ok = all.open(&fake.socket, "t2", 24, 80, move |b| tx.send(b).unwrap(), || {}).unwrap();
+        read_until(&rx, b"fake terminal\r\n");
+        let a = all.clone();
+        let writer = std::thread::spawn(move || {
+            let big = vec![b'x'; 1 << 20];
+            while a.write(stuck.id, &big).is_ok() {}
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let t0 = std::time::Instant::now();
+        all.write(ok.id, b"pwd\r").unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(1), "blocked behind the stalled attach: {:?}", t0.elapsed());
+        read_until(&rx, b"pwd\r");
+        writer.join().unwrap();
+        all.close_all();
+    }
+
+    #[test]
+    fn an_attachment_that_ends_is_removed() {
+        let d = TestDir::new();
+        let fake = FakeDaemon::start(&d.path().join("d.sock"));
+        let all = Attachments::default();
+        let (end_tx, end_rx) = mpsc::channel();
+        let o = all.open(&fake.socket, "t1", 24, 80, |_| {}, move || end_tx.send(()).unwrap()).unwrap();
+        assert_eq!(all.len(), 1);
+        fake.drop_connections();
+        end_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(all.is_empty(), "the ended attachment stays in the map");
+        assert!(matches!(all.write(o.id, b"x"), Err(BridgeError::Protocol { .. })));
+        all.close(o.id);
     }
 }

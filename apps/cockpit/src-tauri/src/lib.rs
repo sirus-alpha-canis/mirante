@@ -1,5 +1,7 @@
 //! Tauri shell of the cockpit: six commands that forward to `mirante-bridge`. No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
+//! The window never leaves the app's origin: links open in the browser through the opener
+//! plugin (github.com only, see `capabilities/default.json`), never in the window itself.
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -11,7 +13,21 @@ use mirante_ipc::Paths;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, State, Url, WindowEvent};
+
+/// Vite's dev server (`build.devUrl` in `tauri.conf.json`), loaded only by `tauri dev`.
+const DEV_ORIGIN: (&str, u16) = ("127.0.0.1", 1420);
+
+/// Whether the window may load `url`: the bundled app (`tauri://localhost` on macOS,
+/// `http(s)://tauri.localhost` elsewhere), plus the dev server in a dev build.
+fn is_app_url(url: &Url, dev: bool) -> bool {
+    match (url.scheme(), url.host_str()) {
+        ("tauri", Some("localhost")) => true,
+        ("http" | "https", Some("tauri.localhost")) => true,
+        ("http", Some(host)) => dev && host == DEV_ORIGIN.0 && url.port() == Some(DEV_ORIGIN.1),
+        _ => false,
+    }
+}
 
 struct Cockpit {
     paths: Paths,
@@ -80,9 +96,11 @@ async fn attach_open(
     )
 }
 
+/// Off the main thread: a daemon that stops reading must not freeze the window. The bridge
+/// bounds the write (`attach::WRITE_TIMEOUT`) and reports `BridgeError::Timeout`.
 #[tauri::command]
-fn attach_write(app: State<'_, Cockpit>, id: u32, data: Vec<u8>) -> Result<(), BridgeError> {
-    app.attachments.write(id, &data)
+async fn attach_write(app: AppHandle, id: u32, data: Vec<u8>) -> Result<(), BridgeError> {
+    joined(tauri::async_runtime::spawn_blocking(move || app.state::<Cockpit>().attachments.write(id, &data)).await)
 }
 
 #[tauri::command]
@@ -109,6 +127,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
+                .on_navigation(|_, url| is_app_url(url, cfg!(debug_assertions)))
+                .build(),
+        )
         .manage(Cockpit { paths, socket, stream: Mutex::new(None), attachments: Attachments::default() })
         .invoke_handler(tauri::generate_handler![rpc, subscribe, attach_open, attach_write, attach_close, daemon_start])
         .on_window_event(|window, event| {
@@ -118,4 +141,39 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running the Mirante cockpit");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> tauri::Url {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_app_origin_is_the_only_place_the_window_may_go() {
+        for ok in ["tauri://localhost/", "tauri://localhost/index.html#/task/t1", "http://tauri.localhost/", "https://tauri.localhost/x"] {
+            assert!(is_app_url(&url(ok), false), "{ok}");
+        }
+        for bad in [
+            "https://github.com/acme/shop/pull/1",
+            "https://evil.example/",
+            "http://localhost:1420/",
+            "tauri://evil/",
+            "http://tauri.localhost.evil.example/",
+            "file:///etc/passwd",
+            "about:blank",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_app_url(&url(bad), false), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_dev_server_is_allowed_only_in_dev() {
+        assert!(is_app_url(&url("http://127.0.0.1:1420/src/main.tsx"), true));
+        assert!(!is_app_url(&url("http://127.0.0.1:1420/"), false));
+        assert!(!is_app_url(&url("http://127.0.0.1:1421/"), true));
+    }
 }

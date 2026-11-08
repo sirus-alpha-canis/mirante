@@ -47,6 +47,8 @@ pub enum BridgeError {
     Protocol { message: String },
     /// The cockpit may not call this method.
     Forbidden { method: String },
+    /// A write to the daemon did not complete in time (the daemon is stalled).
+    Timeout { message: String },
 }
 
 impl std::fmt::Display for BridgeError {
@@ -56,6 +58,7 @@ impl std::fmt::Display for BridgeError {
             BridgeError::Rpc { code, message } => write!(f, "{message} (code {code})"),
             BridgeError::Protocol { message } => write!(f, "daemon protocol: {message}"),
             BridgeError::Forbidden { method } => write!(f, "{method} is not allowed from the cockpit"),
+            BridgeError::Timeout { message } => write!(f, "daemon timed out: {message}"),
         }
     }
 }
