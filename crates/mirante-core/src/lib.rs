@@ -8,6 +8,7 @@ pub mod error;
 pub mod git;
 pub mod hook;
 pub mod model;
+pub mod redact;
 pub mod status;
 pub mod store;
 pub mod transcript_tail;
