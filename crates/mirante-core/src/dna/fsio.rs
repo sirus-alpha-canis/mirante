@@ -3,32 +3,24 @@
 //! The memory directory sits in a checkout that people and agents write (agents edit
 //! checkouts; their worktrees share its repository), and the daemon writes there outside
 //! the agents' sandbox. A path checked first and used later can be swapped for a symlink in
-//! between (e.g. `.mirante/memory` → `~/.claude/commands`), so nothing here uses a path
-//! twice. Every access goes through [`MemoryDir`], a descriptor of the directory opened
-//! one level at a time from the repo root with `O_DIRECTORY | O_NOFOLLOW`; every file
-//! operation after that is relative to that descriptor (`openat`, `linkat`, `renameat`,
-//! `unlinkat`, `fstatat`). Swapping a level for a symlink after the open changes nothing:
-//! the writes stay in the directory that was opened.
+//! between (e.g. `.mirante/memory` → `~/.claude/commands`), so every access goes through
+//! [`MemoryDir`], a [`SafeDir`] over `.mirante/memory` opened one level at a time from the
+//! repo root without following symlinks; every file operation after that is relative to
+//! that descriptor (see [`crate::safedir`]).
 //!
-//! - Notes are created without clobbering (temp file, then `linkat`, which fails if the
-//!   target exists, even as a dangling symlink); updates need the hash of the content they
-//!   replace and land with `renameat`. Both fsync the file and the directory, and hold an
-//!   exclusive `flock` on the directory so two writers cannot interleave.
-//! - Reads open with `O_NOFOLLOW | O_NONBLOCK` and accept only a regular file with a single
-//!   link on the directory's device (a planted hard link to `~/.ssh/id_rsa` is refused).
-//!
-//! Residual risk: someone who can rename the opened directory itself into another place
-//! on the same file system makes the write land there, but that needs write access to the
-//! destination, which then needs no help from Mirante.
-use std::ffi::{CStr, CString};
-use std::fs::File;
-use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::MetadataExt;
+//! - Notes are created without clobbering ([`SafeDir::create_file`]); updates need the hash
+//!   of the content they replace and land with `renameat`. Both fsync the file and the
+//!   directory, and hold an exclusive `flock` on the directory so two writers cannot
+//!   interleave.
+//! - Reads accept only a regular file with a single link on the directory's device (a
+//!   planted hard link to `~/.ssh/id_rsa` is refused), at most [`MAX_NOTE_BYTES`].
 use std::path::{Path, PathBuf};
 
 use super::note::is_slug;
 use super::{sha256_hex, DnaError, MAX_NOTE_BYTES, MEMORY_DIR};
+use crate::safedir::{SafeDir, SafeError};
+
+pub use crate::safedir::Entry;
 
 const README: &str = "# Repository memory\n\
 \n\
@@ -64,105 +56,22 @@ fn unsafe_at(p: &str, why: &str) -> DnaError {
     DnaError::Unsafe(format!("{p}: {why}"))
 }
 
-fn cname(name: &str) -> Result<CString, DnaError> {
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-        return Err(DnaError::Unsafe(format!("{name:?} is not a file name")));
-    }
-    CString::new(name).map_err(|_| DnaError::Unsafe(format!("{name:?} contains NUL")))
-}
-
-/// Retries `f` while it fails with `EINTR`; a negative return is the error in `errno`.
-fn cvt(mut f: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
-    loop {
-        let r = f();
-        if r >= 0 {
-            return Ok(r);
+impl From<SafeError> for DnaError {
+    fn from(e: SafeError) -> Self {
+        match e {
+            SafeError::Unsafe(m) => DnaError::Unsafe(m),
+            SafeError::Exists(m) => DnaError::Exists(m),
+            SafeError::Missing(m) => DnaError::Missing(m),
+            e @ (SafeError::TooLarge(..) | SafeError::NotUtf8(_)) => DnaError::Note(e.to_string()),
+            SafeError::Io(m) => DnaError::Io(m),
         }
-        let e = io::Error::last_os_error();
-        if e.kind() != ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-}
-
-/// `openat(dir, name, flags | O_CLOEXEC, mode)`.
-fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int, mode: libc::c_uint) -> io::Result<OwnedFd> {
-    // SAFETY: `name` is a valid NUL-terminated string; openat does not keep the pointer.
-    let fd = cvt(|| unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode) })?;
-    // SAFETY: openat just returned this descriptor, owned by nobody else.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`.
-fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
-    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: valid name and an out-pointer to a properly sized `stat`.
-    cvt(|| unsafe { libc::fstatat(dir, name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) })?;
-    // SAFETY: fstatat succeeded, so it filled `st`.
-    Ok(unsafe { st.assume_init() })
-}
-
-fn file_type(mode: u32) -> u32 {
-    mode & libc::S_IFMT as u32
-}
-
-/// Opens the directory `name` inside `parent`, never through a symlink.
-fn open_dir_at(parent: RawFd, name: &str, shown: &str) -> Result<Option<OwnedFd>, DnaError> {
-    let c = cname(name)?;
-    match open_at(parent, &c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0) {
-        Ok(fd) => Ok(Some(fd)),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
-            let why = match stat_at(parent, &c) {
-                Ok(st) if file_type(st.st_mode as u32) == libc::S_IFLNK as u32 => "is a symlink",
-                _ => "is not a directory",
-            };
-            Err(unsafe_at(shown, why))
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// One entry of the memory directory, as `fstatat` (not following symlinks) saw it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub name: String,
-    pub mode: u32,
-    pub size: u64,
-    pub mtime: i64,
-    pub mtime_nsec: i64,
-}
-
-impl Entry {
-    pub fn is_file(&self) -> bool {
-        file_type(self.mode) == libc::S_IFREG as u32
-    }
-}
-
-/// An exclusive `flock` on a directory descriptor, released on drop.
-struct Lock(RawFd);
-
-impl Lock {
-    fn take(fd: RawFd) -> Result<Lock, DnaError> {
-        // SAFETY: plain syscall on a descriptor we own for the lock's lifetime.
-        cvt(|| unsafe { libc::flock(fd, libc::LOCK_EX) })?;
-        Ok(Lock(fd))
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // SAFETY: as above.
-        unsafe { libc::flock(self.0, libc::LOCK_UN) };
     }
 }
 
 /// `<repo>/.mirante/memory`, opened (see the module docs). All note I/O goes through it.
 #[derive(Debug)]
 pub struct MemoryDir {
-    fd: OwnedFd,
-    dev: u64,
-    path: PathBuf,
+    dir: SafeDir,
 }
 
 impl MemoryDir {
@@ -170,31 +79,10 @@ impl MemoryDir {
     /// `Err(Unsafe)` when one is a symlink or not a directory. With `create`, missing levels
     /// are made first.
     fn open_in(repo: &Path, create: bool) -> Result<Option<MemoryDir>, DnaError> {
-        let root = repo.canonicalize()?;
-        let mut fd: OwnedFd = File::open(&root)?.into();
-        let mut shown = root.clone();
-        for seg in MEMORY_DIR.split('/') {
-            shown.push(seg);
-            let label = shown.display().to_string();
-            let mut next = open_dir_at(fd.as_raw_fd(), seg, &label)?;
-            if next.is_none() && create {
-                let c = cname(seg)?;
-                // SAFETY: valid name; mkdirat does not keep the pointer.
-                match cvt(|| unsafe { libc::mkdirat(fd.as_raw_fd(), c.as_ptr(), 0o755) }) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e.into()),
-                }
-                next = open_dir_at(fd.as_raw_fd(), seg, &label)?;
-            }
-            match next {
-                Some(n) => fd = n,
-                None => return Ok(None),
-            }
-        }
-        let dev = File::from(fd.try_clone()?).metadata()?.dev();
+        let segs: Vec<&str> = MEMORY_DIR.split('/').collect();
+        let dir = if create { Some(SafeDir::create(repo, &segs, 0o755)?) } else { SafeDir::open(repo, &segs)? };
         after_open();
-        Ok(Some(MemoryDir { fd, dev, path: shown }))
+        Ok(dir.map(|dir| MemoryDir { dir }))
     }
 
     /// The existing memory directory of `repo`, `None` when it does not exist.
@@ -211,95 +99,18 @@ impl MemoryDir {
 
     /// Where it was opened (for display).
     pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn raw(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.dir.path()
     }
 
     /// Its entries (not `.`/`..`), at most `limit + 1` of them, in directory order.
     pub fn entries(&self, limit: usize) -> Result<Vec<Entry>, DnaError> {
-        struct Dir(*mut libc::DIR);
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                // SAFETY: the stream came from fdopendir and is closed once (this also
-                // closes the duplicated descriptor it owns).
-                unsafe { libc::closedir(self.0) };
-            }
-        }
-        // SAFETY: duplicating a descriptor we own; the copy is handed to fdopendir below.
-        let dup = cvt(|| unsafe { libc::fcntl(self.raw(), libc::F_DUPFD_CLOEXEC, 0) })?;
-        // SAFETY: `dup` is a fresh directory descriptor; on success the stream owns it.
-        let dirp = unsafe { libc::fdopendir(dup) };
-        if dirp.is_null() {
-            let e = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so `dup` is still ours to close.
-            unsafe { libc::close(dup) };
-            return Err(e.into());
-        }
-        let dir = Dir(dirp);
-        // SAFETY: valid stream; the duplicate shares the offset, so start from the top.
-        unsafe { libc::rewinddir(dir.0) };
-        let mut out = Vec::new();
-        loop {
-            // SAFETY: valid stream; the entry is read before the next readdir call.
-            let ent = unsafe { libc::readdir(dir.0) };
-            if ent.is_null() {
-                break;
-            }
-            // SAFETY: readdir returned a valid entry whose d_name is NUL-terminated.
-            let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }.to_owned();
-            if name.as_bytes() == b"." || name.as_bytes() == b".." {
-                continue;
-            }
-            let st = match stat_at(self.raw(), &name) {
-                Ok(st) => st,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue, // removed meanwhile
-                Err(e) => return Err(e.into()),
-            };
-            out.push(Entry {
-                name: name.to_string_lossy().into_owned(),
-                mode: st.st_mode as u32,
-                size: st.st_size as u64,
-                mtime: st.st_mtime as i64,
-                mtime_nsec: st.st_mtime_nsec as i64,
-            });
-            if out.len() > limit {
-                break;
-            }
-        }
-        Ok(out)
+        Ok(self.dir.entries(limit)?)
     }
 
     /// The text of the file `name`: a regular file (never through a symlink) with a single
     /// link, on this directory's device, at most [`MAX_NOTE_BYTES`], UTF-8.
     pub fn read_file(&self, name: &str) -> Result<String, DnaError> {
-        let shown = self.path.join(name).display().to_string();
-        let c = cname(name)?;
-        // O_NONBLOCK: a planted FIFO must not hang the reader; it is refused below.
-        let f = match open_at(self.raw(), &c, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0) {
-            Ok(fd) => File::from(fd),
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(unsafe_at(&shown, "is a symlink")),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Err(DnaError::Missing(shown)),
-            Err(e) => return Err(e.into()),
-        };
-        let meta = f.metadata()?;
-        if !meta.is_file() {
-            return Err(unsafe_at(&shown, "is not a regular file"));
-        }
-        if meta.nlink() != 1 || meta.dev() != self.dev {
-            return Err(unsafe_at(&shown, "is a hard link to another file"));
-        }
-        if meta.len() > MAX_NOTE_BYTES as u64 {
-            return Err(DnaError::Note(format!("{shown} is larger than {MAX_NOTE_BYTES} bytes")));
-        }
-        let mut bytes = Vec::with_capacity(meta.len() as usize);
-        f.take(MAX_NOTE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_NOTE_BYTES {
-            return Err(DnaError::Note(format!("{shown} is larger than {MAX_NOTE_BYTES} bytes")));
-        }
-        String::from_utf8(bytes).map_err(|_| DnaError::Note(format!("{shown} is not UTF-8")))
+        Ok(self.dir.read_file(name, MAX_NOTE_BYTES)?)
     }
 
     /// The text of the note `slug` (see [`MemoryDir::read_file`]).
@@ -308,43 +119,9 @@ impl MemoryDir {
         self.read_file(&format!("{slug}.md"))
     }
 
-    fn sync(&self) -> Result<(), DnaError> {
-        // SAFETY: plain syscall on our descriptor.
-        cvt(|| unsafe { libc::fsync(self.raw()) })?;
-        Ok(())
-    }
-
-    fn unlink(&self, name: &CStr) -> io::Result<()> {
-        // SAFETY: valid name; unlinkat does not keep the pointer.
-        cvt(|| unsafe { libc::unlinkat(self.raw(), name.as_ptr(), 0) }).map(drop)
-    }
-
-    /// Writes `text` to a fresh temp file (`.<name>.tmp-<uuid>`, never following a symlink)
-    /// and syncs it. Returns its name.
-    fn write_temp(&self, name: &str, text: &str) -> Result<CString, DnaError> {
-        let tmp = cname(&format!(".{name}.tmp-{}", uuid::Uuid::now_v7()))?;
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
-        let mut f = File::from(open_at(self.raw(), &tmp, flags, 0o644)?);
-        if let Err(e) = f.write_all(text.as_bytes()).and_then(|()| f.sync_all()) {
-            let _ = self.unlink(&tmp);
-            return Err(e.into());
-        }
-        Ok(tmp)
-    }
-
     /// Creates the file `name` with `text`; fails if anything (a file, a symlink) is there.
     fn create_file(&self, name: &str, text: &str) -> Result<(), DnaError> {
-        let target = cname(name)?;
-        let _lock = Lock::take(self.raw())?;
-        let tmp = self.write_temp(name, text)?;
-        // SAFETY: valid names, both relative to our descriptor; flags 0: no symlink follow.
-        let linked = cvt(|| unsafe { libc::linkat(self.raw(), tmp.as_ptr(), self.raw(), target.as_ptr(), 0) });
-        let _ = self.unlink(&tmp);
-        match linked {
-            Ok(_) => self.sync(),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(DnaError::Exists(name.to_string())),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self.dir.create_file(name, text.as_bytes(), 0o644)?)
     }
 
     /// Creates the note `slug` with `text`. Never overwrites.
@@ -360,19 +137,16 @@ impl MemoryDir {
         check_slug(slug)?;
         check_size(text)?;
         let name = format!("{slug}.md");
-        let target = cname(&name)?;
-        let _lock = Lock::take(self.raw())?;
+        let _lock = self.dir.lock()?;
         if sha256_hex(self.read_file(&name)?.as_bytes()) != expect_hash {
             return Err(DnaError::Changed);
         }
-        let tmp = self.write_temp(&name, text)?;
-        // SAFETY: valid names, both relative to our descriptor.
-        let renamed = cvt(|| unsafe { libc::renameat(self.raw(), tmp.as_ptr(), self.raw(), target.as_ptr()) });
-        if let Err(e) = renamed {
-            let _ = self.unlink(&tmp);
+        let tmp = self.dir.write_temp(&name, text.as_bytes(), 0o644)?;
+        if let Err(e) = self.dir.rename(&tmp, &name) {
+            let _ = self.dir.unlink(&tmp);
             return Err(e.into());
         }
-        self.sync()
+        Ok(self.dir.sync()?)
     }
 
     /// Removes the note `slug` only if its content hashes to `expect_hash` (undoing a
@@ -380,12 +154,12 @@ impl MemoryDir {
     pub fn remove(&self, slug: &str, expect_hash: &str) -> Result<bool, DnaError> {
         check_slug(slug)?;
         let name = format!("{slug}.md");
-        let _lock = Lock::take(self.raw())?;
+        let _lock = self.dir.lock()?;
         if sha256_hex(self.read_file(&name)?.as_bytes()) != expect_hash {
             return Ok(false);
         }
-        self.unlink(&cname(&name)?)?;
-        self.sync()?;
+        self.dir.unlink(&name)?;
+        self.dir.sync()?;
         Ok(true)
     }
 }
@@ -393,7 +167,7 @@ impl MemoryDir {
 /// `<repo>/.mirante/memory`, checked (both levels real directories, no symlinks), for
 /// display. Access goes through [`MemoryDir`].
 pub fn memory_dir(repo: &Path) -> Result<PathBuf, DnaError> {
-    Ok(MemoryDir::existing(repo)?.path)
+    Ok(MemoryDir::existing(repo)?.path().to_path_buf())
 }
 
 /// Where the note `slug` lives (unchecked; for display and tests).
@@ -406,12 +180,10 @@ pub fn init(repo: &Path) -> Result<PathBuf, DnaError> {
     let dir = MemoryDir::open_in(repo, true)?.ok_or_else(|| DnaError::Io("could not create the memory dir".into()))?;
     match dir.create_file("README.md", README) {
         Ok(()) => {}
-        Err(DnaError::Exists(_))
-            if stat_at(dir.raw(), c"README.md")
-                .is_ok_and(|st| file_type(st.st_mode as u32) == libc::S_IFREG as u32) => {}
+        Err(DnaError::Exists(_)) if matches!(dir.dir.stat("README.md"), Ok(Some(e)) if e.is_file()) => {}
         Err(e) => return Err(e),
     }
-    Ok(dir.path)
+    Ok(dir.path().to_path_buf())
 }
 
 fn check_slug(slug: &str) -> Result<(), DnaError> {

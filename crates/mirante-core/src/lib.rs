@@ -10,6 +10,7 @@ pub mod git;
 pub mod hook;
 pub mod model;
 pub mod redact;
+pub mod safedir;
 pub mod skills;
 pub mod status;
 pub mod store;
