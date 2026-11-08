@@ -459,6 +459,21 @@ mod tests {
         assert_eq!(links(&parse(SAMPLE).unwrap().body), ["other-note", "x", "y"]);
     }
 
+    /// The cockpit resolves [[links]] itself (apps/cockpit/src/lib/dna.ts): both sides
+    /// check the same vectors.
+    #[test]
+    fn slugify_and_links_match_the_shared_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("link-vectors.json")).unwrap();
+        for case in v["slugify"].as_array().unwrap() {
+            let (input, want) = (case[0].as_str().unwrap(), case[1].as_str().unwrap());
+            assert_eq!(slugify(input), want, "slugify({input:?})");
+        }
+        for case in v["links"].as_array().unwrap() {
+            let want: Vec<&str> = case[1].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+            assert_eq!(links(case[0].as_str().unwrap()), want, "links({:?})", case[0]);
+        }
+    }
+
     #[test]
     fn rejects_missing_fields_bad_kind_no_anchors_and_oversize() {
         assert!(parse("no frontmatter").is_err());

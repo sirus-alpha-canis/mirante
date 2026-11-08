@@ -1,0 +1,133 @@
+{
+ "_comment": "Shared vectors: mirante-core's note::slugify / note::links and the cockpit's slugify / linkParts must agree. Both test suites read this file.",
+ "slugify": [
+  [
+   "Hook events: São Paulo/Δ!",
+   "hook-events-sao-paulo"
+  ],
+  [
+   "!!!",
+   "note"
+  ],
+  [
+   "",
+   "note"
+  ],
+  [
+   "Straße",
+   "strasse"
+  ],
+  [
+   "Æther œuvre",
+   "aether-oeuvre"
+  ],
+  [
+   "Łódź Ørsted",
+   "lodz-orsted"
+  ],
+  [
+   "  --a--b--  ",
+   "a-b"
+  ],
+  [
+   "ÇA VA",
+   "ca-va"
+  ],
+  [
+   "naïve café",
+   "naive-cafe"
+  ],
+  [
+   "résumé",
+   "re-sume"
+  ],
+  [
+   "İstanbul",
+   "i-stanbul"
+  ],
+  [
+   "日本",
+   "note"
+  ],
+  [
+   "a_b.c",
+   "a-b-c"
+  ],
+  [
+   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  ],
+  [
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaß",
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaas"
+  ],
+  [
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa b",
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ]
+ ],
+ "links": [
+  [
+   "see [[a]] and [[B|alias]] and [[c#h]]",
+   [
+    "a",
+    "b",
+    "c"
+   ]
+  ],
+  [
+   "[[a [[b]]",
+   [
+    "b"
+   ]
+  ],
+  [
+   "[[a\nb]] [[c]]",
+   [
+    "c"
+   ]
+  ],
+  [
+   "[[ !!! ]] [[]] [[#h]]",
+   []
+  ],
+  [
+   "[[x]] [[x]] [[X]]",
+   [
+    "x"
+   ]
+  ],
+  [
+   "[[a|b|c]]",
+   [
+    "a"
+   ]
+  ],
+  [
+   "[[Δ]]",
+   [
+    "note"
+   ]
+  ],
+  [
+   "[[a] and [[open",
+   []
+  ],
+  [
+   "[[[x]]",
+   []
+  ],
+  [
+   "[[a [b]] [[c]]",
+   [
+    "c"
+   ]
+  ],
+  [
+   "[[São Paulo]]",
+   [
+    "sao-paulo"
+   ]
+  ]
+ ]
+}

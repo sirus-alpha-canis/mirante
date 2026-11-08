@@ -88,37 +88,90 @@ export function dnaErrorText(e: unknown): string {
 
 export type LinkPart = { text: string } | { link: string; label: string };
 
-/** The ASCII kebab slug a `[[target]]` names (the daemon's `slugify`). */
-export function slugify(s: string): string {
-  const ascii = s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
-  const slug = ascii.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64).replace(/-+$/, "");
-  return slug || "note";
+/** Common Latin letters with diacritics, folded to ASCII (the daemon's `fold`). */
+const FOLD: Record<string, string> = {};
+for (const [to, from] of [
+  ["a", "àáâãäåā"],
+  ["c", "çćč"],
+  ["e", "èéêëēě"],
+  ["i", "ìíîïī"],
+  ["n", "ñń"],
+  ["o", "òóôõöøō"],
+  ["u", "ùúûüūů"],
+  ["y", "ýÿ"],
+  ["s", "šś"],
+  ["z", "žźż"],
+  ["l", "ł"],
+  ["ss", "ß"],
+  ["ae", "æ"],
+  ["oe", "œ"],
+] as const) {
+  for (const c of from) FOLD[c] = to;
 }
 
+/** The ASCII kebab slug a `[[target]]` names: a port of the daemon's `note::slugify`
+ * (both check crates/mirante-core/src/dna/link-vectors.json). */
+export function slugify(s: string): string {
+  let out = "";
+  let dash = false;
+  outer: for (const ch of s) {
+    for (const c of ch.toLowerCase()) {
+      const piece = /^[a-z0-9]$/.test(c) ? c : FOLD[c];
+      if (piece === undefined) dash = true;
+      else {
+        if (dash && out) out += "-";
+        dash = false;
+        out += piece;
+      }
+      if (out.length >= 64) break outer;
+    }
+  }
+  out = out.slice(0, 64).replace(/-+$/, "");
+  return out || "note";
+}
+
+const ALNUM = /[\p{Alphabetic}\p{N}]/u;
+
 /** A note body as text and [[link]] parts: `[[slug]]`, `[[slug|alias]]` and
- * `[[slug#heading]]` link to `slug`. Everything else stays text, markup included. */
+ * `[[slug#heading]]` link to `slug`. Everything else stays text, markup included. The
+ * daemon's `note::links` rules: a link never spans a line or holds a `[`, and its target
+ * has a letter or digit. One pass: each character is looked at a bounded number of times. */
 export function linkParts(body: string): LinkPart[] {
   const out: LinkPart[] = [];
   let text = "";
   let i = 0;
-  while (i < body.length) {
-    const open = body.indexOf("[[", i);
+  let from = 0;
+  for (;;) {
+    const open = body.indexOf("[[", from);
     if (open < 0) break;
-    const close = body.indexOf("]]", open + 2);
-    if (close < 0) break;
-    const inner = body.slice(open + 2, close);
-    const [target, alias] = inner.split("|", 2);
-    const slugPart = target.split("#", 1)[0].trim();
-    if (!slugPart || inner.includes("\n")) {
-      text += body.slice(i, open + 2);
-      i = open + 2;
+    // The inner text runs to the first "]]"; a "[" or newline before it means no link here
+    // (the search for the next "[[" resumes there: nothing before it can start one).
+    let j = open + 2;
+    let close = -1;
+    while (j < body.length) {
+      if (body.startsWith("]]", j)) {
+        close = j;
+        break;
+      }
+      if (body[j] === "[" || body[j] === "\n") break;
+      j++;
+    }
+    if (close < 0) {
+      if (j >= body.length) break;
+      from = j;
       continue;
     }
+    const inner = body.slice(open + 2, close);
+    const bar = inner.indexOf("|");
+    const target = inner.split(/[|#]/, 1)[0];
+    from = close + 2;
+    if (!ALNUM.test(target)) continue;
     text += body.slice(i, open);
     if (text) out.push({ text });
     text = "";
-    out.push({ link: slugify(slugPart), label: (alias ?? target).trim() || slugPart });
-    i = close + 2;
+    const label = (bar >= 0 ? inner.slice(bar + 1) : inner).trim();
+    out.push({ link: slugify(target), label: label || target.trim() });
+    i = from;
   }
   text += body.slice(i);
   if (text) out.push({ text });

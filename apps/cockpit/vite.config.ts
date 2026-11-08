@@ -10,9 +10,10 @@ export default defineConfig(({ mode }) => ({
     port: 1420,
     strictPort: true,
     host: "127.0.0.1",
-    // Tests only: security.test.ts reads the bridge's allowlist from its Rust source. The
+    // Tests only: security.test.ts reads the bridge's allowlist from its Rust source, and
+    // dna.test.ts the daemon's [[link]] vectors. The
     // dev server the app loads keeps Vite's default (this folder only).
-    ...(mode === "test" ? { fs: { allow: [".", "../../crates/mirante-bridge/src"] } } : {}),
+    ...(mode === "test" ? { fs: { allow: [".", "../../crates/mirante-bridge/src", "../../crates/mirante-core/src/dna"] } } : {}),
   },
   // A desktop app loads its bundle from disk: one chunk is fine.
   build: { target: "safari16", outDir: "dist", sourcemap: false, chunkSizeWarningLimit: 2000 },

@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+// The daemon's own vectors (mirante-core checks the same file against note::slugify / links).
+import vectorsText from "../../../../crates/mirante-core/src/dna/link-vectors.json?raw";
 import { makeEnv, rpcError } from "../test/env";
 import {
   dnaErrorText,
   dnaGet,
   dnaStatus,
   linkParts,
+  slugify,
   noteAction,
   proposals,
   review,
@@ -34,6 +37,25 @@ describe("dna helpers", () => {
     ]);
     expect(linkParts("a [[ ]] b [[open")).toEqual([{ text: "a [[ ]] b [[open" }]);
     expect(linkParts("")).toEqual([]);
+  });
+
+  it("slugify and [[link]] targets match the daemon's shared vectors", () => {
+    const v = JSON.parse(vectorsText) as { slugify: [string, string][]; links: [string, string[]][] };
+    for (const [input, want] of v.slugify) expect(slugify(input), `slugify(${JSON.stringify(input)})`).toBe(want);
+    for (const [body, want] of v.links) {
+      const got = [...new Set(linkParts(body).flatMap((p) => ("link" in p ? [p.link] : [])))];
+      expect(got, `links(${JSON.stringify(body)})`).toEqual(want);
+      // Nothing is lost: the parts put back together are the body (labels aside).
+      expect(linkParts(body).every((p) => ("text" in p ? p.text.length > 0 : true))).toBe(true);
+    }
+  });
+
+  it("linkParts stays linear on pathological input", () => {
+    // Every "[[" here sees the one "]]" at the end past a newline: quadratic took seconds.
+    const evil = `${"[[\n".repeat(200_000)}]]`;
+    const t0 = performance.now();
+    linkParts(evil);
+    expect(performance.now() - t0).toBeLessThan(250);
   });
 
   it("labels states for people", () => {
