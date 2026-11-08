@@ -550,16 +550,29 @@ impl Hub {
         let mut st = self.lock();
         match st.store.create_task(new) {
             Ok(task) => {
-                let pinned_before = st.store.skill_repo_origin(&checkout).ok().flatten().is_some();
                 // No origin row: the task gets no skills (fail closed); the task itself stands.
-                let fixed = match st.store.skill_create_origin(&task.id, &checkout, &origin, &tenant, by_person) {
-                    Ok(o) => Some(o),
-                    Err(e) => {
+                // A checkout git cannot name (no common dir) is never pinned.
+                let (fixed, pinned_now) = match &checkout {
+                    None => {
+                        let e = HubError::Conflict(format!(
+                            "git could not read the common dir of {}: no origin recorded, no skills",
+                            repo.display()
+                        ));
                         st.log_error(Some(&task.id), "task origin", &e);
-                        None
+                        (None, false)
+                    }
+                    Some(checkout) => {
+                        let pinned = |st: &State| st.store.skill_repo_origin(checkout).ok().flatten().is_some();
+                        let before = pinned(&st);
+                        match st.store.skill_create_origin(&task.id, checkout, &origin, &tenant, by_person) {
+                            Ok(o) => (Some(o), !before && pinned(&st)),
+                            Err(e) => {
+                                st.log_error(Some(&task.id), "task origin", &e);
+                                (None, false)
+                            }
+                        }
                     }
                 };
-                let pinned_now = !pinned_before && st.store.skill_repo_origin(&checkout).ok().flatten().is_some();
                 let mut v = st.view(task)?;
                 v.origin = fixed.map(|o| mirante_ipc::types::CreatedOrigin {
                     origin: o.origin,

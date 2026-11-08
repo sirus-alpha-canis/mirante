@@ -125,13 +125,18 @@ impl Verifier for Cached<'_> {
 
 /// A checkout's identity for origin pinning: its canonical git common dir (shared by the
 /// main checkout and every worktree, whatever subdirectory a task was created from).
-pub(crate) fn checkout_key(repo: &Path) -> String {
+/// `None` when git cannot say: such a checkout is never pinned (its plain path is no
+/// identity: another checkout made there later would inherit the pin).
+pub(crate) fn checkout_key(repo: &Path) -> Option<String> {
     let out = Git::checkout(repo).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).output();
     let dir = match out {
         Ok(o) if o.status.success() => PathBuf::from(String::from_utf8_lossy(&o.stdout).trim_end_matches(['\n', '\r'])),
-        _ => repo.to_path_buf(),
+        _ => return None,
     };
-    std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned()
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    Some(std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned())
 }
 
 /// A tenant as `skill.learn` takes it: exactly a host and one segment, lowercase.
@@ -176,7 +181,7 @@ impl Hub {
     }
 
     /// `repo`'s checkout key, live origin key and tenant (hardened git, no lock).
-    pub(crate) fn origin_info(&self, repo: &Path) -> (String, String, String) {
+    pub(crate) fn origin_info(&self, repo: &Path) -> (Option<String>, String, String) {
         let aliases = self.skill_conf().ssh_home.map(|h| origin::read_aliases(&h)).unwrap_or_default();
         let key = origin::origin_of(repo, &aliases);
         let tenant = origin::tenant(&key);
@@ -1499,6 +1504,18 @@ pub(crate) mod tests {
         let k2 = Kit::new();
         let t2 = k2.create(AgentKind::Codex, "l").task;
         assert!(k2.hub.lock().store.skill_origin_of(&t2.id).unwrap().unwrap().origin.starts_with("local/"));
+    }
+
+    /// A checkout key is the git common dir; a path git cannot read has none (it is never
+    /// pinned under its plain path, which a later checkout there would share).
+    #[test]
+    fn a_checkout_git_cannot_read_has_no_key() {
+        let k = Kit::new();
+        let plain = k.dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(checkout_key(&plain), None);
+        let key = checkout_key(&k.repo).unwrap();
+        assert!(key.ends_with("/.git"), "{key}");
     }
 
     #[test]
