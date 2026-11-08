@@ -69,6 +69,9 @@ impl From<std::io::Error> for DriverError {
 /// Most characters of one agent message kept in its feed step (the cockpit shows the last
 /// one as the agent's answer).
 pub const AGENT_MESSAGE_CAP: usize = 4000;
+/// Characters kept of an agent text on the way (not the answer that ends the turn): the
+/// feed shows a glimpse; only final answers are stored in full (up to the cap above).
+pub const AGENT_MESSAGE_PARTIAL_CAP: usize = 500;
 
 /// What a driver tells the hub.
 #[derive(Debug, Clone, PartialEq)]

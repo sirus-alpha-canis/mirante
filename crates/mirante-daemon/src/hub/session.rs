@@ -113,7 +113,8 @@ pub(crate) fn self_approves(mode: &str) -> Option<&'static str> {
 }
 
 /// The main agent's text in one transcript line (`assistant`, not a side agent), redacted
-/// and capped, as an `agent_message` feed step. `final` when the line ends the turn.
+/// and capped, as an `agent_message` feed step. `final` when the line ends the turn (kept up
+/// to `AGENT_MESSAGE_CAP`; text on the way up to `AGENT_MESSAGE_PARTIAL_CAP`).
 pub(crate) fn agent_message(line: &Value) -> Option<Value> {
     if line["type"] != "assistant" || is_sidechain(line) {
         return None;
@@ -128,8 +129,9 @@ pub(crate) fn agent_message(line: &Value) -> Option<Value> {
     if text.is_empty() {
         return None;
     }
-    let text: String = redact(&text.join("\n\n")).chars().take(crate::driver::AGENT_MESSAGE_CAP).collect();
     let fin = line["message"]["stop_reason"] == "end_turn";
+    let cap = if fin { crate::driver::AGENT_MESSAGE_CAP } else { crate::driver::AGENT_MESSAGE_PARTIAL_CAP };
+    let text: String = redact(&text.join("\n\n")).chars().take(cap).collect();
     Some(json!({ "type": "agent_message", "text": text, "final": fin }))
 }
 
@@ -153,6 +155,22 @@ impl State {
             "source": source,
         });
         self.event(Some(task_id), "permission_mode", payload)
+    }
+
+    /// A resumed Claude session reports its mode with its first hook only. Until then, the
+    /// task's last known mode is carried over when it approves on its own (`auto`,
+    /// `bypassPermissions`, `acceptEdits`), so its warning never drops across a resume; a
+    /// manual mode is not (a wrong "manual" would hide a warning). The first hook corrects it.
+    pub(crate) fn carry_mode_over(&mut self, task_id: &str, session_id: &str) -> Result<()> {
+        let events = self.store.task_events(task_id)?;
+        let last = events.iter().rev().find(|e| e.kind == "permission_mode").and_then(|e| e.payload["mode"].as_str());
+        match last {
+            Some(mode) if self_approves(mode).is_some() => {
+                let mode = mode.to_string();
+                self.observe_mode(task_id, session_id, &mode, "resume")
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Delivers the next queued message when the session is ready and idle.
@@ -591,6 +609,11 @@ impl Hub {
                 live.queue.push_back(queue::Queued::new(p));
             }
             st.live.insert(task.id.clone(), live);
+            if native.is_some() && task.agent == AgentKind::Claude {
+                if let Err(e) = st.carry_mode_over(&task.id, &session.id) {
+                    st.log_error(Some(&task.id), "permission mode at resume", &e);
+                }
+            }
             st.publish();
             (task, session.id, native, sink, conversation.id)
         };
@@ -1259,8 +1282,11 @@ mod tests {
         let secret = "token ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
         k.emit(DriverEvent::Transcript(text(&format!("Done: 3 files changed. {secret}"), json!("end_turn"))));
         k.emit(DriverEvent::Transcript(text(&"x".repeat(9000), json!("end_turn"))));
+        // A text on the way (not the turn's end) is kept short: only final answers in full.
+        k.emit(DriverEvent::Transcript(text(&"y".repeat(9000), Value::Null)));
         let s = steps(&k, &t.id);
-        assert_eq!(s.len(), 3, "{s:?}");
+        assert_eq!(s.len(), 4, "{s:?}");
+        assert_eq!(s[3]["text"].as_str().unwrap().chars().count(), crate::driver::AGENT_MESSAGE_PARTIAL_CAP);
         assert_eq!(s[0], json!({"type": "agent_message", "text": "Looking at the code.", "final": false}));
         assert_eq!(s[1]["final"], true);
         let said = s[1]["text"].as_str().unwrap();
@@ -1310,6 +1336,33 @@ mod tests {
         assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("acceptEdits"));
         // Not live: no mode.
         k.hub.stop(&t.id).unwrap();
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode, None);
+    }
+
+    /// Review: a resumed Claude session had no mode until its first hook, so a session
+    /// that approved on its own lost its warning across a restart. The last mode that
+    /// approves on its own is carried over (`source: "resume"`) until a hook says otherwise;
+    /// a manual one is not (nothing to warn about).
+    #[test]
+    fn a_resumed_session_keeps_a_self_approving_mode_until_a_hook_says_otherwise() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "mode").task;
+        k.emit(DriverEvent::NativeId("nat-mode".into()));
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "auto"}));
+        k.hub.stop(&t.id).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("auto"));
+        let last = k.hub.lock().store.task_events(&t.id).unwrap().into_iter().rfind(|e| e.kind == "permission_mode");
+        assert_eq!(last.unwrap().payload["source"], "resume");
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "default"}));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("default"));
+        // Manual last time: nothing carried over; a fresh start never carries anything.
+        k.hub.stop(&t.id).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode, None);
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "acceptEdits"}));
+        k.hub.stop(&t.id).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
         assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode, None);
     }
 

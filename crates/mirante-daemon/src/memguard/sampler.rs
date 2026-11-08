@@ -49,9 +49,9 @@ pub struct SystemSample {
 }
 
 /// `pct` percent of `total` (macOS `kern.memorystatus_level`); `None` for a value that is
-/// no percentage.
+/// no percentage, or when the RAM size is unknown (0).
 pub fn available_from_level(pct: u64, total: u64) -> Option<u64> {
-    (pct <= 100).then(|| total / 100 * pct)
+    (pct <= 100 && total > 0).then(|| total / 100 * pct)
 }
 
 impl SystemSample {
@@ -318,6 +318,8 @@ mod tests {
         assert_eq!(available_from_level(45, 16 * GB), Some(16 * GB / 100 * 45));
         assert_eq!(available_from_level(0, 16 * GB), Some(0));
         assert_eq!(available_from_level(101, 16 * GB), None);
+        // No total (the sysctl failed): nothing is known, not "0 bytes available".
+        assert_eq!(available_from_level(45, 0), None);
     }
 
     #[test]

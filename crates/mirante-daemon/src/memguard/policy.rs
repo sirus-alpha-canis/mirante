@@ -270,9 +270,10 @@ impl Policy {
         self.sessions.get(task_id).map(|t| t.mem)
     }
 
-    /// When to sample next: faster under pressure.
+    /// When to sample next: faster under pressure, and while samples rise toward a higher
+    /// level (so the climb is confirmed quickly).
     pub fn next_interval(&self) -> Duration {
-        if self.level == Level::Normal {
+        if self.level == Level::Normal && self.rising == 0 {
             self.cfg.interval
         } else {
             self.cfg.pressure_interval
@@ -443,6 +444,11 @@ impl Policy {
                 None => {}
             }
         }
+        // Offers for tasks that are gone, once their cooldown is over, are forgotten.
+        let cooldown = self.cfg.offer_cooldown;
+        self.offered.retain(|task_id, (_, at)| {
+            sessions.iter().any(|(i, _)| &i.task_id == task_id) || now.saturating_duration_since(*at) < cooldown
+        });
         if !acted && self.level != Level::Normal {
             if let Some(task_id) = victim {
                 // Once per session per episode, and never within `offer_cooldown` of the last.
@@ -577,6 +583,38 @@ mod tests {
             seen.extend(kinds(&p.tick(t0, &sys(Pressure::Normal, 95, free), &[])));
         }
         assert_eq!(seen, ["level:critical"]);
+    }
+
+    /// Review: while samples rise toward a higher level the guard samples fast, so a
+    /// climb is confirmed in `UP_SAMPLES` short intervals, not `UP_SAMPLES` x 2 s.
+    #[test]
+    fn rising_samples_use_the_pressure_interval() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        p.tick(t0, &sys(Pressure::Warn, 0, GB), &[]);
+        assert_eq!(p.level(), Level::Normal);
+        assert_eq!(p.next_interval(), Duration::from_millis(500));
+        p.tick(t0, &normal(), &[]);
+        assert_eq!(p.next_interval(), Duration::from_secs(2));
+    }
+
+    /// Review: offers for tasks that are gone (ended, archived) are forgotten once their
+    /// cooldown has passed; the map does not grow for ever.
+    #[test]
+    fn offers_for_gone_tasks_are_pruned_after_their_cooldown() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        up(&mut p, t0, &sys(Pressure::Warn, 0, GB));
+        let out = kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[s("gone", true, false, GB)]));
+        assert_eq!(out, ["offer:gone"]);
+        assert!(p.offered.contains_key("gone"));
+        // Still within the cooldown: kept (a session coming back is not offered again).
+        p.tick(t0 + Duration::from_secs(60), &sys(Pressure::Warn, 0, GB), &[]);
+        assert!(p.offered.contains_key("gone"));
+        let later = t0 + p.config().offer_cooldown + Duration::from_secs(1);
+        p.tick(later, &sys(Pressure::Warn, 0, GB), &[s("here", true, false, GB)]);
+        assert!(!p.offered.contains_key("gone"), "{:?}", p.offered.keys().collect::<Vec<_>>());
+        assert!(p.offered.contains_key("here"));
     }
 
     /// The founder's Mac: the kernel's level flapping 1 <-> 2 (normal <-> warn) every sample
