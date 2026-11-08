@@ -21,8 +21,9 @@
 //! `--plugin-dir <bundle>/claude-plugin` for the on-demand ones and
 //! `--append-system-prompt-file <bundle>/always.md` for the always-on ones (inline
 //! `--append-system-prompt` when that hidden flag is refused), both before `--mcp-config`.
-//! A bundle that cannot be written is reported as a step and the session starts without
-//! skills.
+//! Codex gets the bundle's first-turn item (`ChildEnv::first_turn`), sent before the goal
+//! on a new thread only. A bundle that cannot be written is reported as a step and the
+//! session starts without skills.
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -213,6 +214,15 @@ fn skill_bundle_for(req: &SpawnRequest, agent: AgentKind, sink: &Sink) -> Option
     }
 }
 
+/// Codex's bundle: none on a resumed thread, whose history already points at the files of
+/// the session that started it (they are left in place).
+fn codex_skill_bundle(req: &SpawnRequest, sink: &Sink) -> Option<SkillBundle> {
+    match req.resume {
+        Some(_) => None,
+        None => skill_bundle_for(req, AgentKind::Codex, sink),
+    }
+}
+
 /// The PTY launch for `req`, and the native session id pinned for a fresh start
 /// (`None` when resuming: the id to resume is `req.resume`).
 pub fn claude_spec(
@@ -330,6 +340,8 @@ impl RealFactory {
         // Appended, never truncated: the last session's stderr explains its crash.
         prepare_append_log(&log, STDERR_LOG_CAP)?;
         let env_remove = codex_env_to_scrub(parent_env());
+        let bundle = codex_skill_bundle(req, &sink);
+        let first_turn = bundle.as_ref().and_then(|b| b.preamble.as_deref());
         let extra_args = match &req.mcp {
             Some(mcp) => codex_mcp_args(mcp, &req.task.id, req.paths.home()).map_err(DriverError::Failed)?,
             None => Vec::new(),
@@ -338,7 +350,7 @@ impl RealFactory {
             &bin,
             &req.task.worktree_path,
             req.resume.as_deref(),
-            ChildEnv { remove: &env_remove, set: &env_set, args: &extra_args },
+            ChildEnv { remove: &env_remove, set: &env_set, args: &extra_args, first_turn },
             &log,
             sink,
             CodexTiming::default(),
@@ -614,5 +626,23 @@ mod tests {
         let (spec, _) =
             claude_spec(&req, Path::new("/bin/claude"), &settings, (40, 120), vec![], ClaudeExtras::default()).unwrap();
         assert!(!spec.args.iter().any(|a| a == "--plugin-dir" || a.starts_with("--append-system-prompt")));
+    }
+    #[test]
+    fn a_resumed_codex_thread_keeps_the_bundle_its_history_points_at() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.task.agent = AgentKind::Codex;
+        req.paths = Paths::new(d.path());
+        req.skills = Some(crate::driver::skill_bundle::tests::sample());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sink = Sink::new("sess-42", tx);
+        let first = codex_skill_bundle(&req, &sink).expect("a new thread gets its bundle");
+        assert!(first.preamble.is_some());
+        let mut resumed = request(Some("th-1"));
+        resumed.task.agent = AgentKind::Codex;
+        resumed.paths = Paths::new(d.path());
+        resumed.session_id = "sess-43".into();
+        assert_eq!(codex_skill_bundle(&resumed, &sink), None);
+        assert!(first.dir.join("lookup-api/SKILL.md").exists(), "the first turn's paths still resolve");
     }
 }

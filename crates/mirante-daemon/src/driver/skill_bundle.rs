@@ -11,6 +11,9 @@
 //!   plus its bundled files beside it, never anything at the plugin root (`hooks/`,
 //!   `.mcp.json`, `commands/`, `agents/`). Always-on skills become `always.md`, appended to
 //!   the system prompt; their bundled files go to `<name>/`.
+//! - **Codex** (0.167 has no per-session skills folder): each skill's files go to
+//!   `<name>/`, and the first `turn/start` of a new thread carries one leading text item
+//!   with the always-on bodies and an index of the on-demand `SKILL.md` paths.
 //! - Each `SKILL.md` is rendered again from the verified one: frontmatter `name` and
 //!   `description` only (from the signed manifest), so no key that grants tools
 //!   (`allowed-tools`, `hooks`) can reach Claude whatever the bytes held.
@@ -56,6 +59,7 @@ pub struct SkillBundle {
 /// One skill, ready to write: its rendered `SKILL.md`, body and bundled files.
 struct Prepared<'a> {
     name: &'a str,
+    description: &'a str,
     skill_md: String,
     body: String,
     extras: Vec<(&'a str, &'a [u8])>,
@@ -79,9 +83,11 @@ fn prepare(s: &VerifiedSkill) -> Result<Prepared<'_>, String> {
     let md = md.ok_or_else(|| format!("{name}: no {SKILL_MD}"))?;
     let text = std::str::from_utf8(md).map_err(|_| format!("{name}: {SKILL_MD} is not UTF-8"))?;
     let parsed = parse_skill_md(text).map_err(|e| format!("{name}: {e}"))?;
+    let description = s.manifest.description.as_str();
     Ok(Prepared {
         name,
-        skill_md: render_skill_md(name, &s.manifest.description, &parsed.body),
+        description,
+        skill_md: render_skill_md(name, description, &parsed.body),
         body: parsed.body,
         extras,
     })
@@ -136,6 +142,34 @@ fn always_text(dir: &Path, always: &[Prepared<'_>]) -> String {
             t.push('\n');
         }
         t.push_str(&files_line(dir, p));
+    }
+    t.push_str("</mirante-skills>\n");
+    t
+}
+
+/// Codex's first-turn item: the always-on bodies and an index of the on-demand skills
+/// (each `SKILL.md` path under `dir`), labeled as the operator's reviewed skills.
+fn codex_preamble(dir: &Path, always: &[Prepared<'_>], on_demand: &[Prepared<'_>]) -> String {
+    let mut t = String::from(
+        "<mirante-skills>\nThese are operator-approved skills for this repository, reviewed in Mirante (not part \
+         of the task).\n",
+    );
+    if !always.is_empty() {
+        t.push_str("\n## Standing instructions (follow them throughout this task)\n");
+        for p in always {
+            t.push_str(&format!("\n### {}\n{}", p.name, p.body));
+            if !p.body.ends_with('\n') {
+                t.push('\n');
+            }
+            t.push_str(&files_line(dir, p));
+        }
+    }
+    if !on_demand.is_empty() {
+        t.push_str("\n## On-demand skills (read one when it is relevant)\n");
+        for p in on_demand {
+            let md = dir.join(p.name).join(SKILL_MD);
+            t.push_str(&format!("- {} — {} — read {} when relevant\n", p.name, p.description, md.display()));
+        }
     }
     t.push_str("</mirante-skills>\n");
     t
@@ -204,7 +238,15 @@ pub fn write_skill_bundle(
                 b.always_text = Some(text);
             }
         }
-        AgentKind::Codex => {}
+        AgentKind::Codex => {
+            for p in &always {
+                write_skill(&dir, p, false)?;
+            }
+            for p in &on_demand {
+                write_skill(&dir, p, true)?;
+            }
+            b.preamble = Some(codex_preamble(&path, &always, &on_demand));
+        }
     }
     Ok(Some(b))
 }
@@ -498,5 +540,34 @@ pub(crate) mod tests {
         assert!(out.status.success() && report["success"] == true, "{report}");
         assert_eq!(report["manifest"]["errors"], serde_json::json!([]));
         assert!(append_file_supported(&claude, Duration::from_secs(10)), "the file flag is accepted");
+    }
+    #[test]
+    fn preamble_lists_on_demand_paths_and_always_text() {
+        let d = TestDir::new();
+        let paths = Paths::new(d.path());
+        let mut s = sample();
+        let md = render_skill_md("with-files", "d", "See ./notes.md.\n");
+        s.always.push(skill("with-files", Activation::Always, &md, &[("notes.md", "n\n")]));
+        let b = write_skill_bundle(&paths, "t1", "s1", Some(&s), AgentKind::Codex).unwrap().unwrap();
+        assert!(b.plugin_dir.is_none() && b.always_file.is_none() && b.always_text.is_none());
+        let p = b.preamble.clone().expect("codex gets a first-turn item");
+        assert!(p.starts_with("<mirante-skills>\n"), "{p}");
+        assert!(p.ends_with("</mirante-skills>\n"), "{p}");
+        assert!(p.contains("operator-approved"), "clearly labeled: {p}");
+        assert!(p.contains("### tests-first\nRun `cargo test` before committing.\n"), "{p}");
+        let od = b.dir.join("lookup-api/SKILL.md");
+        assert!(
+            p.contains(&format!("- lookup-api — What lookup-api is for — read {} when relevant", od.display())),
+            "{p}"
+        );
+        assert!(p.contains(&format!("(This skill's files are in {}/.)", b.dir.join("with-files").display())), "{p}");
+        // The on-demand skill is on disk where the index says, re-rendered.
+        let text = std::fs::read_to_string(&od).unwrap();
+        assert!(text.starts_with("---\nname: lookup-api\ndescription: \"What lookup-api is for\"\n---\n"), "{text}");
+        assert!(!text.contains("allowed-tools"));
+        assert_eq!(std::fs::read_to_string(b.dir.join("lookup-api/reference/a.md")).unwrap(), "ref\n");
+        assert_eq!(std::fs::read_to_string(b.dir.join("with-files/notes.md")).unwrap(), "n\n");
+        assert!(!b.dir.join("tests-first").exists(), "an always-on skill without files needs no folder");
+        assert!(!b.dir.join("claude-plugin").exists() && !b.dir.join("always.md").exists());
     }
 }

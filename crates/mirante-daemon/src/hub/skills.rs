@@ -2337,6 +2337,28 @@ pub(crate) mod tests {
         assert_eq!((usage["acme-rules"].injected, usage["everywhere"].injected), (1, 2));
     }
 
+    /// A resumed Codex thread has its skills in its history already (the first turn of the
+    /// new thread carried them): nothing is resolved, injected or recorded again. A
+    /// resumed Claude session gets them again (its plugin is rebuilt).
+    #[test]
+    fn a_resumed_codex_thread_gets_no_skills_again_but_claude_does() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "acme-rules", 1, Scope::org("github.com/acme"), Activation::Always, "Acme.\n");
+        for (agent, again) in [(AgentKind::Codex, false), (AgentKind::Claude, true)] {
+            let t = k.started(agent, agent.as_str()).task;
+            assert!(spawned(&k).is_some());
+            k.emit(crate::driver::DriverEvent::NativeId(format!("nat-{}", agent.as_str())));
+            k.emit(crate::driver::DriverEvent::Exited { code: Some(0) });
+            let before = k.payloads("skill.injected").len();
+            let r = k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, true);
+            assert!(r.unwrap().resumed);
+            assert_eq!(spawned(&k).is_some(), again, "{agent:?}");
+            assert_eq!(k.payloads("skill.injected").len(), before + usize::from(again), "{agent:?}");
+        }
+    }
+
     #[test]
     fn a_skill_modified_on_disk_is_refused_with_an_event() {
         let Some(_) = keygen() else { return };

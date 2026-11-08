@@ -145,10 +145,20 @@ pub fn check_mode(response: &Value) -> Result<(), String> {
 
 /// `turn/start` parameters: the input plus the mode again (the sandbox policy exactly as
 /// the thread response reported it, so the user's writable roots / network setting stay).
-pub fn turn_start_params(thread: &str, text: &str, client_id: &str, sandbox_policy: &Value) -> Value {
+/// `prefix` (the session's skills, on a new thread's first turn) is a text item before
+/// the message.
+pub fn turn_start_params(
+    thread: &str,
+    prefix: Option<&str>,
+    text: &str,
+    client_id: &str,
+    sandbox_policy: &Value,
+) -> Value {
+    let mut input: Vec<Value> = prefix.map(|p| json!({ "type": "text", "text": p })).into_iter().collect();
+    input.push(json!({ "type": "text", "text": text }));
     json!({
         "threadId": thread,
-        "input": [{ "type": "text", "text": text }],
+        "input": input,
         "clientUserMessageId": client_id,
         "approvalPolicy": APPROVAL_POLICY,
         "approvalsReviewer": REVIEWER,
@@ -614,6 +624,9 @@ struct Shared {
     reap_due: Option<Vec<String>>,
     /// Abandoned command ids Codex has not reported ended yet.
     abandoned_open: HashSet<String>,
+    /// The skills item owed to the first `turn/start` of a new thread (never a resumed one,
+    /// whose history has it already); taken by that start, put back if it was refused.
+    first_turn: Option<String>,
 }
 
 impl Shared {
@@ -874,7 +887,19 @@ fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, tim
         (s.thread_id.clone().unwrap_or_default(), s.engine.turn_id().map(str::to_string), s.sandbox_policy.clone())
     };
     let start = || -> Result<(), CallError> {
-        let r = conn.request("turn/start", turn_start_params(&thread, text, &client_id, &sandbox), timeout)?;
+        let prefix = lock(shared).first_turn.take();
+        let params = turn_start_params(&thread, prefix.as_deref(), text, &client_id, &sandbox);
+        let r = match conn.request("turn/start", params, timeout) {
+            // Certainly not delivered: the next start carries the skills instead.
+            Err(e) if !matches!(e, CallError::Timeout(_) | CallError::AfterWrite(_)) => {
+                let mut s = lock(shared);
+                if s.first_turn.is_none() {
+                    s.first_turn = prefix;
+                }
+                return Err(e);
+            }
+            other => other?,
+        };
         if let Some(id) = r["turn"]["id"].as_str() {
             let mut out = Vec::new();
             {
@@ -929,6 +954,8 @@ pub struct ChildEnv<'a> {
     /// `-c key=value` config overrides (the per-task memory server), which `app-server`
     /// accepts after the subcommand.
     pub args: &'a [String],
+    /// The session's skills, as the leading input item of a new thread's first turn.
+    pub first_turn: Option<&'a str>,
 }
 
 impl CodexDriver {
@@ -965,7 +992,8 @@ impl CodexDriver {
         let stdout = child.stdout.take().ok_or_else(|| DriverError::Failed("no stdout".into()))?;
         let process = Arc::new(Process::new(child, root, Some(stderr_log.to_path_buf())));
         process.watch();
-        CodexDriver::connect_process(BufReader::new(stdout), stdin, Some(process), cwd, resume, sink, timing)
+        let first = env.first_turn.map(str::to_string);
+        CodexDriver::connect_process(BufReader::new(stdout), stdin, Some(process), cwd, resume, first, sink, timing)
     }
 
     /// Handshake over any stream pair (tests use a socket pair): `initialize`,
@@ -979,15 +1007,31 @@ impl CodexDriver {
         sink: Sink,
         timing: CodexTiming,
     ) -> Result<Arc<CodexDriver>, DriverError> {
-        CodexDriver::connect_process(reader, writer, None, cwd, resume, sink, timing)
+        CodexDriver::connect_process(reader, writer, None, cwd, resume, None, sink, timing)
     }
 
+    /// [`CodexDriver::connect`], owing `first_turn` to a new thread's first `turn/start`
+    /// (dropped when resuming).
+    pub fn connect_with_first_turn(
+        reader: impl BufRead + Send + 'static,
+        writer: impl Write + Send + 'static,
+        cwd: &str,
+        resume: Option<&str>,
+        first_turn: Option<String>,
+        sink: Sink,
+        timing: CodexTiming,
+    ) -> Result<Arc<CodexDriver>, DriverError> {
+        CodexDriver::connect_process(reader, writer, None, cwd, resume, first_turn, sink, timing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn connect_process(
         reader: impl BufRead + Send + 'static,
         writer: impl Write + Send + 'static,
         process: Option<Arc<Process>>,
         cwd: &str,
         resume: Option<&str>,
+        first_turn: Option<String>,
         sink: Sink,
         timing: CodexTiming,
     ) -> Result<Arc<CodexDriver>, DriverError> {
@@ -1009,6 +1053,7 @@ impl CodexDriver {
             turn_baseline: None,
             reap_due: None,
             abandoned_open: HashSet::new(),
+            first_turn: if resume.is_none() { first_turn } else { None },
         }));
         let ctx = Arc::new(Ctx {
             shared: shared.clone(),
@@ -1300,13 +1345,31 @@ mod tests {
         resume: Option<&str>,
         answer: impl FnOnce(&mut FakeServer, &Value) + Send + 'static,
     ) -> (Result<Arc<CodexDriver>, DriverError>, FakeServer, Rx, Value) {
+        connect_full(resume, None, answer)
+    }
+
+    /// [`connect_with`], with a first-turn item (the session's skills).
+    fn connect_full(
+        resume: Option<&str>,
+        first_turn: Option<&str>,
+        answer: impl FnOnce(&mut FakeServer, &Value) + Send + 'static,
+    ) -> (Result<Arc<CodexDriver>, DriverError>, FakeServer, Rx, Value) {
         let (client, server) = UnixStream::pair().unwrap();
         let mut fake = FakeServer { r: BufReader::new(server.try_clone().unwrap()), w: server };
         let (tx, rx) = mpsc::channel();
         let resume = resume.map(str::to_string);
+        let first_turn = first_turn.map(str::to_string);
         let h = std::thread::spawn(move || {
             let reader = BufReader::new(client.try_clone().unwrap());
-            CodexDriver::connect(reader, client, "/w/tree", resume.as_deref(), Sink::new("s1", tx), timing())
+            CodexDriver::connect_with_first_turn(
+                reader,
+                client,
+                "/w/tree",
+                resume.as_deref(),
+                first_turn,
+                Sink::new("s1", tx),
+                timing(),
+            )
         });
         let init = fake.expect("initialize");
         assert_eq!(init["params"]["clientInfo"]["name"], "mirante");
@@ -2098,5 +2161,68 @@ mod tests {
         assert_eq!(fake.next(), json!({"jsonrpc": "2.0", "id": "e1", "result": {"action": "decline"}}));
         let seen = stream(&a, "declined");
         assert!(seen.contains("[mcp elicitation from github declined automatically"), "{seen}");
+    }
+    const SKILLS: &str = "<mirante-skills>\nStanding instructions\n</mirante-skills>\n";
+
+    fn setup_skills(resume: Option<&str>) -> (Arc<CodexDriver>, FakeServer, Rx) {
+        let (d, fake, rx, _) = connect_full(resume, Some(SKILLS), |f, t| f.reply(t, thread_ok("th-1")));
+        (d.unwrap(), fake, rx)
+    }
+
+    fn texts(req: &Value) -> Vec<String> {
+        let input = req["params"]["input"].as_array().unwrap();
+        assert!(input.iter().all(|i| i["type"] == "text"), "{req}");
+        input.iter().map(|i| i["text"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn first_turn_of_a_new_thread_carries_the_skills_item_before_the_text() {
+        let (d, mut fake, rx) = setup_skills(None);
+        d.send("fix the login").unwrap();
+        let start = fake.expect("turn/start");
+        assert_eq!(texts(&start), [SKILLS, "fix the login"]);
+        fake.reply(&start, json!({"turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
+        fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "completed"}}));
+        next_event(&rx, status_to(Status::Idle));
+        // Later turns: the text alone (the skills are in the thread's history already).
+        d.send("now the tests").unwrap();
+        let start = fake.expect("turn/start");
+        assert_eq!(texts(&start), ["now the tests"]);
+    }
+
+    #[test]
+    fn resume_and_later_turns_do_not() {
+        let (d, mut fake, _rx) = setup_skills(Some("th-old"));
+        d.send("go on").unwrap();
+        assert_eq!(texts(&fake.expect("turn/start")), ["go on"]);
+    }
+
+    #[test]
+    fn steer_never_carries_it() {
+        let (d, mut fake, rx) = setup_skills(None);
+        fake.notify("turn/started", json!({"threadId": "th-1", "turn": {"id": "tu-1"}}));
+        next_event(&rx, status_to(Status::Working));
+        d.send("steer this").unwrap();
+        let steer = fake.expect("turn/steer");
+        assert_eq!(texts(&steer), ["steer this"]);
+        fake.reply(&steer, json!({"turnId": "tu-1"}));
+        fake.notify("turn/completed", json!({"threadId": "th-1", "turn": {"id": "tu-1", "status": "completed"}}));
+        next_event(&rx, status_to(Status::Idle));
+        // Still owed to the first turn/start.
+        d.send("start one").unwrap();
+        assert_eq!(texts(&fake.expect("turn/start")), [SKILLS, "start one"]);
+    }
+
+    #[test]
+    fn a_refused_first_turn_keeps_the_skills_for_the_next_start() {
+        let (d, mut fake, rx) = setup_skills(None);
+        d.send("first").unwrap();
+        let start = fake.expect("turn/start");
+        assert_eq!(texts(&start).len(), 2);
+        fake.send(json!({"jsonrpc": "2.0", "id": start["id"], "error": {"code": -32600, "message": "busy"}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::DeliveryAborted { .. }));
+        d.send("first").unwrap();
+        assert_eq!(texts(&fake.expect("turn/start")), [SKILLS, "first"]);
     }
 }

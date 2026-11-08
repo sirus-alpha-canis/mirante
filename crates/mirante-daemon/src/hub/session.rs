@@ -501,7 +501,12 @@ impl Hub {
             (task, session.id, native, sink)
         };
         let mcp = self.memory_server_for(&task);
-        let skills = self.skills_for(&task, &session_id);
+        // A resumed Codex thread has its skills in its history (its first turn carried
+        // them); a resumed Claude session gets its plugin and always-on text again.
+        let skills = match (task.agent, &native) {
+            (AgentKind::Codex, Some(_)) => None,
+            _ => self.skills_for(&task, &session_id),
+        };
         let req = SpawnRequest {
             task: task.clone(),
             session_id: session_id.clone(),
