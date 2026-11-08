@@ -6,6 +6,11 @@ export interface Label {
   title: string;
 }
 
+export interface Scope extends Label {
+  /** The accept button's words: what allowing grants. */
+  allow: string;
+}
+
 /** Codex runs with `approvalPolicy: on-request` in a `workspace-write` sandbox (Plan 2b). */
 export function agentModeLabel(agent: AgentKind): Label | null {
   return agent === "codex"
@@ -20,8 +25,12 @@ export function agentModeLabel(agent: AgentKind): Label | null {
 export const GRANT_ROOT_TOOL = "file_change (session-wide grant)";
 
 /** A `grantRoot` approval lets Codex write under that folder for the rest of the session. */
-export function permissionScope(tool: string): Label {
+export function permissionScope(tool: string): Scope {
   return tool === GRANT_ROOT_TOOL
-    ? { text: "session-wide grant", title: "Allowing lets the agent write under this folder until the session ends, not just once." }
-    : { text: "once", title: "Allowing applies to this request only." };
+    ? {
+        text: "session-wide grant",
+        title: "Allowing lets the agent write under this folder until the session ends, not just once.",
+        allow: "Allow for this session",
+      }
+    : { text: "once", title: "Allowing applies to this request only.", allow: "Allow once" };
 }

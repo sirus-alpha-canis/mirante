@@ -10,7 +10,7 @@ export function DoneCard({ taskId, version, onOpen }: { taskId: string; version:
   const t = diffTotals(d.diff);
   const url = d.diff.compare_url;
   return (
-    <div className="done" aria-label="Turn finished">
+    <div className="done" role="group" aria-label="Turn finished">
       <span>
         {t.files} file{t.files === 1 ? "" : "s"} changed, <span className="add">+{t.added}</span>{" "}
         <span className="del">−{t.removed}</span> vs <code>{d.diff.base}</code>

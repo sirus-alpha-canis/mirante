@@ -33,7 +33,10 @@ export function AgentCard({
   const s = useStore();
   const feed = s.feed[t.id];
   const col = columnOf(t, feed);
-  const perms = useMemo(() => pendingPerms(s, t.id), [s, t.id]);
+  const perms = useMemo(() => pendingPerms(s.perms, t.id), [s.perms, t.id]);
+  // The task waits on the user but its request has not loaded (or is a dialog Mirante does
+  // not model): the terminal is where it can be answered.
+  const unexplained = t.status === "needs_you" && perms.length === 0 && t.boot !== "trust_prompt";
   const lines = lastLines(feed, 5);
   return (
     <article className={`card card-${col}`} aria-label={`${t.agent} on ${t.branch}`}>
@@ -48,13 +51,21 @@ export function AgentCard({
         <StatusPill column={col} />
       </header>
       {lines.length > 0 && (
-        <ol className="lines" aria-live="polite">
+        <ol className="lines">
           {lines.map((i) => (
             <FeedLine key={i.seq} item={i} />
           ))}
         </ol>
       )}
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
+      {unexplained && (
+        <p className="perm perm-compact">
+          <span className="muted">Waiting for you in the agent's terminal.</span>{" "}
+          <button className="btn btn-small" onClick={() => onOpen(t.id, "Terminal")}>
+            Open terminal
+          </button>
+        </p>
+      )}
       {perms.map((p) => (
         <PermissionCard
           key={p.id}

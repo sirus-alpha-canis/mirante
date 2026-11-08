@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useEnv } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { permissionScope } from "../lib/labels";
@@ -24,24 +24,37 @@ export function PermissionCard({
   compact?: boolean;
 }) {
   const { rpc } = useEnv();
-  const [busy, setBusy] = useState(false);
+  // "idle" | in flight | answered (sent, or already answered elsewhere): the card stays
+  // until the closing event removes it, so a sent answer keeps its buttons off.
+  const [phase, setPhase] = useState<"idle" | "busy" | "sent" | "done">("idle");
   const [error, setError] = useState<string | null>(null);
   const [refused, setRefused] = useState(false);
+  const terminalButton = useRef<HTMLButtonElement>(null);
   const scope = permissionScope(perm.tool);
   const inTerminal = agent === "claude" && (!inlineAnswers || refused);
+  useEffect(() => {
+    // The buttons the user just used are gone: keep the keyboard on the card.
+    if (refused) terminalButton.current?.focus();
+  }, [refused]);
+  const sending = useRef(false);
   const answer = async (allow: boolean) => {
-    setBusy(true);
+    // A ref, not state: two clicks in one frame both see the old state.
+    if (sending.current) return;
+    sending.current = true;
+    setPhase("busy");
     setError(null);
     try {
       await rpc(M.permissionAnswer, { id: perm.id, allow });
+      setPhase("sent");
     } catch (e) {
       const code = e instanceof DaemonError ? e.code : null;
       if (code === RpcCode.ANSWER_IN_TERMINAL) setRefused(true);
       setError(code === RpcCode.CONFLICT ? "already answered" : String(e instanceof Error ? e.message : e));
-    } finally {
-      setBusy(false);
+      setPhase(code === RpcCode.CONFLICT ? "done" : "idle");
+      sending.current = code === RpcCode.CONFLICT;
     }
   };
+  const off = phase !== "idle";
   return (
     <div className={`perm ${compact ? "perm-compact" : ""}`} role="group" aria-label={`Permission request: ${perm.tool}`}>
       <div className="perm-what">
@@ -54,6 +67,7 @@ export function PermissionCard({
       <div className="perm-actions">
         {inTerminal ? (
           <button
+            ref={terminalButton}
             className="btn btn-primary"
             title="Mirante does not type this answer: answer the dialog in Claude's own terminal."
             onClick={onAnswerInTerminal}
@@ -62,12 +76,17 @@ export function PermissionCard({
           </button>
         ) : (
           <>
-            <button className="btn btn-primary" disabled={busy} onClick={() => answer(true)}>
-              Allow once
+            <button className="btn btn-primary" disabled={off} onClick={() => answer(true)}>
+              {scope.allow}
             </button>
-            <button className="btn" disabled={busy} onClick={() => answer(false)}>
+            <button className="btn" disabled={off} onClick={() => answer(false)}>
               Deny
             </button>
+            {phase === "sent" && (
+              <span className="muted small" role="status">
+                sent…
+              </span>
+            )}
           </>
         )}
       </div>

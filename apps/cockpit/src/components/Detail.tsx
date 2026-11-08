@@ -103,7 +103,7 @@ export function Detail({
   const [tab, setTab] = useState<Tab>(initialTab ?? "Steps");
   const t = s.tasks[taskId];
   const feed = s.feed[taskId] ?? [];
-  const perms = useMemo(() => pendingPerms(s, taskId), [s, taskId]);
+  const perms = useMemo(() => pendingPerms(s.perms, taskId), [s.perms, taskId]);
   const onTabKey = (e: KeyboardEvent) => {
     const i = TABS.indexOf(tab);
     if (e.key === "ArrowRight") setTab(TABS[(i + 1) % TABS.length]);

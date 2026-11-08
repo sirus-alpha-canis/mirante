@@ -59,6 +59,39 @@ describe("AgentCard", () => {
     ]);
     await userEvent.click(screen.getByRole("button", { name: "Deny" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("already answered");
+    // Nothing left to answer: both buttons stay off until the closing event removes the card.
+    expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
+  });
+
+  it("after a sent answer the buttons stay off (sent…) until the card closes", async () => {
+    const h = setup({ "permission.answer": { status: "allowed_once" } }, task("a", { status: "needs_you" }), [
+      ev(1, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "ls" }),
+    ]);
+    await userEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(await screen.findByText("sent…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
+    expect(h.calls.filter(([m]) => m === "permission.answer")).toHaveLength(1);
+  });
+
+  it("a session-wide grant's accept button says it grants for the session", () => {
+    setup({}, task("c", { agent: "codex", status: "needs_you" }), [
+      ev(1, "c", "permission_requested", { permission_id: "p6", tool: GRANT_ROOT_TOOL, detail: "write under /wt/c" }),
+    ]);
+    expect(screen.getByRole("button", { name: "Allow for this session" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+  });
+
+  it("needs you with no request loaded yet offers Open terminal", async () => {
+    const h = setup({}, task("a", { status: "needs_you" }));
+    await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    expect(h.opened).toEqual([["a", "Terminal"]]);
+  });
+
+  it("the card's lines are not a live region (status changes are announced once, elsewhere)", () => {
+    setup({}, task("a", { status: "working" }), [ev(1, "a", "step", { type: "tool", tool: "Bash", summary: "ls", ok: true })]);
+    expect(document.querySelector("[aria-live]")).toBeNull();
   });
 
   it("a Claude card with inline answers off offers Answer in terminal, never Allow/Deny", async () => {
@@ -82,6 +115,7 @@ describe("AgentCard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Allow once" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("a newer tool call");
     expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Answer in terminal" })).toHaveFocus();
     await userEvent.click(screen.getByRole("button", { name: "Answer in terminal" }));
     expect(h.opened).toEqual([["a", "Terminal"]]);
   });
@@ -122,6 +156,7 @@ describe("AgentCard", () => {
   it("a finished turn shows the diff summary and opens the PR page", async () => {
     const h = setup({ "task.diff": diff }, task("b", { status: "idle" }), [ev(1, "b", "turn_started"), ev(2, "b", "turn_ended")]);
     expect(await screen.findByText(/2 files changed/)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Turn finished" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Open PR" }));
     expect(h.env.openUrl).toHaveBeenCalledWith(diff.compare_url);
   });
@@ -135,5 +170,33 @@ describe("AgentCard", () => {
     const h = setup({ "session.trust": {} }, task("t", { boot: "trust_prompt" }));
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Trust folder" })));
     expect(h.calls).toContainEqual(["session.trust", { task: "t", accept: true }]);
+  });
+
+  it("a trust answer is sent once; both buttons stay off after it", async () => {
+    const h = setup({ "session.trust": {} }, task("t", { boot: "trust_prompt" }));
+    await userEvent.dblClick(screen.getByRole("button", { name: "Trust folder" }));
+    expect(h.calls.filter(([m]) => m === "session.trust")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Trust folder" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Decline" })).toBeDisabled();
+  });
+
+  it("declining the trust prompt sends accept: false", async () => {
+    const h = setup({ "session.trust": {} }, task("t", { boot: "trust_prompt" }));
+    await userEvent.click(screen.getByRole("button", { name: "Decline" }));
+    expect(h.calls).toEqual([["session.trust", { task: "t", accept: false }]]);
+  });
+
+  it("a trust prompt answered elsewhere (CONFLICT) says so and stays off", async () => {
+    setup({ "session.trust": rpcError(RpcCode.CONFLICT) }, task("t", { boot: "trust_prompt" }));
+    await userEvent.click(screen.getByRole("button", { name: "Trust folder" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("already answered");
+    expect(screen.getByRole("button", { name: "Trust folder" })).toBeDisabled();
+  });
+
+  it("a failed trust answer can be retried", async () => {
+    setup({ "session.trust": rpcError(RpcCode.DRIVER, "pty gone") }, task("t", { boot: "trust_prompt" }));
+    await userEvent.click(screen.getByRole("button", { name: "Trust folder" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("pty gone");
+    expect(screen.getByRole("button", { name: "Trust folder" })).toBeEnabled();
   });
 });

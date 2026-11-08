@@ -37,8 +37,8 @@ export function tasksIn(s: State, col: Column, repo?: string): TaskView[] {
     .sort((a, b) => b.updated_at - a.updated_at);
 }
 
-export function pendingPerms(s: State, taskId: string): Perm[] {
-  return Object.values(s.perms)
+export function pendingPerms(perms: State["perms"], taskId: string): Perm[] {
+  return Object.values(perms)
     .filter((p) => p.task_id === taskId && p.status === "pending")
     .sort((a, b) => a.created_at - b.created_at);
 }
