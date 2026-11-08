@@ -1313,6 +1313,7 @@ impl Hub {
                     scope: r.scope.clone(),
                     description: r.description.clone(),
                     body,
+                    activation: r.activation,
                 })
             })
             .collect();

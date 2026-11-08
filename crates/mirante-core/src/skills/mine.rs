@@ -312,6 +312,8 @@ pub struct ActiveSkill {
     pub scope: Scope,
     pub description: String,
     pub body: String,
+    /// An edit keeps it.
+    pub activation: Activation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,7 +496,7 @@ pub fn draft(
             name: s.name.clone(),
             description: s.description.clone(),
             body,
-            activation: Activation::Always,
+            activation: s.activation,
             scope: s.scope.clone(),
             fingerprint,
             tasks: c.tasks.len(),
@@ -618,6 +620,7 @@ mod tests {
             scope,
             description: format!("{name} rules"),
             body: body.into(),
+            activation: Activation::OnDemand,
         }
     }
 
@@ -640,6 +643,9 @@ mod tests {
         assert_eq!(d.kind, Kind::Edit { name: "house-style".into(), base_hash: "h".repeat(64) });
         assert_eq!(d.name, "house-style");
         assert!(d.body.starts_with("Use tabs.\n") && d.body.lines().count() == 2, "{}", d.body);
+        // An edit keeps the skill's activation: an on-demand skill never becomes always on
+        // (the system prompt of every session) because one line was added to it.
+        assert_eq!(d.activation, Activation::OnDemand);
         // Active in only 1 of 3: a new skill.
         let once: HashMap<String, Vec<String>> = [("t1".to_string(), vec!["house-style".to_string()])].into();
         assert_eq!(draft(&c[0], &[style], &once, &[]).unwrap().kind, Kind::New);
