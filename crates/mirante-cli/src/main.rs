@@ -50,8 +50,13 @@ const DETACH: u8 = 0x1d;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A progress line on stderr (daemon start-up).
+fn notice(m: &str) {
+    eprintln!("mirante: {m}");
+}
+
 fn client(paths: &Paths) -> Result<Client, Box<dyn Error>> {
-    let mut c = daemon_ctl::connect(paths)?;
+    let mut c = daemon_ctl::connect_with_notice(paths, &notice)?;
     // `session.start` may wait up to 45 s for the agent to boot.
     c.set_timeout(Some(Duration::from_secs(90)))?;
     warn_on_version_skew(&mut c);
@@ -766,6 +771,8 @@ fn run(cmd: Cmd) -> Res {
     match cmd {
         Cmd::Help => println!("{USAGE}"),
         Cmd::Daemon(DaemonCmd::Status) => match Client::connect(&paths.socket()) {
+            // A socket path that cannot exist is a setup error, not "not running".
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e.into()),
             Ok(mut c) => {
                 let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
                 println!(
@@ -782,7 +789,7 @@ fn run(cmd: Cmd) -> Res {
             if Client::connect(&paths.socket()).is_ok() {
                 println!("already running");
             } else {
-                daemon_ctl::start_daemon(&paths)?;
+                daemon_ctl::start_daemon_with_notice(&paths, &notice)?;
                 println!("started");
             }
         }
@@ -803,7 +810,7 @@ fn run(cmd: Cmd) -> Res {
                 daemon_ctl::wait_stopped(&paths, Duration::from_secs(10))?;
                 println!("stopped ({back})");
             }
-            let mut c = daemon_ctl::start_daemon(&paths)?;
+            let mut c = daemon_ctl::start_daemon_with_notice(&paths, &notice)?;
             c.set_timeout(Some(Duration::from_secs(10)))?;
             let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
             println!("started: pid {} (v{})", s.pid, s.version);

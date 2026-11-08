@@ -90,6 +90,13 @@ impl Paths {
         self.home.join("daemon.lock")
     }
 
+    /// `flock`ed by whoever is starting a daemon (the CLI, the app) from the spawn until the
+    /// socket answers: commands that auto-start at the same moment start one daemon and the
+    /// others wait for it.
+    pub fn start_lock(&self) -> PathBuf {
+        self.home.join("daemon-start.lock")
+    }
+
     /// Touched by the hook after a daemon timeout; while fresh, hooks spool without
     /// trying the socket.
     pub fn hook_breaker(&self) -> PathBuf {

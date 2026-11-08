@@ -11,8 +11,18 @@ use mirante_core::claude_launch::daemon_env_to_scrub;
 use mirante_ipc::types::DaemonStatus;
 use mirante_ipc::{logfile, Client, Paths};
 
-/// How long `start_daemon` waits for the socket.
-pub const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `start_daemon` waits for the socket. The first launch of a freshly built
+/// binary can take 10-20 s on macOS while XProtect scans it.
+pub const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Said (once) when the daemon has not answered after [`NOTICE_AFTER`].
+pub const SLOW_START_NOTICE: &str =
+    "starting the daemon (the first launch after a build can take ~20 s while macOS scans it)…";
+
+/// Said when another command holds the start lock.
+pub const WAITING_NOTICE: &str = "waiting for the daemon another mirante command is starting…";
+
+const NOTICE_AFTER: Duration = Duration::from_secs(1);
 
 /// `MIRANTE_DAEMON_BIN`, else `mirante-daemon` next to this executable.
 pub fn daemon_bin() -> io::Result<PathBuf> {
@@ -54,10 +64,16 @@ fn env_names() -> Vec<String> {
 }
 
 /// Spawns the daemon in its own session (it survives this terminal), logging to
-/// `~/.mirante/daemon.log` (rotated to `daemon.log.1` past 10 MiB), and waits up to 5 s for
-/// its socket.
+/// `~/.mirante/daemon.log` (rotated to `daemon.log.1` past 10 MiB), and waits up to
+/// [`START_TIMEOUT`] for its socket. Quiet; see [`start_daemon_with_notice`].
 pub fn start_daemon(paths: &Paths) -> io::Result<Client> {
     start_daemon_with(paths, &daemon_bin()?)
+}
+
+/// [`start_daemon`], saying on stderr-like `notice` what it waits for when that takes long
+/// (the CLI prints these lines).
+pub fn start_daemon_with_notice(paths: &Paths, notice: &dyn Fn(&str)) -> io::Result<Client> {
+    start_daemon_inner(paths, &daemon_bin()?, &[], START_TIMEOUT, notice)
 }
 
 /// [`start_daemon`] with an explicit daemon binary (the desktop app is not installed next to
@@ -68,7 +84,70 @@ pub fn start_daemon_with(paths: &Paths, bin: &Path) -> io::Result<Client> {
 
 /// [`start_daemon_with`] with extra variables for the daemon (see [`daemon_command_with_env`]).
 pub fn start_daemon_with_env(paths: &Paths, bin: &Path, extra: &[(String, String)]) -> io::Result<Client> {
+    start_daemon_inner(paths, bin, extra, START_TIMEOUT, &|_| {})
+}
+
+/// An exclusive `flock` on [`Paths::start_lock`], released on drop.
+struct StartLock {
+    _file: std::fs::File,
+}
+
+impl StartLock {
+    /// Waits for the lock until `deadline`, saying [`WAITING_NOTICE`] once when it is taken.
+    fn acquire(paths: &Paths, deadline: Instant, notice: &dyn Fn(&str)) -> io::Result<StartLock> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(paths.start_lock())?;
+        let mut said = false;
+        loop {
+            // SAFETY: valid fd owned by `f`; the lock is released when `f` closes.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(StartLock { _file: f });
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("another command is still starting the daemon; see {}", paths.log().display()),
+                ));
+            }
+            if !said {
+                notice(WAITING_NOTICE);
+                said = true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// The last `n` non-empty lines of the daemon log (best effort).
+fn log_tail(paths: &Paths, n: usize) -> String {
+    let text = std::fs::read_to_string(paths.log()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// One starter at a time (the start lock); a command that finds a daemon answering once it
+/// holds the lock uses it. While waiting: a notice after [`NOTICE_AFTER`]; a daemon that
+/// exits is reported with the end of its log (unless it lost the daemon lock to a daemon
+/// started some other way, whose socket is then awaited); the timeout names the log, not a
+/// raw "socket not found".
+pub(crate) fn start_daemon_inner(
+    paths: &Paths,
+    bin: &Path,
+    extra: &[(String, String)],
+    timeout: Duration,
+    notice: &dyn Fn(&str),
+) -> io::Result<Client> {
     paths.ensure_home()?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let _starter = StartLock::acquire(paths, deadline, notice)?;
+    if let Ok(c) = Client::connect(&paths.socket()) {
+        return Ok(c);
+    }
     let _ = logfile::rotate_if_over(&paths.log(), logfile::LOG_CAP);
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(paths.log())?;
     let mut cmd = daemon_command_with_env(bin, paths, env_names(), extra);
@@ -77,32 +156,63 @@ pub fn start_daemon_with_env(paths: &Paths, bin: &Path, extra: &[(String, String
     unsafe {
         cmd.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
     }
-    cmd.spawn()?;
-    let deadline = Instant::now() + START_TIMEOUT;
+    let mut child = cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", bin.display())))?;
+    let mut noticed = false;
+    let mut exited = false;
     loop {
-        match Client::connect(&paths.socket()) {
+        let err = match Client::connect(&paths.socket()) {
             Ok(c) => return Ok(c),
-            Err(e) if Instant::now() >= deadline => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "the daemon did not answer within {} s; it may still be starting (try again shortly, \
-                         or see {}): {e}",
-                        START_TIMEOUT.as_secs(),
+            Err(e) => e,
+        };
+        if !exited {
+            if let Some(status) = child.try_wait()? {
+                let tail = log_tail(paths, 5);
+                if !tail.contains("another mirante-daemon is running") {
+                    return Err(io::Error::other(format!(
+                        "the daemon exited during startup ({status}); the end of {}:\n{tail}",
                         paths.log().display()
-                    ),
-                ))
+                    )));
+                }
+                exited = true;
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
+        let now = Instant::now();
+        if now >= deadline {
+            // A missing or refusing socket is the expected "not up yet"; anything else is news.
+            let why = match err.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => String::new(),
+                _ => format!(" ({err})"),
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the daemon did not answer within {} s{why}; it may still be starting: try again shortly, \
+                     or see {}",
+                    timeout.as_secs(),
+                    paths.log().display()
+                ),
+            ));
+        }
+        if !noticed && now - started >= NOTICE_AFTER {
+            notice(SLOW_START_NOTICE);
+            noticed = true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 /// A client, starting the daemon if nothing listens on the socket.
 pub fn connect(paths: &Paths) -> io::Result<Client> {
+    connect_with_notice(paths, &|_| {})
+}
+
+/// [`connect`], passing `notice` to [`start_daemon_with_notice`] when it starts one.
+pub fn connect_with_notice(paths: &Paths, notice: &dyn Fn(&str)) -> io::Result<Client> {
     match Client::connect(&paths.socket()) {
         Ok(c) => Ok(c),
-        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => start_daemon(paths),
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+            start_daemon_with_notice(paths, notice)
+        }
         Err(e) => Err(e),
     }
 }
@@ -249,6 +359,78 @@ mod tests {
         let busy = version_warning(&st("0.0.9", 2), "0.1.0").unwrap();
         assert!(busy.contains("2 live session(s)") && busy.contains("when they are done"));
         assert!(busy.contains("resumes them on their conversations when auto-resume is on"), "{busy}");
+    }
+
+    /// A stand-in daemon: a shell script that appends a line to `<home>/launches` and then
+    /// runs `rest`.
+    fn script(d: &TestDir, rest: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = d.path().join("fake-daemon.sh");
+        let body = format!("#!/bin/sh\necho launched >> \"$MIRANTE_HOME/launches\"\n{rest}\n");
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn launches(paths: &Paths) -> usize {
+        std::fs::read_to_string(paths.home().join("launches")).unwrap_or_default().lines().count()
+    }
+
+    #[test]
+    fn a_daemon_that_exits_at_start_says_why_without_os_error_2() {
+        let d = TestDir::new();
+        let paths = Paths::new(&d.path().join("h"));
+        let bin = script(&d, "echo 'mirante-daemon: the store is locked by a newer version' >&2; exit 1");
+        let e = start_daemon_inner(&paths, &bin, &[], Duration::from_secs(10), &|_| {}).err().unwrap().to_string();
+        assert!(e.contains("exited") && e.contains("the store is locked by a newer version"), "{e}");
+        assert!(!e.contains("os error"), "{e}");
+    }
+
+    #[test]
+    fn a_slow_daemon_times_out_with_a_plain_message_and_a_notice() {
+        let d = TestDir::new();
+        let paths = Paths::new(&d.path().join("h"));
+        let bin = script(&d, "sleep 5");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let notice = |m: &str| seen.lock().unwrap().push(m.to_string());
+        let e = start_daemon_inner(&paths, &bin, &[], Duration::from_millis(1500), &notice).err().unwrap();
+        let msg = e.to_string();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(msg.contains("did not answer within") && msg.contains("daemon.log"), "{msg}");
+        assert!(!msg.contains("os error"), "{msg}");
+        assert!(seen.lock().unwrap().iter().any(|m| m.contains("macOS scans it")), "{seen:?}");
+    }
+
+    #[test]
+    fn concurrent_starts_launch_one_daemon() {
+        let d = TestDir::new();
+        let paths = Paths::new(&d.path().join("h"));
+        paths.ensure_home().unwrap();
+        // The script only records the launch; the test plays the daemon and binds the
+        // socket once the first launch is recorded.
+        let bin = script(&d, "sleep 3");
+        let binder = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while launches(&paths) == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                std::os::unix::net::UnixListener::bind(paths.socket()).unwrap()
+            })
+        };
+        let starters: Vec<_> = (0..3)
+            .map(|_| {
+                let (paths, bin) = (paths.clone(), bin.clone());
+                std::thread::spawn(move || start_daemon_inner(&paths, &bin, &[], Duration::from_secs(10), &|_| {}))
+            })
+            .collect();
+        for s in starters {
+            s.join().unwrap().unwrap();
+        }
+        let _listener = binder.join().unwrap();
+        assert_eq!(launches(&paths), 1);
     }
 
     #[test]

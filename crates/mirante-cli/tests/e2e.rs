@@ -1039,3 +1039,39 @@ fn skills_tenant_and_mine_follow_the_pinned_origin() {
     assert!(!ok && out.contains("github.com/evil/x") && out.contains("github.com/acme/app"), "{out}");
     assert!(!out.contains("new proposal"), "{out}");
 }
+
+#[test]
+fn commands_that_auto_start_at_once_share_one_daemon() {
+    let env = Env::new();
+    let kids: Vec<_> = (0..3)
+        .map(|i| {
+            let args: &[&str] = if i == 1 { &["doctor"] } else { &["ls"] };
+            env.cmd(&bin("mirante"))
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for k in kids {
+        let out = k.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(!err.contains("os error"), "{err}");
+    }
+    let log = std::fs::read_to_string(env.home.join("daemon.log")).unwrap();
+    assert_eq!(log.matches("listening on").count(), 1, "{log}");
+    assert!(!log.contains("another mirante-daemon is running"), "{log}");
+}
+
+#[test]
+fn a_too_long_mirante_home_is_an_error_not_not_running() {
+    let env = Env::new();
+    let long = env.dir.path().join("x".repeat(120));
+    let out = env.cmd(&bin("mirante")).env("MIRANTE_HOME", &long).args(["daemon", "status"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(err.contains("socket path is") && err.contains("MIRANTE_HOME"), "{err}");
+}
