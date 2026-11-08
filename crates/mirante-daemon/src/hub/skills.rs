@@ -8,7 +8,7 @@
 //!
 //! Each task's origin is fixed at `task.create` against the origin pinned for its checkout
 //! (see [`mirante_core::skills::index::Store::skill_create_origin`]).
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -24,7 +24,7 @@ use mirante_core::skills::format::{
 };
 use mirante_core::skills::index::EvidenceItem;
 use mirante_core::skills::index::{
-    Final, NewSkillProposal, ProposalFile, SkillCaps, SkillProposal, SkillProposalQuery, SkillRow,
+    Final, NewSkillProposal, ProposalFile, SkillCaps, SkillProposal, SkillProposalQuery, SkillRow, UsageCounts,
 };
 use mirante_core::skills::library::{self, Bundle, VerifiedSkill};
 use mirante_core::skills::lint::{has_errors, lint, Draft, Finding, Severity};
@@ -268,8 +268,16 @@ impl Hub {
         self.tenant_view(&p.tenant)
     }
 
-    fn summary(&self, row: &SkillRow, verified: &std::result::Result<VerifiedSkill, SkillError>) -> SkillSummary {
-        let usage = self.lock().store.skill_usage_counts(now_ms() - USAGE_WINDOW_MS).unwrap_or_default();
+    /// Usage per skill over [`USAGE_WINDOW_MS`]: one query for a whole list.
+    fn usage_counts(&self) -> HashMap<String, UsageCounts> {
+        self.lock().store.skill_usage_counts(now_ms() - USAGE_WINDOW_MS).unwrap_or_default()
+    }
+
+    fn summary(
+        row: &SkillRow,
+        verified: &std::result::Result<VerifiedSkill, SkillError>,
+        usage: &HashMap<String, UsageCounts>,
+    ) -> SkillSummary {
         let u = usage.get(&row.name).copied().unwrap_or_default();
         SkillSummary {
             name: row.name.clone(),
@@ -303,11 +311,12 @@ impl Hub {
                 (Some(t), Some(st)) => *t == st,
             })
             .collect();
+        let usage = self.usage_counts();
         Ok(rows
             .iter()
             .map(|r| {
                 let v = self.skill_verify(&r.name, r.version, &r.manifest_hash);
-                self.summary(r, &v)
+                Hub::summary(r, &v, &usage)
             })
             .collect())
     }
@@ -363,7 +372,7 @@ impl Hub {
         let (version, hash) = hash;
         let verified = self.skill_verify(&row.name, version, &hash);
         let versions = library::list_versions(&self.paths.skills(), &row.name).map_err(skill_err)?;
-        let summary = self.summary(&row, &verified);
+        let summary = Hub::summary(&row, &verified, &self.usage_counts());
         let (manifest, skill_md, files, warnings) = match verified {
             Ok(v) => {
                 let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
