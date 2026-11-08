@@ -66,6 +66,10 @@ impl From<std::io::Error> for DriverError {
     }
 }
 
+/// Most characters of one agent message kept in its feed step (the cockpit shows the last
+/// one as the agent's answer).
+pub const AGENT_MESSAGE_CAP: usize = 4000;
+
 /// What a driver tells the hub.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DriverEvent {

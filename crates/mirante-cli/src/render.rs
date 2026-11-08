@@ -653,6 +653,7 @@ mod tests {
             sandbox: None,
             memory: None,
             hibernated: false,
+            permission_mode: None,
             origin: None,
         }
     }

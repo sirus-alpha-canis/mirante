@@ -101,7 +101,60 @@ pub(crate) fn tool_step(ev: &HookEvent) -> Option<Value> {
     Some(json!({ "type": "tool", "tool": tool, "summary": summary, "ok": ok, "agent": agent }))
 }
 
+/// What a Claude permission mode lets the agent approve on its own: `commands` (auto,
+/// bypassPermissions), `edits` (acceptEdits), or nothing (default / manual, plan, dontAsk,
+/// and modes this daemon does not know).
+pub(crate) fn self_approves(mode: &str) -> Option<&'static str> {
+    match mode {
+        "auto" | "bypassPermissions" => Some("commands"),
+        "acceptEdits" => Some("edits"),
+        _ => None,
+    }
+}
+
+/// The main agent's text in one transcript line (`assistant`, not a side agent), redacted
+/// and capped, as an `agent_message` feed step. `final` when the line ends the turn.
+pub(crate) fn agent_message(line: &Value) -> Option<Value> {
+    if line["type"] != "assistant" || is_sidechain(line) {
+        return None;
+    }
+    let text: Vec<&str> = line["message"]["content"]
+        .as_array()?
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .filter(|t| !t.trim().is_empty())
+        .collect();
+    if text.is_empty() {
+        return None;
+    }
+    let text: String = redact(&text.join("\n\n")).chars().take(crate::driver::AGENT_MESSAGE_CAP).collect();
+    let fin = line["message"]["stop_reason"] == "end_turn";
+    Some(json!({ "type": "agent_message", "text": text, "final": fin }))
+}
+
 impl State {
+    /// A Claude session reported its permission mode (`source`: "hook" or "transcript"):
+    /// remembered on the live session, and a `permission_mode` event when it changed.
+    pub(crate) fn observe_mode(&mut self, task_id: &str, session_id: &str, mode: &str, source: &str) -> Result<()> {
+        let mode: String = mode.chars().take(64).collect();
+        let Some(l) = self.live.get_mut(task_id).filter(|l| l.session_id == session_id) else {
+            return Ok(());
+        };
+        if l.permission_mode.as_deref() == Some(mode.as_str()) {
+            return Ok(());
+        }
+        let from = l.permission_mode.replace(mode.clone());
+        let payload = json!({
+            "session_id": session_id,
+            "from": from,
+            "mode": mode,
+            "self_approves": self_approves(&mode),
+            "source": source,
+        });
+        self.event(Some(task_id), "permission_mode", payload)
+    }
+
     /// Delivers the next queued message when the session is ready and idle.
     pub(crate) fn kick(&mut self, task_id: &str) -> Result<()> {
         let status = self.store.get_task(task_id)?.status;
@@ -317,6 +370,14 @@ impl State {
                         let excess = l.transcript.len().saturating_sub(TRANSCRIPT_WINDOW);
                         l.transcript.drain(..excess);
                     }
+                }
+                if line["type"] == "permission-mode" && !is_sidechain(&line) {
+                    if let Some(mode) = line["permissionMode"].as_str() {
+                        self.observe_mode(task_id, session_id, mode, "transcript")?;
+                    }
+                }
+                if let Some(step) = agent_message(&line) {
+                    self.event(Some(task_id), "step", step)?;
                 }
                 self.feed_claude(task_id, &Input::Transcript(line))
             }
@@ -827,6 +888,9 @@ impl State {
         if let Some(path) = ev.transcript_path.clone() {
             st.follow_transcript(&p.task, &session_id, &path)?;
         }
+        if let Some(mode) = ev.permission_mode.as_deref().filter(|m| !m.is_empty()) {
+            st.observe_mode(&p.task, &session_id, mode, "hook")?;
+        }
         if ev.hook_event_name == "PermissionRequest" {
             st.open_card(&p.task, &session_id, &ev)?;
         }
@@ -1146,6 +1210,80 @@ mod tests {
                 json!({"type": "tool", "tool": "Edit", "summary": "/w/src/lib.rs", "ok": false, "agent": "Explore"}),
             ]
         );
+    }
+
+    fn steps(k: &Kit, task: &str) -> Vec<Value> {
+        let events = k.hub.lock().store.task_events(task).unwrap();
+        events.into_iter().filter(|e| e.kind == "step").map(|e| e.payload).collect()
+    }
+
+    /// What Claude says (its main-chain text) is a feed step, so the cockpit can show the
+    /// agent's last answer; side agents' text and tool calls are not.
+    #[test]
+    fn claude_text_in_the_transcript_becomes_an_agent_message_step() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "answer").task;
+        let text = |t: &str, stop: Value| json!({"type": "assistant", "message": {"stop_reason": stop, "content": [{"type": "text", "text": t}]}});
+        k.emit(DriverEvent::Transcript(text("Looking at the code.", Value::Null)));
+        k.tool_use("tu1");
+        let mut side = text("side agent text", Value::Null);
+        side["isSidechain"] = json!(true);
+        k.emit(DriverEvent::Transcript(side));
+        let secret = "token ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+        k.emit(DriverEvent::Transcript(text(&format!("Done: 3 files changed. {secret}"), json!("end_turn"))));
+        k.emit(DriverEvent::Transcript(text(&"x".repeat(9000), json!("end_turn"))));
+        let s = steps(&k, &t.id);
+        assert_eq!(s.len(), 3, "{s:?}");
+        assert_eq!(s[0], json!({"type": "agent_message", "text": "Looking at the code.", "final": false}));
+        assert_eq!(s[1]["final"], true);
+        let said = s[1]["text"].as_str().unwrap();
+        assert!(said.starts_with("Done: 3 files changed.") && !said.contains("ghp_0123"), "{said}");
+        assert_eq!(s[2]["text"].as_str().unwrap().chars().count(), crate::driver::AGENT_MESSAGE_CAP);
+    }
+
+    /// Claude's permission mode, from every hook payload (`permission_mode`) and from the
+    /// transcript's `permission-mode` lines: leaving manual mode is an event and shows on the
+    /// task; the same mode again is not news.
+    #[test]
+    fn leaving_manual_mode_is_reported_from_hooks_and_the_transcript() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "mode").task;
+        let hook = |mode: &str| json!({"hook_event_name": "UserPromptSubmit", "permission_mode": mode});
+        k.hook(&t.id, hook("default"));
+        k.hook(&t.id, hook("default"));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("default"));
+        k.hook(&t.id, hook("auto"));
+        k.hook(&t.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "permission_mode": "auto"}));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("auto"));
+        k.emit(DriverEvent::Transcript(json!({"type": "permission-mode", "permissionMode": "default"})));
+        k.emit(DriverEvent::Transcript(json!({"type": "permission-mode", "permissionMode": "acceptEdits"})));
+        let modes: Vec<Value> = k
+            .hub
+            .lock()
+            .store
+            .task_events(&t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "permission_mode")
+            .map(|e| json!([e.payload["from"], e.payload["mode"], e.payload["self_approves"], e.payload["source"]]))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                json!([null, "default", null, "hook"]),
+                json!(["default", "auto", "commands", "hook"]),
+                json!(["auto", "default", null, "transcript"]),
+                json!(["default", "acceptEdits", "edits", "transcript"]),
+            ]
+        );
+        // A side agent's transcript line is not the session's mode.
+        k.emit(DriverEvent::Transcript(
+            json!({"type": "permission-mode", "permissionMode": "plan", "isSidechain": true}),
+        ));
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("acceptEdits"));
+        // Not live: no mode.
+        k.hub.stop(&t.id).unwrap();
+        assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode, None);
     }
 
     /// The process's exit is applied while `stop` runs (the pump thread can get there

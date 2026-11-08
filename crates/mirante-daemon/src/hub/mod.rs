@@ -175,6 +175,8 @@ pub(crate) struct Live {
     pub(crate) usage: Option<String>,
     /// Codex: the effective sandbox, as the driver last reported it (`net:off`).
     pub(crate) sandbox: Option<String>,
+    /// Claude: the permission mode its hooks / transcript last reported.
+    pub(crate) permission_mode: Option<String>,
     /// Since when the status is `Idle` (the memory guard's idle hibernation and leak check).
     pub(crate) idle_since: Option<Instant>,
     /// This session's `SessionStart` hook was seen (told to the driver once it is attached,
@@ -281,6 +283,7 @@ impl Live {
             card_gen: Arc::default(),
             usage: None,
             sandbox: None,
+            permission_mode: None,
             idle_since: Some(Instant::now()),
             saw_session_start: false,
             attach_recorded: false,
@@ -395,6 +398,7 @@ impl State {
             sandbox: live.and_then(|l| l.sandbox.clone()),
             memory: live.and(self.mem.sessions.get(&task.id)).map(memory::mem_view),
             hibernated: self.mem.hibernated.contains(&task.id),
+            permission_mode: live.and_then(|l| l.permission_mode.clone()),
             origin: None,
             task,
         })

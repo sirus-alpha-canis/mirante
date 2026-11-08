@@ -169,6 +169,11 @@ pub struct TaskView {
     /// The session was hibernated to free memory (`mirante wake` resumes it).
     #[serde(default)]
     pub hibernated: bool,
+    /// Claude, while live: its permission mode as its hooks and transcript last said
+    /// (`default`, `plan`, `acceptEdits`, `auto`, `bypassPermissions`, ...). Mirante starts
+    /// it in manual mode; anything that approves on its own is worth a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// `task.create` only: the origin fixed for the task's skills.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<CreatedOrigin>,
@@ -558,12 +563,14 @@ mod tests {
             sandbox: Some("net:off".into()),
             memory: Some(MemView { bytes: 1, peak: 2, budget: 3, state: "ok".into() }),
             hibernated: false,
+            permission_mode: Some("auto".into()),
             origin: None,
         };
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["id"], "t1");
         assert_eq!(j["status"], "needs_you");
         assert_eq!(j["boot"], "ready");
+        assert_eq!(j["permission_mode"], "auto");
         assert_eq!(serde_json::from_value::<TaskView>(j).unwrap(), v);
     }
 

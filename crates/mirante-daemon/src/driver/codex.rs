@@ -417,7 +417,8 @@ fn step(method: &str, params: &Value) -> Option<Value> {
             Some(json!({ "type": "command", "command": item["command"], "exit_code": item["exitCode"] }))
         }
         ("item/completed", Some("agentMessage")) => {
-            let text: String = item["text"].as_str().unwrap_or("").chars().take(500).collect();
+            let text = mirante_core::redact::redact(item["text"].as_str().unwrap_or(""));
+            let text: String = text.chars().take(super::AGENT_MESSAGE_CAP).collect();
             Some(json!({ "type": "agent_message", "text": text }))
         }
         ("error", _) => Some(json!({
