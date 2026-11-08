@@ -137,7 +137,11 @@ pub struct Inserted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillCaps {
     pub per_task: usize,
+    /// The miner's pending proposals per tenant.
     pub per_tenant: usize,
+    /// Agents' pending proposals per tenant (their own budget: they cannot crowd out the
+    /// miner, nor a person's proposals, which are never capped).
+    pub per_tenant_agent: usize,
 }
 
 /// Which proposals [`Store::skill_proposals`] returns: oldest first, filtered, at most
@@ -555,19 +559,31 @@ impl Store {
                 return Ok(Inserted { proposal, new: false });
             }
         }
-        if let Some(task) = &p.task_id {
-            let n = count(&tx, "SELECT COUNT(*) FROM skill_proposals WHERE task_id = ?1 AND status = 'pending'", task)?;
-            if n >= caps.per_task {
-                let max = caps.per_task;
+        // A person's own proposals (`cli`, `import`) are never capped.
+        if !matches!(p.origin.as_str(), "cli" | "import") {
+            if let Some(task) = &p.task_id {
+                let n =
+                    count(&tx, "SELECT COUNT(*) FROM skill_proposals WHERE task_id = ?1 AND status = 'pending'", task)?;
+                if n >= caps.per_task {
+                    let max = caps.per_task;
+                    return Err(CoreError::Limit(format!(
+                        "this task already has {max} skill proposals waiting for review"
+                    )));
+                }
+            }
+            // Each origin against its own budget, so agents cannot crowd out the miner.
+            let (max, whose) =
+                if p.origin == "agent" { (caps.per_tenant_agent, "agent ") } else { (caps.per_tenant, "") };
+            let n = tx.query_row(
+                "SELECT COUNT(*) FROM skill_proposals WHERE tenant = ?1 AND origin = ?2 AND status = 'pending'",
+                params![p.tenant, p.origin],
+                |r| r.get::<_, i64>(0),
+            )? as usize;
+            if n >= max {
                 return Err(CoreError::Limit(format!(
-                    "this task already has {max} skill proposals waiting for review"
+                    "this tenant already has {max} {whose}skill proposals waiting for review"
                 )));
             }
-        }
-        let n = count(&tx, "SELECT COUNT(*) FROM skill_proposals WHERE tenant = ?1 AND status = 'pending'", &p.tenant)?;
-        if n >= caps.per_tenant {
-            let max = caps.per_tenant;
-            return Err(CoreError::Limit(format!("this tenant already has {max} skill proposals waiting for review")));
         }
         let id = new_id();
         tx.execute(
@@ -883,7 +899,7 @@ mod tests {
         s.skill_create_origin(task, origin, origin, tenant, true).unwrap();
     }
 
-    const CAPS: SkillCaps = SkillCaps { per_task: 20, per_tenant: 200 };
+    const CAPS: SkillCaps = SkillCaps { per_task: 20, per_tenant: 200, per_tenant_agent: 50 };
 
     fn kinds(s: &Store) -> Vec<String> {
         s.events_since(0, 1000).unwrap().into_iter().map(|e| e.kind).collect()
@@ -982,7 +998,7 @@ mod tests {
         s.skill_decide(&first.proposal.id, false, "").unwrap();
         let refused = s.skill_insert_proposal(&proposal("github.com/acme", None, Some("fp1")), CAPS);
         assert!(matches!(refused, Err(CoreError::Limit(_))), "{refused:?}");
-        let small = SkillCaps { per_task: 1, per_tenant: 2 };
+        let small = SkillCaps { per_task: 1, per_tenant: 2, per_tenant_agent: 2 };
         s.skill_insert_proposal(&proposal("github.com/acme", Some(&t), None), small).unwrap();
         let per_task = s.skill_insert_proposal(&proposal("github.com/acme", Some(&t), None), small);
         assert!(matches!(per_task, Err(CoreError::Limit(_))), "{per_task:?}");
@@ -999,6 +1015,31 @@ mod tests {
         };
         assert_eq!(s.skill_proposals(&q("github.com/acme")).unwrap().len(), 2);
         assert_eq!(s.skill_proposals(&q("github.com/other")).unwrap().len(), 1);
+    }
+
+    /// Agents have their own, smaller per-tenant budget, so they cannot crowd out the miner;
+    /// a person's proposals (`cli`, `import`) are never capped.
+    #[test]
+    fn agent_proposals_have_their_own_cap_and_a_person_s_have_none() {
+        let mut s = Store::open_in_memory().unwrap();
+        let caps = SkillCaps { per_task: 10, per_tenant: 2, per_tenant_agent: 1 };
+        let by = |origin: &str, task: Option<&str>| NewSkillProposal {
+            origin: origin.into(),
+            ..proposal("github.com/acme", task, None)
+        };
+        let (t1, t2) = (task(&mut s, "g"), task(&mut s, "g"));
+        s.skill_insert_proposal(&by("agent", Some(&t1)), caps).unwrap();
+        let full = s.skill_insert_proposal(&by("agent", Some(&t2)), caps);
+        assert!(matches!(&full, Err(CoreError::Limit(m)) if m.contains("agent")), "{full:?}");
+        // The miner's budget is its own: the agent's proposal does not count against it.
+        s.skill_insert_proposal(&by("miner", None), caps).unwrap();
+        s.skill_insert_proposal(&by("miner", None), caps).unwrap();
+        assert!(matches!(s.skill_insert_proposal(&by("miner", None), caps), Err(CoreError::Limit(_))));
+        // A person is past every cap, per task too.
+        let tiny = SkillCaps { per_task: 0, ..caps };
+        for origin in ["cli", "import", "cli"] {
+            s.skill_insert_proposal(&by(origin, Some(&t1)), tiny).unwrap();
+        }
     }
 
     #[test]

@@ -63,7 +63,7 @@ const AGENT_READ_REFUSED: &str = "Mirante-launched agents cannot read the skills
 own skills when it starts";
 
 /// Pending proposals one task, and one tenant, may have at once.
-const CAPS: SkillCaps = SkillCaps { per_task: 20, per_tenant: 200 };
+const CAPS: SkillCaps = SkillCaps { per_task: 20, per_tenant: 200, per_tenant_agent: 50 };
 
 /// Proposals per `skill.proposals` page by default and at most.
 const PAGE_DEFAULT: usize = 50;
@@ -639,8 +639,14 @@ impl Hub {
         let (description, body, redactions) = clean_text(&p.description, &p.body)?;
         let (kind, name, base_hash, scope, activation) = match &p.base {
             Some(base) => {
-                let row =
-                    self.lock().store.skill_get(base)?.ok_or_else(|| HubError::NotFound(format!("no skill {base}")))?;
+                // An agent edits only its own tenant's skills (never a personal one), and a
+                // skill it may not edit is reported exactly like a missing one: nothing of
+                // another tenant's library (existence, scope, hash) reaches it.
+                let missing = || HubError::NotFound(format!("no skill {base}"));
+                let row = self.lock().store.skill_get(base)?.ok_or_else(missing)?;
+                if agent_task.is_some() && scope_tenant(&row.scope).as_deref() != Some(o.tenant.as_str()) {
+                    return Err(missing());
+                }
                 let activation = parse_activation(p.activation.as_deref(), row.activation)?;
                 ("edit", row.name, Some(row.manifest_hash), row.scope, activation)
             }
@@ -1578,6 +1584,46 @@ pub(crate) mod tests {
         // A person (the CLI) proposes for any task.
         let cli = k.hub.skill_propose(&Caller::Person, propose(&other.id, None, None, "Run cargo test first.\n"));
         assert_eq!(cli.unwrap().proposal.origin, "cli");
+    }
+
+    /// An agent edits only its own tenant's skills, and cannot tell a skill of another
+    /// tenant (or a personal one) from a missing one: same error, nothing about its scope
+    /// or manifest hash.
+    #[test]
+    fn an_agent_edits_only_its_own_tenant_s_skills_and_learns_nothing_of_others() {
+        let k = Kit::new();
+        let mine = learning(&k, "mine");
+        let row = |name: &str, scope: Scope| SkillRow {
+            name: name.into(),
+            version: 1,
+            manifest_hash: format!("hash-of-{name}"),
+            scope,
+            activation: Activation::Always,
+            agents: vec!["claude".into()],
+            status: "active".into(),
+            description: "d".into(),
+            updated_at: 0,
+        };
+        for r in [
+            row("ours", Scope::Repo("github.com/acme/app".into())),
+            row("theirs", Scope::org("github.com/other")),
+            row("private", Scope::Personal),
+        ] {
+            k.hub.lock().store.skill_upsert_current(&r).unwrap();
+        }
+        let agent = Peer::spawn(&[(AGENT_ENV, &mine.id)], k.dir.path());
+        let edit = |base: &str| k.hub.skill_propose(&agent.caller(), propose(&mine.id, None, Some(base), "b\n"));
+        let ok = edit("ours").unwrap();
+        assert_eq!((ok.proposal.kind.as_str(), ok.proposal.base_hash.as_deref()), ("edit", Some("hash-of-ours")));
+        let missing = format!("{:?}", edit("nowhere").unwrap_err());
+        for base in ["theirs", "private"] {
+            let e = edit(base).unwrap_err();
+            assert!(matches!(e, HubError::NotFound(_)), "{base}: {e:?}");
+            assert_eq!(format!("{e:?}").replace(base, "nowhere"), missing, "{base} leaks something");
+        }
+        // A person (the CLI) may still propose an edit of any skill.
+        let p = k.hub.skill_propose(&Caller::Person, propose(&mine.id, None, Some("theirs"), "b\n")).unwrap();
+        assert_eq!(p.proposal.base_hash.as_deref(), Some("hash-of-theirs"));
     }
 
     #[test]
