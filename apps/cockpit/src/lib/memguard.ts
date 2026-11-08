@@ -20,13 +20,59 @@ export interface SystemMemory {
   total: number;
   free: number;
   swapUsed: number;
+  swapTotal: number;
+  /** The OS's own measure when it set the level ("normal" | "warn" | "critical"); null when
+   * the daemon judged from swap and free memory, or is older. */
+  kernelLevel: string | null;
+  /** "macos" or "linux-psi", with `kernelLevel`. */
+  kernelSource: string | null;
 }
 
 export function systemMemory(status: DaemonStatus | null): SystemMemory | null {
   const m = status?.memory;
   if (!m) return null;
   const level: Pressure = m.level === "normal" || m.level === "elevated" || m.level === "critical" ? m.level : "unknown";
-  return { level, paused: m.paused, total: m.total, free: m.free, swapUsed: m.swap_used };
+  return {
+    level,
+    paused: m.paused,
+    total: m.total,
+    free: m.free,
+    swapUsed: m.swap_used,
+    swapTotal: m.swap_total,
+    kernelLevel: m.kernel_level ?? null,
+    kernelSource: m.kernel_level ? (m.kernel_source ?? null) : null,
+  };
+}
+
+const KERNEL_NAME: Record<string, string> = { macos: "macOS", "linux-psi": "Linux (PSI)" };
+
+/** Why new sessions wait (or that they do not), from the daemon's numbers only; free memory
+ * is secondary (on macOS it is always low: the file cache uses it). */
+export function pressureText(m: SystemMemory): { main: string; secondary: string } {
+  const swap = m.swapTotal > 0 ? `swap ${Math.round((m.swapUsed * 100) / m.swapTotal)}%` : null;
+  const who = m.kernelLevel ? (KERNEL_NAME[m.kernelSource ?? ""] ?? "The system") : null;
+  const parts: string[] = [];
+  if (!m.paused) {
+    parts.push(`Memory pressure ${m.level}${who ? ` (${who})` : ""}`);
+    if (swap) parts.push(swap);
+  } else if (who && m.kernelLevel === "normal") {
+    parts.push(`${who} reports normal memory pressure again`);
+    if (swap) parts.push(swap);
+    parts.push("new sessions paused until it settles");
+  } else if (who) {
+    parts.push(`${who} reported ${m.kernelLevel === "critical" ? "critical " : ""}memory pressure`);
+    if (swap) parts.push(swap);
+    parts.push("new sessions paused until it eases");
+  } else {
+    parts.push(swap ? `Memory tight (${swap} used, little free)` : "Memory tight (little free memory)");
+    parts.push("new sessions paused until it eases");
+  }
+  return { main: parts.join(" · "), secondary: `${size(m.free)} free of ${size(m.total)}` };
+}
+
+/** Bytes as MB, or GB with one decimal from 1 GB. */
+export function size(v: number): string {
+  return v >= 1 << 30 ? `${(v / (1 << 30)).toFixed(1)} GB` : mb(v);
 }
 
 export interface TaskMemory {

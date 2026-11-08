@@ -55,6 +55,16 @@ pub fn config_from(total: u64, budget_mb: Option<&str>, idle_min: Option<&str>) 
 }
 
 fn system_view(level: &str, s: &SystemSample, paused: bool) -> SystemView {
+    // Said only when the kernel measured it (then it, not swap or free, set `level`).
+    let kernel_level = s.kernel_signal.then(|| {
+        match s.pressure {
+            memguard::Pressure::Normal => "normal",
+            memguard::Pressure::Warn => "warn",
+            memguard::Pressure::Critical => "critical",
+        }
+        .to_string()
+    });
+    let source = if cfg!(target_os = "macos") { "macos" } else { "linux-psi" };
     SystemView {
         level: level.to_string(),
         total: s.total,
@@ -62,6 +72,8 @@ fn system_view(level: &str, s: &SystemSample, paused: bool) -> SystemView {
         swap_used: s.swap_used,
         swap_total: s.swap_total,
         paused,
+        kernel_source: kernel_level.as_ref().map(|_| source.to_string()),
+        kernel_level,
     }
 }
 
@@ -370,6 +382,19 @@ mod tests {
     fn with_root(k: &Kit, branch: &str, pid: i32) -> String {
         *k.factory.driver.root.lock().unwrap() = Some(Proc { pid, start: 1 });
         k.started(AgentKind::Claude, branch).task.id
+    }
+
+    #[test]
+    fn the_system_view_says_when_the_kernel_judged_the_pressure() {
+        let v = system_view("elevated", &sys(Pressure::Warn), true);
+        assert_eq!(v.kernel_level.as_deref(), Some("warn"));
+        let os = if cfg!(target_os = "macos") { "macos" } else { "linux-psi" };
+        assert_eq!(v.kernel_source.as_deref(), Some(os));
+        assert_eq!(system_view("critical", &sys(Pressure::Critical), true).kernel_level.as_deref(), Some("critical"));
+        assert_eq!(system_view("normal", &sys(Pressure::Normal), false).kernel_level.as_deref(), Some("normal"));
+        // Judged from swap and free memory (no kernel measure): nothing is claimed for it.
+        let judged = system_view("elevated", &SystemSample { kernel_signal: false, ..sys(Pressure::Normal) }, true);
+        assert_eq!((judged.kernel_level, judged.kernel_source), (None, None));
     }
 
     #[test]

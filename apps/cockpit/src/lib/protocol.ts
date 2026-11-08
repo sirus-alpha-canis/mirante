@@ -66,6 +66,11 @@ export interface SystemView {
   swap_used: number;
   swap_total: number;
   paused: boolean;
+  /** The OS's own pressure measure when it set `level`: "normal" | "warn" | "critical"
+   * (absent when judged from swap and free memory, and from older daemons). */
+  kernel_level?: string | null;
+  /** Where `kernel_level` came from: "macos" or "linux-psi". */
+  kernel_source?: string | null;
 }
 
 export interface DaemonEvent {

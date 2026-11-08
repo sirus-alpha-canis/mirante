@@ -210,6 +210,14 @@ pub struct SystemView {
     pub swap_total: u64,
     /// New sessions and queued deliveries wait while memory is tight.
     pub paused: bool,
+    /// The operating system's own pressure measure, when it gave one and it decided `level`:
+    /// "normal", "warn" or "critical" (macOS `kern.memorystatus_vm_pressure_level`, Linux
+    /// PSI). Absent when the level was judged from swap and free memory, and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_level: Option<String>,
+    /// Where `kernel_level` came from: "macos" (memorystatus) or "linux-psi".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_source: Option<String>,
 }
 
 /// A process left behind by an agent: parent gone (ppid 1), working directory or command
@@ -569,6 +577,13 @@ mod tests {
         let d: DaemonStatus =
             serde_json::from_value(json!({"pid": 1, "boot_id": "b", "version": "0.1.0", "live_sessions": 0})).unwrap();
         assert_eq!(d.memory, None);
+        // A system view from a daemon that does not say which signal decided its level.
+        let v: SystemView = serde_json::from_value(json!({
+            "level": "elevated", "total": 1, "free": 1, "swap_used": 0, "swap_total": 0, "paused": true
+        }))
+        .unwrap();
+        assert_eq!((&v.kernel_level, &v.kernel_source), (&None, &None));
+        assert!(serde_json::to_value(&v).unwrap().get("kernel_level").is_none());
     }
 
     #[test]

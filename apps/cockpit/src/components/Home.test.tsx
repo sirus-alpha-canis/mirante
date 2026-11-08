@@ -375,11 +375,21 @@ describe("Home (V3 group chat)", () => {
   });
 
   it("the rail ends with the memory guard panel, fed by daemon.status", () => {
-    const sys = { level: "critical", total: 16 * 2 ** 30, free: 256 * 2 ** 20, swap_used: 0, swap_total: 0, paused: true };
+    const sys = {
+      level: "critical",
+      total: 16 * 2 ** 30,
+      free: 256 * 2 ** 20,
+      swap_used: 0,
+      swap_total: 0,
+      paused: true,
+      kernel_level: "critical",
+      kernel_source: "macos",
+    };
     setup({}, [task("a", { status: "working" })], [], { ...daemonStatus(false), memory: sys });
     const rail = screen.getByRole("navigation", { name: "Projects and agents" });
     const panel = within(rail).getByRole("region", { name: "Memory guard" });
-    expect(panel).toHaveTextContent("System pressure critical · 256 MB free · new sessions paused");
+    expect(panel).toHaveTextContent("macOS reported critical memory pressure · new sessions paused until it eases");
+    expect(panel).toHaveTextContent("256 MB free of 16.0 GB");
   });
 });
 

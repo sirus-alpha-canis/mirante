@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useEnv, useStore } from "../env";
 import { DaemonError } from "../lib/daemon";
-import { HIBERNATE, isHibernated, mb, systemMemory, taskMemory, WAKE } from "../lib/memguard";
+import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
 import type { DaemonStatus, TaskView } from "../lib/protocol";
 
 /** Hibernate (end the process, keep the native session) or wake (resume it). One request at
@@ -95,10 +95,12 @@ export function MemoryPanel({ status }: { status: DaemonStatus | null }) {
       ) : !sys ? (
         <p className="muted small">Memory guard not available in this daemon.</p>
       ) : (
-        <p className={`small level-${sys.level}`}>
-          System pressure <strong>{sys.level}</strong> · {mb(sys.free)} free
-          {sys.paused && <> · new sessions paused</>}
-        </p>
+        <>
+          <p className={`small level-${sys.level}`}>{pressureText(sys).main}</p>
+          <p className="small muted" title="On macOS free memory is always low (the file cache uses it); it is not what pauses sessions.">
+            {pressureText(sys).secondary}
+          </p>
+        </>
       )}
       {heavy.length > 0 && (
         <ul className="mem-list" aria-label="Sessions by memory">

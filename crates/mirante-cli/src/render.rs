@@ -724,6 +724,8 @@ mod tests {
             swap_used: 9 << 30,
             swap_total: 10 << 30,
             paused: true,
+            kernel_level: None,
+            kernel_source: None,
         };
         assert_eq!(
             memory_line(&s),
