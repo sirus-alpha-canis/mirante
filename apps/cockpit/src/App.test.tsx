@@ -53,9 +53,9 @@ describe("App", () => {
     beforeEach(() => vi.useFakeTimers());
 
     it("notifies when a task off screen starts needing you, not when it is on screen and focused", () => {
-      const h = setup();
+      const h = setup({}, [task("a", { repo_path: "/repos/shop", status: "working" }), task("z", { repo_path: "/repos/other", status: "working" })]);
       vi.spyOn(document, "hasFocus").mockReturnValue(true);
-      // Home is an inbox of every project: z is on screen there.
+      // Home is an inbox of every project: z's row is on screen there.
       act(() => h.env.cockpit.dispatch({ type: "event", event: needs(1, "z") }));
       flushNotes();
       expect(h.env.notify).not.toHaveBeenCalled();
@@ -80,6 +80,28 @@ describe("App", () => {
       act(() => h.env.cockpit.dispatch({ type: "event", event: needs(1, "z") }));
       flushNotes();
       expect(h.env.notify).toHaveBeenCalledTimes(1);
+    });
+
+    it("on Home, a task folded away (idle) or a hidden window is not on screen", () => {
+      const h = setup({}, [task("w", { status: "working" }), task("i", { status: "idle" })]);
+      vi.spyOn(document, "hasFocus").mockReturnValue(true);
+      act(() => h.env.cockpit.dispatch({ type: "event", event: needs(1, "w") }));
+      flushNotes();
+      expect(h.env.notify).not.toHaveBeenCalled();
+      // "Parados" is folded: its task is not on screen.
+      act(() => h.env.cockpit.dispatch({ type: "event", event: needs(2, "i") }));
+      flushNotes();
+      expect(titles(h)).toEqual(["feat/i needs you"]);
+      // A focused but hidden document (another space, minimized) is not looking either.
+      Object.defineProperty(document, "hidden", { value: true, configurable: true });
+      try {
+        act(() => h.env.cockpit.dispatch({ type: "event", event: ev(3, "w", "status", { to: "working" }) }));
+        act(() => h.env.cockpit.dispatch({ type: "event", event: needs(4, "w") }));
+        flushNotes();
+        expect(titles(h)).toEqual(["feat/i needs you", "feat/w needs you"]);
+      } finally {
+        delete (document as { hidden?: boolean }).hidden;
+      }
     });
 
     it("in the detail, only the task on screen is quiet", () => {
@@ -323,6 +345,22 @@ describe("App", () => {
     expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
   });
 
+  it("a remembered detail whose task is gone opens Home instead", () => {
+    const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [] });
+    h.env.storage.setItem("mirante.ui", JSON.stringify({ mode: "detail", taskId: "deleted", project: null, tab: "Diff", scroll: 0 }));
+    render(<App env={h.env} />);
+    act(() => h.load([task("a")]));
+    expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Detail" })).toBeDisabled();
+  });
+
+  it("Próximo's tooltip says its shortcut and that it waits while typing", () => {
+    setup({}, [task("n", { status: "needs_you" })]);
+    const title = screen.getByRole("button", { name: /^Próximo/ }).getAttribute("title") ?? "";
+    expect(title).toMatch(/[⌘C].*J/);
+    expect(title).toMatch(/not while typing/i);
+  });
+
   it("reopens where the person was: the view, the task and its tab", async () => {
     const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [], "task.diff": { base: "main", merge_base: "x", files: [], untracked: [], patch: "", truncated: false, compare_url: null, pushed: false } });
     h.load([task("a"), task("b")]);
@@ -339,8 +377,9 @@ describe("App", () => {
     const h = makeEnv();
     h.load([task("a"), task("b", { repo_path: "/x" })]);
     const s = h.env.cockpit.getState();
-    // Home is an inbox of every project.
-    expect([...visibleTasks(s, "home", "/x", null)].sort()).toEqual(["a", "b"]);
+    // Home is an inbox of every project: the ones whose card or row is on screen.
+    expect([...visibleTasks(s, "home", "/x", null, () => true)].sort()).toEqual(["a", "b"]);
+    expect([...visibleTasks(s, "home", "/x", null, (id) => id === "b")]).toEqual(["b"]);
     expect([...visibleTasks(s, "detail", null, "a")]).toEqual(["a"]);
     expect([...visibleTasks(s, "brain", "/x", "a")]).toEqual([]);
     expect([...visibleTasks(s, "skills", "/x", "a")]).toEqual([]);

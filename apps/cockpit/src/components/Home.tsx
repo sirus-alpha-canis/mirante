@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
-import { inboxSections, type ProjectGroup, type Section, sameSections, waitingLongerThan } from "../lib/inbox";
+import { inboxOf, inboxSections, type ProjectGroup, type Section, sameSections, waitingLongerThan } from "../lib/inbox";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { useNow } from "../lib/useNow";
-import { columnOf, COLUMN_LABEL, type Column, type Project } from "../store/select";
+import { COLUMN_LABEL, type Column, type Project } from "../store/select";
 import type { State } from "../store/state";
 import { AgentCard } from "./AgentCard";
 import { DispatchComposer, loadAgent, saveAgent } from "./DispatchComposer";
@@ -21,7 +21,9 @@ export const SECTION_TITLE: Record<Section, string> = {
   idle: "Parados",
 };
 
+// Both from the one memoized inbox (see `inboxOf`): an event works it out once.
 const selectSections = (s: State) => inboxSections(s);
+const selectColumns = (s: State) => inboxOf(s).columns;
 
 /** "N agentes esperam você há mais de 10 min" (nothing when none do). */
 function Nudge() {
@@ -94,7 +96,7 @@ export function Home(props: {
   const count = (k: Section) => sections[k].reduce((n, g) => n + g.ids.length, 0);
   const total = count("needs_you") + count("review") + count("working") + count("idle");
   // Every task's column (for the announcement below): renders when one changes, not per event.
-  const columns = useSelect((s) => Object.fromEntries(Object.values(s.tasks).map((t) => [t.id, columnOf(t, s.feed[t.id])])), shallow);
+  const columns = useSelect(selectColumns, shallow);
   const titles = useSelect((s) => s.tasks);
   const composer = useRef<HTMLTextAreaElement>(null);
   const [agent, setAgent] = useState<AgentKind>(() => loadAgent(env.storage));

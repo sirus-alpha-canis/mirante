@@ -32,20 +32,44 @@ function isFormField(target: EventTarget | null): boolean {
  * single summary (a reconnect replays missed events one by one, a restart sends them all). */
 export const NOTIFY_BATCH_MS = 250;
 
-/** The task ids whose card, tile or detail is on screen in this mode. */
-export function visibleTasks(s: State, mode: Mode, project: string | null, taskId: string | null): Set<string> {
+/** On Home: the task's card or row is in the page, not folded away (a closed "Parados"),
+ * and not scrolled out of the window (when the layout says where it is). */
+export function cardOnScreen(id: string): boolean {
+  const el = document.querySelector(`[data-task="${CSS.escape(id)}"]`);
+  if (!el || el.closest("details:not([open])")) return false;
+  const r = el.getBoundingClientRect();
+  // No layout (zero box): nothing says it is off screen.
+  if (r.width === 0 && r.height === 0) return true;
+  return r.bottom > 0 && r.top < window.innerHeight;
+}
+
+/** The person is looking at this window: focused and not hidden (another space, minimized). */
+export function looking(): boolean {
+  return document.hasFocus() && !document.hidden;
+}
+
+/** The task ids whose card, tile or detail is on screen in this mode. `onScreen`: on Home,
+ * whether a task's card is (the DOM by default). */
+export function visibleTasks(
+  s: State,
+  mode: Mode,
+  project: string | null,
+  taskId: string | null,
+  onScreen: (id: string) => boolean = cardOnScreen,
+): Set<string> {
   // The brain shows notes, no task: every task that starts needing you is off screen.
   if (mode === "brain" || mode === "skills") return new Set();
   if (mode === "detail") return new Set(taskId ? [taskId] : []);
   if (mode === "grid") return new Set(gridTasks(s).map((t) => t.id));
-  // Home is an inbox of every project: a task that starts needing you shows there.
+  // Home is an inbox of every project: the tasks whose card or row is on screen.
   void project;
-  return new Set(Object.values(s.tasks).filter((t) => t.lifecycle !== "archived").map((t) => t.id));
+  return new Set(Object.values(s.tasks).filter((t) => t.lifecycle !== "archived" && onScreen(t.id)).map((t) => t.id));
 }
 
 const selectTasks = (s: State) => s.tasks;
 const selectNeeding = (s: State) => needingOrder(s);
 const selectConnection = (s: State) => s.connection;
+const selectBoot = (s: State) => s.bootId;
 
 function ConnectionBanner({ connection, env }: { connection: Connection; env: Env }) {
   const [error, setError] = useState<string | null>(null);
@@ -83,6 +107,7 @@ export function App({ env }: { env: Env }) {
   const tasks = useCockpitSelect(env.cockpit, selectTasks);
   const connection = useCockpitSelect(env.cockpit, selectConnection);
   const needing = useCockpitSelect(env.cockpit, selectNeeding, shallow);
+  const bootId = useCockpitSelect(env.cockpit, selectBoot);
   // Where the person was when the app last closed (per viewer, this machine).
   const [saved] = useState(() => loadUi(env.storage));
   const [mode, setMode] = useState<Mode>(saved.mode);
@@ -142,7 +167,7 @@ export function App({ env }: { env: Env }) {
       const { mode, current, taskId } = view.current;
       const visible = visibleTasks(prev, mode, current, taskId);
       for (const t of fresh) {
-        if (shouldNotify(t.id, visible, document.hasFocus())) due.set(t.id, t);
+        if (shouldNotify(t.id, visible, looking())) due.set(t.id, t);
       }
       if (due.size > 0 && !timer) timer = setTimeout(flush, NOTIFY_BATCH_MS);
     });
@@ -200,6 +225,14 @@ export function App({ env }: { env: Env }) {
     applyTheme(theme);
     env.storage.setItem(THEME_KEY, theme);
   }, [env, theme]);
+
+  // A remembered (or open) detail whose task is gone, once the daemon's tasks are known:
+  // back to Home.
+  useEffect(() => {
+    if (bootId === null || !taskId || tasks[taskId]) return;
+    setTaskId(null);
+    setMode((m) => (m === "detail" ? "home" : m));
+  }, [bootId, taskId, tasks]);
 
   const open = useCallback((id: string, tab?: "Terminal") => {
     setTaskId(id);
@@ -346,7 +379,11 @@ export function App({ env }: { env: Env }) {
             className="btn btn-small next"
             disabled={needing.length === 0}
             onClick={goNext}
-            title={needing.length === 0 ? "Nothing needs you" : "Open the next task that needs you"}
+            title={
+              needing.length === 0
+                ? "Nothing needs you"
+                : `Open the next task that needs you (${hints.next}; not while typing in a field)`
+            }
             aria-label={needing.length === 0 ? "Próximo: nada precisa de você" : `Próximo, ${Math.max(next.at, 1)} de ${needing.length}`}
           >
             Próximo <kbd>{hints.next}</kbd>

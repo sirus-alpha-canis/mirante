@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ev, snapshot, task } from "../test/fixtures";
 import { initialState, reduce, type State } from "../store/state";
-import { elapsed, inboxSections, needingOrder, nextNeeding, PROJECT_COLORS, projectColor, sameSections, waitingLongerThan } from "./inbox";
+import { elapsed, inboxOf, inboxSections, needingOrder, nextNeeding, PROJECT_COLORS, projectColor, sameSections, waitingLongerThan } from "./inbox";
 
 function state(tasks: ReturnType<typeof task>[], events: ReturnType<typeof ev>[] = []): State {
   let s = reduce(initialState, { type: "connected", snapshot: snapshot(tasks) });
@@ -55,6 +55,23 @@ describe("inboxSections", () => {
     const asked = s.perms.p1.created_at;
     expect(waitingLongerThan(s, asked + 11 * 60_000, 10 * 60_000)).toBe(2);
     expect(waitingLongerThan(s, asked + 9 * 60_000, 10 * 60_000)).toBe(1);
+  });
+});
+
+describe("inboxOf", () => {
+  it("is worked out once per (tasks, perms, feed): every reader shares it", () => {
+    const s = state([task("a", { status: "needs_you", updated_at: 1 }), task("w", { status: "working" })]);
+    const a = inboxOf(s);
+    expect(inboxOf(s)).toBe(a);
+    // Another state object with the same slices (a connection change): the same answer.
+    expect(inboxOf({ ...s, connection: { state: "connecting" } } as State)).toBe(a);
+    expect(inboxSections(s)).toBe(a.sections);
+    expect(needingOrder(s)).toBe(a.needing);
+    expect(a.columns).toEqual({ a: "needs_you", w: "working" });
+    expect(a.waits.get("a")).toBe(1);
+    // A new feed (an event) is a new answer.
+    const s2 = reduce(s, { type: "event", event: ev(9, "w", "turn_started") });
+    expect(inboxOf(s2)).not.toBe(a);
   });
 });
 

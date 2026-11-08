@@ -35,16 +35,52 @@ export interface ProjectGroup {
   ids: string[];
 }
 
-/** Each section's task ids grouped by project (projects by name, tasks in the section's
- * order: needs-you by longest wait, the others by most recent change). Archived tasks are
- * left out. Ids only, so a selector can compare it shallowly. */
-export function inboxSections(s: Pick<State, "tasks" | "feed" | "perms">): Record<Section, ProjectGroup[]> {
+/** Everything Home and "Próximo" read, worked out in one pass. */
+export interface Inbox {
+  /** Each section's task ids grouped by project. */
+  sections: Record<Section, ProjectGroup[]>;
+  /** The ids needing the person, longest wait first (the focus-mode order). */
+  needing: string[];
+  /** Since when each task needing the person waits (ms). */
+  waits: Map<string, number>;
+  /** Every task's column. */
+  columns: Record<string, Column>;
+}
+
+type Slices = Pick<State, "tasks" | "feed" | "perms">;
+
+// One answer per (tasks, perms, feed): App, Home, the nudge and "Próximo" all read it, and
+// an event recomputes it once (not once per reader).
+const memo = new WeakMap<object, { perms: object; feed: object; value: Inbox }>();
+
+/** The inbox of `s` (see [`Inbox`]), memoized on its slices. */
+export function inboxOf(s: Slices): Inbox {
+  const hit = memo.get(s.tasks);
+  if (hit && hit.perms === s.perms && hit.feed === s.feed) return hit.value;
+  const value = computeInbox(s);
+  memo.set(s.tasks, { perms: s.perms, feed: s.feed, value });
+  return value;
+}
+
+function computeInbox(s: Slices): Inbox {
+  // Oldest pending request per task, in one pass over the requests.
+  const oldest = new Map<string, number>();
+  for (const p of Object.values(s.perms)) {
+    if (p.status !== "pending") continue;
+    const cur = oldest.get(p.task_id);
+    if (cur === undefined || p.created_at < cur) oldest.set(p.task_id, p.created_at);
+  }
   const by: Record<Section, TaskView[]> = { needs_you: [], review: [], working: [], idle: [] };
+  const columns: Record<string, Column> = {};
+  const waits = new Map<string, number>();
   for (const t of Object.values(s.tasks)) {
     const col: Column = columnOf(t, s.feed[t.id]);
-    if (col !== "archived") by[col].push(t);
+    columns[t.id] = col;
+    if (col === "archived") continue;
+    by[col].push(t);
+    if (col === "needs_you") waits.set(t.id, oldest.get(t.id) ?? t.updated_at);
   }
-  const wait = (t: TaskView) => waitingSince(t, s.perms);
+  const wait = (t: TaskView) => waits.get(t.id) ?? t.updated_at;
   by.needs_you.sort((a, b) => wait(a) - wait(b) || a.id.localeCompare(b.id));
   for (const k of ["review", "working", "idle"] as const) by[k].sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id));
   const group = (ts: TaskView[]): ProjectGroup[] => {
@@ -56,7 +92,19 @@ export function inboxSections(s: Pick<State, "tasks" | "feed" | "perms">): Recor
     }
     return [...m.values()].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
   };
-  return { needs_you: group(by.needs_you), review: group(by.review), working: group(by.working), idle: group(by.idle) };
+  return {
+    sections: { needs_you: group(by.needs_you), review: group(by.review), working: group(by.working), idle: group(by.idle) },
+    needing: by.needs_you.map((t) => t.id),
+    waits,
+    columns,
+  };
+}
+
+/** Each section's task ids grouped by project (projects by name, tasks in the section's
+ * order: needs-you by longest wait, the others by most recent change). Archived tasks are
+ * left out. Ids only, so a selector can compare it shallowly. */
+export function inboxSections(s: Slices): Record<Section, ProjectGroup[]> {
+  return inboxOf(s).sections;
 }
 
 /** Same groups (ids in the same order): what a selector compares to skip a render. */
@@ -69,12 +117,8 @@ export function sameSections(a: Record<Section, ProjectGroup[]>, b: Record<Secti
 }
 
 /** The ids needing the person, longest wait first (the focus-mode order). */
-export function needingOrder(s: Pick<State, "tasks" | "feed" | "perms">): string[] {
-  return inboxSections(s).needs_you.flatMap((g) => g.ids).sort((a, b) => {
-    const ta = s.tasks[a];
-    const tb = s.tasks[b];
-    return waitingSince(ta, s.perms) - waitingSince(tb, s.perms) || a.localeCompare(b);
-  });
+export function needingOrder(s: Slices): string[] {
+  return inboxOf(s).needing;
 }
 
 /** Where "Próximo" goes from `current`: the item after it (wrapping), else the first; and
@@ -86,8 +130,10 @@ export function nextNeeding(order: string[], current: string | null): { id: stri
 }
 
 /** How many tasks have waited on the person longer than `ms` at `now`. */
-export function waitingLongerThan(s: Pick<State, "tasks" | "feed" | "perms">, now: number, ms: number): number {
-  return needingOrder(s).filter((id) => now - waitingSince(s.tasks[id], s.perms) > ms).length;
+export function waitingLongerThan(s: Slices, now: number, ms: number): number {
+  let n = 0;
+  for (const since of inboxOf(s).waits.values()) if (now - since > ms) n++;
+  return n;
 }
 
 /** "3 min", "1 h 5 min", "2 d": a short elapsed time. */

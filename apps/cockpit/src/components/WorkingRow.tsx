@@ -32,7 +32,7 @@ export const WorkingRow = memo(function WorkingRow({ t, onOpen }: { t: TaskView;
   const col = useSelect((s) => columnOf(t, s.feed[t.id]));
   const now = useNow(30_000);
   return (
-    <article className="row" aria-label={`${t.agent} on ${t.branch}`}>
+    <article className="row" aria-label={`${t.agent} on ${t.branch}`} data-task={t.id}>
       <button className="link row-title" onClick={() => onOpen(t.id)}>
         {t.title}
       </button>

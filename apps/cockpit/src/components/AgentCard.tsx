@@ -56,7 +56,7 @@ export const AgentCard = memo(function AgentCard({
   const answer = lastAnswer(feed);
   const mode = agentModeLabel(t.agent);
   return (
-    <article className={`card card-${col}`} aria-label={`${t.agent} on ${t.branch}`}>
+    <article className={`card card-${col}`} aria-label={`${t.agent} on ${t.branch}`} data-task={t.id}>
       <header className="card-head">
         <ProjectChip path={t.repo_path} />
         <button className="link" onClick={() => onOpen(t.id)}>
