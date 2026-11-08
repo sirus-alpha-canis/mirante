@@ -140,6 +140,9 @@ impl Hub {
             }
             _ => {
                 st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
+                if let Err(e) = crate::hub::remove_session_dir(&self.paths, &task.id) {
+                    st.log_error(Some(&task.id), "removing the archived task's session files", &e);
+                }
                 report.archives_finished += 1;
             }
         }

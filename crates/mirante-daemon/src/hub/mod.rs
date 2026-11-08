@@ -348,6 +348,20 @@ pub struct Hub {
     pub(crate) spawning: std::sync::atomic::AtomicUsize,
 }
 
+/// Removes `<home>/sessions/<task>/` (MCP config, skill bundles, agent logs) of a task that
+/// will never run again, through descriptors: a symlink inside is unlinked, never followed.
+pub(crate) fn remove_session_dir(paths: &Paths, task_id: &str) -> std::result::Result<(), String> {
+    use mirante_core::safedir::SafeDir;
+    let Some(sessions) = SafeDir::open(paths.home(), &["sessions"]).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    match sessions.stat(task_id).map_err(|e| e.to_string())? {
+        Some(e) if e.is_dir() => sessions.remove_tree(task_id).map_err(|e| e.to_string()),
+        Some(_) => sessions.unlink(task_id).map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
+}
+
 /// Highest event seq in the store (0 when empty).
 fn last_seq(store: &Store) -> Result<u64> {
     let mut seq = 0;
@@ -718,6 +732,9 @@ impl Hub {
             return Err(e.into());
         }
         let t = st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
+        if let Err(e) = remove_session_dir(&self.paths, &task.id) {
+            st.log_error(Some(&task.id), "removing the archived task's session files", &e);
+        }
         let v = st.view(t)?;
         st.publish();
         drop(st);
@@ -1086,6 +1103,25 @@ mod tests {
         assert!(k.hub.list_tasks(false).unwrap().is_empty());
         assert_eq!(k.hub.list_tasks(true).unwrap().len(), 1);
         assert!(matches!(k.hub.archive(&t.id), Err(HubError::Conflict(_))));
+    }
+
+    #[test]
+    fn archive_removes_the_task_s_session_dir_without_following_links() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Codex, "gone").task;
+        let dir = k.hub.paths().session_dir(&t.id);
+        std::fs::create_dir_all(dir.join("skills/s1")).unwrap();
+        std::fs::write(dir.join("codex-stderr.log"), "log\n").unwrap();
+        let outside = k.dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "keep\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        // Another task's directory stays.
+        let other = k.hub.paths().session_dir("other-task");
+        std::fs::create_dir_all(&other).unwrap();
+        k.hub.archive("gone").unwrap();
+        assert!(!dir.exists(), "{dir:?}");
+        assert!(outside.join("keep.txt").exists() && other.exists());
     }
 
     fn lifecycle_moves(k: &Kit, task: &str) -> Vec<String> {
