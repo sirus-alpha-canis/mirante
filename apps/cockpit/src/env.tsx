@@ -20,6 +20,29 @@ export interface Env {
   homeDir(): Promise<string>;
   /** What is at an absolute path. */
   pathKind(path: string): Promise<PathKind>;
+  /** Calls `fn` with the task of a notification the person clicked; returns the unsubscribe. */
+  onNoteClick?(fn: (taskId: string) => void): () => void;
+}
+
+/** `store` with every call guarded: a read that throws is nothing stored, a write that
+ * throws is not remembered (a private window, blocked site data). */
+export function safeStorage(store: Pick<Storage, "getItem" | "setItem"> | null): Pick<Storage, "getItem" | "setItem"> {
+  return {
+    getItem(k) {
+      try {
+        return store ? store.getItem(k) : null;
+      } catch {
+        return null;
+      }
+    },
+    setItem(k, v) {
+      try {
+        store?.setItem(k, v);
+      } catch {
+        // Not remembered.
+      }
+    },
+  };
 }
 
 export type PathKind = "dir" | "file" | "missing";
@@ -55,4 +78,11 @@ const selectBoot = (s: State) => s.bootId;
  * fetch again when it changes (a restarted daemon may answer differently). */
 export function useBoot(): string | null {
   return useSelect(selectBoot);
+}
+
+const selectLive = (s: State) => s.connection.state === "live";
+
+/** Whether the daemon answers now: actions that need it are off while it does not. */
+export function useLive(): boolean {
+  return useSelect(selectLive);
 }

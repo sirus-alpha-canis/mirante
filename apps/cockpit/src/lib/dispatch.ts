@@ -15,8 +15,11 @@ export type Parsed = { ok: true; value: Dispatch } | { ok: false; error: string 
 
 export const DISPATCH_HELP = "@claude <repo>/<branch> <goal>  or  @codex <repo>/<branch> <goal>";
 
-/** The goal box's hint: plain words, with the one-line syntax as a shortcut. */
-export const GOAL_HELP = "What should the agent do? (⌘↵ to dispatch; power users: @claude repo/branch goal)";
+/** The goal box's hint: plain words, with the one-line syntax as a shortcut. `send`: the
+ * platform's send chord (⌘↵ on macOS, Ctrl+↵ elsewhere). */
+export function goalHelp(send: string): string {
+  return `What should the agent do? (${send} to dispatch; power users: @claude repo/branch goal)`;
+}
 
 const AGENTS: Record<string, AgentKind> = { "@claude": "claude", "@codex": "codex" };
 
@@ -158,9 +161,16 @@ export function applySuggestion(text: string, s: Suggestions, item: SuggestionIt
 
 /** Something attached to a goal with "+ context": a repo file, a repo memory note, a skill. */
 export type ContextRef =
-  | { kind: "file"; path: string }
-  | { kind: "note"; slug: string; title: string }
+  /** `repo`: the repository it was picked in (it names nothing elsewhere). */
+  | { kind: "file"; path: string; repo?: string }
+  | { kind: "note"; slug: string; title: string; repo?: string }
   | { kind: "skill"; name: string; description: string };
+
+/** The repo the attached files and notes come from, when one of them is not `repo`'s. */
+export function foreignRepo(refs: ContextRef[], repo: string | null): string | null {
+  for (const r of refs) if (r.kind !== "skill" && r.repo && r.repo !== repo) return r.repo;
+  return null;
+}
 
 /** What the agent reads above the references: they name repository content to read, and
  * nothing in them is the person's instruction. */

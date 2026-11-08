@@ -5,7 +5,19 @@ import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const count = vi.hoisted(() => ({ pills: 0 }));
+const count = vi.hoisted(() => ({ pills: 0, views: {} as Record<string, number> }));
+/** Counts the renders of a component module's export (the real one renders). */
+function counted<M extends Record<string, unknown>>(real: M, name: keyof M & string): M {
+  const Real = real[name] as (p: object) => unknown;
+  const Wrapped = (p: object) => {
+    count.views[name] = (count.views[name] ?? 0) + 1;
+    return Real(p);
+  };
+  return { ...real, [name]: Wrapped };
+}
+vi.mock("./components/LeftRail", async (actual) => counted(await actual<typeof import("./components/LeftRail")>(), "LeftRail"));
+vi.mock("./components/DispatchComposer", async (actual) => counted(await actual<typeof import("./components/DispatchComposer")>(), "DispatchComposer"));
+vi.mock("./components/MemoryPanel", async (actual) => counted(await actual<typeof import("./components/MemoryPanel")>(), "MemoryPanel"));
 vi.mock("./components/TerminalTab", () => ({ TerminalTab: () => null }));
 vi.mock("./components/Badges", async (actual) => {
   const real = await actual<typeof import("./components/Badges")>();
@@ -56,6 +68,16 @@ describe("renders per daemon event", () => {
     const h = setup();
     expect(screen.getAllByRole("article")).toHaveLength(5);
     expect(await rendersOf(() => h.env.cockpit.dispatch({ type: "event", event: step("a") }))).toBe(1);
+  });
+
+  it("Home: an event about one task renders no rail, form or memory panel (no whole-state readers)", async () => {
+    const h = setup();
+    await act(async () => {});
+    count.views = {};
+    await act(async () => h.env.cockpit.dispatch({ type: "event", event: step("a") }));
+    await act(async () => h.env.cockpit.dispatch({ type: "task", view: { ...h.env.cockpit.getState().tasks.a, updated_at: 99 } }));
+    await act(async () => {});
+    expect(count.views).toEqual({});
   });
 
   it("Home: a task.get that changed nothing renders nothing", async () => {

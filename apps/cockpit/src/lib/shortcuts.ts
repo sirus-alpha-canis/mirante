@@ -9,7 +9,7 @@
 // Inside the terminal: off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K kills
 // a line, Ctrl+G…), so the caller leaves mod chords there to the terminal. On macOS ⌘ is not
 // a terminal key, so ⌘K opens the command bar even with the terminal focused.
-export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme" | "next";
+export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme" | "next" | "skills";
 
 type KeyLike = Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey"> & Partial<Pick<KeyboardEvent, "code" | "repeat">>;
 
@@ -21,9 +21,11 @@ const CHORDS: { code: string; action: Exclude<ShortcutAction, "escape">; shift: 
   { code: "KeyJ", action: "theme", shift: true },
   // Focus mode: the next task that needs you.
   { code: "KeyJ", action: "next", shift: false },
+  // The skills library ("L" for library).
+  { code: "KeyL", action: "skills", shift: false },
 ];
 
-const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ" };
+const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ", l: "KeyL" };
 
 export function shortcutFor(e: KeyLike, mac: boolean): ShortcutAction | null {
   if (e.repeat) return null;
@@ -61,10 +63,11 @@ export function onMac(): boolean {
   return isMacPlatform(typeof navigator === "undefined" ? undefined : (navigator as NavLike));
 }
 
-export type ShortcutHints = Record<Exclude<ShortcutAction, "escape">, string>;
+/** Each chord's label, plus `send`: the key that sends a composer or the dispatch form. */
+export type ShortcutHints = Record<Exclude<ShortcutAction, "escape"> | "send", string>;
 
 export function hintsFor(mac: boolean): ShortcutHints {
   return mac
-    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J" }
-    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J" };
+    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", send: "⌘↵" }
+    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J", skills: "Ctrl+L", send: "Ctrl+↵" };
 }

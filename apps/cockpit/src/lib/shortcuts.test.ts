@@ -66,8 +66,22 @@ describe("platform", () => {
   });
 
   it("hints name the keys of the platform", () => {
-    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J" });
-    expect(hintsFor(false)).toEqual({ palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J" });
+    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", send: "⌘↵" });
+    expect(hintsFor(false)).toEqual({
+      palette: "Ctrl+K",
+      grid: "Ctrl+G",
+      brain: "Ctrl+B",
+      home: "Ctrl+1",
+      theme: "Ctrl+Shift+J",
+      next: "Ctrl+J",
+      skills: "Ctrl+L",
+      send: "Ctrl+↵",
+    });
+  });
+
+  it("⌘L (Ctrl+L elsewhere) is the Skills chord", () => {
+    expect(shortcutFor({ key: "l", code: "KeyL", metaKey: true, ctrlKey: false, shiftKey: false, altKey: false }, true)).toBe("skills");
+    expect(shortcutFor({ key: "l", code: "KeyL", metaKey: false, ctrlKey: true, shiftKey: false, altKey: false }, false)).toBe("skills");
   });
 });
 

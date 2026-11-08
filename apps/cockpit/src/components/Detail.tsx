@@ -6,7 +6,7 @@ import { inboxOf } from "../lib/inbox";
 import { M, type TaskView } from "../lib/protocol";
 import type { FeedItem, State } from "../store/state";
 import { useDnaKey, useDnaRev } from "../lib/useDna";
-import { columnOf, COLUMN_LABEL, type Column, pendingPerms, repoName, turnsEnded } from "../store/select";
+import { columnLabel, columnOf, type Column, pendingPerms, repoName, turnsEnded } from "../store/select";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
@@ -99,7 +99,7 @@ const TaskList = memo(function TaskList({ selected, onSelect }: { selected: stri
           </h2>
           {groups.map(({ g, tasks }) => (
             <div key={g}>
-              <h3>{COLUMN_LABEL[g]}</h3>
+              <h3>{columnLabel(g)}</h3>
               <ul>
                 {tasks.map((t) => (
                   <li key={t.id}>

@@ -1,16 +1,22 @@
 // Derived views of the store. Pure functions, unit-tested.
 import type { TaskView } from "../lib/protocol";
 import type { FeedItem, Perm, State } from "./state";
+import { type Key, t } from "../lib/i18n";
 
 export type Column = "needs_you" | "working" | "review" | "idle" | "archived";
 
-export const COLUMN_LABEL: Record<Column, string> = {
-  needs_you: "Needs you",
-  working: "Working",
-  review: "Ready for review",
-  idle: "Idle",
-  archived: "Archived",
+const COLUMN_KEY: Record<Column, Key> = {
+  needs_you: "column.needs_you",
+  working: "column.working",
+  review: "column.review",
+  idle: "column.idle",
+  archived: "column.archived",
 };
+
+/** A column's name in the current language. */
+export function columnLabel(c: Column): string {
+  return t(COLUMN_KEY[c]);
+}
 
 /** The three board columns, in order. */
 export const BOARD: Column[] = ["needs_you", "working", "review"];

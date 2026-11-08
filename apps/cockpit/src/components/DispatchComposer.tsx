@@ -10,7 +10,9 @@ import {
   useRef,
   useState,
 } from "react";
-import { useEnv, useSelect } from "../env";
+import { shallow, useEnv, useLive, useSelect } from "../env";
+import { hintsFor, onMac } from "../lib/shortcuts";
+import { DaemonError } from "../lib/daemon";
 import {
   AGENT_OPTIONS,
   applySuggestion,
@@ -18,7 +20,8 @@ import {
   branchProblem,
   type ContextRef,
   contextKey,
-  GOAL_HELP,
+  foreignRepo,
+  goalHelp,
   isPowerSyntax,
   matchProjects,
   mayHoldSecrets,
@@ -29,8 +32,35 @@ import {
   type SuggestionItem,
   withContext,
 } from "../lib/dispatch";
-import { type AgentKind, type CreatedOrigin, M, type NoteSummary, type SkillSummary, type StartResult, type TaskView } from "../lib/protocol";
+import { type AgentKind, type CreatedOrigin, M, type NoteSummary, RpcCode, type SkillSummary, type StartResult, type TaskView } from "../lib/protocol";
 import type { Project } from "../store/select";
+import type { State } from "../store/state";
+
+/** What the form holds besides the goal: attached context, an edited branch, a repo picked
+ * here. The app keeps it (with the goal), so leaving Home and coming back loses nothing. */
+export interface ComposerForm {
+  refs: ContextRef[];
+  /** The branch as typed (null: named after the goal). */
+  edited: string | null;
+  /** The repo picked in the form (null: the rail's selection). */
+  picked: string | null;
+}
+
+export const EMPTY_FORM: ComposerForm = { refs: [], edited: null, picked: null };
+
+/** The branches `repo`'s tasks use, sorted (a list compared shallowly: a task event that
+ * changes no branch renders nothing). */
+function branchesIn(s: State, repo: string | null): string[] {
+  if (!repo) return [];
+  const out: string[] = [];
+  for (const t of Object.values(s.tasks)) if (t.repo_path === repo) out.push(t.branch);
+  return out.sort();
+}
+
+/** git refused the branch because it exists (`task.create` with a base). */
+function branchExists(e: unknown): boolean {
+  return e instanceof DaemonError && e.code === RpcCode.INVALID_PARAMS && /branch already exists/.test(e.message);
+}
 
 /** What `task.create` fixed for the new task's skills, in a person's words. */
 export function originText(branch: string, o: CreatedOrigin): { text: string; warn: boolean } {
@@ -93,9 +123,16 @@ export function DispatchComposer(props: {
   inputRef?: Ref<HTMLTextAreaElement>;
   /** The memory guard pauses new sessions (`daemon.status.memory.paused`). */
   paused?: boolean;
+  /** The rest of the form, when the caller keeps it (else the form keeps its own). */
+  form?: ComposerForm;
+  onForm?(update: (cur: ComposerForm) => ComposerForm): void;
 }) {
   const { rpc, cockpit } = useEnv();
-  const tasks = useSelect((s) => s.tasks);
+  const live = useLive();
+  const hints = useMemo(() => hintsFor(onMac()), []);
+  const [ownForm, setOwnForm] = useState<ComposerForm>(EMPTY_FORM);
+  const form = props.form ?? ownForm;
+  const setForm = props.onForm ?? setOwnForm;
   const [error, setError] = useState<string | null>(null);
   const [originNote, setOriginNote] = useState<{ text: string; warn: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -105,27 +142,35 @@ export function DispatchComposer(props: {
   const latest = useRef(props.value);
   latest.current = props.value;
 
-  // The repo: picked here, else the rail's selection, else the first project.
-  const [picked, setPicked] = useState<string | null>(null);
-  useEffect(() => setPicked(null), [props.project]);
+  // The repo: picked here, else the rail's selection, else the first project. A new rail
+  // selection takes over from what was picked here.
+  const picked = form.picked;
+  const setPicked = (p: string | null) => setForm((f) => ({ ...f, picked: p }));
+  const railWas = useRef(props.project);
+  useEffect(() => {
+    if (railWas.current === props.project) return;
+    railWas.current = props.project;
+    setForm((f) => (f.picked === null ? f : { ...f, picked: null }));
+  }, [props.project, setForm]);
   const has = (p: string | null) => !!p && props.projects.some((x) => x.path === p);
   const repo = has(picked) ? picked : has(props.project) ? props.project : (props.projects[0]?.path ?? null);
 
   // The branch: named after the goal, past the names this repo's tasks already use, unless edited.
-  const [edited, setEdited] = useState<string | null>(null);
+  const edited = form.edited;
+  const setEdited = (b: string | null) => setForm((f) => ({ ...f, edited: b }));
   const power = isPowerSyntax(props.value);
-  const takenIn = useCallback(
-    (path: string | null) => new Set(Object.values(tasks).filter((t) => t.repo_path === path).map((t) => t.branch)),
-    [tasks],
-  );
-  const taken = useMemo(() => takenIn(repo), [takenIn, repo]);
+  const takenIn = (path: string | null) => new Set(branchesIn(cockpit.getState(), path));
+  const selectBranches = useCallback((s: State) => branchesIn(s, repo), [repo]);
+  const branches = useSelect(selectBranches, shallow);
+  const taken = useMemo(() => new Set(branches), [branches]);
   const auto = nextFreeBranch(branchFromGoal(props.value), taken);
   const branch = edited ?? auto;
 
   // "+ contexto": what is attached to this goal (cleared with it once dispatched).
-  const [refs, setRefs] = useState<ContextRef[]>([]);
-  const attach = (r: ContextRef) => setRefs((cur) => (cur.some((x) => contextKey(x) === contextKey(r)) ? cur : [...cur, r]));
-  const detach = (key: string) => setRefs((cur) => cur.filter((x) => contextKey(x) !== key));
+  const refs = form.refs;
+  const attach = (r: ContextRef) => setForm((f) => (f.refs.some((x) => contextKey(x) === contextKey(r)) ? f : { ...f, refs: [...f.refs, r] }));
+  const detach = (key: string) => setForm((f) => ({ ...f, refs: f.refs.filter((x) => contextKey(x) !== key) }));
+  const repoLabel = (path: string | null) => props.projects.find((x) => x.path === path)?.name ?? path ?? "another repo";
 
   /** task.create; an auto-named branch git already has moves on to -2, -3… */
   const create = async (target: { repo: string; agent: AgentKind; branch: string; goal: string }, renames: boolean) => {
@@ -137,7 +182,7 @@ export function DispatchComposer(props: {
         // A base makes the daemon refuse an existing branch instead of checking it out.
         return { v: await rpc<TaskView>(M.taskCreate, { ...target, branch: b, base: "HEAD" }), branch: b };
       } catch (e) {
-        if (n >= MAX_RENAMES || !(e instanceof Error) || !/already exists/.test(e.message)) throw e;
+        if (n >= MAX_RENAMES || !branchExists(e)) throw e;
         tried.add(b);
         b = nextFreeBranch(branchFromGoal(target.goal), tried);
       }
@@ -145,7 +190,7 @@ export function DispatchComposer(props: {
   };
 
   const submit = async () => {
-    if (inFlight.current) return;
+    if (inFlight.current || !live) return;
     const sent = props.value;
     const sentRefs = refs;
     let target: { repo: string; agent: AgentKind; branch: string; goal: string };
@@ -157,9 +202,9 @@ export function DispatchComposer(props: {
       if (!r.ok) return setError(r.error);
       // Files and notes were picked in the form's repo: elsewhere they name nothing (or
       // something else).
-      const local = sentRefs.filter((x) => x.kind !== "skill");
-      if (local.length > 0 && r.path !== repo) {
-        const from = props.projects.find((x) => x.path === repo)?.name ?? repo ?? "another repo";
+      const other = foreignRepo(sentRefs, r.path);
+      if (other) {
+        const from = repoLabel(other);
         return setError(`The attached files and notes are from ${from}, not ${p.value.repo}: remove them, or dispatch to ${from}.`);
       }
       // "shop/" with no branch: named from the goal, like the form's.
@@ -172,6 +217,11 @@ export function DispatchComposer(props: {
       if (!repo) return setError("Add a repository under Projects first.");
       const bad = branchProblem(branch);
       if (bad) return setError(bad);
+      const other = foreignRepo(sentRefs, repo);
+      if (other) {
+        const from = repoLabel(other);
+        return setError(`The attached files and notes are from ${from}, not ${repoLabel(repo)}: remove them, or dispatch to ${from}.`);
+      }
       target = { repo, agent: props.agent, branch, goal: withContext(goal, sentRefs) };
       renames = edited === null;
     }
@@ -186,8 +236,7 @@ export function DispatchComposer(props: {
       // Clear only what was dispatched: text typed meanwhile is the user's next message.
       if (latest.current === sent) {
         props.onChange("");
-        setEdited(null);
-        setRefs([]);
+        setForm((f) => ({ ...f, edited: null, refs: [] }));
       }
       props.onDispatched?.(v.id);
       // Boot can take up to 45 s; progress arrives as events, so do not wait here.
@@ -304,7 +353,7 @@ export function DispatchComposer(props: {
           id="dispatch"
           ref={setBox}
           rows={2}
-          placeholder={GOAL_HELP}
+          placeholder={goalHelp(hints.send)}
           value={props.value}
           onChange={(e) => {
             setCaret(e.target.selectionStart ?? e.target.value.length);
@@ -350,7 +399,12 @@ export function DispatchComposer(props: {
               Memory is tight: new sessions wait until it eases
             </span>
           )}
-          <button className="btn btn-primary" type="submit" disabled={busy || !hasGoal} title="Dispatch (⌘↵)">
+          <button
+            className="btn btn-primary"
+            type="submit"
+            disabled={busy || !hasGoal || !live}
+            title={live ? `Dispatch (${hints.send})` : "The daemon is not reachable"}
+          >
             Dispatch
           </button>
         </div>
@@ -471,6 +525,8 @@ function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: 
 }
 
 type ContextTab = "files" | "notes" | "skills";
+/** A file or note search goes out once typing has paused this long. */
+export const CONTEXT_DEBOUNCE_MS = 150;
 const CONTEXT_TABS: { id: ContextTab; label: string }[] = [
   { id: "files", label: "Files" },
   { id: "notes", label: "Memory notes" },
@@ -486,10 +542,21 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<{ key: string; ref: ContextRef; label: string; detail?: string }[]>([]);
   const [note, setNote] = useState<string | null>(null);
+  // The active skills, asked once per opening (filtered here as the person types).
+  const skills = useRef<Promise<SkillSummary[]> | null>(null);
+  useEffect(() => {
+    if (!open) skills.current = null;
+  }, [open]);
+  // What was last searched: a new query waits for typing to settle; opening, a tab or a
+  // repo search at once.
+  const searched = useRef<{ tab: ContextTab; repo: string | null; open: boolean } | null>(null);
   const searchId = useId();
   const search = useRef<HTMLInputElement>(null);
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      searched.current = null;
+      return;
+    }
     let live = true;
     const q = query.trim();
     const run = async () => {
@@ -499,7 +566,7 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
         return {
           list: files.map((path) => ({
             key: `file:${path}`,
-            ref: { kind: "file", path } as ContextRef,
+            ref: { kind: "file", path, repo } as ContextRef,
             label: path,
             detail: mayHoldSecrets(path) ? "⚠ may hold secrets" : undefined,
           })),
@@ -511,31 +578,46 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
         if (!q) return { list: [], note: "Type to search the repo's memory." };
         const notes = (await rpc<NoteSummary[]>(M.dnaSearch, { repo, query: q, limit: 10 })) ?? [];
         return {
-          list: notes.map((n) => ({ key: `note:${n.slug}`, ref: { kind: "note", slug: n.slug, title: n.title } as ContextRef, label: n.title, detail: n.slug })),
+          list: notes.map((n) => ({ key: `note:${n.slug}`, ref: { kind: "note", slug: n.slug, title: n.title, repo } as ContextRef, label: n.title, detail: n.slug })),
           note: notes.length ? null : "No matching note.",
         };
       }
-      const skills = ((await rpc<SkillSummary[]>(M.skillList, { status: "active" })) ?? []).filter(
-        (s) => !q || s.name.toLowerCase().includes(q.toLowerCase()) || s.description.toLowerCase().includes(q.toLowerCase()),
-      );
+      if (!skills.current) {
+        skills.current = rpc<SkillSummary[]>(M.skillList, { status: "active" }).then((l) => l ?? []);
+        // A failed list is asked again next time.
+        skills.current.catch(() => {
+          skills.current = null;
+        });
+      }
+      const needle = q.toLowerCase();
+      const found = (await skills.current).filter((x) => !needle || x.name.toLowerCase().includes(needle) || x.description.toLowerCase().includes(needle));
       return {
-        list: skills.slice(0, 20).map((s) => ({ key: `skill:${s.name}`, ref: { kind: "skill", name: s.name, description: s.description } as ContextRef, label: s.name, detail: s.description })),
-        note: skills.length ? null : "No matching skill.",
+        list: found.slice(0, 20).map((x) => ({ key: `skill:${x.name}`, ref: { kind: "skill", name: x.name, description: x.description } as ContextRef, label: x.name, detail: x.description })),
+        note: found.length ? null : "No matching skill.",
       };
     };
-    run()
-      .then((r) => {
-        if (!live) return;
-        setHits(r.list);
-        setNote(r.note);
-      })
-      .catch((e) => {
-        if (!live) return;
-        setHits([]);
-        setNote(e instanceof Error ? e.message : String(e));
-      });
+    const go = () =>
+      run()
+        .then((r) => {
+          if (!live) return;
+          setHits(r.list);
+          setNote(r.note);
+        })
+        .catch((e) => {
+          if (!live) return;
+          setHits([]);
+          setNote(e instanceof Error ? e.message : String(e));
+        });
+    const prev = searched.current;
+    searched.current = { tab, repo, open };
+    // Only the daemon's searches wait (skills filter here).
+    const typed = prev !== null && prev.tab === tab && prev.repo === repo && tab !== "skills";
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (typed) timer = setTimeout(go, CONTEXT_DEBOUNCE_MS);
+    else void go();
     return () => {
       live = false;
+      if (timer !== null) clearTimeout(timer);
     };
   }, [open, tab, query, repo, rpc]);
   const taken = new Set(attached.map(contextKey));

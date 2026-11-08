@@ -1,5 +1,6 @@
-import { useMemo, useRef, useState } from "react";
-import { useEnv, useSelect } from "../env";
+import { useRef, useState } from "react";
+import { shallow, useEnv, useSelect } from "../env";
+import { same, type State } from "../store/state";
 import { DaemonError } from "../lib/daemon";
 import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
 import type { DaemonStatus, TaskView } from "../lib/protocol";
@@ -74,23 +75,30 @@ export function HibernateButton({ t }: { t: TaskView }) {
   );
 }
 
+/** The sessions using the most memory (and the hibernated ones), heaviest first, at most 5. */
+function selectHeavy(s: State): TaskView[] {
+  return Object.values(s.tasks)
+    .filter((t) => taskMemory(t) || isHibernated(t))
+    .sort((a, b) => (taskMemory(b)?.bytes ?? 0) - (taskMemory(a)?.bytes ?? 0))
+    .slice(0, 5);
+}
+
+/** The latest three memory-guard notices, newest first, with their task's branch. */
+function selectNotices(s: State): { seq: number; text: string; branch: string | null }[] {
+  return s.memory
+    .slice(-3)
+    .reverse()
+    .map((n) => ({ seq: n.seq, text: n.text, branch: n.task_id ? (s.tasks[n.task_id]?.branch ?? null) : null }));
+}
+
 /** The daemon's memory guard: machine pressure, the heaviest sessions, the latest notices. */
 export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; onOpen?(taskId: string): void }) {
-  const tasks = useSelect((s) => s.tasks);
-  const memory = useSelect((s) => s.memory);
+  const heavy = useSelect(selectHeavy, shallow);
+  const notices = useSelect(selectNotices, same);
   const sys = systemMemory(status);
-  const heavy = useMemo(
-    () =>
-      Object.values(tasks)
-        .filter((t) => taskMemory(t) || isHibernated(t))
-        .sort((a, b) => (taskMemory(b)?.bytes ?? 0) - (taskMemory(a)?.bytes ?? 0))
-        .slice(0, 5),
-    [tasks],
-  );
-  const notices = memory.slice(-3).reverse();
   return (
     <section className="memory" aria-label="Memory guard">
-      <h2>Memory</h2>
+      <h2>System memory</h2>
       {!status ? (
         <p className="muted small">Memory status unknown.</p>
       ) : !sys ? (
@@ -127,7 +135,7 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
         <ul className="mem-notices" aria-label="Memory notices">
           {notices.map((n) => (
             <li key={n.seq} className="small">
-              {n.task_id && tasks[n.task_id] ? `${tasks[n.task_id].branch}: ` : ""}
+              {n.branch ? `${n.branch}: ` : ""}
               {n.text}
             </li>
           ))}

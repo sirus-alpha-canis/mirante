@@ -6,16 +6,19 @@ import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
 import { Skills } from "./components/Skills";
 import { type Env, EnvContext } from "./env";
+import { type ComposerForm, EMPTY_FORM } from "./components/DispatchComposer";
+import { type Lang, LANGS, LangContext, loadLang, saveLang, setLang, t as tr, useT } from "./lib/i18n";
 import { notificationsFor, shouldNotify } from "./lib/notify";
+import { useNow } from "./lib/useNow";
 import { needingOrder, nextNeeding } from "./lib/inbox";
 import { type DaemonStatus, M, type TaskView } from "./lib/protocol";
 import { loadRepos } from "./lib/repos";
 import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
-import { applyTheme, loadTheme, nextTheme, THEME_KEY, type Theme } from "./lib/theme";
+import { applyTheme, loadTheme, nextTheme, saveTheme, type Theme } from "./lib/theme";
 import { type DetailTab, loadUi, saveUi } from "./lib/uistate";
 import { useCockpitSelect } from "./store/cockpit";
-import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
-import { shallow } from "./env";
+import { gridTasks, needsYou, newlyNeedingYou, type Project, projects } from "./store/select";
+import { safeStorage, shallow, useSelect } from "./env";
 import { type Connection, same, type State } from "./store/state";
 
 export type Mode = "home" | "detail" | "grid" | "brain" | "skills";
@@ -71,9 +74,16 @@ const selectNeeding = (s: State) => needingOrder(s);
 const selectConnection = (s: State) => s.connection;
 const selectBoot = (s: State) => s.bootId;
 
+/** How long to wait between saves of Home's scroll (it is kept in memory at once). */
+export const SCROLL_SAVE_MS = 250;
+
 function ConnectionBanner({ connection, env }: { connection: Connection; env: Env }) {
+  const t = useT();
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  // When the next try is due (a new value per disconnect report), counted down each second.
+  const due = useMemo(() => (connection.state === "down" ? Date.now() + connection.retryMs : 0), [connection]);
+  const now = useNow(1000);
   if (connection.state === "live") return null;
   const start = () => {
     setStarting(true);
@@ -84,14 +94,14 @@ function ConnectionBanner({ connection, env }: { connection: Connection; env: En
       .finally(() => setStarting(false));
   };
   return (
-    <div className={`banner banner-${connection.state}`} role="status" aria-label="Daemon connection">
+    <div className={`banner banner-${connection.state}`} role="status" aria-label={t("conn.aria")}>
       {connection.state === "connecting" ? (
-        "Connecting to the Mirante daemon…"
+        t("conn.connecting")
       ) : (
         <>
-          Daemon not reachable ({connection.error}). Retrying in {Math.round(connection.retryMs / 100) / 10}s.{" "}
+          {t("conn.down", { error: connection.error, s: Math.max(0, Math.ceil((due - now) / 1000)) })}{" "}
           <button className="btn btn-small" disabled={starting} onClick={start}>
-            Start daemon
+            {t("conn.start")}
           </button>
           {error && <span className="error"> {error}</span>}
         </>
@@ -100,11 +110,60 @@ function ConnectionBanner({ connection, env }: { connection: Connection; env: En
   );
 }
 
-export function App({ env }: { env: Env }) {
+/** The command bar with its task commands: mounted (and reading every task) only while open. */
+function Palette(props: {
+  base: Command[];
+  inlineAnswers: boolean;
+  onOpen(id: string, tab?: "Terminal"): void;
+  onClose(): void;
+  onDispatch(text: string): void;
+}) {
+  const t = useT();
+  const tasks = useSelect(selectTasks);
+  const { base, inlineAnswers, onOpen } = props;
+  const commands = useMemo(
+    () => [
+      ...base,
+      ...Object.values(tasks)
+        .filter((x) => x.lifecycle !== "archived")
+        .map((x) =>
+          // A Claude request is answered in its own TUI unless the daemon types answers (a
+          // trust prompt is not: its card answers it here).
+          needsYou(x) && x.boot !== "trust_prompt" && x.agent === "claude" && !inlineAnswers
+            ? { id: `t-${x.id}`, label: t("cmd.answer", { title: x.title, branch: x.branch }), run: () => onOpen(x.id, "Terminal") }
+            : { id: `t-${x.id}`, label: t("cmd.open", { title: x.title, agent: x.agent, branch: x.branch }), run: () => onOpen(x.id) },
+        ),
+    ],
+    [base, tasks, inlineAnswers, onOpen, t],
+  );
+  return <CommandBar commands={commands} onClose={props.onClose} onDispatch={props.onDispatch} />;
+}
+
+/** Whether `t` is answered in its terminal (a Claude request, unless the daemon types answers). */
+function answeredInTerminal(t: TaskView | undefined, inlineAnswers: boolean): boolean {
+  return !!t && t.agent === "claude" && t.boot !== "trust_prompt" && !inlineAnswers;
+}
+
+export function App({ env: given }: { env: Env }) {
+  // Storage that throws (a private window, blocked site data) is storage that forgets.
+  const env = useMemo(() => ({ ...given, storage: safeStorage(given.storage) }), [given]);
   const mac = useMemo(onMac, []);
   const hints = useMemo(() => hintsFor(mac), [mac]);
+  const [lang, setLangState] = useState<Lang>(() => loadLang(env.storage));
+  // Before anything below renders: `t` speaks the chosen language.
+  setLang(lang);
+  const t = tr;
+  useEffect(() => {
+    document.documentElement.lang = lang;
+  }, [lang]);
+  const changeLang = useCallback(
+    (l: Lang) => {
+      setLangState(l);
+      saveLang(env.storage, l);
+    },
+    [env],
+  );
   // Only what App itself shows: the views below select their own slices.
-  const tasks = useCockpitSelect(env.cockpit, selectTasks);
   const connection = useCockpitSelect(env.cockpit, selectConnection);
   const needing = useCockpitSelect(env.cockpit, selectNeeding, shallow);
   const bootId = useCockpitSelect(env.cockpit, selectBoot);
@@ -113,6 +172,10 @@ export function App({ env }: { env: Env }) {
   const [mode, setMode] = useState<Mode>(saved.mode);
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
   const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
+  // The view a detail was opened from (Escape goes back there).
+  const [beforeDetail, setBeforeDetail] = useState<Mode>("home");
+  // The task whose detail was left for Home: its card takes the keyboard there.
+  const [returnTo, setReturnTo] = useState<string | null>(null);
   // Bumped by every "Review memory": the brain (open or not) switches to its review queue.
   const [reviewNonce, setReviewNonce] = useState(0);
   // Bumped by every "Review skills": the Skills view shows its review queue.
@@ -125,19 +188,31 @@ export function App({ env }: { env: Env }) {
   const [terminalNonce, setTerminalNonce] = useState(0);
   const [repos, setRepos] = useState(() => loadRepos(env.storage));
   const [project, setProject] = useState<string | null>(saved.project);
+  // The dispatch form (goal and the rest) lives here: Home unmounts on every other view.
   const [draft, setDraft] = useState("");
+  const [form, setForm] = useState<ComposerForm>(EMPTY_FORM);
   const [palette, setPalette] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => loadTheme(env.storage));
   const [status, setStatus] = useState<DaemonStatus | null>(null);
 
-  // Kept while equal: a task refresh that changes no project leaves Home's props alone.
-  const projsRef = useRef<ReturnType<typeof projects>>([]);
-  const projs = useMemo(() => {
-    const next = projects({ tasks }, repos);
-    if (!same(projsRef.current, next)) projsRef.current = next;
-    return projsRef.current;
-  }, [tasks, repos]);
-  const current = project ?? projs[0]?.path ?? null;
+  // The projects, kept while equal: a task refresh that changes no project leaves Home's
+  // props alone (and is worked out once per change of the tasks).
+  const projCache = useRef<{ tasks: State["tasks"] | null; repos: string[]; value: Project[] }>({ tasks: null, repos, value: [] });
+  const selectProjects = useCallback(
+    (s: State) => {
+      const c = projCache.current;
+      if (c.tasks === s.tasks && c.repos === repos) return c.value;
+      const next = projects(s, repos);
+      projCache.current = { tasks: s.tasks, repos, value: same(c.value, next) ? c.value : next };
+      return projCache.current.value;
+    },
+    [repos],
+  );
+  const projs = useCockpitSelect(env.cockpit, selectProjects);
+  // A remembered project that is no longer listed (removed, its tasks gone) is not shown:
+  // the first one is, once the daemon's tasks are known.
+  const listed = bootId === null || (project !== null && projs.some((p) => p.path === project));
+  const current = (listed ? project : null) ?? projs[0]?.path ?? null;
 
   // The view as of the last render; what it shows is worked out from the state before a
   // change (App does not render for every event).
@@ -207,8 +282,9 @@ export function App({ env }: { env: Env }) {
     };
   }, [env, live]);
 
-  // Home's scroll goes to storage directly (it changes too often for state).
+  // Home's scroll is kept here at once and saved a moment after scrolling stops.
   const ui = useRef({ ...saved });
+  const scrollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     ui.current = { ...ui.current, mode, project, taskId, tab: shownTab };
     saveUi(env.storage, ui.current);
@@ -216,49 +292,96 @@ export function App({ env }: { env: Env }) {
   const onHomeScroll = useCallback(
     (top: number) => {
       ui.current = { ...ui.current, scroll: top };
-      saveUi(env.storage, ui.current);
+      if (scrollTimer.current !== null) clearTimeout(scrollTimer.current);
+      scrollTimer.current = setTimeout(() => {
+        scrollTimer.current = null;
+        saveUi(env.storage, ui.current);
+      }, SCROLL_SAVE_MS);
     },
     [env],
+  );
+  useEffect(
+    () => () => {
+      if (scrollTimer.current !== null) clearTimeout(scrollTimer.current);
+    },
+    [],
   );
 
   useEffect(() => {
     applyTheme(theme);
-    env.storage.setItem(THEME_KEY, theme);
+    saveTheme(env.storage, theme);
   }, [env, theme]);
 
-  // A remembered (or open) detail whose task is gone, once the daemon's tasks are known:
-  // back to Home.
+  // A new rail selection takes over from a repo picked in the form.
+  const formProject = useRef(current);
   useEffect(() => {
-    if (bootId === null || !taskId || tasks[taskId]) return;
+    if (formProject.current === current) return;
+    formProject.current = current;
+    setForm((f) => (f.picked === null ? f : { ...f, picked: null }));
+  }, [current]);
+
+  // A remembered (or open) detail whose task is gone, once the daemon's tasks are known:
+  // back to Home (the one behaviour for a task that disappears).
+  const gone = useCockpitSelect(env.cockpit, useCallback((s: State) => s.bootId !== null && !!taskId && !s.tasks[taskId], [taskId]));
+  useEffect(() => {
+    if (!gone) return;
     setTaskId(null);
     setMode((m) => (m === "detail" ? "home" : m));
-  }, [bootId, taskId, tasks]);
+  }, [gone]);
 
   const open = useCallback((id: string, tab?: "Terminal") => {
     setTaskId(id);
     setDetailTab(tab);
     if (tab === "Terminal") setTerminalNonce((n) => n + 1);
-    setMode("detail");
+    setMode((m) => {
+      if (m !== "detail") setBeforeDetail(m);
+      return "detail";
+    });
   }, []);
-  const inlineAnswersNow = status?.claude_inline_answers ?? false;
+  const inlineAnswers = status?.claude_inline_answers ?? false;
+  const inlineRef = useRef(inlineAnswers);
+  inlineRef.current = inlineAnswers;
+  /** Opens a task where it is answered (Claude's request on its Terminal tab). */
+  const openWhereAnswered = useCallback(
+    (id: string) => {
+      const t = env.cockpit.getState().tasks[id];
+      if (!t) return;
+      open(id, needsYou(t) && answeredInTerminal(t, inlineRef.current) ? "Terminal" : undefined);
+    },
+    [env, open],
+  );
+  // A click on a task's notification opens it.
+  useEffect(() => env.onNoteClick?.(openWhereAnswered), [env, openWhereAnswered]);
   // Focus mode: the next task that needs the person, on the tab where it is answered.
   const next = nextNeeding(needing, mode === "detail" ? taskId : null);
   const goNext = useCallback(() => {
     if (!next.id) return;
-    const t = tasks[next.id];
-    const terminal = t && t.agent === "claude" && t.boot !== "trust_prompt" && !inlineAnswersNow;
-    open(next.id, terminal ? "Terminal" : undefined);
-  }, [next.id, tasks, inlineAnswersNow, open]);
+    const t = env.cockpit.getState().tasks[next.id];
+    open(next.id, answeredInTerminal(t, inlineRef.current) ? "Terminal" : undefined);
+  }, [env, next.id, open]);
+  /** Leaves the detail for `to` (Home focuses the card of the task it showed). */
+  const leave = useCallback(
+    (to: Mode) => {
+      if (mode === "detail" && to !== "detail") setReturnTo(taskId);
+      setMode(to);
+    },
+    [mode, taskId],
+  );
+  const goHome = useCallback(() => leave("home"), [leave]);
+  const goSkills = useCallback(() => leave("skills"), [leave]);
   const toggleGrid = useCallback(() => {
     if (mode === "grid") {
       setMode(beforeGrid);
     } else {
       setBeforeGrid(mode);
-      setMode("grid");
+      leave("grid");
     }
-  }, [mode, beforeGrid]);
+  }, [mode, beforeGrid, leave]);
   // From a task's detail, the brain shows that task's repo (its project).
-  const detailRepo = mode === "detail" && taskId ? tasks[taskId]?.repo_path : undefined;
+  const detailRepo = useCockpitSelect(
+    env.cockpit,
+    useCallback((s: State) => (mode === "detail" && taskId ? s.tasks[taskId]?.repo_path : undefined), [mode, taskId]),
+  );
   const toggleBrain = useCallback(() => {
     if (mode === "brain") {
       setMode(beforeBrain);
@@ -266,19 +389,23 @@ export function App({ env }: { env: Env }) {
       if (detailRepo) setProject(detailRepo);
       setBeforeBrain(mode);
       setReviewNonce(0);
-      setMode("brain");
+      leave("brain");
     }
-  }, [mode, beforeBrain, detailRepo]);
+  }, [mode, beforeBrain, detailRepo, leave]);
   const openReview = useCallback(
     (path?: string) => {
       const repo = path ?? detailRepo;
       if (repo) setProject(repo);
       if (mode !== "brain") setBeforeBrain(mode);
       setReviewNonce((n) => n + 1);
-      setMode("brain");
+      leave("brain");
     },
-    [mode, detailRepo],
+    [mode, detailRepo, leave],
   );
+  const reviewSkills = useCallback(() => {
+    setSkillsReviewNonce((n) => n + 1);
+    leave("skills");
+  }, [leave]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -288,163 +415,172 @@ export function App({ env }: { env: Env }) {
       if (palette && a !== "palette" && a !== "escape") return;
       if (a === "escape") {
         // Escape belongs to whatever is being typed in (the terminal, a composer).
-        if (!palette && mode === "detail" && !isTypingTarget(e.target)) setMode("home");
+        if (!palette && mode === "detail" && !isTypingTarget(e.target)) leave(beforeDetail === "detail" ? "home" : beforeDetail);
         return;
       }
       // Off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K, Ctrl+G…). On macOS
       // ⌘ is no terminal key, so ⌘K opens the command bar even from the terminal.
       if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
-      if ((a === "brain" || a === "grid" || a === "home" || a === "next") && isFormField(e.target)) return;
+      if ((a === "brain" || a === "grid" || a === "home" || a === "next" || a === "skills") && isFormField(e.target)) return;
       e.preventDefault();
       if (a === "next") goNext();
       if (a === "palette") setPalette((p) => !p);
       if (a === "grid") toggleGrid();
       if (a === "brain") toggleBrain();
-      if (a === "home") setMode("home");
+      if (a === "home") goHome();
+      if (a === "skills") goSkills();
       if (a === "theme") setTheme(nextTheme);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, mode, toggleGrid, toggleBrain, mac, goNext]);
+  }, [palette, mode, beforeDetail, toggleGrid, toggleBrain, goHome, goSkills, leave, mac, goNext]);
 
-  const inlineAnswers = status?.claude_inline_answers ?? false;
-  const commands: Command[] = useMemo(
-    () => [
-      { id: "home", label: "Go to Home", hint: hints.home, run: () => setMode("home") },
-      { id: "next", label: "Next task that needs you", hint: hints.next, run: goNext },
-      { id: "grid", label: "Toggle agent grid", hint: hints.grid, run: toggleGrid },
-      {
-        id: "brain",
-        label: "Go to Brain",
-        hint: hints.brain,
-        run: () => {
-          if (mode !== "brain") toggleBrain();
-        },
-      },
-      { id: "review", label: "Review memory", run: () => openReview() },
-      { id: "skills", label: "Go to Skills", run: () => setMode("skills") },
-      {
-        id: "skills-review",
-        label: "Review skills",
-        run: () => {
-          setSkillsReviewNonce((n) => n + 1);
-          setMode("skills");
-        },
-      },
-      { id: "theme", label: `Theme: ${nextTheme(theme)}`, hint: hints.theme, run: () => setTheme(nextTheme) },
-      ...projs.map((p) => ({
-        id: `p-${p.path}`,
-        label: `Project ${p.name}`,
-        run: () => {
-          setProject(p.path);
-          setMode("home");
-        },
-      })),
-      ...Object.values(tasks)
-        .filter((t) => t.lifecycle !== "archived")
-        .map((t) =>
-          // A Claude request is answered in its own TUI unless the daemon types answers (a
-          // trust prompt is not: its card answers it here).
-          needsYou(t) && t.boot !== "trust_prompt" && t.agent === "claude" && !inlineAnswers
-            ? { id: `t-${t.id}`, label: `Answer in terminal: ${t.title} (@claude ${t.branch})`, run: () => open(t.id, "Terminal") }
-            : { id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) },
-        ),
-    ],
-    [projs, tasks, theme, open, toggleGrid, toggleBrain, openReview, mode, hints, inlineAnswers, goNext],
+  const themeName = (x: Theme) => t(x === "system" ? "theme.system" : x === "light" ? "theme.light" : "theme.dark");
+  // Built only while the command bar is open.
+  const baseCommands = useMemo<Command[]>(
+    () =>
+      !palette
+        ? []
+        : [
+            { id: "home", label: t("cmd.home"), hint: hints.home, run: goHome },
+            { id: "next", label: t("cmd.next"), hint: hints.next, run: goNext },
+            { id: "grid", label: t("cmd.grid"), hint: hints.grid, run: toggleGrid },
+            {
+              id: "brain",
+              label: t("cmd.brain"),
+              hint: hints.brain,
+              run: () => {
+                if (mode !== "brain") toggleBrain();
+              },
+            },
+            { id: "review", label: t("cmd.review"), run: () => openReview() },
+            { id: "skills", label: t("cmd.skills"), hint: hints.skills, run: goSkills },
+            { id: "skills-review", label: t("cmd.skillsReview"), run: reviewSkills },
+            { id: "theme", label: t("theme.label", { theme: themeName(nextTheme(theme)) }), hint: hints.theme, run: () => setTheme(nextTheme) },
+            {
+              id: "lang",
+              label: t("cmd.lang", { lang: t(lang === "en" ? "lang.pt" : "lang.en") }),
+              run: () => changeLang(lang === "en" ? "pt" : "en"),
+            },
+            ...projs.map((p) => ({
+              id: `p-${p.path}`,
+              label: t("cmd.project", { name: p.name }),
+              run: () => {
+                setProject(p.path);
+                leave("home");
+              },
+            })),
+          ],
+    // `t` follows `lang`.
+    [palette, projs, theme, lang, toggleGrid, toggleBrain, openReview, mode, hints, goNext, goHome, goSkills, reviewSkills, leave, changeLang],
   );
+  const onDispatchText = useCallback(
+    (text: string) => {
+      setDraft(text);
+      leave("home");
+    },
+    [leave],
+  );
+  const closePalette = useCallback(() => setPalette(false), []);
+  const consumedReturn = useCallback(() => setReturnTo(null), []);
 
   return (
     <EnvContext.Provider value={env}>
-      <div className="app">
-        <header className="topbar">
-          <span className="brand">Mirante</span>
-          <nav aria-label="Views" className="modes">
-            <button aria-pressed={mode === "home"} onClick={() => setMode("home")}>
-              Home <kbd>{hints.home}</kbd>
+      <LangContext.Provider value={lang}>
+        <div className="app">
+          <header className="topbar">
+            <span className="brand">Mirante</span>
+            <nav aria-label={t("nav.views")} className="modes">
+              <button aria-pressed={mode === "home"} onClick={goHome}>
+                {t("nav.home")} <kbd>{hints.home}</kbd>
+              </button>
+              <button aria-pressed={mode === "detail"} disabled={!taskId} onClick={() => setMode("detail")}>
+                {t("nav.detail")}
+              </button>
+              <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
+                {t("nav.grid")} <kbd>{hints.grid}</kbd>
+              </button>
+              <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
+                {t("nav.brain")} <kbd>{hints.brain}</kbd>
+              </button>
+              <button aria-pressed={mode === "skills"} onClick={goSkills}>
+                {t("nav.skills")} <kbd>{hints.skills}</kbd>
+              </button>
+            </nav>
+            <button
+              className="btn btn-small next"
+              disabled={needing.length === 0}
+              onClick={goNext}
+              title={needing.length === 0 ? t("next.none") : t("next.title", { key: hints.next })}
+              aria-label={needing.length === 0 ? t("next.ariaNone") : t("next.aria", { at: Math.max(next.at, 1), n: needing.length })}
+            >
+              {t("next.label")} <kbd>{hints.next}</kbd>
+              {needing.length > 0 && (
+                <span className="muted small">
+                  {" "}
+                  · {t("next.position", { at: next.at > 0 ? next.at : "–", n: needing.length })}
+                </span>
+              )}
             </button>
-            <button aria-pressed={mode === "detail"} disabled={!taskId} onClick={() => setMode("detail")}>
-              Detail
+            <button className="btn btn-small" onClick={() => setPalette(true)}>
+              {t("top.commands")} <kbd>{hints.palette}</kbd>
             </button>
-            <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
-              Grid <kbd>{hints.grid}</kbd>
+            <button
+              className="btn btn-small"
+              onClick={() => setTheme(nextTheme)}
+              aria-label={t("theme.label", { theme: themeName(theme) })}
+              title={`${t("theme.label", { theme: themeName(theme) })} (${hints.theme})`}
+            >
+              <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
             </button>
-            <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
-              Brain <kbd>{hints.brain}</kbd>
-            </button>
-            <button aria-pressed={mode === "skills"} onClick={() => setMode("skills")}>
-              Skills
-            </button>
-          </nav>
-          <button
-            className="btn btn-small next"
-            disabled={needing.length === 0}
-            onClick={goNext}
-            title={
-              needing.length === 0
-                ? "Nothing needs you"
-                : `Open the next task that needs you (${hints.next}; not while typing in a field)`
-            }
-            aria-label={needing.length === 0 ? "Próximo: nada precisa de você" : `Próximo, ${Math.max(next.at, 1)} de ${needing.length}`}
-          >
-            Próximo <kbd>{hints.next}</kbd>
-            {needing.length > 0 && (
-              <span className="muted small">
-                {" "}
-                · {next.at > 0 ? next.at : "–"} de {needing.length}
-              </span>
-            )}
-          </button>
-          <button className="btn btn-small" onClick={() => setPalette(true)}>
-            Commands <kbd>{hints.palette}</kbd>
-          </button>
-          <button className="btn btn-small" onClick={() => setTheme(nextTheme)} aria-label={`Theme: ${theme}`} title={`Theme: ${theme} (${hints.theme})`}>
-            <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
-          </button>
-        </header>
-        <ConnectionBanner connection={connection} env={env} />
-        {mode === "home" && (
-          <Home
-            projects={projs}
-            project={current}
-            onProject={setProject}
-            onReposChanged={setRepos}
-            onOpen={open}
-            onReview={openReview}
-            onSkills={() => {
-              setSkillsReviewNonce((n) => n + 1);
-              setMode("skills");
-            }}
-            status={status}
-            draft={draft}
-            onDraft={setDraft}
-            scroll={saved.scroll}
-            onScroll={onHomeScroll}
-          />
-        )}
-        {mode === "detail" && taskId && (
-          <Detail
-            taskId={taskId}
-            onSelect={setTaskId}
-            initialTab={detailTab}
-            focusTerminalNonce={terminalNonce}
-            inlineAnswers={inlineAnswers}
-            onTab={setShownTab}
-          />
-        )}
-        {mode === "grid" && <Grid onOpen={open} status={status} />}
-        {mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
-        {mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
-        {palette && (
-          <CommandBar
-            commands={commands}
-            onClose={() => setPalette(false)}
-            onDispatch={(text) => {
-              setDraft(text);
-              setMode("home");
-            }}
-          />
-        )}
-      </div>
+            <label className="sr-only" htmlFor="lang">
+              {t("lang.label")}
+            </label>
+            <select id="lang" className="lang" value={lang} onChange={(e) => changeLang(e.target.value as Lang)} title={t("lang.label")}>
+              {LANGS.map((l) => (
+                <option key={l} value={l}>
+                  {l === "en" ? "EN · English" : "PT · Português"}
+                </option>
+              ))}
+            </select>
+          </header>
+          <ConnectionBanner connection={connection} env={env} />
+          {mode === "home" && (
+            <Home
+              projects={projs}
+              project={current}
+              onProject={setProject}
+              onReposChanged={setRepos}
+              onOpen={open}
+              onReview={openReview}
+              onSkills={reviewSkills}
+              status={status}
+              draft={draft}
+              onDraft={setDraft}
+              form={form}
+              onForm={setForm}
+              scroll={ui.current.scroll}
+              onScroll={onHomeScroll}
+              focusTask={returnTo}
+              onFocused={consumedReturn}
+            />
+          )}
+          {mode === "detail" && taskId && (
+            <Detail
+              taskId={taskId}
+              onSelect={setTaskId}
+              initialTab={detailTab}
+              focusTerminalNonce={terminalNonce}
+              inlineAnswers={inlineAnswers}
+              onTab={setShownTab}
+            />
+          )}
+          {mode === "grid" && <Grid onOpen={open} status={status} />}
+          {mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
+          {mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
+          {palette && <Palette base={baseCommands} inlineAnswers={inlineAnswers} onOpen={open} onClose={closePalette} onDispatch={onDispatchText} />}
+        </div>
+      </LangContext.Provider>
     </EnvContext.Provider>
   );
 }

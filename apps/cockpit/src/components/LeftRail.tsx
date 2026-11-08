@@ -1,13 +1,37 @@
 import { useEffect, useMemo, useState } from "react";
-import { useEnv, useSelect } from "../env";
+import { shallow, useEnv, useSelect } from "../env";
+import { AGENT_OPTIONS } from "../lib/dispatch";
+import { same, type State } from "../store/state";
 import { dnaStatus } from "../lib/dna";
 import { type DaemonSettings, M } from "../lib/protocol";
 import { usePendingSkills } from "../lib/useSkills";
-import type { AgentKind, DaemonStatus, TaskView } from "../lib/protocol";
+import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { addRepo, expandHome, loadRepos, normaliseRepoPath, removeRepo } from "../lib/repos";
-import { needsYou, type Project, repoName } from "../store/select";
+import { columnLabel, needsYou, type Project, repoName } from "../store/select";
+import { inboxOf } from "../lib/inbox";
 import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
+
+const selectColumns = (s: State) => inboxOf(s).columns;
+
+/** What the rail shows of a live session. */
+interface LiveSession {
+  id: string;
+  agent: AgentKind;
+  branch: string;
+  repo_path: string;
+  title: string;
+  needsYou: boolean;
+}
+
+/** Live sessions, oldest first: only what the rail shows (compared by value, so a task's
+ * other changes render nothing here). */
+function selectLive(s: State): LiveSession[] {
+  return Object.values(s.tasks)
+    .filter((t) => t.live)
+    .sort((x, y) => x.created_at - y.created_at)
+    .map((t) => ({ id: t.id, agent: t.agent, branch: t.branch, repo_path: t.repo_path, title: t.title, needsYou: needsYou(t) }));
+}
 
 export function LeftRail(props: {
   projects: Project[];
@@ -25,7 +49,10 @@ export function LeftRail(props: {
   status: DaemonStatus | null;
 }) {
   const { storage, rpc, cockpit, pickFolder, homeDir, pathKind } = useEnv();
-  const tasks = useSelect((s) => s.tasks);
+  // Live sessions per agent (the task objects: kept while unchanged, so a step elsewhere
+  // renders nothing here).
+  const liveTasks = useSelect(selectLive, same);
+  const columns = useSelect(selectColumns, shallow);
   // The selected project's memory proposals waiting for a person (none when its memory is
   // off, the daemon is older, or the path is no repo).
   const sel = props.selected;
@@ -46,24 +73,18 @@ export function LeftRail(props: {
   }, [rpc, cockpit, sel, version]);
   const [path, setPath] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const agents = useMemo(() => {
-    const live = (a: AgentKind) =>
-      Object.values(tasks)
-        .filter((t) => t.agent === a && t.live)
-        .sort((x, y) => x.created_at - y.created_at);
-    return [
-      { agent: "claude" as const, live: live("claude") },
-      { agent: "codex" as const, live: live("codex") },
-    ];
-  }, [tasks]);
+  const agents = useMemo(
+    () => AGENT_OPTIONS.map((o) => ({ agent: o.id, live: liveTasks.filter((t) => t.agent === o.id) })),
+    [liveTasks],
+  );
   // The agent whose live sessions are listed to pick from (it has several).
   const [picking, setPicking] = useState<AgentKind | null>(null);
-  const openTask = (t: TaskView) => {
+  const openTask = (t: LiveSession) => {
     setPicking(null);
-    props.onOpen(t.id, needsYou(t) ? "Terminal" : undefined);
+    props.onOpen(t.id, t.needsYou ? "Terminal" : undefined);
   };
   /** One live session: open it. Several: list them. None: write it a new task. */
-  const agentClick = (a: { agent: AgentKind; live: TaskView[] }) => {
+  const agentClick = (a: { agent: AgentKind; live: LiveSession[] }) => {
     if (a.live.length === 1) return openTask(a.live[0]);
     if (a.live.length > 1) return setPicking((p) => (p === a.agent ? null : a.agent));
     setPicking(null);
@@ -99,7 +120,7 @@ export function LeftRail(props: {
     }
   };
   // Only repos added here can be removed; a task's repo stays listed while the task exists.
-  const added = new Set(loadRepos(storage));
+  const added = useMemo(() => new Set(loadRepos(storage)), [storage, props.projects]);
   const remove = (p: string) => props.onReposChanged(removeRepo(storage, p));
 
   return (
@@ -202,7 +223,7 @@ export function LeftRail(props: {
                       <span>
                         {t.branch} · {repoName(t.repo_path)}
                       </span>
-                      <span className={`small ${needsYou(t) ? "warn" : "muted"}`}>{needsYou(t) ? "needs you" : t.status}</span>
+                      <span className={`small ${t.needsYou ? "warn" : "muted"}`}>{columns[t.id] ? columnLabel(columns[t.id]) : ""}</span>
                     </button>
                   </li>
                 ))}

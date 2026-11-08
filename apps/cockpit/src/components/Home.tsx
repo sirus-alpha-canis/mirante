@@ -1,12 +1,13 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
 import { inboxOf, inboxSections, type ProjectGroup, type Section, sameSections, waitingLongerThan } from "../lib/inbox";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { useNow } from "../lib/useNow";
-import { COLUMN_LABEL, type Column, type Project } from "../store/select";
+import { columnLabel, type Column, type Project } from "../store/select";
+import { type Key, t, tn, useT } from "../lib/i18n";
 import type { State } from "../store/state";
 import { AgentCard } from "./AgentCard";
-import { DispatchComposer, loadAgent, saveAgent } from "./DispatchComposer";
+import { type ComposerForm, DispatchComposer, loadAgent, saveAgent } from "./DispatchComposer";
 import { LeftRail } from "./LeftRail";
 import { ProjectChip } from "./ProjectChip";
 import { WorkingRow } from "./WorkingRow";
@@ -14,28 +15,39 @@ import { WorkingRow } from "./WorkingRow";
 /** A nudge past this wait. */
 export const OVERDUE_MS = 10 * 60_000;
 
-export const SECTION_TITLE: Record<Section, string> = {
-  needs_you: "Precisa de você",
-  review: "Pronto para revisar",
-  working: "Trabalhando",
-  idle: "Parados",
+const SECTION_KEY: Record<Section, Key> = {
+  needs_you: "section.needs_you",
+  review: "section.review",
+  working: "section.working",
+  idle: "section.idle",
 };
+
+/** A section's title in the current language. */
+export const sectionTitle = (k: Section) => t(SECTION_KEY[k]);
 
 // Both from the one memoized inbox (see `inboxOf`): an event works it out once.
 const selectSections = (s: State) => inboxSections(s);
 const selectColumns = (s: State) => inboxOf(s).columns;
 
-/** "N agentes esperam você há mais de 10 min" (nothing when none do). */
+/** "N agents have waited on you for over 10 min" (nothing when none have). */
 function Nudge() {
+  useT();
   const now = useNow(30_000);
   const n = useSelect((s) => waitingLongerThan(s, now, OVERDUE_MS));
   if (n === 0) return null;
   return (
     <p className="nudge" role="status">
-      {n === 1 ? "1 agente espera você há mais de 10 min" : `${n} agentes esperam você há mais de 10 min`}
+      {tn(n, "nudge.one", "nudge.many")}
     </p>
   );
 }
+
+/** One task's card or row: renders when that task changes, not when another does. */
+const TaskEntry = memo(function TaskEntry(props: { id: string; card: boolean; onOpen(taskId: string, tab?: "Terminal"): void; inlineAnswers: boolean }) {
+  const task = useSelect(useCallback((s: State) => s.tasks[props.id], [props.id]));
+  if (!task) return null;
+  return props.card ? <AgentCard t={task} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} /> : <WorkingRow t={task} onOpen={props.onOpen} />;
+});
 
 function Groups(props: {
   groups: ProjectGroup[];
@@ -43,7 +55,7 @@ function Groups(props: {
   onOpen(taskId: string, tab?: "Terminal"): void;
   inlineAnswers: boolean;
 }) {
-  const tasks = useSelect((s) => s.tasks);
+  const card = props.section === "needs_you" || props.section === "review";
   return (
     <>
       {props.groups.map((g) => (
@@ -51,15 +63,9 @@ function Groups(props: {
           <h3 className="inbox-project">
             <ProjectChip path={g.path} />
           </h3>
-          {g.ids.map((id) =>
-            tasks[id] ? (
-              props.section === "needs_you" || props.section === "review" ? (
-                <AgentCard key={id} t={tasks[id]} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} />
-              ) : (
-                <WorkingRow key={id} t={tasks[id]} onOpen={props.onOpen} />
-              )
-            ) : null,
-          )}
+          {g.ids.map((id) => (
+            <TaskEntry key={id} id={id} card={card} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} />
+          ))}
         </div>
       ))}
     </>
@@ -67,13 +73,13 @@ function Groups(props: {
 }
 
 /**
- * Home, an inbox across every project: "Precisa de você" (each with its one action),
- * "Pronto para revisar" (the agent's last answer and its diff), "Trabalhando" (one line
- * each), grouped by project; the dispatch form at the bottom. The rail keeps projects,
- * agents, skills, memory and settings. `scroll` / `onScroll`: where the list was (restored
- * once the tasks are there).
+ * Home, an inbox across every project: "Needs you" (each with its one action), "Ready for
+ * review" (the agent's last answer and its diff), "Working" (one line each), grouped by
+ * project; the dispatch form at the bottom. The rail keeps projects, agents, skills, system
+ * memory and settings. `scroll` / `onScroll`: where the list was (restored once the tasks are
+ * there). `focusTask`: the task whose card takes the keyboard (back from its detail).
  */
-export function Home(props: {
+export const Home = memo(function Home(props: {
   projects: Project[];
   project: string | null;
   onProject(path: string): void;
@@ -87,27 +93,38 @@ export function Home(props: {
   status: DaemonStatus | null;
   draft: string;
   onDraft(v: string): void;
+  /** The rest of the dispatch form, when the caller keeps it. */
+  form?: ComposerForm;
+  onForm?(update: (cur: ComposerForm) => ComposerForm): void;
   scroll?: number;
   onScroll?(top: number): void;
+  focusTask?: string | null;
+  onFocused?(): void;
 }) {
   const env = useEnv();
+  const t = useT();
   const sections = useSelect(selectSections, sameSections);
   const inlineAnswers = props.status?.claude_inline_answers ?? false;
   const count = (k: Section) => sections[k].reduce((n, g) => n + g.ids.length, 0);
   const total = count("needs_you") + count("review") + count("working") + count("idle");
   // Every task's column (for the announcement below): renders when one changes, not per event.
   const columns = useSelect(selectColumns, shallow);
-  const titles = useSelect((s) => s.tasks);
   const composer = useRef<HTMLTextAreaElement>(null);
   const [agent, setAgent] = useState<AgentKind>(() => loadAgent(env.storage));
-  const pickAgent = (a: AgentKind) => {
-    setAgent(a);
-    saveAgent(env.storage, a);
-  };
-  const mention = (a: AgentKind) => {
-    pickAgent(a);
-    composer.current?.focus();
-  };
+  const pickAgent = useCallback(
+    (a: AgentKind) => {
+      setAgent(a);
+      saveAgent(env.storage, a);
+    },
+    [env],
+  );
+  const mention = useCallback(
+    (a: AgentKind) => {
+      pickAgent(a);
+      composer.current?.focus();
+    },
+    [pickAgent],
+  );
   // One polite region says when a task changes state (not every new line of every task).
   const [announce, setAnnounce] = useState("");
   const seen = useRef<Record<string, Column> | null>(null);
@@ -115,9 +132,10 @@ export function Home(props: {
     const before = seen.current;
     seen.current = columns;
     if (!before) return;
-    const changed = Object.keys(columns).filter((id) => id in before && before[id] !== columns[id] && titles[id]);
-    if (changed.length > 0) setAnnounce(changed.map((id) => `${titles[id].title}: ${COLUMN_LABEL[columns[id]]}`).join(". "));
-  }, [columns, titles]);
+    const tasks = env.cockpit.getState().tasks;
+    const changed = Object.keys(columns).filter((id) => id in before && before[id] !== columns[id] && tasks[id]);
+    if (changed.length > 0) setAnnounce(changed.map((id) => `${tasks[id].title}: ${columnLabel(columns[id])}`).join(". "));
+  }, [columns, env]);
   // Back where the list was, once there is something to scroll.
   const list = useRef<HTMLDivElement>(null);
   const restored = useRef(false);
@@ -126,6 +144,17 @@ export function Home(props: {
     restored.current = true;
     if (props.scroll) list.current.scrollTop = props.scroll;
   }, [total, props.scroll]);
+  // Back from a task's detail: its card (or row) takes the keyboard.
+  const { focusTask, onFocused } = props;
+  useEffect(() => {
+    if (!focusTask) return;
+    const el = list.current?.querySelector(`[data-task="${CSS.escape(focusTask)}"]`);
+    const target = el?.querySelector<HTMLElement>("button, [href], [tabindex]");
+    if (target) {
+      target.focus();
+      onFocused?.();
+    }
+  }, [focusTask, onFocused, total]);
   const onScroll = props.onScroll;
   const scrolled = useMemo(() => {
     let frame = 0;
@@ -143,7 +172,7 @@ export function Home(props: {
       <details key={k} className={`inbox-section inbox-${k}`}>
         <summary>
           <h2 id={id}>
-            {SECTION_TITLE[k]} ({n})
+            {sectionTitle(k)} ({n})
           </h2>
         </summary>
         {body}
@@ -151,7 +180,7 @@ export function Home(props: {
     ) : (
       <section key={k} className={`inbox-section inbox-${k}`} aria-labelledby={id}>
         <h2 id={id}>
-          {SECTION_TITLE[k]} ({n})
+          {sectionTitle(k)} ({n})
         </h2>
         {body}
       </section>
@@ -170,20 +199,16 @@ export function Home(props: {
         onSkills={props.onSkills}
         status={props.status}
       />
-      <main className="feed inbox" aria-label="Inbox">
+      <main className="feed inbox" aria-label={t("home.inbox")}>
         <div className="cards" ref={list} onScroll={(e) => scrolled(e.currentTarget.scrollTop)}>
           <Nudge />
-          {total === 0 && (
-            <p className="muted empty">
-              {props.projects.length > 0 ? "No agents yet. Dispatch one below." : "Add a repository on the left to start."}
-            </p>
-          )}
+          {total === 0 && <p className="muted empty">{props.projects.length > 0 ? t("home.empty") : t("home.noProject")}</p>}
           {section("needs_you")}
           {section("review")}
           {section("working")}
           {section("idle")}
         </div>
-        <p className="sr-only" role="status" aria-label="Agent updates">
+        <p className="sr-only" role="status" aria-label={t("home.updates")}>
           {announce}
         </p>
         <DispatchComposer
@@ -195,8 +220,10 @@ export function Home(props: {
           onAgent={pickAgent}
           inputRef={composer}
           paused={props.status?.memory?.paused ?? false}
+          form={props.form}
+          onForm={props.onForm}
         />
       </main>
     </div>
   );
-}
+});

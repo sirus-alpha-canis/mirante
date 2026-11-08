@@ -333,26 +333,26 @@ describe("Home (V3 group chat)", () => {
     );
     const inbox = screen.getByRole("main", { name: "Inbox" });
     const section = (name: RegExp) => within(inbox).getByRole("region", { name });
-    const needs = section(/^Precisa de você \(2\)$/);
+    const needs = section(/^Needs you \(2\)$/);
     // Grouped by project, each with its chip.
     expect(within(needs).getAllByRole("group").map((g) => g.getAttribute("aria-label"))).toEqual(["api", "shop"]);
     expect(within(needs).getAllByRole("article")).toHaveLength(2);
-    expect(within(section(/^Pronto para revisar \(1\)$/)).getByRole("article", { name: "claude on feat/r" })).toBeInTheDocument();
-    const working = section(/^Trabalhando \(1\)$/);
+    expect(within(section(/^Ready for review \(1\)$/)).getByRole("article", { name: "claude on feat/r" })).toBeInTheDocument();
+    const working = section(/^Working \(1\)$/);
     const row = within(working).getByRole("article", { name: "claude on feat/w" });
     // One line, in plain words: never the raw command.
     expect(row).toHaveTextContent("@claude");
     expect(row).toHaveTextContent("rodando um comando");
     expect(row).not.toHaveTextContent("rm -rf");
     // Idle tasks wait folded away.
-    expect(within(inbox).getByText(/^Parados \(1\)$/)).toBeInTheDocument();
+    expect(within(inbox).getByText(/^Idle \(1\)$/)).toBeInTheDocument();
     expect(screen.queryByRole("complementary", { name: "Board" })).toBeNull();
   });
 
   it("says when agents have waited on you more than 10 minutes", () => {
     const long = Date.now() - 11 * 60_000;
     setup({}, [task("a", { status: "needs_you", updated_at: long }), task("b", { status: "needs_you", updated_at: long }), task("c", { status: "needs_you", updated_at: Date.now() })]);
-    expect(screen.getByText("2 agentes esperam você há mais de 10 min")).toBeInTheDocument();
+    expect(screen.getByText("2 agents have waited on you for over 10 min")).toBeInTheDocument();
   });
 
   it("the branch chip shows once there is a goal; attached context goes after the goal, labeled", async () => {
@@ -414,6 +414,48 @@ describe("Home (V3 group chat)", () => {
     expect(sent(h).map((c) => c[0])).not.toContain("task.create");
   });
 
+  it("files attached for one repo are refused once the form's repo changes", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" }, "repo.files": ["src/login.ts"] }, [task("x", { repo_path: "/repos/api" })], [], null, [
+      "/repos/shop",
+      "/repos/api",
+    ]);
+    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    const dialog = screen.getByRole("dialog", { name: "Add context" });
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
+    await userEvent.keyboard("{Escape}");
+    const box = screen.getByRole("combobox", { name: "Repository" });
+    await userEvent.clear(box);
+    await userEvent.type(box, "api{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "do it{Meta>}{Enter}{/Meta}");
+    expect(await screen.findByRole("alert")).toHaveTextContent("The attached files and notes are from shop, not api");
+    expect(sent(h).map((c) => c[0])).not.toContain("task.create");
+  });
+
+  it("the context search asks the daemon once typing settles, and the skills once per opening", async () => {
+    const h = setup({
+      "repo.files": ["src/login.ts"],
+      "skill.list": [
+        { name: "cargo-tests-first", description: "run the tests first", version: 1, scope: "personal", activation: "on_demand", status: "active", manifest_hash: "h", verified: true, injected_30d: 0, used_30d: 0, updated_at: 0 },
+        { name: "docs", description: "write docs", version: 1, scope: "personal", activation: "on_demand", status: "active", manifest_hash: "h", verified: true, injected_30d: 0, used_30d: 0, updated_at: 0 },
+      ],
+    });
+    const count = (m: string) => h.calls.filter(([x]) => x === m).length;
+    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    const dialog = screen.getByRole("dialog", { name: "Add context" });
+    await waitFor(() => expect(count("repo.files")).toBe(1));
+    await userEvent.type(within(dialog).getByLabelText("Search Files"), "login");
+    await waitFor(() => expect(count("repo.files")).toBe(2));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(count("repo.files")).toBe(2);
+    expect(h.calls.filter(([x]) => x === "repo.files").at(-1)?.[1]).toMatchObject({ query: "login" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Skills" }));
+    await within(dialog).findByRole("button", { name: /^docs/ });
+    await userEvent.type(within(dialog).getByLabelText("Search Skills"), "cargo");
+    expect(await within(dialog).findByRole("button", { name: /^cargo-tests-first/ })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /^docs/ })).toBeNull();
+    expect(count("skill.list")).toBe(1);
+  });
+
   it("with MIRANTE_AUTO_RESUME=off the setting is shown off and cannot be changed here", () => {
     setup({}, [], [], { ...daemonStatus(false), auto_resume: false, auto_resume_forced_off: true });
     const settings = screen.getByRole("region", { name: "Sessions" });
@@ -461,7 +503,7 @@ describe("Home (V3 group chat)", () => {
     const rail = screen.getByRole("navigation", { name: "Projects and agents" });
     await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));
     const list = within(rail).getByRole("list", { name: "Live @claude sessions" });
-    expect(within(list).getAllByRole("button").map((b) => b.textContent)).toEqual(["feat/a · shopworking", "feat/b · apineeds you", "New @claude task"]);
+    expect(within(list).getAllByRole("button").map((b) => b.textContent)).toEqual(["feat/a · shopWorking", "feat/b · apiNeeds you", "New @claude task"]);
     await userEvent.keyboard("{Escape}");
     expect(within(rail).queryByRole("list", { name: "Live @claude sessions" })).toBeNull();
     await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));

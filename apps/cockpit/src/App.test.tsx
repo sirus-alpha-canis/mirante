@@ -63,7 +63,7 @@ describe("App", () => {
       openViaPalette("goal of z");
       act(() => h.env.cockpit.dispatch({ type: "event", event: needs(2, "a") }));
       flushNotes();
-      expect(h.env.notify).toHaveBeenCalledWith({ title: "feat/a needs you", body: "goal of a" });
+      expect(h.env.notify).toHaveBeenCalledWith({ title: "feat/a needs you", body: "goal of a", taskId: "a" });
     });
 
     it("the first snapshot never notifies", () => {
@@ -315,21 +315,21 @@ describe("App", () => {
     expect(screen.getByRole("dialog", { name: "Command bar" })).toBeInTheDocument();
   });
 
-  it("⌘J opens the task that has waited longest, then the next (Claude on its Terminal tab); the button says i de n", async () => {
+  it("⌘J opens the task that has waited longest, then the next (Claude on its Terminal tab); the button says i of n", async () => {
     const h = setup({}, [
       task("a", { status: "needs_you", updated_at: 5, agent: "codex" }),
       task("b", { status: "needs_you", updated_at: 1 }),
       task("w", { status: "working" }),
     ]);
-    const next = screen.getByRole("button", { name: /^Próximo/ });
-    expect(next).toHaveTextContent("– de 2");
+    const next = screen.getByRole("button", { name: /^Next/ });
+    expect(next).toHaveTextContent("– of 2");
     fireEvent.keyDown(window, { key: "j", code: "KeyJ", ...mod });
     expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("button", { name: /^Próximo/ })).toHaveTextContent("1 de 2");
-    await userEvent.click(screen.getByRole("button", { name: /^Próximo/ }));
+    expect(screen.getByRole("button", { name: /^Next/ })).toHaveTextContent("1 of 2");
+    await userEvent.click(screen.getByRole("button", { name: /^Next/ }));
     expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^Próximo/ })).toHaveTextContent("2 de 2");
+    expect(screen.getByRole("button", { name: /^Next/ })).toHaveTextContent("2 of 2");
     // Back to the first.
     fireEvent.keyDown(window, { key: "j", code: "KeyJ", ...mod });
     expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
@@ -338,7 +338,7 @@ describe("App", () => {
 
   it("⌘J waits while a form field is being typed in; with nothing waiting, the button is off", () => {
     setup({}, [task("w", { status: "working" })]);
-    expect(screen.getByRole("button", { name: /^Próximo/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Next/ })).toBeDisabled();
     const goal = screen.getByLabelText("Goal");
     goal.focus();
     fireEvent.keyDown(goal, { key: "j", code: "KeyJ", ...mod });
@@ -354,9 +354,9 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Detail" })).toBeDisabled();
   });
 
-  it("Próximo's tooltip says its shortcut and that it waits while typing", () => {
+  it("Next's tooltip says its shortcut and that it waits while typing", () => {
     setup({}, [task("n", { status: "needs_you" })]);
-    const title = screen.getByRole("button", { name: /^Próximo/ }).getAttribute("title") ?? "";
+    const title = screen.getByRole("button", { name: /^Next/ }).getAttribute("title") ?? "";
     expect(title).toMatch(/[⌘C].*J/);
     expect(title).toMatch(/not while typing/i);
   });
@@ -387,7 +387,7 @@ describe("App", () => {
 
   it("the Skills view opens from the nav and the command bar", async () => {
     setup({ "skill.tenants": [], "skill.list": [], "skill.proposals": [] });
-    const nav = () => within(screen.getByRole("navigation", { name: "Views" })).getByRole("button", { name: "Skills" });
+    const nav = () => within(screen.getByRole("navigation", { name: "Views" })).getByRole("button", { name: /^Skills/ });
     await userEvent.click(nav());
     expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Home/ }));
@@ -442,5 +442,132 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Detail" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.keyDown(window, { key: "b", ...mod });
     expect(await screen.findByRole("heading", { name: "Memory of shop" })).toBeInTheDocument();
+  });
+  describe("coming back to Home", () => {
+    it("Home → Detail → Home keeps where the list was scrolled", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      setup({}, [task("a", { status: "working" }), task("b", { status: "working" })]);
+      const list = () => screen.getByRole("main", { name: "Inbox" }).querySelector(".cards") as HTMLElement;
+      list().scrollTop = 140;
+      fireEvent.scroll(list());
+      await act(async () => new Promise<void>((r) => requestAnimationFrame(() => r())));
+      openViaPalette("goal of a");
+      expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(list().scrollTop).toBe(140);
+    });
+
+    it("the dispatch form keeps its attached context and edited branch across a visit elsewhere", async () => {
+      setup({ "repo.files": ["src/login.ts"] });
+      await userEvent.type(screen.getByLabelText("Goal"), "Fix the login");
+      await userEvent.click(screen.getByRole("button", { name: "Edit branch" }));
+      const name = screen.getByLabelText("Branch");
+      await userEvent.clear(name);
+      await userEvent.type(name, "feat/mine");
+      await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+      const dialog = screen.getByRole("dialog", { name: "Add context" });
+      await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
+      await userEvent.keyboard("{Escape}");
+      await userEvent.click(screen.getByRole("button", { name: /^Grid/ }));
+      await userEvent.click(screen.getByRole("button", { name: /^Home/ }));
+      expect(screen.getByLabelText("Goal")).toHaveValue("Fix the login");
+      expect(screen.getByLabelText("Branch")).toHaveValue("feat/mine");
+      expect(within(screen.getByRole("list", { name: "Attached context" })).getByText("src/login.ts")).toBeInTheDocument();
+    });
+
+    it("Escape goes back to the view the detail was opened from, and Home focuses the card it came from", async () => {
+      setup({}, [task("a", { status: "working" }), task("z", { repo_path: "/repos/other", status: "working" })]);
+      await userEvent.click(screen.getByRole("button", { name: "goal of a" }));
+      expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "goal of a" }));
+      fireEvent.keyDown(window, { key: "g", ...mod });
+      openViaPalette("goal of z");
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.getByRole("main", { name: "Agent grid" })).toBeInTheDocument();
+    });
+  });
+
+  it("a remembered project that is no longer listed falls back to the first one", () => {
+    const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [] });
+    h.env.storage.setItem("mirante.ui", JSON.stringify({ mode: "home", taskId: null, project: "/repos/removed", tab: null, scroll: 0 }));
+    h.env.storage.setItem("mirante.repos", JSON.stringify(["/repos/shop"]));
+    render(<App env={h.env} />);
+    act(() => h.load([task("a")]));
+    expect(screen.getByRole("button", { name: "shop" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("starts on Home with storage that throws on every call", () => {
+    const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [] });
+    const boom = () => {
+      throw new Error("SecurityError");
+    };
+    h.env.storage = { getItem: boom, setItem: boom };
+    render(<App env={h.env} />);
+    act(() => h.load([task("a")]));
+    expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "J", shiftKey: true, ...mod });
+    expect(document.documentElement.dataset.theme).toBe("light");
+  });
+
+  it("⌘L opens Skills, and the command bar shows its chord", async () => {
+    setup({ "skill.tenants": [], "skill.list": [], "skill.proposals": [] });
+    fireEvent.keyDown(window, { key: "l", code: "KeyL", ...mod });
+    expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    const option = screen.getAllByRole("option").find((o) => o.textContent?.startsWith("Go to Skills"));
+    expect(option?.querySelector("kbd")?.textContent).toMatch(/L$/);
+  });
+
+  it("clicking a task's notification opens it", () => {
+    let click: ((taskId: string) => void) | null = null;
+    const h2 = makeEnv({ "daemon.status": STATUS, "message.list_queued": [] });
+    h2.env.onNoteClick = (fn) => {
+      click = fn;
+      return () => {
+        click = null;
+      };
+    };
+    render(<App env={h2.env} />);
+    act(() => h2.load([task("a", { status: "needs_you", agent: "codex" })]));
+    act(() => click!("a"));
+    expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+  });
+
+  it("while the daemon is down, dispatch is off and the banner counts down", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const h = setup();
+    await act(async () => {});
+    act(() => h.env.cockpit.dispatch({ type: "disconnected", error: "no socket", retryMs: 3000 }));
+    const banner = screen.getByRole("status", { name: "Daemon connection" });
+    expect(banner).toHaveTextContent("Retrying in 3s");
+    act(() => vi.advanceTimersByTime(1000));
+    expect(banner).toHaveTextContent("Retrying in 2s");
+    fireEvent.change(screen.getByLabelText("Goal"), { target: { value: "do it" } });
+    expect(screen.getByRole("button", { name: "Dispatch" })).toBeDisabled();
+  });
+
+  describe("language", () => {
+    it("switches the interface to Portuguese and back, remembered, with <html lang>", async () => {
+      const h = setup({}, [task("n", { status: "needs_you" })]);
+      expect(document.documentElement.lang).toBe("en");
+      expect(screen.getByRole("heading", { name: /^Needs you/ })).toBeInTheDocument();
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Language" }), "pt");
+      expect(document.documentElement.lang).toBe("pt");
+      expect(h.env.storage.getItem("mirante.lang")).toBe("pt");
+      expect(screen.getByRole("heading", { name: /^Precisa de você/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Próximo/ })).toBeInTheDocument();
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Idioma" }), "en");
+      expect(screen.getByRole("heading", { name: /^Needs you/ })).toBeInTheDocument();
+    });
+
+    it("starts in the remembered language, else the system's", () => {
+      const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [] });
+      h.env.storage.setItem("mirante.lang", "pt");
+      render(<App env={h.env} />);
+      expect(document.documentElement.lang).toBe("pt");
+      expect(screen.getByRole("button", { name: /^Comandos/ })).toBeInTheDocument();
+    });
   });
 });

@@ -39,12 +39,21 @@ export function addRepo(store: KV, raw: string): Added {
   if (n.path === "/") return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
   const repos = loadRepos(store);
   if (!repos.includes(n.path)) repos.push(n.path);
-  store.setItem(REPOS_KEY, JSON.stringify(repos));
+  save(store, repos);
   return { ok: true, repos };
 }
 
 export function removeRepo(store: KV, path: string): string[] {
   const repos = loadRepos(store).filter((p) => p !== path);
-  store.setItem(REPOS_KEY, JSON.stringify(repos));
+  save(store, repos);
   return repos;
+}
+
+/** Storage that refuses (a private window, blocked site data): the list holds for this run. */
+function save(store: KV, repos: string[]): void {
+  try {
+    store.setItem(REPOS_KEY, JSON.stringify(repos));
+  } catch {
+    // Not remembered past this run.
+  }
 }
