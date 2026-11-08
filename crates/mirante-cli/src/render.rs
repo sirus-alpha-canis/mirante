@@ -1,12 +1,15 @@
 //! Plain-text tables. Colors only on a terminal (`color` = stdout is a tty).
+use mirante_core::dna::untrusted::line;
 use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
-use mirante_ipc::types::{BootState, DoctorReport, MemView, PermissionView, ProposalView, SystemView, TaskView};
+use mirante_ipc::types::{
+    AnchorView, BootState, DoctorReport, MemView, NoteSummary, NoteView, PermissionView, ProposalView, SystemView,
+    TaskView,
+};
 
 /// A proposal as the review prompt shows it: status, title (or the person's new title),
 /// kind, origin, redactions, cited code and body. Control characters are stripped (the text
 /// came from an agent and goes to a terminal).
 pub fn proposal(p: &ProposalView, new_title: Option<&str>) -> String {
-    use mirante_core::dna::untrusted::line;
     let mut out = format!("Proposal {} ({}, {} from {})\n", p.id, p.status, p.kind, p.origin);
     out.push_str(&format!("  title: {}\n", line(&p.title, 200)));
     if let Some(t) = new_title {
@@ -31,6 +34,105 @@ pub fn proposal(p: &ProposalView, new_title: Option<&str>) -> String {
     }
     if p.body.lines().count() > 40 {
         out.push_str("  | …\n");
+    }
+    out
+}
+
+/// One anchor in `mirante memory check`: `state  slug  path:start-end`, then the reason
+/// when there is one. Text from notes goes to a terminal: controls stripped.
+pub fn check_line(state: &str, slug: &str, path: &str, start: u32, end: u32, reason: Option<&str>) -> String {
+    let mut out = format!("{}  {}  {}:{start}-{end}", line(state, 20), line(slug, 120), line(path, 300));
+    if let Some(r) = reason.filter(|r| !r.is_empty()) {
+        out.push_str(&format!("  {}", line(r, 300)));
+    }
+    out
+}
+
+/// What `check` says about an anchor the daemon reported (a relocated one: where it is now).
+pub fn anchor_reason(a: &AnchorView) -> Option<String> {
+    match (a.now_start, a.now_end, &a.reason) {
+        (Some(s), Some(e), _) if a.state == "relocated" => Some(format!("now at lines {s}-{e}")),
+        (_, _, r) => r.clone(),
+    }
+}
+
+fn review_label(reviewed: bool) -> &'static str {
+    if reviewed {
+        "reviewed"
+    } else {
+        "unreviewed"
+    }
+}
+
+/// Notes as a table: state, review, kind, slug, title (retired ones say so).
+pub fn notes_table(notes: &[NoteSummary]) -> String {
+    let mut out =
+        format!("{}{}{}{}{}\n", fit("STATE", 13), fit("REVIEW", 11), fit("KIND", 9), fit("SLUG", 32), "TITLE");
+    for n in notes {
+        let state = if n.status == "retired" { "retired".to_string() } else { line(&n.state, 12) };
+        out.push_str(&format!(
+            "{}{}{}{}{}\n",
+            fit(&state, 13),
+            fit(review_label(n.reviewed), 11),
+            fit(&line(&n.kind, 8), 9),
+            fit(&line(&n.slug, 31), 32),
+            line(&n.title, 120)
+        ));
+    }
+    out
+}
+
+/// One note in full: title, state, review, the code it cites, links, then the body.
+pub fn note_view(n: &NoteView) -> String {
+    let s = &n.summary;
+    let mut out = format!("{}  ({})\n", line(&s.title, 200), line(&s.slug, 120));
+    out.push_str(&format!(
+        "  {} · {} · {} · {} · source {}\n",
+        line(&s.kind, 20),
+        line(&s.status, 20),
+        line(&s.state, 20),
+        review_label(s.reviewed),
+        line(&n.source, 120)
+    ));
+    for a in &s.anchors {
+        let symbol = a.symbol.as_deref().map(|x| format!(" ({})", line(x, 100))).unwrap_or_default();
+        let why = anchor_reason(a).map(|r| format!(": {}", line(&r, 300))).unwrap_or_default();
+        out.push_str(&format!(
+            "  cites: {}:{}-{}{symbol} @ {}  {}{why}\n",
+            line(&a.path, 300),
+            a.start,
+            a.end,
+            &a.commit[..a.commit.len().min(7)],
+            line(&a.state, 20)
+        ));
+    }
+    let slugs = |v: &[String]| v.iter().map(|x| format!("[[{}]]", line(x, 120))).collect::<Vec<_>>().join(", ");
+    if !n.links.is_empty() {
+        out.push_str(&format!("  links: {}\n", slugs(&n.links)));
+    }
+    if !n.backlinks.is_empty() {
+        out.push_str(&format!("  backlinks: {}\n", slugs(&n.backlinks)));
+    }
+    out.push_str(&format!("  file: {}\n\n", line(&n.path, 500)));
+    for l in n.body.lines() {
+        out.push_str(&format!("  | {}\n", line(l, 500)));
+    }
+    out
+}
+
+/// The review queue: full id (what `accept` takes), status, origin, kind, title.
+pub fn proposals_table(ps: &[ProposalView]) -> String {
+    let mut out = format!("{}{}{}{}{}\n", fit("ID", 38), fit("STATUS", 10), fit("FROM", 7), fit("KIND", 9), "TITLE");
+    for p in ps {
+        let redacted = if p.redactions > 0 { format!("  ({} redacted)", p.redactions) } else { String::new() };
+        out.push_str(&format!(
+            "{}{}{}{}{}{redacted}\n",
+            fit(&line(&p.id, 37), 38),
+            fit(&line(&p.status, 9), 10),
+            fit(&line(&p.origin, 6), 7),
+            fit(&line(&p.kind, 8), 9),
+            line(&p.title, 120)
+        ));
     }
     out
 }
@@ -273,6 +375,41 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
 mod tests {
     use super::*;
     use mirante_core::model::{PermissionStatus, Task};
+
+    fn summary(slug: &str, state: &str, reviewed: bool) -> serde_json::Value {
+        serde_json::json!({"slug": slug, "title": "Spool <b>\u{1b}[2J", "kind": "gotcha", "status": "active",
+            "state": state, "reviewed": reviewed, "anchors": [{"path": "src/a.rs", "symbol": "spool", "start": 1,
+            "end": 3, "commit": "50ea8cc255941e739b13cdbe2c937abca0319834", "state": "relocated",
+            "reason": null, "now_start": 4, "now_end": 6}]})
+    }
+
+    #[test]
+    fn check_lines_name_state_slug_and_lines() {
+        assert_eq!(check_line("stale", "hook-spool", "src/a.rs", 1, 2, None), "stale  hook-spool  src/a.rs:1-2");
+        assert_eq!(
+            check_line("stale", "a", "b.rs", 3, 4, Some("text changed\u{1b}[2J")),
+            "stale  a  b.rs:3-4  text changed[2J"
+        );
+        let a: AnchorView = serde_json::from_value(summary("a", "fresh", true)["anchors"][0].clone()).unwrap();
+        assert_eq!(anchor_reason(&a).as_deref(), Some("now at lines 4-6"));
+    }
+
+    #[test]
+    fn notes_and_one_note_render_without_terminal_controls() {
+        let n: NoteSummary = serde_json::from_value(summary("hook-spool", "stale", false)).unwrap();
+        let t = notes_table(&[n]);
+        assert!(t.starts_with("STATE"), "{t}");
+        let row = t.lines().nth(1).unwrap();
+        assert!(row.starts_with("stale") && row.contains("unreviewed") && row.contains("hook-spool"), "{row}");
+        assert!(row.contains("Spool <b>[2J") && !t.contains('\u{1b}'), "{row}");
+        let mut v = summary("hook-spool", "fresh", true);
+        let extra = serde_json::json!({"body": "one\n\u{1b}]0;x\u{7}two", "links": ["b"], "backlinks": [],
+            "content_hash": "h", "source": "cli", "path": "/r/.mirante/memory/hook-spool.md"});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let full = note_view(&serde_json::from_value(v).unwrap());
+        assert!(full.contains("cites: src/a.rs:1-3 (spool) @ 50ea8cc  relocated: now at lines 4-6"), "{full}");
+        assert!(full.contains("links: [[b]]") && full.contains("  | one") && !full.contains('\u{1b}'), "{full}");
+    }
 
     #[test]
     fn a_proposal_prompt_shows_what_is_decided_without_terminal_controls() {

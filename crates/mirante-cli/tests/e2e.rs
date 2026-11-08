@@ -389,3 +389,228 @@ fn memory_review_without_a_terminal_is_refused_before_the_daemon() {
     }
     assert!(!env.home.join("daemon.sock").exists(), "the daemon was never started");
 }
+
+/// Git in `dir` with a fixed identity.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+impl Env {
+    fn commit(&self, dir: &Path, path: &str, text: &str) {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+        git(dir, &["add", "-A", "--", path]);
+        git(dir, &["commit", "-q", "-m", path]);
+    }
+
+    /// The repo with `src/a.rs` committed and a committed note `hook-spool` citing
+    /// `path:start-end` of it at that commit.
+    fn repo_with_note_citing(&self, path: &str, start: u32, end: u32) -> PathBuf {
+        use mirante_core::dna::check::cite;
+        use mirante_core::dna::note::{render, Kind, Note, Status};
+        self.commit(&self.repo, path, "fn spool() {\n    write();\n}\n");
+        let anchor = cite(&self.repo, "HEAD", path, None, start, end).unwrap();
+        let note = Note {
+            id: "0193b7c2-5f1e-7c3a-9a10-3f2b8d1e4c55".into(),
+            title: "Hook events fall back to the spool".into(),
+            kind: Kind::Gotcha,
+            status: Status::Active,
+            created: "2026-11-07".into(),
+            source: "cli".into(),
+            anchors: vec![anchor],
+            body: "When the socket is down, events go to the spool.\n".into(),
+        };
+        self.commit(&self.repo, ".mirante/memory/hook-spool.md", &render(&note).unwrap());
+        self.repo.clone()
+    }
+
+    fn mirante_in(&self, dir: &Path, args: &[&str]) -> Output {
+        self.cmd(&bin("mirante")).args(args).current_dir(dir).stdin(Stdio::null()).output().unwrap()
+    }
+
+    fn ok_in(&self, dir: &Path, args: &[&str]) -> String {
+        let out = self.mirante_in(dir, args);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "mirante {args:?}: {text}{}", String::from_utf8_lossy(&out.stderr));
+        text
+    }
+
+    /// `mirante <args>` on a pseudo-terminal (`script`), typing `answer` once it asks.
+    /// Returns everything it printed.
+    fn on_tty(&self, dir: &Path, args: &[&str], answer: &str) -> String {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        let mirante = bin("mirante");
+        let mut cmd = self.cmd(Path::new("script"));
+        if cfg!(target_os = "macos") {
+            cmd.args(["-q", "/dev/null"]).arg(&mirante).args(args);
+        } else {
+            let quoted: Vec<String> = std::iter::once(mirante.to_string_lossy().into_owned())
+                .chain(args.iter().map(|a| a.to_string()))
+                .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+                .collect();
+            cmd.args(["-q", "-e", "-c", &quoted.join(" "), "/dev/null"]);
+        }
+        let mut child =
+            cmd.current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut stdout = child.stdout.take().unwrap();
+        let sink = seen.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        wait_until("the confirmation prompt", || seen.lock().unwrap().contains("to confirm"));
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(format!("{answer}\n").as_bytes()).unwrap();
+        child.wait().unwrap();
+        drop(stdin);
+        reader.join().unwrap();
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+}
+
+#[test]
+fn memory_check_offline_exits_1_on_stale_and_names_the_note() {
+    let env = Env::new();
+    let repo = env.repo_with_note_citing("src/a.rs", 1, 2);
+    // From a subdirectory too: the repo is the checkout around it.
+    let out = env.mirante_in(&repo.join("src"), &["memory", "check", "--offline"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("fresh  hook-spool  src/a.rs:1-2"), "{text}");
+
+    env.commit(&repo, "src/a.rs", "changed\n");
+    let out = env.mirante_in(&repo, &["memory", "check", "--offline"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("stale  hook-spool  src/a.rs:1-2"), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 stale"), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // Against the earlier commit (a PR's base, say) the note still holds.
+    let out = env.mirante_in(&repo, &["memory", "check", "--offline", "--rev", "HEAD~1"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!env.home.join("daemon.sock").exists(), "offline never starts the daemon");
+}
+
+#[test]
+fn memory_enable_ls_accept_round_trip_through_the_daemon() {
+    use mirante_core::model::AgentKind;
+    use mirante_ipc::types::{CreateTask, DnaProposals, ProposalView};
+    let env = Env::new();
+    let repo = env.repo.clone();
+    assert!(env.ok_in(&repo, &["memory", "enable"]).contains("enabled"));
+    assert!(repo.join(".mirante/memory/README.md").exists());
+    assert!(env.ok_in(&repo, &["memory", "ls"]).contains("no notes"));
+
+    // A task to cite from (no session needed): committed code in its worktree.
+    let create = CreateTask {
+        repo: repo.to_string_lossy().into_owned(),
+        agent: AgentKind::Claude,
+        branch: "mem".into(),
+        base: None,
+        goal: "g".into(),
+        title: None,
+    };
+    let t: TaskView = env.client().call(method::TASK_CREATE, create).unwrap();
+    env.commit(Path::new(&t.task.worktree_path), "src/a.rs", "fn spool() {\n    write();\n}\n");
+    let out = env.ok_in(
+        &repo,
+        &[
+            "memory",
+            "propose",
+            "--task",
+            "mem",
+            "--title",
+            "Spool falls back",
+            "--kind",
+            "gotcha",
+            "--cite",
+            "src/a.rs:1-3#spool",
+            "uses TOKEN=ghp_0123456789abcdefghijABCDEFGHIJ012345 when down",
+        ],
+    );
+    assert!(out.contains("waiting for review") && out.contains("1 secret"), "{out}");
+    let queue = env.ok_in(&repo, &["memory", "proposals"]);
+    assert!(queue.contains("Spool falls back") && queue.contains("cli"), "{queue}");
+    let pending: Vec<ProposalView> = env.client().call(method::DNA_PROPOSALS, DnaProposals::default()).unwrap();
+    let id = pending[0].id.clone();
+
+    let out = env.on_tty(&repo, &["memory", "accept", &id], "accept");
+    assert!(out.contains("accepted: .mirante/memory/spool-falls-back.md"), "{out}");
+    assert!(env.ok_in(&repo, &["memory", "proposals"]).contains("no pending proposals"));
+    assert!(env.ok_in(&repo, &["memory", "proposals", "--all"]).contains("accepted"));
+
+    let ls = env.ok_in(&repo, &["memory", "ls"]);
+    assert!(ls.lines().any(|l| l.contains("spool-falls-back") && l.contains("reviewed")), "{ls}");
+    let show = env.ok_in(&repo, &["memory", "show", "spool-falls-back"]);
+    assert!(
+        show.contains("Spool falls back") && show.contains("src/a.rs:1-3") && show.contains("«redacted»"),
+        "{show}"
+    );
+    assert!(!show.contains("ghp_0123"), "{show}");
+    assert!(env.ok_in(&repo, &["memory", "search", "spool"]).contains("spool-falls-back"));
+    // The accepted note cites code only on the task branch: the checkout's HEAD lacks it.
+    let check = env.mirante_in(&repo, &["memory", "check"]);
+    assert_eq!(check.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&check.stdout).contains("spool-falls-back  src/a.rs:1-3"));
+    // Once the code lands on the checkout the note holds there, and a person confirms it.
+    env.commit(&repo, "src/a.rs", "fn spool() {\n    write();\n}\n");
+    assert!(env.ok_in(&repo, &["memory", "check"]).contains("fresh  spool-falls-back  src/a.rs:1-3"));
+    let out = env.on_tty(&repo, &["memory", "confirm", "spool-falls-back"], "confirm");
+    assert!(out.contains("confirmed spool-falls-back"), "{out}");
+    let text = std::fs::read_to_string(repo.join(".mirante/memory/spool-falls-back.md")).unwrap();
+    let head = String::from_utf8(
+        Command::new("git").arg("-C").arg(&repo).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+    )
+    .unwrap();
+    assert!(text.contains(&format!("@{}~", head.trim())), "re-anchored at the checkout's HEAD: {text}");
+
+    // A wrong word decides nothing; retire keeps the file.
+    let out = env.on_tty(&repo, &["memory", "retire", "spool-falls-back"], "yes");
+    assert!(out.contains("not confirmed"), "{out}");
+    let out = env.on_tty(&repo, &["memory", "retire", "spool-falls-back"], "retire");
+    assert!(out.contains("retired spool-falls-back"), "{out}");
+    let text = std::fs::read_to_string(repo.join(".mirante/memory/spool-falls-back.md")).unwrap();
+    assert!(text.contains("status: retired"), "{text}");
+
+    assert!(env.ok_in(&repo, &["memory", "disable"]).contains("disabled"));
+    assert!(repo.join(".mirante/memory/spool-falls-back.md").exists());
+}
+
+/// `confirm` and `retire` are person decisions like `accept`: no terminal, no decision.
+#[test]
+fn memory_note_actions_without_a_terminal_are_refused_before_the_daemon() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    for verb in ["confirm", "retire"] {
+        let mut cmd = env.cmd(&bin("mirante"));
+        cmd.args(["memory", verb, "a-note"]).current_dir(&env.repo).stdin(Stdio::null());
+        // SAFETY: setsid is async-signal-safe; it detaches the child from any terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(err.contains("/dev/tty") && err.contains("cockpit"), "{err}");
+    }
+    assert!(!env.home.join("daemon.sock").exists(), "the daemon was never started");
+}

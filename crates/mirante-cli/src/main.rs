@@ -11,16 +11,17 @@ use std::time::Duration;
 use mirante_core::model::{PermissionRequest, Status};
 use mirante_ipc::rpc::code;
 use mirante_ipc::types::{
-    method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, DnaProposals, DnaReview,
-    DoctorReport, EditQueued, KillOrphan, ListParams, OrphanView, PermissionView, ProposalView, QueueRef,
-    QueuedMessage, QueuedRef, ReorderQueue, ResizeParams, SendMessage, SendMode, SendResult, Snapshot, StartResult,
-    StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
+    method, AnswerPermission, AttachParams, AttachResult, BootState, CheckReport, CreateTask, DaemonStatus, DnaGet,
+    DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus, DoctorReport,
+    EditQueued, KillOrphan, ListParams, NoteAction, NoteSummary, NoteView, OrphanView, PermissionView, ProposalView,
+    ProposeAnchor, QueueRef, QueuedMessage, QueuedRef, ReorderQueue, ResizeParams, SendMessage, SendMode, SendResult,
+    Snapshot, StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
 use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, USAGE};
-use mirante_cli::{confirm, daemon_ctl, render, term};
+use mirante_cli::{confirm, daemon_ctl, memcheck, render, term};
 
 type Res = Result<(), Box<dyn Error>>;
 
@@ -289,11 +290,21 @@ fn watch(paths: &Paths) -> Res {
     }
 }
 
+/// The repo a memory command names: `repo`, else the current directory (the daemon
+/// resolves the checkout around it).
+fn repo_or_cwd(repo: Option<String>) -> Result<String, Box<dyn Error>> {
+    let p = match repo {
+        Some(r) => std::path::PathBuf::from(r),
+        None => std::env::current_dir()?,
+    };
+    let canonical = std::fs::canonicalize(&p).map_err(|e| format!("repo {}: {e}", p.display()))?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
 /// `mirante memory accept|reject`: the typed confirmation happens on the controlling
 /// terminal, which is checked before the daemon is contacted; the daemon refuses
 /// Mirante-launched agents on its side.
-fn memory(paths: &Paths, m: MemoryCmd) -> Res {
-    let MemoryCmd::Review { id, accept, title, note } = m;
+fn memory_review(paths: &Paths, id: String, accept: bool, title: Option<String>, note: Option<String>) -> Res {
     let mut tty = confirm::DevTty::open()?;
     let mut c = client(paths)?;
     let query = DnaProposals { id: Some(id.clone()), status: Some("all".into()), ..Default::default() };
@@ -308,6 +319,177 @@ fn memory(paths: &Paths, m: MemoryCmd) -> Res {
         None => println!("rejected {}", render::short(&d.id)),
     }
     Ok(())
+}
+
+/// `mirante memory confirm|retire`: like accept, a person's decision typed on the
+/// controlling terminal (checked before the daemon is contacted). The action carries the
+/// hash of the note the person was shown, so a file changed meanwhile is refused.
+fn memory_note_action(paths: &Paths, slug: String, repo: Option<String>, confirm: bool) -> Res {
+    let mut tty = confirm::DevTty::open()?;
+    let repo = repo_or_cwd(repo)?;
+    let mut c = client(paths)?;
+    let n: NoteView = c.call(method::DNA_GET, DnaGet { at: DnaRef { repo: Some(repo.clone()), task: None }, slug })?;
+    let (word, action) = if confirm { ("confirm", NoteAction::Confirm) } else { ("retire", NoteAction::Retire) };
+    confirm::typed(&mut tty, &render::note_view(&n), word)?;
+    let slug = n.summary.slug.clone();
+    let a = DnaNoteAction { repo, slug: slug.clone(), action, expect_hash: n.content_hash };
+    let v: NoteView = c.call(method::DNA_NOTE_ACTION, a)?;
+    if confirm {
+        println!("confirmed {slug}: re-anchored at HEAD and marked reviewed ({}; not committed)", v.path);
+    } else {
+        println!("retired {slug}: the file stays, with status: retired ({}; not committed)", v.path);
+    }
+    Ok(())
+}
+
+/// `mirante memory check`: one line per anchor; a stale or unverifiable anchor (or a note
+/// that does not parse) is an error, so the exit status fails a CI job.
+fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offline: bool) -> Res {
+    if offline {
+        let dir = match repo {
+            Some(r) => std::path::PathBuf::from(r),
+            None => std::env::current_dir()?,
+        };
+        let top = memcheck::toplevel(&dir)?;
+        let (r, sha) = memcheck::check(&top, rev.as_deref().unwrap_or("HEAD"))?;
+        for l in &r.lines {
+            println!("{l}");
+        }
+        let summary = r.summary(&sha[..sha.len().min(12)]);
+        if r.failed() {
+            return Err(format!("memory check failed: {summary}").into());
+        }
+        println!("{summary}");
+        return Ok(());
+    }
+    let repo = repo_or_cwd(repo)?;
+    let mut c = client(paths)?;
+    let at = DnaRef { repo: Some(repo), task: None };
+    let report: CheckReport = c.call(method::DNA_CHECK, &at)?;
+    let graph: DnaGraph = c.call(method::DNA_GRAPH, &at)?;
+    let (mut stale, mut unverifiable, mut anchors) = (0, 0, 0);
+    for bad in &report.invalid {
+        println!("invalid  {}  {}", mirante_core::dna::untrusted::line(&bad.file, 200), bad.error);
+    }
+    for n in graph.nodes.iter().filter(|n| n.status == "active") {
+        for a in &n.anchors {
+            anchors += 1;
+            match a.state.as_str() {
+                "stale" => stale += 1,
+                "unverifiable" => unverifiable += 1,
+                _ => {}
+            }
+            println!(
+                "{}",
+                render::check_line(&a.state, &n.slug, &a.path, a.start, a.end, render::anchor_reason(a).as_deref())
+            );
+        }
+    }
+    let head = report.head.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("HEAD");
+    let summary = format!(
+        "{} notes, {anchors} anchors checked at {head}: {stale} stale, {unverifiable} unverifiable, {} invalid",
+        report.notes,
+        report.invalid.len()
+    );
+    if stale + unverifiable + report.invalid.len() > 0 {
+        return Err(format!("memory check failed: {summary}").into());
+    }
+    println!("{summary}");
+    Ok(())
+}
+
+fn memory(paths: &Paths, m: MemoryCmd) -> Res {
+    match m {
+        MemoryCmd::Review { id, accept, title, note } => memory_review(paths, id, accept, title, note),
+        MemoryCmd::NoteAction { slug, repo, confirm } => memory_note_action(paths, slug, repo, confirm),
+        MemoryCmd::Check { repo, rev, offline } => memory_check(paths, repo, rev, offline),
+        MemoryCmd::Enable { repo, on } => {
+            let repo = repo_or_cwd(repo)?;
+            let at = DnaRef { repo: Some(repo), task: None };
+            let st: DnaStatus = client(paths)?.call(if on { method::DNA_ENABLE } else { method::DNA_DISABLE }, at)?;
+            if st.enabled {
+                println!(
+                    "memory enabled for {}: new sessions of its tasks get the memory tools ({} notes in .mirante/memory/)",
+                    st.repo, st.notes
+                );
+            } else {
+                println!("memory disabled for {}: new sessions start without it; the notes stay", st.repo);
+            }
+            Ok(())
+        }
+        MemoryCmd::Ls { repo } => {
+            let repo = repo_or_cwd(repo)?;
+            let g: DnaGraph =
+                client(paths)?.call(method::DNA_GRAPH, DnaRef { repo: Some(repo.clone()), task: None })?;
+            if g.nodes.is_empty() {
+                println!("no notes in {repo}/.mirante/memory");
+            } else {
+                print!("{}", render::notes_table(&g.nodes));
+            }
+            Ok(())
+        }
+        MemoryCmd::Show { slug, repo } => {
+            let at = DnaRef { repo: Some(repo_or_cwd(repo)?), task: None };
+            let n: NoteView = client(paths)?.call(method::DNA_GET, DnaGet { at, slug })?;
+            print!("{}", render::note_view(&n));
+            Ok(())
+        }
+        MemoryCmd::Search { query, repo } => {
+            let at = DnaRef { repo: Some(repo_or_cwd(repo)?), task: None };
+            let hits: Vec<NoteSummary> =
+                client(paths)?.call(method::DNA_SEARCH, DnaSearch { at, query, limit: Some(25) })?;
+            if hits.is_empty() {
+                println!("no notes matched");
+            } else {
+                print!("{}", render::notes_table(&hits));
+            }
+            Ok(())
+        }
+        MemoryCmd::Proposals { repo, all } => {
+            let repo = match repo {
+                Some(r) => Some(repo_or_cwd(Some(r))?),
+                None => None,
+            };
+            let mut c = client(paths)?;
+            let mut list: Vec<ProposalView> = Vec::new();
+            loop {
+                let q = DnaProposals {
+                    repo: repo.clone(),
+                    status: all.then(|| "all".to_string()),
+                    after: list.last().map(|p| p.id.clone()),
+                    limit: Some(200),
+                    ..Default::default()
+                };
+                let page: Vec<ProposalView> = c.call(method::DNA_PROPOSALS, q)?;
+                let more = page.len() == 200;
+                list.extend(page);
+                if !more {
+                    break;
+                }
+            }
+            if list.is_empty() {
+                println!("{}", if all { "no proposals" } else { "no pending proposals" });
+            } else {
+                print!("{}", render::proposals_table(&list));
+            }
+            Ok(())
+        }
+        MemoryCmd::Propose { task, title, kind, cites, body } => {
+            let anchors = cites
+                .into_iter()
+                .map(|c| ProposeAnchor { path: c.path, symbol: c.symbol, start: c.start, end: c.end })
+                .collect();
+            let p: ProposalView =
+                client(paths)?.call(method::DNA_PROPOSE, DnaPropose { task, title, kind, body, anchors })?;
+            let redacted = match p.redactions {
+                0 => String::new(),
+                1 => " (1 secret redacted)".to_string(),
+                n => format!(" ({n} secrets redacted)"),
+            };
+            println!("proposal {} waiting for review{redacted}: mirante memory accept|reject {}", p.id, p.id);
+            Ok(())
+        }
+    }
 }
 
 fn run(cmd: Cmd) -> Res {

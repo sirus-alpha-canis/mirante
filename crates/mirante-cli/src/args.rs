@@ -32,13 +32,28 @@ usage: mirante <command>
   wake <task> [--trust]  resume a hibernated task on its native conversation
   doctor [--kill <pid>]  orphan processes / checkouts and memory; --kill asks, then kills one orphan
   archive <task>         remove the worktree (branch kept) and hide the task
+  memory enable|disable [<repo>]
+                         repo memory for new sessions of the repo's tasks (explicit, per repo)
+  memory ls [<repo>] | memory show <slug> [--repo <r>] | memory search <query...> [--repo <r>]
+                         notes with their state (fresh, stale, unverifiable) and review
+  memory proposals [--repo <r>] [--all]
+                         the review queue (--all: decided ones too)
   memory accept <proposal> [--title <t>] [--note <why>] | memory reject <proposal> [--note <why>]
-                         decide a memory proposal; you type the verb on this terminal to
-                         confirm (Mirante-launched agents are refused)
+  memory confirm <slug> [--repo <r>] | memory retire <slug> [--repo <r>]
+                         a person's decision: you type the verb on this terminal to confirm
+                         (Mirante-launched agents are refused). Confirm re-anchors at HEAD;
+                         retire keeps the file with status retired
+  memory check [<repo>] [--offline [--rev <rev>]]
+                         recheck every anchor; exits 1 when one is stale or unverifiable.
+                         --offline reads the files and git directly (no daemon; for CI)
+  memory propose --task <task> --title <t> --kind fact|decision|pattern|gotcha
+                 --cite <path:start-end[#symbol]>... <body...>
+                         propose a note yourself, citing committed code in the task worktree
   daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade
 
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
+<repo> defaults to the git checkout of the current directory.
 <perm> is a permission id or a unique suffix.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,10 +64,66 @@ pub enum QueueCmd {
     Mv { task: String, n: usize, to: usize },
 }
 
+/// Code a hand-written proposal cites: `path:start-end[#symbol]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cite {
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+    pub symbol: Option<String>,
+}
+
+/// `mirante memory …`. A `repo` of `None` means the current directory's checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryCmd {
     /// Accept (writes the note, optionally retitled) or reject a proposal.
-    Review { id: String, accept: bool, title: Option<String>, note: Option<String> },
+    Review {
+        id: String,
+        accept: bool,
+        title: Option<String>,
+        note: Option<String>,
+    },
+    /// `enable` (`on`) or `disable` memory for new sessions of the repo's tasks.
+    Enable {
+        repo: Option<String>,
+        on: bool,
+    },
+    Ls {
+        repo: Option<String>,
+    },
+    Show {
+        slug: String,
+        repo: Option<String>,
+    },
+    Search {
+        query: String,
+        repo: Option<String>,
+    },
+    /// The review queue (`all`: decided ones too).
+    Proposals {
+        repo: Option<String>,
+        all: bool,
+    },
+    /// `confirm` (re-anchor at HEAD, mark reviewed) or `retire` a note.
+    NoteAction {
+        slug: String,
+        repo: Option<String>,
+        confirm: bool,
+    },
+    /// Recheck every anchor; `offline` reads the files and git directly, no daemon.
+    Check {
+        repo: Option<String>,
+        rev: Option<String>,
+        offline: bool,
+    },
+    /// A person's own proposal, cited at the task worktree's HEAD.
+    Propose {
+        task: String,
+        title: String,
+        kind: String,
+        cites: Vec<Cite>,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,12 +197,15 @@ pub enum Cmd {
 
 struct Parsed {
     positional: Vec<String>,
+    /// The last value of each flag.
     values: HashMap<String, String>,
+    /// Every flag value, in order (for repeatable flags).
+    all: Vec<(String, String)>,
     bools: Vec<String>,
 }
 
 fn split(args: &[String], with_value: &[&str], bools: &[&str]) -> Result<Parsed, String> {
-    let mut p = Parsed { positional: Vec::new(), values: HashMap::new(), bools: Vec::new() };
+    let mut p = Parsed { positional: Vec::new(), values: HashMap::new(), all: Vec::new(), bools: Vec::new() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--" {
@@ -151,6 +225,7 @@ fn split(args: &[String], with_value: &[&str], bools: &[&str]) -> Result<Parsed,
                 Some(v) => v,
                 None => it.next().cloned().ok_or_else(|| format!("{name} needs a value"))?,
             };
+            p.all.push((name.to_string(), v.clone()));
             p.values.insert(name.to_string(), v);
         } else if bools.contains(&name) && inline.is_none() {
             p.bools.push(name.to_string());
@@ -184,17 +259,110 @@ fn position(v: &str) -> Result<usize, String> {
     v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{v} is not a queue position (1 = next)"))
 }
 
-fn memory(args: &[String]) -> Result<MemoryCmd, String> {
-    let (op, rest) = args.split_first().ok_or("memory accept|reject <proposal>")?;
-    let accept = match op.as_str() {
-        "accept" => true,
-        "reject" => false,
-        other => return Err(format!("unknown memory command {other} (accept, reject)")),
+const MEMORY_VERBS: &str =
+    "enable, disable, ls, show, search, proposals, accept, reject, confirm, retire, check, propose";
+
+/// At most one positional: the repo (default: the current directory's checkout).
+fn repo_arg(p: &Parsed) -> Result<Option<String>, String> {
+    match p.positional.as_slice() {
+        [] => Ok(None),
+        [r] => Ok(Some(r.clone())),
+        more => Err(format!("expected at most one <repo>, got {}", more.len())),
+    }
+}
+
+/// `path:start-end[#symbol]`, 1-based inclusive lines.
+fn cite(v: &str) -> Result<Cite, String> {
+    let bad = || format!("--cite {v}: expected path:start-end[#symbol]");
+    let (path, rest) = v.rsplit_once(':').ok_or_else(bad)?;
+    let (range, symbol) = match rest.split_once('#') {
+        Some((r, s)) if !s.is_empty() => (r, Some(s.to_string())),
+        Some(_) => return Err(bad()),
+        None => (rest, None),
     };
-    let flags: &[&str] = if accept { &["--title", "--note"] } else { &["--note"] };
-    let p = split(rest, flags, &[])?;
-    let id = one(&p, "proposal")?;
-    Ok(MemoryCmd::Review { id, accept, title: p.values.get("--title").cloned(), note: p.values.get("--note").cloned() })
+    let (a, b) = range.split_once('-').ok_or_else(bad)?;
+    let line = |x: &str| x.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(bad);
+    let (start, end) = (line(a)?, line(b)?);
+    if path.is_empty() || end < start {
+        return Err(format!("--cite {v}: lines must be start-end with start <= end"));
+    }
+    Ok(Cite { path: path.to_string(), start, end, symbol })
+}
+
+fn memory(args: &[String]) -> Result<MemoryCmd, String> {
+    let (op, rest) = args.split_first().ok_or(format!("memory <command> ({MEMORY_VERBS})"))?;
+    let none: &[&str] = &[];
+    let repo_flag = |p: &Parsed| p.values.get("--repo").cloned();
+    match op.as_str() {
+        "accept" | "reject" => {
+            let accept = op == "accept";
+            let flags: &[&str] = if accept { &["--title", "--note"] } else { &["--note"] };
+            let p = split(rest, flags, none)?;
+            let id = one(&p, "proposal")?;
+            Ok(MemoryCmd::Review {
+                id,
+                accept,
+                title: p.values.get("--title").cloned(),
+                note: p.values.get("--note").cloned(),
+            })
+        }
+        "enable" | "disable" => {
+            Ok(MemoryCmd::Enable { repo: repo_arg(&split(rest, none, none)?)?, on: op == "enable" })
+        }
+        "ls" | "list" => Ok(MemoryCmd::Ls { repo: repo_arg(&split(rest, none, none)?)? }),
+        "show" => {
+            let p = split(rest, &["--repo"], none)?;
+            Ok(MemoryCmd::Show { slug: one(&p, "slug")?, repo: repo_flag(&p) })
+        }
+        "search" => {
+            let p = split(rest, &["--repo"], none)?;
+            let query = p.positional.join(" ");
+            if query.trim().is_empty() {
+                return Err("missing <query>".into());
+            }
+            Ok(MemoryCmd::Search { query, repo: repo_flag(&p) })
+        }
+        "proposals" => {
+            let p = split(rest, &["--repo"], &["--all"])?;
+            if !p.positional.is_empty() {
+                return Err("proposals takes no arguments (use --repo)".into());
+            }
+            Ok(MemoryCmd::Proposals { repo: repo_flag(&p), all: !p.bools.is_empty() })
+        }
+        "confirm" | "retire" => {
+            let p = split(rest, &["--repo"], none)?;
+            Ok(MemoryCmd::NoteAction { slug: one(&p, "slug")?, repo: repo_flag(&p), confirm: op == "confirm" })
+        }
+        "check" => {
+            let p = split(rest, &["--rev"], &["--offline"])?;
+            let offline = !p.bools.is_empty();
+            let rev = p.values.get("--rev").cloned();
+            if rev.is_some() && !offline {
+                return Err("--rev needs --offline (the daemon checks the checkout's HEAD)".into());
+            }
+            Ok(MemoryCmd::Check { repo: repo_arg(&p)?, rev, offline })
+        }
+        "propose" => {
+            let p = split(rest, &["--task", "--title", "--kind", "--cite"], none)?;
+            let task = p.values.get("--task").cloned().ok_or("missing --task <task>")?;
+            let title = p.values.get("--title").cloned().ok_or("missing --title <title>")?;
+            let kind = p.values.get("--kind").cloned().ok_or("missing --kind fact|decision|pattern|gotcha")?;
+            if !["fact", "decision", "pattern", "gotcha"].contains(&kind.as_str()) {
+                return Err(format!("unknown kind {kind} (fact, decision, pattern, gotcha)"));
+            }
+            let cites: Vec<Cite> =
+                p.all.iter().filter(|(k, _)| k == "--cite").map(|(_, v)| cite(v)).collect::<Result<_, _>>()?;
+            if cites.is_empty() {
+                return Err("missing --cite path:start-end[#symbol]".into());
+            }
+            let body = p.positional.join(" ");
+            if body.trim().is_empty() {
+                return Err("missing <body>".into());
+            }
+            Ok(MemoryCmd::Propose { task, title, kind, cites, body })
+        }
+        other => Err(format!("unknown memory command {other} ({MEMORY_VERBS})")),
+    }
 }
 
 fn queue(args: &[String]) -> Result<QueueCmd, String> {
@@ -399,7 +567,76 @@ mod tests {
         );
         assert_eq!(p("memory reject p1 --title x").unwrap_err(), "unknown option --title");
         assert_eq!(p("memory accept").unwrap_err(), "missing <proposal>");
-        assert_eq!(p("memory forget p1").unwrap_err(), "unknown memory command forget (accept, reject)");
+        assert!(p("memory forget p1").unwrap_err().starts_with("unknown memory command forget ("));
+    }
+
+    #[test]
+    fn memory_subcommands_parse() {
+        let m = |s: &str| {
+            p(s).map(|c| match c {
+                Cmd::Memory(m) => m,
+                other => panic!("{other:?}"),
+            })
+        };
+        assert_eq!(m("memory enable").unwrap(), MemoryCmd::Enable { repo: None, on: true });
+        assert_eq!(m("memory disable ~/app").unwrap(), MemoryCmd::Enable { repo: Some("~/app".into()), on: false });
+        assert_eq!(m("memory ls").unwrap(), MemoryCmd::Ls { repo: None });
+        assert_eq!(m("memory ls /r").unwrap(), MemoryCmd::Ls { repo: Some("/r".into()) });
+        assert_eq!(
+            m("memory show hook-spool --repo /r").unwrap(),
+            MemoryCmd::Show { slug: "hook-spool".into(), repo: Some("/r".into()) }
+        );
+        assert_eq!(
+            m("memory search hook spool fallback").unwrap(),
+            MemoryCmd::Search { query: "hook spool fallback".into(), repo: None }
+        );
+        assert_eq!(
+            m("memory proposals --all --repo /r").unwrap(),
+            MemoryCmd::Proposals { repo: Some("/r".into()), all: true }
+        );
+        assert_eq!(m("memory proposals").unwrap(), MemoryCmd::Proposals { repo: None, all: false });
+        assert_eq!(
+            m("memory confirm a-note").unwrap(),
+            MemoryCmd::NoteAction { slug: "a-note".into(), repo: None, confirm: true }
+        );
+        assert_eq!(
+            m("memory retire a-note --repo /r").unwrap(),
+            MemoryCmd::NoteAction { slug: "a-note".into(), repo: Some("/r".into()), confirm: false }
+        );
+        assert_eq!(m("memory check").unwrap(), MemoryCmd::Check { repo: None, rev: None, offline: false });
+        assert_eq!(
+            m("memory check /r --offline --rev HEAD~1").unwrap(),
+            MemoryCmd::Check { repo: Some("/r".into()), rev: Some("HEAD~1".into()), offline: true }
+        );
+        assert_eq!(
+            m("memory propose --task feat --title Spool --kind gotcha --cite src/a.rs:1-3#spool --cite b.rs:4-4 uses the spool")
+                .unwrap(),
+            MemoryCmd::Propose {
+                task: "feat".into(),
+                title: "Spool".into(),
+                kind: "gotcha".into(),
+                cites: vec![
+                    Cite { path: "src/a.rs".into(), start: 1, end: 3, symbol: Some("spool".into()) },
+                    Cite { path: "b.rs".into(), start: 4, end: 4, symbol: None },
+                ],
+                body: "uses the spool".into(),
+            }
+        );
+        // Errors.
+        assert_eq!(m("memory check --offline --rev").unwrap_err(), "--rev needs a value");
+        assert!(m("memory check --rev HEAD").unwrap_err().contains("--offline"));
+        assert_eq!(m("memory search").unwrap_err(), "missing <query>");
+        assert_eq!(m("memory show").unwrap_err(), "missing <slug>");
+        assert_eq!(m("memory ls a b").unwrap_err(), "expected at most one <repo>, got 2");
+        assert!(m("memory forget x").unwrap_err().starts_with("unknown memory command forget"));
+        assert!(m("memory").is_err());
+        let propose = "memory propose --task t --title T --kind fact";
+        assert_eq!(m(&format!("{propose} body")).unwrap_err(), "missing --cite path:start-end[#symbol]");
+        assert_eq!(m(&format!("{propose} --cite a.rs:1-2")).unwrap_err(), "missing <body>");
+        assert!(m(&format!("{propose} --cite a.rs:2-1 b")).unwrap_err().contains("a.rs:2-1"));
+        assert!(m(&format!("{propose} --cite a.rs b")).unwrap_err().contains("path:start-end"));
+        assert!(m("memory propose --task t --title T --kind rumor --cite a.rs:1-1 b").unwrap_err().contains("gotcha"));
+        assert_eq!(m("memory propose --title T --kind fact --cite a.rs:1-1 b").unwrap_err(), "missing --task <task>");
     }
 
     #[test]
