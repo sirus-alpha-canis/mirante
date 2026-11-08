@@ -554,6 +554,45 @@ impl Hub {
         }
     }
 
+    /// The projection a socket caller's read of `at` gets, or why it may not read. A person
+    /// reads any repo or task. A Mirante-launched agent reads only through its own task
+    /// (named as `task`, never as a `repo` path), and only while that repo's memory is
+    /// enabled, so disabling it stops a running session's reads too. An agent whose task is
+    /// unknown, and a caller that could not be checked, are refused (like `dna.propose`).
+    pub fn read_view(&self, caller: &Caller, at: &DnaRef) -> Result<View> {
+        let own = |why: &str| {
+            HubError::Forbidden(format!("{why}: a Mirante-launched agent can only read memory for its own task"))
+        };
+        let task = match self.identify(caller) {
+            Identity::Person => return Ok(View::Person),
+            Identity::Agent { task: Some(t) } => t,
+            Identity::Agent { task: None } => return Err(own("this agent's task is unknown")),
+            Identity::Unverified(why) => return Err(HubError::Forbidden(why)),
+        };
+        let named = match (&at.task, &at.repo) {
+            (Some(n), None) => self.lock().resolve(n)?.id,
+            _ => return Err(own("name the task, not a repo")),
+        };
+        if named != task {
+            return Err(own("another task was named"));
+        }
+        let repo = self.dna_repo_of(at)?;
+        self.require_enabled(&key_of(&repo))?;
+        Ok(View::Agent)
+    }
+
+    /// `dna.search` for a socket caller (see [`Hub::read_view`]).
+    pub fn dna_search_from(&self, caller: &Caller, p: DnaSearch) -> Result<Vec<NoteSummary>> {
+        let view = self.read_view(caller, &p.at)?;
+        self.dna_search_in(view, p)
+    }
+
+    /// `dna.get` for a socket caller (see [`Hub::read_view`]).
+    pub fn dna_get_from(&self, caller: &Caller, p: DnaGet) -> Result<NoteView> {
+        let view = self.read_view(caller, &p.at)?;
+        self.dna_get_in(view, p)
+    }
+
     pub fn dna_search(&self, p: DnaSearch) -> Result<Vec<NoteSummary>> {
         self.dna_search_in(View::Person, p)
     }
@@ -1319,6 +1358,45 @@ pub(crate) mod tests {
         let mixed = Peer::spawn(&[(TASK_ENV, &mine.id), (AGENT_ENV, &other.id)], k.dir.path());
         assert_eq!(k.hub.identify(&mixed.caller()), Identity::Agent { task: None });
         forbidden_with(k.hub.dna_propose(&mixed.caller(), propose(&mine.id, "T", "b", "src/a.rs", 1, 1)), "task");
+    }
+
+    #[test]
+    fn an_agent_reads_only_its_own_tasks_memory_and_only_while_it_is_enabled() {
+        let k = Kit::new();
+        with_two_notes(&k);
+        let mine = k.create(AgentKind::Claude, "mine").task;
+        let other = k.create(AgentKind::Claude, "other").task;
+        let agent = Peer::spawn(&[(AGENT_ENV, &mine.id)], k.dir.path());
+        let caller = agent.caller();
+        let at = |task: Option<&str>, repo: bool| DnaRef {
+            task: task.map(str::to_string),
+            repo: repo.then(|| k.repo.to_string_lossy().into_owned()),
+        };
+        let search =
+            |c: &Caller, at: DnaRef| k.hub.dna_search_from(c, DnaSearch { at, query: "spool".into(), limit: None });
+        let get = |c: &Caller, at: DnaRef| k.hub.dna_get_from(c, DnaGet { at, slug: "hook-spool".into() });
+        // Its own task (by id or by branch): the agent view.
+        let hits = search(&caller, at(Some(&mine.id), false)).unwrap();
+        assert_eq!(hits[0].slug, "hook-spool");
+        assert_eq!(get(&caller, at(Some("mine"), false)).unwrap().summary.slug, "hook-spool");
+        // Another task, a repo path, or both: refused.
+        forbidden_with(search(&caller, at(Some(&other.id), false)), "its own task");
+        forbidden_with(get(&caller, at(Some(&other.id), false)), "its own task");
+        forbidden_with(search(&caller, at(None, true)), "its own task");
+        forbidden_with(get(&caller, at(Some(&mine.id), true)), "its own task");
+        // An agent whose task is unknown, or a caller that could not be checked: refused.
+        let lost = Peer::spawn(&[(TASK_ENV, &mine.id), (AGENT_ENV, &other.id)], k.dir.path());
+        forbidden_with(search(&lost.caller(), at(Some(&mine.id), false)), "task is unknown");
+        forbidden_with(get(&Caller::Unknown, at(Some(&mine.id), false)), "could not read");
+        // A person reads any repo or task (the cockpit, the CLI).
+        assert_eq!(search(&Caller::Person, at(None, true)).unwrap().len(), 1);
+        assert_eq!(get(&Caller::Person, at(Some(&other.id), false)).unwrap().summary.slug, "hook-spool");
+        // Disabling the repo stops a running session's reads; a person still reads.
+        k.hub.dna_disable(&k.repo_ref(), &Caller::Person).unwrap();
+        let off = search(&caller, at(Some(&mine.id), false));
+        assert!(matches!(&off, Err(HubError::Conflict(m)) if m.contains("not enabled")), "{off:?}");
+        assert!(matches!(get(&caller, at(Some(&mine.id), false)), Err(HubError::Conflict(_))));
+        assert_eq!(search(&Caller::Person, at(None, true)).unwrap().len(), 1);
     }
 
     #[test]

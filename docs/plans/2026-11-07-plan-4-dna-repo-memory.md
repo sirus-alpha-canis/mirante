@@ -55,6 +55,7 @@ All frontend commands use `pnpm --dir apps/cockpit …`.
    - `Hub::identify` calls a peer a **Mirante-launched agent** when any sign says so: it is a live session's process-tree root or below it; its environment carries `MIRANTE_TASK=<task id>` (set on every Claude and Codex spawn, inherited by everything an agent starts, so it survives a double fork, `setsid`, a tmux/screen server, `osascript`, `launchctl`, `at`, and a daemon restart; Claude's `MIRANTE_TASK_ID` counts too); or it works inside the worktree root. The environment is read from `KERN_PROCARGS2` (macOS) or `/proc/<pid>/environ` (Linux).
    - It fails closed: a peer whose environment or working directory cannot be read is **unverified** and refused review, with what to do instead (the cockpit, or the CLI in a terminal you opened yourself). macOS hides the environment of Apple platform binaries (`nc`, `perl`, `python3`, `osascript` in `/bin` and `/usr/bin`) from other processes, so a raw `nc -U` on the socket is refused; the `mirante` CLI and the cockpit are not platform binaries.
    - A `memory_propose` whose claimed task differs from the task the signs name is refused; so is one from an agent whose task is unknown (only a worktree cwd, or markers that disagree).
+   - Reads are bound the same way (Batch C review): `dna.search` and `dna.get` from a Mirante-launched agent must name its own task (`task`, never a `repo` path) and need the repo's memory to be enabled, so disabling it stops a running session's reads too. An agent whose task is unknown, and an unverified caller, are refused. People (the cockpit, the CLI) read any repo or task, enabled or not.
    - `dna.review`, `dna.note_action`, `dna.enable` and `dna.disable` are refused (`FORBIDDEN`) for Mirante-launched agents and unverified callers. The CLI's `mirante memory accept|reject` also asks the person to type the verb on `/dev/tty` and refuses without a controlling terminal. This is defense in depth: agents run as the same uid, so the socket cannot be a hard boundary (see Risks).
 7. **Explicit install, never global.**
    - `mirante memory enable <repo>` (or the cockpit's **Enable repo memory**) creates `.mirante/memory/README.md` and sets `dna_repos.enabled = 1`. Only then do new sessions of that repo's tasks get the MCP config.
@@ -114,8 +115,8 @@ path[#symbol]:L<start>-<end>@<commit 40|64 hex>~<fingerprint 16 hex>
 | `dna.status` | `{repo}` → `{enabled, dir, notes, stale, unreviewed, pending, head}` | cockpit, CLI, MCP |
 | `dna.enable` / `dna.disable` | `{repo}` → `DnaStatus` | person only (Mirante-launched agents refused) |
 | `dna.graph` | `{repo}` → `{nodes: NoteSummary[], links: {src,dst,dangling}[]}` | cockpit, CLI |
-| `dna.search` | `{repo?\|task?, query, limit?}` → `NoteSummary[]` | all |
-| `dna.get` | `{repo?\|task?, slug}` → `NoteView` | all |
+| `dna.search` | `{repo?\|task?, query, limit?}` → `NoteSummary[]` | people: any repo or task; a Mirante-launched agent: its own `task` only, enabled repos only |
+| `dna.get` | `{repo?\|task?, slug}` → `NoteView` | as `dna.search` |
 | `dna.check` | `{repo}` → `CheckReport` (reindex and recheck anchors at checkout HEAD) | cockpit, CLI |
 | `dna.task_context` | `{task, for_agent?}` → `{enabled, relevant, at_risk, proposals}` | cockpit; agents get the escaped view |
 | `dna.propose` | `{task, title, kind, body, anchors:[{path,symbol?,start,end}]}` → `ProposalView` | MCP (agent) and CLI |

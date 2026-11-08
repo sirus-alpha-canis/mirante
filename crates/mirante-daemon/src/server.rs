@@ -313,8 +313,8 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
         method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, caller)),
         method::DNA_DISABLE => out(hub.dna_disable(&params(p)?, caller)),
         method::DNA_GRAPH => out(hub.dna_graph_in(hub.view_for(caller, false), &params(p)?)),
-        method::DNA_SEARCH => out(hub.dna_search_in(hub.view_for(caller, false), params(p)?)),
-        method::DNA_GET => out(hub.dna_get_in(hub.view_for(caller, false), params(p)?)),
+        method::DNA_SEARCH => out(hub.dna_search_from(caller, params(p)?)),
+        method::DNA_GET => out(hub.dna_get_from(caller, params(p)?)),
         method::DNA_CHECK => out(hub.dna_check(&params(p)?)),
         method::DNA_PROPOSE => out(hub.dna_propose(caller, params(p)?)),
         method::DNA_PROPOSALS => {
@@ -531,11 +531,14 @@ mod tests {
         let title = |v: &Value| v[0]["title"].as_str().unwrap().to_string();
         let search = json!({"repo": k.repo, "query": "use"});
         assert_eq!(title(&dispatch(&k.hub, method::DNA_SEARCH, search.clone()).unwrap()), "Use <b> here");
-        // A Mirante-launched agent gets the agent view, whatever it asks for.
+        // A Mirante-launched agent gets the agent view, through its own task only.
         let agent = Peer::spawn(&[("MIRANTE_TASK", &t.id)], k.dir.path());
-        let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_SEARCH, search).unwrap();
+        let e = dispatch_from(&k.hub, &agent.caller(), method::DNA_SEARCH, search).unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN, "{e:?}");
+        let own = json!({"task": t.id, "query": "use"});
+        let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_SEARCH, own).unwrap();
         assert_eq!(title(&v), "Use &lt;b> here");
-        let get = json!({"repo": k.repo, "slug": "n"});
+        let get = json!({"task": t.id, "slug": "n"});
         let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_GET, get.clone()).unwrap();
         assert!(v["body"].as_str().unwrap().contains("Body &lt;i>."), "{v}");
         let v = dispatch(&k.hub, method::DNA_GET, get).unwrap();
