@@ -42,23 +42,35 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features mirante-bridge/fake -- -D warnings
 pnpm --dir apps/cockpit test
 pnpm --dir apps/cockpit typecheck
+cargo deny check                   # if you changed dependencies (cargo install cargo-deny --locked)
 ```
+
+Dependabot ([`.github/dependabot.yml`](.github/dependabot.yml)) opens weekly update PRs for
+the actions, both Cargo workspaces and the app's npm packages.
 
 ### CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull request and every
-push to `main`. It uses no secrets and has read-only access to the repo.
+push to `main` (a new push to a pull request cancels its older run; runs on `main` always
+finish). It uses no secrets and has read-only access to the repo.
 
 - **rust (macOS)**, the main gate: `cargo build --workspace --all-targets`,
   `cargo test --workspace` (the e2e tests run against a fake `claude`; the real-agent tests
-  stay ignored), both clippy passes above with `-D warnings`, and the e2e suite again on its
-  own (`cargo test -p mirante-cli --test e2e`).
+  stay ignored) and both clippy passes above with `-D warnings`.
 - **rust (Linux)**: clippy on the whole workspace (`-D warnings`, as on macOS), and the `mirante-core` and `mirante-ipc`
   tests as the gate. The rest of the workspace's tests also run there, but only as
   information, until the daemon's Linux paths have been proven.
 - **cockpit (macOS)**: in `apps/cockpit`, `pnpm install --frozen-lockfile`, `pnpm test`,
   `pnpm typecheck` and `pnpm build`, then `cargo test` and
   `cargo clippy --all-targets -- -D warnings` in `src-tauri` (its own workspace).
+- **cargo deny**: licenses and RustSec advisories ([`deny.toml`](deny.toml)) for the
+  workspace and for `apps/cockpit/src-tauri`. Locally: `cargo install cargo-deny --locked`,
+  then `cargo deny check` and `cargo deny --manifest-path apps/cockpit/src-tauri/Cargo.toml
+  check` from the repo root. A new dependency under another license needs a discussion.
+- **shellcheck**: `scripts/install.sh`, `uninstall.sh` and `try.sh` (warnings and errors).
+- **install.sh (macOS, main only)**: `scripts/install.sh` into a temp prefix with its own
+  `MIRANTE_HOME`, `mirante --version`, `daemon status`, `doctor`, a second `install.sh`
+  run, `scripts/try.sh --smoke` and `scripts/uninstall.sh`.
 - **rustfmt (non-blocking)**: `cargo fmt --all --check`, reported as a warning only, since
   the tree is not formatted yet.
 

@@ -1,0 +1,49 @@
+# cargo-deny: licenses and security advisories of every Rust dependency.
+# CI runs `cargo deny check` for the workspace and for apps/cockpit/src-tauri.
+# Local: cargo install cargo-deny --locked && cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory database: a vulnerability or an unsound crate fails the check; an
+# unmaintained crate is reported for direct dependencies.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+# One list for both workspaces: a license only the app uses is not a warning here.
+unused-allowed-license = "allow"
+# Permissive licenses compatible with shipping Mirante under Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+]
+
+[licenses.private]
+# The workspace's own crates (publish = false).
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

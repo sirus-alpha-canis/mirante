@@ -7,9 +7,10 @@ on:
   push:
     branches: [main]
 
+# A new push to a PR cancels its older run; every push to main runs to the end.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -48,7 +49,8 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # The e2e tests run the built binaries (mirante, mirante-daemon, mirante-hook).
+      # The e2e tests (part of the workspace run) use the built binaries (mirante,
+      # mirante-daemon, mirante-hook, mirante-mcp).
       - name: cargo build --workspace
         run: cargo build --workspace --all-targets --locked
       - name: cargo test --workspace
@@ -57,9 +59,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo clippy (mirante-bridge/fake)
         run: cargo clippy --workspace --all-targets --locked --features mirante-bridge/fake -- -D warnings
-      # Already part of the workspace run; repeated on its own so an e2e failure is obvious.
-      - name: cargo test e2e
-        run: cargo test -p mirante-cli --test e2e --locked
 
   # Linux is partially supported: the workspace compiles and is linted there; the core
   # crates' tests gate, the rest of the workspace's tests are informational until proven.
@@ -105,9 +104,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The pnpm version comes from package.json's packageManager.
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 10
           package_json_file: apps/cockpit/package.json
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -139,6 +138,78 @@ jobs:
       - name: cargo clippy (src-tauri)
         working-directory: apps/cockpit/src-tauri
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  # A new user's path, on main only (it builds release): scripts/install.sh into a temp
+  # prefix with its own MIRANTE_HOME, then --version, doctor and the try.sh tour.
+  install:
+    name: install.sh (macOS, main)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      # Short on purpose: the socket path must fit in about 104 bytes.
+      MIRANTE_HOME: /tmp/mci-home
+      # Hosted runners have no agents; the tour uses the fake one.
+      MIRANTE_MEMGUARD: "off"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Git identity
+        run: |
+          git config --global user.name "Mirante CI"
+          git config --global user.email "ci@example.invalid"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: install-release
+      - name: scripts/install.sh
+        run: scripts/install.sh --prefix "$RUNNER_TEMP/bin"
+      - name: mirante --version, daemon status, doctor
+        run: |
+          "$RUNNER_TEMP/bin/mirante" --version
+          "$RUNNER_TEMP/bin/mirante" daemon status | grep running
+          "$RUNNER_TEMP/bin/mirante" doctor
+      - name: scripts/install.sh again (idempotent)
+        run: scripts/install.sh --prefix "$RUNNER_TEMP/bin"
+      - name: scripts/try.sh --smoke
+        run: env -u MIRANTE_HOME scripts/try.sh --smoke
+      - name: scripts/uninstall.sh
+        run: |
+          scripts/uninstall.sh --prefix "$RUNNER_TEMP/bin"
+          test ! -e "$RUNNER_TEMP/bin/mirante"
+      - name: daemon log
+        if: failure()
+        run: cat "$MIRANTE_HOME/daemon.log" || true
+
+  # Licenses and security advisories of every Rust dependency (deny.toml), both workspaces.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: cargo deny (workspace)
+        run: cargo deny check
+      - name: cargo deny (apps/cockpit/src-tauri)
+        run: cargo deny --manifest-path apps/cockpit/src-tauri/Cargo.toml check
+
+  # The shell scripts a new user runs (warnings and errors; style notes are not gates).
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck scripts
+        run: shellcheck --version && shellcheck -S warning scripts/install.sh scripts/uninstall.sh scripts/try.sh
 
   # Not a gate: the tree is not rustfmt-clean yet. Reports the drift as a warning
   # annotation and stays green. Turn it into a gate once the tree is formatted.
