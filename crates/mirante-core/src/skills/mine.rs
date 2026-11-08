@@ -9,8 +9,9 @@
 //! or containment ≥ 0.8 with the cluster's first unit. Denials cluster on (tool, the first
 //! two words of the command). A cluster qualifies with at least 3 distinct tasks; tenants
 //! never mix. [`draft`] turns one into a proposal: skipped when an active in-scope skill
-//! already says it, an edit of a skill that was active in ≥ 2/3 of its tasks, else a new
-//! always-on skill. Deterministic: the same history gives the same drafts.
+//! already says it, an edit of a repo or org skill of the same tenant that was active in
+//! ≥ 2/3 of its tasks (never a personal skill: that would carry one client's words to every
+//! other), else a new always-on skill. Deterministic: the same history gives the same drafts.
 use std::collections::{HashMap, HashSet};
 
 use super::format::{render_skill_md, Activation};
@@ -444,12 +445,23 @@ pub fn draft(
         [one] => Scope::Repo(one.clone()),
         _ => Scope::Org(c.tenant.clone()),
     };
-    // An edit when one in-scope skill was active in at least 2/3 of the cluster's tasks.
+    // An edit when one in-scope skill of the cluster's own tenant (a repo or org scope
+    // inside it) was active in at least 2/3 of the cluster's tasks. A personal skill (or one
+    // of another tenant) may cover a line but is never edited: the tenant's words would
+    // reach every other client through it.
+    let own_tenant = |s: &ActiveSkill| match &s.scope {
+        Scope::Repo(k) | Scope::Org(k) => super::origin::tenant(k) == c.tenant,
+        Scope::Personal => false,
+    };
     let ran_with = |s: &ActiveSkill| {
         c.tasks.iter().filter(|t| active_in_tasks.get(*t).is_some_and(|names| names.contains(&s.name))).count()
     };
-    let mut candidates: Vec<(&ActiveSkill, usize)> =
-        in_scope.iter().map(|s| (*s, ran_with(s))).filter(|(_, n)| n * 3 >= c.tasks.len() * 2).collect();
+    let mut candidates: Vec<(&ActiveSkill, usize)> = in_scope
+        .iter()
+        .filter(|s| own_tenant(s))
+        .map(|s| (*s, ran_with(s)))
+        .filter(|(_, n)| n * 3 >= c.tasks.len() * 2)
+        .collect();
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.name.cmp(&b.0.name)));
     if let Some((s, _)) = candidates.first() {
         let mut body = s.body.clone();
@@ -613,6 +625,28 @@ mod tests {
         // Active in only 1 of 3: a new skill.
         let once: HashMap<String, Vec<String>> = [("t1".to_string(), vec!["house-style".to_string()])].into();
         assert_eq!(draft(&c[0], &[style], &once, &[]).unwrap().kind, Kind::New);
+    }
+
+    #[test]
+    fn a_personal_or_other_tenant_skill_is_never_edited_with_a_tenants_words() {
+        // Three tasks of tenant A over two repos, an always-on personal skill active in all.
+        let mut u = clippy_three();
+        u[1].repo_key = format!("{A}/web");
+        let c = cluster(&units(&u), &Params::default());
+        let all: HashMap<String, Vec<String>> =
+            ["t1", "t2", "t3"].iter().map(|t| (t.to_string(), vec!["mine".to_string()])).collect();
+        let personal = active("mine", Scope::Personal, "Be terse.\n");
+        let d = draft(&c[0], std::slice::from_ref(&personal), &all, &[]).unwrap();
+        assert_eq!(d.kind, Kind::New, "A's line would leak into every client through a personal skill");
+        assert_eq!(d.scope, Scope::org(A));
+        // A personal skill that already says it still covers it.
+        let says = active("mine", Scope::Personal, "rode cargo clippy antes de commitar\n");
+        assert!(draft(&c[0], &[says], &all, &[]).is_none());
+        // A repo or org skill of the tenant itself is an edit candidate.
+        let org = active("mine", Scope::org(A), "Be terse.\n");
+        assert!(matches!(draft(&c[0], &[org], &all, &[]).unwrap().kind, Kind::Edit { .. }));
+        let repo = active("mine", Scope::repo(&format!("{A}/api")), "Be terse.\n");
+        assert!(matches!(draft(&c[0], &[repo], &all, &[]).unwrap().kind, Kind::Edit { .. }));
     }
 
     #[test]
