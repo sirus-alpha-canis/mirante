@@ -64,6 +64,15 @@ function setup(answers: Record<string, unknown> = {}) {
 const library = () => screen.getByRole("region", { name: "Skill library" });
 
 describe("Skills view", () => {
+  it("a library that fails to load offers Retry", async () => {
+    let fail = true;
+    setup({ "skill.list": () => (fail ? rpcError(4, "store broke") : LIST) });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Skills unavailable: store broke");
+    fail = false;
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByText(/Skills unavailable/)).toBeNull());
+  });
+
   it("lists skills grouped Personal / org / repo with activation, version, verified badge and 30-day usage", async () => {
     setup();
     await screen.findByRole("button", { name: /cargo-tests-first/ });

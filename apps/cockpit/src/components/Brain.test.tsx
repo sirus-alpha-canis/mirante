@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { DnaGraph, DnaStatus, NoteSummary, NoteView } from "../lib/protocol";
@@ -65,6 +65,23 @@ function setup(answers: Record<string, unknown> = {}) {
 const nodeButton = (name: string) => screen.findByRole("button", { name });
 
 describe("Brain", () => {
+  it("a failed load offers Retry", async () => {
+    let fail = true;
+    setup({ "dna.graph": () => (fail ? rpcError(4, "index broke") : GRAPH) });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Repo memory unavailable");
+    fail = false;
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await nodeButton("Boot order, stale, reviewed")).toBeInTheDocument();
+  });
+
+  it("refetches when the daemon restarts (a new boot)", async () => {
+    const h = setup();
+    await nodeButton("Boot order, stale, reviewed");
+    const before = h.calls.filter(([m]) => m === "dna.graph").length;
+    await act(async () => h.env.cockpit.dispatch({ type: "connected", snapshot: { boot_id: "b2", seq: 0, tasks: [], resumed: false } }));
+    await waitFor(() => expect(h.calls.filter(([m]) => m === "dna.graph").length).toBe(before + 1));
+  });
+
   it("renders nodes colored by state, dangling links dashed, and a legend", async () => {
     setup();
     expect(await nodeButton("Boot order, stale, reviewed")).toHaveClass("node-stale");

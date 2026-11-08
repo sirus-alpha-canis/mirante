@@ -1,13 +1,14 @@
 // The Memory tab of a task: notes this task's branch puts at risk, notes relevant to it,
 // and what it proposed. Everything shown is the daemon's person view, rendered as text.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useEnv, useSelect } from "../env";
+import { useBoot, useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { citation, dnaEnable, dnaErrorText, taskContext } from "../lib/dna";
 import type { NoteSummary, ProposalView, TaskMemoryContext, TaskView } from "../lib/protocol";
 import { M, RpcCode } from "../lib/protocol";
 import { turnsEnded } from "../store/select";
 import { NoteView, StatePill } from "./NoteView";
+import { ErrorRetry } from "./ErrorRetry";
 
 export type TaskMemory =
   | { state: "loading" }
@@ -28,6 +29,7 @@ export function redactedText(n: number): string {
 /** `dna.task_context` for `taskId`, refetched when `version` changes or on `reload()`. */
 export function useTaskMemory(taskId: string, version: number): { mem: TaskMemory; reload(): void } {
   const { rpc } = useEnv();
+  const boot = useBoot();
   const [s, setS] = useState<{ taskId: string; mem: TaskMemory }>({ taskId, mem: { state: "loading" } });
   const [nonce, setNonce] = useState(0);
   useEffect(() => {
@@ -51,7 +53,7 @@ export function useTaskMemory(taskId: string, version: number): { mem: TaskMemor
     return () => {
       live = false;
     };
-  }, [rpc, taskId, version, nonce]);
+  }, [rpc, taskId, version, nonce, boot]);
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   return { mem: s.taskId === taskId ? s.mem : { state: "loading" }, reload };
 }
@@ -181,7 +183,7 @@ export function MemoryTab({ t, mem, reload, version }: { t: TaskView; mem: TaskM
   const [open, setOpen] = useState<string | null>(null);
   if (mem.state === "loading") return <p className="muted">Reading repo memory…</p>;
   if (mem.state === "unavailable") return <p className="muted">This daemon has no repo memory. Update Mirante to use it.</p>;
-  if (mem.state === "error") return <p className="error">Repo memory unavailable: {mem.error}</p>;
+  if (mem.state === "error") return <ErrorRetry text={`Repo memory unavailable: ${mem.error}`} onRetry={reload} />;
   const { ctx } = mem;
   if (!ctx.enabled) return <EnableMemory repo={t.repo_path} onEnabled={reload} />;
   if (open) {

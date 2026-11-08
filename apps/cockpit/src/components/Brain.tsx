@@ -3,7 +3,7 @@
 // (lib/graphLayout), keyboard-reachable nodes, and a list view as the accessible fallback
 // (the only view past MAX_GRAPH_NODES). Every label is text; nothing is rendered as HTML.
 import { type KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useEnv } from "../env";
+import { useBoot, useEnv } from "../env";
 import { type DnaAvailability, dnaCheck, dnaErrorText, dnaGraph, dnaSearch, dnaStatus } from "../lib/dna";
 import { layout, MAX_GRAPH_NODES } from "../lib/graphLayout";
 import type { DnaGraph, NoteSummary } from "../lib/protocol";
@@ -12,6 +12,7 @@ import { repoName } from "../store/select";
 import { EnableMemory } from "./MemoryTab";
 import { NoteView, StatePill } from "./NoteView";
 import { ReviewQueue } from "./ReviewQueue";
+import { ErrorRetry } from "./ErrorRetry";
 
 const W = 820;
 const H = 540;
@@ -165,6 +166,7 @@ type Panel = { kind: "note"; slug: string } | { kind: "review" } | null;
  * (above 0) switches the panel to the review queue, without starting the brain over. */
 export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNonce?: number }) {
   const { rpc, cockpit } = useEnv();
+  const boot = useBoot();
   const version = useDnaRev(repo);
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [nonce, setNonce] = useState(0);
@@ -198,7 +200,7 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
     return () => {
       live = false;
     };
-  }, [rpc, cockpit, repo, version, nonce]);
+  }, [rpc, cockpit, repo, version, nonce, boot]);
 
   const shown = useMemo<DnaGraph | null>(() => {
     if (loaded.state !== "ready") return null;
@@ -253,7 +255,7 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
   let body: React.ReactNode;
   if (loaded.state === "loading") body = <p className="muted">Reading repo memory…</p>;
   else if (loaded.state === "unavailable") body = <p className="muted">This daemon has no repo memory. Update Mirante to use it.</p>;
-  else if (loaded.state === "error") body = <p className="error">Repo memory unavailable: {loaded.error}</p>;
+  else if (loaded.state === "error") body = <ErrorRetry text={`Repo memory unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />;
   else if (loaded.state === "off") body = <EnableMemory repo={repo} onEnabled={() => setNonce((n) => n + 1)} />;
   else if (shown) {
     // Missing notes are drawn too: they count toward what the layout has to place.

@@ -7,7 +7,7 @@
 // verified it (`base`): never against a folder changed outside Mirante. Long content may be
 // collapsed to scan the queue, but Accept is off while anything is hidden.
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { useEnv, useSelect } from "../env";
+import { useBoot, useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { lineDiff, splitLines } from "../lib/lineDiff";
 import type { Finding, ProposalFile, SkillBase, SkillEdits, SkillProposalView } from "../lib/protocol";
@@ -25,6 +25,7 @@ import {
   wideningWarnings,
 } from "../lib/skills";
 import { usePendingSkills, useSkillsVersion } from "../lib/useSkills";
+import { ErrorRetry } from "./ErrorRetry";
 
 /** Wait after the last edit before linting it again. */
 export const LINT_DEBOUNCE_MS = 300;
@@ -561,6 +562,7 @@ type Loaded = { state: "loading" } | { state: "ready"; list: SkillProposalView[]
  * all (the view's count); asked here when not given. */
 export function SkillProposals({ onDecided, pending: given }: { onDecided?(): void; pending?: number | null }) {
   const { rpc } = useEnv();
+  const boot = useBoot();
   const version = useSkillsVersion();
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   // A refetch that failed after a list was shown: the cards (and what was typed in them) stay.
@@ -585,7 +587,7 @@ export function SkillProposals({ onDecided, pending: given }: { onDecided?(): vo
     return () => {
       live = false;
     };
-  }, [rpc, version, nonce]);
+  }, [rpc, version, nonce, boot]);
   const decided = (id: string, text: string, conflict: boolean) => {
     if (conflict) {
       setNonce((n) => n + 1);
@@ -608,8 +610,8 @@ export function SkillProposals({ onDecided, pending: given }: { onDecided?(): vo
         </p>
       )}
       {loaded.state === "loading" && <p className="muted">Reading the queue…</p>}
-      {loaded.state === "error" && <p className="error">Review queue unavailable: {loaded.error}</p>}
-      {loaded.state === "ready" && refreshError && <p className="error small">Could not refresh the queue: {refreshError}</p>}
+      {loaded.state === "error" && <ErrorRetry text={`Review queue unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />}
+      {loaded.state === "ready" && refreshError && <ErrorRetry small text={`Could not refresh the queue: ${refreshError}`} onRetry={() => setNonce((n) => n + 1)} />}
       {loaded.state === "ready" && pending !== null && pending > loaded.list.length && loaded.list.length > 0 && (
         <p className="muted small">{`Showing the oldest ${loaded.list.length} of ${pending} proposals.`}</p>
       )}

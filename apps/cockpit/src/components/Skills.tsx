@@ -3,7 +3,7 @@
 // the selected skill beside it. Skill text is rendered as text nodes only: a SKILL.md is
 // instructions for an agent, never markup for the cockpit.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useEnv } from "../env";
+import { useBoot, useEnv } from "../env";
 import { DaemonError } from "../lib/daemon";
 import type { SkillSummary, SkillView, TenantView } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
@@ -25,6 +25,7 @@ import {
 } from "../lib/skills";
 import { usePendingSkills, useSkillsVersion } from "../lib/useSkills";
 import { SkillProposals } from "./SkillProposals";
+import { ErrorRetry } from "./ErrorRetry";
 
 const KIND_ORDER = { personal: 0, org: 1, repo: 2 } as const;
 
@@ -122,6 +123,7 @@ type Loaded = { state: "loading" } | { state: "ready"; view: SkillView } | { sta
  * (each sends the `manifest_hash` it was shown). */
 export function SkillPanel({ name, version, onChanged }: { name: string; version: number; onChanged(): void }) {
   const { rpc } = useEnv();
+  const boot = useBoot();
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [nonce, setNonce] = useState(0);
   const [scope, setScope] = useState("");
@@ -148,9 +150,9 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
     return () => {
       live = false;
     };
-  }, [rpc, name, version, nonce]);
+  }, [rpc, name, version, nonce, boot]);
   if (loaded.state === "loading") return <p className="muted">Reading {name}…</p>;
-  if (loaded.state === "error") return <p className="error">Skill unavailable: {loaded.error}</p>;
+  if (loaded.state === "error") return <ErrorRetry text={`Skill unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />;
   const v = loaded.view;
   const run = async (fn: () => Promise<string | null>) => {
     if (inFlight.current) return;
@@ -315,6 +317,7 @@ type Library =
 /** The skills view. `reviewNonce`: each new value opens the review queue. */
 export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
   const { rpc } = useEnv();
+  const boot = useBoot();
   const version = useSkillsVersion();
   const [nonce, setNonce] = useState(0);
   const [lib, setLib] = useState<Library>({ state: "loading" });
@@ -338,14 +341,14 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
     return () => {
       live = false;
     };
-  }, [rpc, version, nonce]);
+  }, [rpc, version, nonce, boot]);
   const groups = useMemo(() => (lib.state === "ready" ? groupByScope(lib.skills) : []), [lib]);
   const reload = () => setNonce((n) => n + 1);
 
   let body: React.ReactNode;
   if (lib.state === "loading") body = <p className="muted">Reading the skill library…</p>;
   else if (lib.state === "unavailable") body = <p className="muted">This daemon predates skills. Update Mirante to use them.</p>;
-  else if (lib.state === "error") body = <p className="error">Skills unavailable: {lib.error}</p>;
+  else if (lib.state === "error") body = <ErrorRetry text={`Skills unavailable: ${lib.error}`} onRetry={reload} />;
   else
     body = (
       <>

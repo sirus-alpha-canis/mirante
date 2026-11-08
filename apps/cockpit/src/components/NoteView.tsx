@@ -2,7 +2,7 @@
 // as plain text with [[links]] as buttons. Never HTML: the body is untrusted (an agent may
 // have proposed it, a teammate may have pushed it) and is rendered as React text nodes.
 import { useEffect, useRef, useState } from "react";
-import { useEnv } from "../env";
+import { useBoot, useEnv } from "../env";
 import { DaemonError } from "../lib/daemon";
 import {
   citation,
@@ -17,6 +17,7 @@ import {
 } from "../lib/dna";
 import type { AnchorView, NoteSummary, NoteView as Note } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
+import { ErrorRetry } from "./ErrorRetry";
 
 /** "stale", "unreviewed", "retired"…: the class that colors a note's state. */
 export function stateClass(n: Pick<NoteSummary, "state" | "reviewed" | "status">): string {
@@ -89,6 +90,7 @@ export function NoteView({
   onOpen(slug: string): void;
 }) {
   const { rpc } = useEnv();
+  const boot = useBoot();
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [reload, setReload] = useState(0);
   const [error, setError] = useState<{ text: string; reload: boolean } | null>(null);
@@ -119,10 +121,10 @@ export function NoteView({
     return () => {
       live = false;
     };
-  }, [rpc, atKey, slug, version, reload]);
+  }, [rpc, atKey, slug, version, reload, boot]);
 
   if (loaded.state === "loading") return <p className="muted">Reading the note…</p>;
-  if (loaded.state === "error") return <p className="error">{loaded.error}</p>;
+  if (loaded.state === "error") return <ErrorRetry text={loaded.error} onRetry={() => setReload((n) => n + 1)} />;
   const n = loaded.note;
   const act = async (action: NoteActionKind) => {
     if (inFlight.current) return;

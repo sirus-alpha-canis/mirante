@@ -2,13 +2,14 @@
 // made, waiting for a person. Nothing is ever accepted automatically. Title and body are
 // editable before Accept (the daemon redacts them again); Reject takes an optional note.
 import { useEffect, useRef, useState } from "react";
-import { useEnv, useSelect } from "../env";
+import { useBoot, useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { citation, dnaErrorText, proposals, review, shortCommit } from "../lib/dna";
 import type { ProposalView, ReviewedView } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
 import { useDnaRev } from "../lib/useDna";
 import { redactedText } from "./MemoryTab";
+import { ErrorRetry } from "./ErrorRetry";
 
 export const PAGE = 50;
 /** The daemon's largest page (`dna.proposals` limit). */
@@ -127,6 +128,7 @@ function decisionText(d: ReviewedView): string {
  * was decided here. */
 export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): void }) {
   const { rpc } = useEnv();
+  const boot = useBoot();
   const version = useDnaRev(repo);
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [nonce, setNonce] = useState(0);
@@ -147,7 +149,7 @@ export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): v
     return () => {
       live = false;
     };
-  }, [rpc, repo, version, nonce]);
+  }, [rpc, repo, version, nonce, boot]);
   const more = async () => {
     if (loaded.state !== "ready" || loaded.list.length === 0) return;
     const after = loaded.list[loaded.list.length - 1].id;
@@ -186,7 +188,7 @@ export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): v
         </p>
       )}
       {loaded.state === "loading" && <p className="muted">Reading the queue…</p>}
-      {loaded.state === "error" && <p className="error">Review queue unavailable: {loaded.error}</p>}
+      {loaded.state === "error" && <ErrorRetry text={`Review queue unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />}
       {loaded.state === "ready" &&
         (loaded.list.length === 0 ? (
           <p className="muted">Nothing waits for review.</p>
