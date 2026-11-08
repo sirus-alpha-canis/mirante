@@ -791,7 +791,10 @@ impl Hub {
         let written = library::write_version(&lib, &signer, bundle).map_err(skill_err)?;
         match commit(&written) {
             Ok(t) => {
-                if let Err(e) = library::prune(&lib, &bundle.manifest.name, KEEP_VERSIONS) {
+                // Never the current version (the index's), nor the one just written.
+                let current = self.lock().store.skill_get(&bundle.manifest.name).ok().flatten().map(|r| r.version);
+                let protect: Vec<u32> = current.into_iter().chain([written.version]).collect();
+                if let Err(e) = library::prune(&lib, &bundle.manifest.name, KEEP_VERSIONS, &protect) {
                     self.lock().log_error(None, "skill prune", &e);
                 }
                 Ok(t)

@@ -25,6 +25,8 @@ use crate::safedir::{SafeDir, SafeError};
 const MAX_META: usize = 64 * 1024;
 /// How deep a version folder's files may nest (`a/b/c.md`).
 const MAX_LEVELS: usize = 3;
+/// Most entries in one folder of a version, and most files in a version.
+const MAX_ENTRIES: usize = 64;
 
 impl From<SafeError> for SkillError {
     fn from(e: SafeError) -> Self {
@@ -171,14 +173,21 @@ pub fn write_version(lib: &Path, signer: &dyn Signer, b: &Bundle) -> Result<Writ
 }
 
 /// The regular files under `dir`, as `/`-separated paths below `prefix`. A symlink or any
-/// other non-file, non-directory entry is [`SkillError::Modified`].
+/// other non-file, non-directory entry is [`SkillError::Modified`], and so is a folder with
+/// more than [`MAX_ENTRIES`] entries or a version with more than that many files: never a
+/// listing cut short, which would leave entries past the cut unseen.
 fn walk(dir: &SafeDir, prefix: &str, depth: usize, out: &mut Vec<String>) -> Result<(), SkillError> {
     if depth > MAX_LEVELS {
         return Err(SkillError::Modified(format!("{prefix} is nested too deep")));
     }
-    for e in dir.entries(64)? {
+    let entries = dir.entries(MAX_ENTRIES)?;
+    if entries.len() > MAX_ENTRIES {
+        let at = if prefix.is_empty() { "the version folder" } else { prefix };
+        return Err(SkillError::Modified(format!("{at} has too many entries")));
+    }
+    for e in entries {
         let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
-        if out.len() > 64 {
+        if out.len() >= MAX_ENTRIES {
             return Err(SkillError::Modified("too many files".into()));
         }
         if e.is_dir() {
@@ -286,9 +295,9 @@ pub fn remove_version(lib: &Path, name: &str, version: u32) -> Result<(), SkillE
 }
 
 /// Keeps the newest `keep` versions of `name` and removes the older ones (and staging
-/// folders a crashed write left), through descriptors, under the skill's lock. Returns the
-/// versions removed.
-pub fn prune(lib: &Path, name: &str, keep: usize) -> Result<Vec<u32>, SkillError> {
+/// folders a crashed write left), through descriptors, under the skill's lock. A version in
+/// `protect` (the ledger's current one) is never removed. Returns the versions removed.
+pub fn prune(lib: &Path, name: &str, keep: usize, protect: &[u32]) -> Result<Vec<u32>, SkillError> {
     check_name(name)?;
     let (parent, lib_name) = split_lib(lib)?;
     let Some(dir) = SafeDir::open(parent, &[lib_name, name])? else {
@@ -303,7 +312,7 @@ pub fn prune(lib: &Path, name: &str, keep: usize) -> Result<Vec<u32>, SkillError
         entries.iter().filter(|e| e.is_dir()).filter_map(|e| parse_version_dir(&e.name)).collect();
     versions.sort_unstable();
     let old = versions.len().saturating_sub(keep);
-    let removed: Vec<u32> = versions[..old].to_vec();
+    let removed: Vec<u32> = versions[..old].iter().copied().filter(|v| !protect.contains(v)).collect();
     for v in &removed {
         dir.remove_tree(&version_dir(*v))?;
     }
@@ -520,10 +529,26 @@ mod tests {
             write_version(&lib, &signer(), &bundle("a", v)).unwrap();
         }
         std::fs::create_dir(lib.join("a/.stage-crashed")).unwrap();
-        assert_eq!(prune(&lib, "a", KEEP_VERSIONS).unwrap(), [1, 2, 3]);
-        assert_eq!(list_versions(&lib, "a").unwrap(), (4..=KEEP_VERSIONS as u32 + 3).collect::<Vec<_>>());
+        // The current version (the ledger's) is never pruned, however old.
+        assert_eq!(prune(&lib, "a", KEEP_VERSIONS, &[2]).unwrap(), [1, 3]);
+        let mut left = vec![2];
+        left.extend(4..=KEEP_VERSIONS as u32 + 3);
+        assert_eq!(list_versions(&lib, "a").unwrap(), left);
         assert!(!lib.join("a/.stage-crashed").exists());
-        assert!(prune(&lib, "a", KEEP_VERSIONS).unwrap().is_empty());
+        assert!(prune(&lib, "a", KEEP_VERSIONS, &[2]).unwrap().is_empty());
+        assert_eq!(prune(&lib, "a", KEEP_VERSIONS, &[]).unwrap(), [2]);
+    }
+
+    #[test]
+    fn a_version_folder_with_too_many_entries_is_refused_whatever_their_order() {
+        let (_home, lib) = lib_dir();
+        let v = write_version(&lib, &signer(), &bundle("a", 1)).unwrap();
+        // Empty folders hold no file, but past the listing limit they would hide one.
+        for i in 0..70 {
+            std::fs::create_dir(lib.join(format!("a/v1/d{i:02}"))).unwrap();
+        }
+        let r = read_verified(&lib, "a", 1, &v.manifest_hash, FAKE_KEY, &verifier());
+        assert!(matches!(&r, Err(SkillError::Modified(m)) if m.contains("too many")), "{r:?}");
     }
 
     #[test]
