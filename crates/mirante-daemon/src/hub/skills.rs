@@ -1219,6 +1219,23 @@ impl Hub {
                     continue;
                 }
             };
+            // The index row is not signed: only what it narrows counts. The signed manifest
+            // must agree on the scope and still match this task's origin, name this agent,
+            // and its hash must be the one a person last reviewed.
+            let reviewed = self.lock().store.skill_is_reviewed(&row.name, &row.manifest_hash).unwrap_or(false);
+            let mismatch = if v.manifest.scope != row.scope || !v.manifest.scope.matches(&origin.origin) {
+                Some("its index scope does not match its signed manifest")
+            } else if !v.manifest.agents.iter().any(|a| a == agent) {
+                Some("its signed manifest does not name this agent")
+            } else if !reviewed {
+                Some("not the version a person last reviewed")
+            } else {
+                None
+            };
+            if let Some(why) = mismatch {
+                r.refused.push((row.name, row.version, why.into()));
+                continue;
+            }
             let size = v.files.iter().find(|(p, _)| p == SKILL_MD).map_or(0, |(_, b)| b.len());
             let is_always = v.manifest.activation == Activation::Always;
             if count >= BUDGET_SKILLS || (is_always && always + size > BUDGET_ALWAYS) {
@@ -2199,6 +2216,62 @@ pub(crate) mod tests {
         );
         assert!(k.kinds(&t.id).contains(&"skill.refused".to_string()));
         assert!(k.payloads("skill.injected").is_empty());
+    }
+
+    /// The index row is not signed: injection takes scope, agents and activation from the
+    /// verified manifest, and needs the row's hash to be the one a person last reviewed.
+    #[test]
+    fn injection_trusts_the_signed_manifest_and_the_ledger_not_the_index_row() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "widened", 1, Scope::org("github.com/other"), Activation::Always, "Other's.\n");
+        install(&k, "unreviewed", 1, Scope::Personal, Activation::Always, "U.\n");
+        install(&k, "codex-signed", 1, Scope::Personal, Activation::OnDemand, "C.\n");
+        install(&k, "flipped", 1, Scope::Personal, Activation::Always, "F.\n");
+        {
+            let mut st = k.hub.lock();
+            // A row edited to reach this repo: the manifest says another client's org.
+            let mut row = st.store.skill_get("widened").unwrap().unwrap();
+            row.scope = Scope::org("github.com/acme");
+            st.store.skill_upsert_current(&row).unwrap();
+            // A later review superseded the hash the row still names.
+            st.store.skill_record_review("unreviewed", 2, "another-hash", "accepted").unwrap();
+            // Activation flipped in the row: the manifest's (always) wins.
+            let mut row = st.store.skill_get("flipped").unwrap().unwrap();
+            row.activation = Activation::OnDemand;
+            st.store.skill_upsert_current(&row).unwrap();
+        }
+        // The manifest of codex-signed names only codex (written by hand, re-signed).
+        rewrite_agents(&k, "codex-signed", &["codex"]);
+        k.started(AgentKind::Claude, "t");
+        assert_eq!(spawned(&k), Some((strs(&["flipped"]), vec![])));
+        let refused: std::collections::BTreeMap<String, String> = k
+            .payloads("skill.refused")
+            .iter()
+            .map(|p| (p["name"].as_str().unwrap().into(), p["reason"].as_str().unwrap().into()))
+            .collect();
+        assert!(refused["widened"].contains("scope"), "{refused:?}");
+        assert!(refused["unreviewed"].contains("review"), "{refused:?}");
+        assert!(refused["codex-signed"].contains("agent"), "{refused:?}");
+    }
+
+    /// Re-signs `name`'s current version with `agents` in its manifest and records the new
+    /// hash as reviewed and current (as an accept would), keeping the row's agents as they
+    /// were.
+    fn rewrite_agents(k: &Kit, name: &str, agents: &[&str]) {
+        let row = k.hub.lock().store.skill_get(name).unwrap().unwrap();
+        let v = k.hub.skill_verify(name, row.version, &row.manifest_hash).unwrap();
+        let mut manifest = v.manifest.clone();
+        manifest.agents = agents.iter().map(|a| a.to_string()).collect();
+        manifest.version = row.version + 1;
+        let signer = SshKeygen::ensure_key_with(k.hub.paths().home(), &keygen().unwrap()).unwrap();
+        let w = write_version(&k.hub.paths().skills(), &signer, &Bundle { manifest, files: v.files }).unwrap();
+        let mut st = k.hub.lock();
+        st.store.skill_record_review(name, w.version, &w.manifest_hash, "accepted").unwrap();
+        st.store
+            .skill_upsert_current(&SkillRow { version: w.version, manifest_hash: w.manifest_hash.clone(), ..row })
+            .unwrap();
     }
 
     #[test]
