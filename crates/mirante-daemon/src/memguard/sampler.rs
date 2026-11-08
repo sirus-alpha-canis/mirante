@@ -5,7 +5,9 @@
 //! system side reads `hw.memsize`, `vm.swapusage`, the kernel's own pressure level
 //! (`kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical) and a conservative
 //! "free" (`vm.page_free_count + vm.page_speculative_count + vm.page_purgeable_count`, times
-//! `hw.pagesize`; inactive file cache is not counted).
+//! `hw.pagesize`; inactive file cache is not counted, it is what the policy judges by) and
+//! what is available (`kern.memorystatus_level`, the system-wide free percentage that
+//! `memory_pressure` prints, times `hw.memsize`: the file cache macOS gives back counts).
 //! Linux: `Pss` from `/proc/<pid>/smaps_rollup` (else `VmRSS` from `/proc/<pid>/status`),
 //! `/proc/meminfo` (`MemTotal`, `MemAvailable`, swap) and PSI `/proc/pressure/memory`.
 use std::collections::HashMap;
@@ -35,11 +37,21 @@ pub struct SystemSample {
     pub free: u64,
     pub swap_used: u64,
     pub swap_total: u64,
+    /// What a new program could get without swapping: macOS `kern.memorystatus_level` (the
+    /// free percentage `memory_pressure` reports) times the RAM, Linux `MemAvailable`.
+    /// `None` when the OS gave no such number (then only `free` is known).
+    pub available: Option<u64>,
     pub pressure: Pressure,
     /// `pressure` came from the kernel's own measure (macOS memorystatus level, Linux PSI).
     /// Then swap and free are shown but not used to judge: macOS keeps swap allocated and
     /// free pages near zero (file cache) on a machine that is not under pressure.
     pub kernel_signal: bool,
+}
+
+/// `pct` percent of `total` (macOS `kern.memorystatus_level`); `None` for a value that is
+/// no percentage.
+pub fn available_from_level(pct: u64, total: u64) -> Option<u64> {
+    (pct <= 100).then(|| total / 100 * pct)
 }
 
 impl SystemSample {
@@ -136,11 +148,13 @@ impl MemSampler for MacSampler {
             Some(2) => Pressure::Warn,
             _ => Pressure::Normal,
         };
+        let total = mac::sysctl_int("hw.memsize").unwrap_or(0);
         SystemSample {
-            total: mac::sysctl_int("hw.memsize").unwrap_or(0),
+            total,
             free: pages * page,
             swap_used: swap.map_or(0, |s| s.xsu_used),
             swap_total: swap.map_or(0, |s| s.xsu_total),
+            available: mac::sysctl_int("kern.memorystatus_level").and_then(|pct| available_from_level(pct, total)),
             pressure,
             kernel_signal: level.is_some(),
         }
@@ -200,6 +214,7 @@ impl MemSampler for LinuxSampler {
         SystemSample {
             total: linux::kb(&mem, "MemTotal").unwrap_or(0),
             free: linux::kb(&mem, "MemAvailable").unwrap_or(0),
+            available: linux::kb(&mem, "MemAvailable"),
             swap_used: swap_total.saturating_sub(linux::kb(&mem, "SwapFree").unwrap_or(0)),
             swap_total,
             pressure,
@@ -289,6 +304,20 @@ mod tests {
         let raw = mac::sysctl_int("kern.memorystatus_vm_pressure_level").unwrap();
         assert!([1, 2, 4].contains(&raw), "pressure level {raw}");
         assert!(s.kernel_signal);
+        // Available counts what macOS gives back (file cache): never less than the strict free.
+        let pct = mac::sysctl_int("kern.memorystatus_level").unwrap();
+        assert!(pct <= 100, "{pct}");
+        let avail = s.available.expect("macOS reports its free percentage");
+        assert!(avail <= s.total, "{s:?}");
+    }
+
+    #[test]
+    fn available_is_the_free_percentage_of_the_ram() {
+        const GB: u64 = 1 << 30;
+        // The founder's screenshot: 45 % free of 16 GB is about 7.2 GB, not "454 MB free".
+        assert_eq!(available_from_level(45, 16 * GB), Some(16 * GB / 100 * 45));
+        assert_eq!(available_from_level(0, 16 * GB), Some(0));
+        assert_eq!(available_from_level(101, 16 * GB), None);
     }
 
     #[test]

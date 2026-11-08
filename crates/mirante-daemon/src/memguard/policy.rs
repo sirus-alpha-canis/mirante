@@ -3,10 +3,12 @@
 //!
 //! Per session: a budget (default `min(4 GiB, 25 % of RAM)`), `Soft` at 80 % and `Hard` at
 //! 100 % of it, each reported once when the state is entered. For the machine: a [`Level`]
-//! from the OS pressure signal and swap use, stepping up at once and down only after
-//! [`CALM_SAMPLES`] calm samples below a lower threshold (hysteresis). The ladder:
+//! from the OS pressure signal and swap use, stepping up after [`UP_SAMPLES`] samples in a row
+//! and down only after [`CALM_SAMPLES`] calm samples below a lower threshold (hysteresis). The ladder:
 //! 1. `Elevated` → pause new dispatches and queued deliveries, offer to hibernate the
-//!    largest idle session (the user confirms; one offer per cooldown);
+//!    largest idle session (the user confirms; once per session per episode, and at most
+//!    once per `offer_cooldown`, 10 min, per session). Stepping up also takes
+//!    [`UP_SAMPLES`] samples in a row, so a flapping kernel level opens no episode;
 //! 2. `Critical` sustained for `critical_sustain` → hibernate the largest IDLE session
 //!    automatically, one action per cooldown. Never a session that is working (turn, tool,
 //!    background work) and never one with a pending permission request: when only such
@@ -25,6 +27,9 @@ const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 /// Calm samples in a row before the level steps down.
 pub const CALM_SAMPLES: u32 = 3;
+/// Samples in a row above the level before it steps up: a kernel level that flaps between
+/// two values every sample (seen on macOS: 1 <-> 2) opens no episode.
+pub const UP_SAMPLES: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -36,8 +41,11 @@ pub struct Config {
     pub interval: Duration,
     /// Sampling interval under pressure.
     pub pressure_interval: Duration,
-    /// At most one offer, and one automatic action, per cooldown.
+    /// At most one automatic action (and one refusal) per cooldown.
     pub cooldown: Duration,
+    /// A session is offered for hibernation at most once per pressure episode, and never
+    /// again within this long of its last offer.
+    pub offer_cooldown: Duration,
     /// How long `Critical` must last before a session is hibernated automatically.
     pub critical_sustain: Duration,
     /// Hibernate sessions idle this long (`None`: never; the default).
@@ -59,6 +67,7 @@ impl Config {
             interval: Duration::from_secs(2),
             pressure_interval: Duration::from_millis(500),
             cooldown: Duration::from_secs(60),
+            offer_cooldown: Duration::from_secs(600),
             critical_sustain: Duration::from_secs(10),
             idle_hibernate: None,
             leak_mb_per_min: 200,
@@ -188,9 +197,15 @@ pub struct Policy {
     cfg: Config,
     level: Level,
     calm: u32,
+    /// Samples in a row above the level, and the lowest level they reached.
+    rising: u32,
+    rising_to: Level,
+    /// Bumped each time the level leaves `Normal` (a pressure episode).
+    episode: u64,
+    /// Per task: the episode and time of its last hibernation offer.
+    offered: HashMap<String, (u64, Instant)>,
     last_free: Option<u64>,
     critical_since: Option<Instant>,
-    last_offer: Option<Instant>,
     last_action: Option<Instant>,
     last_refusal: Option<Instant>,
     sessions: HashMap<String, Track>,
@@ -231,9 +246,12 @@ impl Policy {
             cfg,
             level: Level::Normal,
             calm: 0,
+            rising: 0,
+            rising_to: Level::Normal,
+            episode: 0,
+            offered: HashMap::new(),
             last_free: None,
             critical_since: None,
-            last_offer: None,
             last_action: None,
             last_refusal: None,
             sessions: HashMap::new(),
@@ -274,18 +292,28 @@ impl Policy {
         let down = classify(s, falling, 70, 85);
         let from = self.level;
         if up > self.level {
-            self.level = up;
             self.calm = 0;
+            self.rising_to = if self.rising == 0 { up } else { self.rising_to.min(up) };
+            self.rising += 1;
+            if self.rising >= UP_SAMPLES {
+                self.level = self.rising_to;
+                self.rising = 0;
+            }
         } else if down < self.level {
+            self.rising = 0;
             self.calm += 1;
             if self.calm >= CALM_SAMPLES {
                 self.level = down;
                 self.calm = 0;
             }
         } else {
+            self.rising = 0;
             self.calm = 0;
         }
         if self.level != from {
+            if from == Level::Normal {
+                self.episode += 1;
+            }
             out.push(Action::LevelChanged { from, to: self.level });
             if from == Level::Normal {
                 out.push(Action::Pause(true));
@@ -415,13 +443,19 @@ impl Policy {
                 None => {}
             }
         }
-        if !acted && self.level != Level::Normal && due(self.last_offer, now, self.cfg.cooldown) {
+        if !acted && self.level != Level::Normal {
             if let Some(task_id) = victim {
-                self.last_offer = Some(now);
-                out.push(Action::OfferHibernate {
-                    task_id,
-                    reason: format!("memory pressure {}", self.level.as_str()),
+                // Once per session per episode, and never within `offer_cooldown` of the last.
+                let fresh = self.offered.get(&task_id).is_none_or(|(ep, at)| {
+                    *ep != self.episode && now.saturating_duration_since(*at) >= self.cfg.offer_cooldown
                 });
+                if fresh {
+                    self.offered.insert(task_id.clone(), (self.episode, now));
+                    out.push(Action::OfferHibernate {
+                        task_id,
+                        reason: format!("memory pressure {}", self.level.as_str()),
+                    });
+                }
             }
         }
         out
@@ -444,6 +478,7 @@ mod tests {
             free,
             swap_used: swap_pct * GB / 100,
             swap_total: GB,
+            available: None,
             pressure,
             kernel_signal: false,
         }
@@ -505,11 +540,23 @@ mod tests {
         assert_eq!(p.session("a"), None);
     }
 
+    /// Up `UP_SAMPLES` samples in a row before the level rises; down after `CALM_SAMPLES`.
+    fn up(p: &mut Policy, t: Instant, s: &SystemSample) -> Vec<String> {
+        let mut out = Vec::new();
+        for _ in 0..UP_SAMPLES {
+            out.extend(kinds(&p.tick(t, s, &[])));
+        }
+        out
+    }
+
     #[test]
-    fn the_level_steps_up_at_once_and_down_only_after_calm_samples() {
+    fn the_level_steps_up_after_consecutive_samples_and_down_only_after_calm_samples() {
         let mut p = Policy::new(cfg());
         let t0 = Instant::now();
         assert_eq!(p.next_interval(), Duration::from_secs(2));
+        for _ in 1..UP_SAMPLES {
+            assert!(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])).is_empty());
+        }
         assert_eq!(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])), ["level:elevated", "pause:true"]);
         assert_eq!(p.next_interval(), Duration::from_millis(500));
         // Swap at 72 %: below the 75 % entry threshold but above the 70 % exit margin.
@@ -521,9 +568,32 @@ mod tests {
         assert!(kinds(&p.tick(t0, &normal(), &[])).is_empty());
         assert_eq!(kinds(&p.tick(t0, &normal(), &[])), ["level:normal", "pause:false"]);
         // Swap over 90 % with little free memory: elevated; falling under 5 %: critical.
-        p.tick(t0, &sys(Pressure::Normal, 95, 3 * GB / 2), &[]);
+        up(&mut p, t0, &sys(Pressure::Normal, 95, 3 * GB / 2));
         assert_eq!(p.level(), Level::Elevated);
-        assert_eq!(kinds(&p.tick(t0, &sys(Pressure::Normal, 95, GB / 2), &[])), ["level:critical"]);
+        let mut free = GB / 2;
+        let mut seen = Vec::new();
+        for _ in 0..UP_SAMPLES {
+            free -= MIB;
+            seen.extend(kinds(&p.tick(t0, &sys(Pressure::Normal, 95, free), &[])));
+        }
+        assert_eq!(seen, ["level:critical"]);
+    }
+
+    /// The founder's Mac: the kernel's level flapping 1 <-> 2 (normal <-> warn) every sample
+    /// opened an episode (and an offer) each time. A level must hold to count.
+    #[test]
+    fn a_flapping_kernel_level_opens_no_episode() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let sessions = [s("big", true, false, GB)];
+        let mut out = Vec::new();
+        for i in 0..40u64 {
+            let pressure = if i % 2 == 0 { Pressure::Warn } else { Pressure::Normal };
+            let mac = SystemSample { kernel_signal: true, ..sys(pressure, 0, 8 * GB) };
+            out.extend(kinds(&p.tick(t0 + Duration::from_secs(2 * i), &mac, &sessions)));
+        }
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(p.level(), Level::Normal);
     }
 
     /// Measured on the founder's Mac: swap 90 % used, 2 % "free" (file cache), kernel level
@@ -538,21 +608,54 @@ mod tests {
         }
         assert_eq!(p.level(), Level::Normal);
         let warn = SystemSample { kernel_signal: true, ..sys(Pressure::Warn, 0, 8 * GB) };
-        assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(9), &warn, &[])), ["level:elevated", "pause:true"]);
+        assert_eq!(up(&mut p, t0 + Duration::from_secs(9), &warn), ["level:elevated", "pause:true"]);
         // Without a kernel signal the same swap counts only with little free memory.
         let mut q = Policy::new(cfg());
         assert!(kinds(&q.tick(t0, &sys(Pressure::Normal, 92, 4 * GB), &[])).is_empty());
     }
 
     #[test]
-    fn pressure_pauses_and_offers_the_largest_idle_session_once_per_cooldown() {
+    fn pressure_pauses_and_offers_the_largest_idle_session_once_per_episode() {
         let mut p = Policy::new(cfg());
         let t0 = Instant::now();
+        let warn = sys(Pressure::Warn, 0, GB);
         let sessions = [s("busy", false, false, 3 * GB), s("small", true, false, GB / 2), s("big", true, false, GB)];
-        let a = kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &sessions));
+        for _ in 1..UP_SAMPLES {
+            assert!(kinds(&p.tick(t0, &warn, &sessions)).is_empty());
+        }
+        let a = kinds(&p.tick(t0, &warn, &sessions));
         assert_eq!(a, ["level:elevated", "pause:true", "offer:big"]);
-        assert!(kinds(&p.tick(t0 + Duration::from_secs(30), &sys(Pressure::Warn, 0, GB), &sessions)).is_empty());
-        assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(61), &sys(Pressure::Warn, 0, GB), &sessions)), ["offer:big"]);
+        // The whole episode (here half an hour): one offer, never repeated.
+        let mut later = Vec::new();
+        for i in 1..=900u64 {
+            later.extend(kinds(&p.tick(t0 + Duration::from_secs(2 * i), &warn, &sessions)));
+        }
+        assert!(later.is_empty(), "{later:?}");
+    }
+
+    #[test]
+    fn a_new_episode_offers_a_session_again_only_after_ten_minutes() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let warn = sys(Pressure::Warn, 0, GB);
+        let sessions = [s("big", true, false, GB)];
+        let episode = |p: &mut Policy, at: Instant| {
+            let mut out = Vec::new();
+            for i in 0..UP_SAMPLES + 2 {
+                out.extend(kinds(&p.tick(at + Duration::from_secs(u64::from(i)), &warn, &sessions)));
+            }
+            for i in 0..CALM_SAMPLES + 1 {
+                out.extend(kinds(&p.tick(at + Duration::from_secs(30 + u64::from(i)), &normal(), &sessions)));
+            }
+            out
+        };
+        assert!(episode(&mut p, t0).contains(&"offer:big".to_string()));
+        // Five minutes later, a second episode: paused again, no second offer.
+        let second = episode(&mut p, t0 + Duration::from_secs(300));
+        assert!(second.contains(&"pause:true".to_string()) && !second.contains(&"offer:big".to_string()), "{second:?}");
+        // Past the ten minutes: the next episode may offer it once more.
+        assert!(episode(&mut p, t0 + Duration::from_secs(700)).contains(&"offer:big".to_string()));
+        assert_eq!(cfg().offer_cooldown, Duration::from_secs(600));
     }
 
     #[test]
@@ -562,6 +665,9 @@ mod tests {
         let crit = sys(Pressure::Critical, 0, GB);
         let sessions = [s("busy", false, false, 3 * GB), s("asking", true, true, 2 * GB), s("idle", true, false, GB)];
         // Not sustained yet: only the offer.
+        for _ in 1..UP_SAMPLES {
+            assert!(kinds(&p.tick(t0, &crit, &sessions)).is_empty());
+        }
         assert_eq!(kinds(&p.tick(t0, &crit, &sessions)), ["level:critical", "pause:true", "offer:idle"]);
         assert!(kinds(&p.tick(t0 + Duration::from_secs(5), &crit, &sessions)).is_empty());
         assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(10), &crit, &sessions)), ["auto:idle"]);
@@ -577,7 +683,9 @@ mod tests {
         let t0 = Instant::now();
         let crit = sys(Pressure::Critical, 0, GB);
         let asking = [s("busy", false, false, 3 * GB), s("asking", true, true, GB)];
-        p.tick(t0, &crit, &asking);
+        for _ in 0..UP_SAMPLES {
+            p.tick(t0, &crit, &asking);
+        }
         let a = p.tick(t0 + Duration::from_secs(10), &crit, &asking);
         assert_eq!(kinds(&a), ["refused:asking"]);
         let Action::Refused { reason, .. } = &a[0] else { unreachable!() };
@@ -586,7 +694,9 @@ mod tests {
         assert!(kinds(&p.tick(t0 + Duration::from_secs(20), &crit, &asking)).is_empty());
         let mut q = Policy::new(cfg());
         let busy = [s("busy", false, false, 3 * GB)];
-        q.tick(t0, &crit, &busy);
+        for _ in 0..UP_SAMPLES {
+            q.tick(t0, &crit, &busy);
+        }
         let a = q.tick(t0 + Duration::from_secs(10), &crit, &busy);
         assert_eq!(kinds(&a), ["refused:busy"]);
         assert!(matches!(&a[0], Action::Refused { reason, .. } if reason.contains("working")));

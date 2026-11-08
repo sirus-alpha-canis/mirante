@@ -69,6 +69,7 @@ fn system_view(level: &str, s: &SystemSample, paused: bool) -> SystemView {
         level: level.to_string(),
         total: s.total,
         free: s.free,
+        available: s.available,
         swap_used: s.swap_used,
         swap_total: s.swap_total,
         paused,
@@ -356,6 +357,7 @@ mod tests {
             free: 4 * GIB,
             swap_used: 0,
             swap_total: 4 * GIB,
+            available: Some(6 * GIB),
             pressure,
             kernel_signal: true,
         }
@@ -392,6 +394,9 @@ mod tests {
         assert_eq!(v.kernel_source.as_deref(), Some(os));
         assert_eq!(system_view("critical", &sys(Pressure::Critical), true).kernel_level.as_deref(), Some("critical"));
         assert_eq!(system_view("normal", &sys(Pressure::Normal), false).kernel_level.as_deref(), Some("normal"));
+        // What macOS calls free (memorystatus level), beside the strict free pages.
+        let v = system_view("normal", &sys(Pressure::Normal), false);
+        assert_eq!((v.free, v.available), (4 * GIB, Some(6 * GIB)));
         // Judged from swap and free memory (no kernel measure): nothing is claimed for it.
         let judged = system_view("elevated", &SystemSample { kernel_signal: false, ..sys(Pressure::Normal) }, true);
         assert_eq!((judged.kernel_level, judged.kernel_source), (None, None));
@@ -427,7 +432,9 @@ mod tests {
         let mut p = Policy::new(cfg());
         let now = Instant::now();
         s.set_system(sys(Pressure::Warn));
-        k.hub.memory_tick(&mut p, &s, now);
+        for _ in 0..crate::memguard::policy::UP_SAMPLES {
+            k.hub.memory_tick(&mut p, &s, now);
+        }
         assert!(k.hub.status().memory.unwrap().paused);
         // Queued while paused: held even though the agent is idle.
         let m = mirante_ipc::types::SendMessage { task: t.clone(), text: "next".into(), mode: SendMode::Queue };

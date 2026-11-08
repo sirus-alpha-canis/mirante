@@ -205,7 +205,12 @@ pub struct SystemView {
     /// "normal", "elevated" or "critical".
     pub level: String,
     pub total: u64,
+    /// Strictly free pages (macOS: free + speculative + purgeable; Linux: `MemAvailable`).
     pub free: u64,
+    /// What the OS says is available: macOS `kern.memorystatus_level` (its free percentage)
+    /// times the RAM, Linux `MemAvailable`. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<u64>,
     pub swap_used: u64,
     pub swap_total: u64,
     /// New sessions and queued deliveries wait while memory is tight.

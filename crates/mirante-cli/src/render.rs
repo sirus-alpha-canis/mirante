@@ -281,10 +281,15 @@ pub fn mem_cell(m: &MemView) -> String {
 /// The `watch` header line about the machine's memory.
 pub fn memory_line(s: &SystemView) -> String {
     let paused = if s.paused { " · new sessions and queued messages paused" } else { "" };
+    // What the OS calls available when it says (macOS counts the file cache it gives back).
+    let (what, n) = match s.available {
+        Some(a) => ("available", a),
+        None => ("free", s.free),
+    };
     format!(
-        "memory: {} · free {} of {} · swap {}/{}{paused}",
+        "memory: {} · {what} {} of {} · swap {}/{}{paused}",
         s.level,
-        bytes(s.free),
+        bytes(n),
         bytes(s.total),
         bytes(s.swap_used),
         bytes(s.swap_total)
@@ -721,6 +726,7 @@ mod tests {
             level: "elevated".into(),
             total: 16 << 30,
             free: 512 << 20,
+            available: None,
             swap_used: 9 << 30,
             swap_total: 10 << 30,
             paused: true,
@@ -731,6 +737,8 @@ mod tests {
             memory_line(&s),
             "memory: elevated · free 512M of 16.0G · swap 9.0G/10.0G · new sessions and queued messages paused"
         );
+        let mac = SystemView { available: Some(7 << 30), ..s.clone() };
+        assert!(memory_line(&mac).starts_with("memory: elevated · available 7.0G of 16.0G"), "{}", memory_line(&mac));
         let d = DoctorReport {
             orphan_processes: vec![mirante_ipc::types::OrphanView {
                 pid: 4242,
