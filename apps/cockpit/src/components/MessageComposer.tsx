@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
-import { useEnv } from "../env";
+import { useEnv, useLive } from "../env";
+import { onMac } from "../lib/shortcuts";
 import { DaemonError } from "../lib/daemon";
 import { M, RpcCode, type SendMode, type SendResult, type TaskView } from "../lib/protocol";
 
@@ -14,6 +15,8 @@ import { M, RpcCode, type SendMode, type SendResult, type TaskView } from "../li
  */
 export function MessageComposer({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
+  const live = useLive();
+  const [mac] = useState(onMac);
   const [text, setText] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [fallback, setFallback] = useState(false);
@@ -48,7 +51,7 @@ export function MessageComposer({ t }: { t: TaskView }) {
 
   const send = (mode: SendMode) => {
     const msg = text;
-    if (!msg.trim()) return;
+    if (!msg.trim() || !live) return;
     return guarded(async () => {
       setNote(null);
       setFallback(false);
@@ -73,7 +76,8 @@ export function MessageComposer({ t }: { t: TaskView }) {
   };
 
   if (!t.live) return <p className="muted small composer-off">No live session: resume it to talk to the agent.</p>;
-  const empty = !text.trim();
+  // Nothing can be sent while the daemon is away.
+  const empty = !text.trim() || !live;
   return (
     <div className="composer">
       <label htmlFor={`msg-${t.id}`} className="sr-only">
@@ -83,7 +87,7 @@ export function MessageComposer({ t }: { t: TaskView }) {
         id={`msg-${t.id}`}
         rows={2}
         value={text}
-        placeholder="Message the agent (⌘↵ steer now, ⌥↵ queue)"
+        placeholder={`Message the agent (${mac ? "⌘↵" : "Ctrl+↵"} steer now, ${mac ? "⌥↵" : "Alt+↵"} queue)`}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
           // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.

@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { shallow, useEnv, useSelect } from "../env";
+import { shallow, useEnv, useLive, useSelect } from "../env";
 import { same, type State } from "../store/state";
 import { DaemonError } from "../lib/daemon";
 import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
@@ -10,6 +10,7 @@ import type { DaemonStatus, TaskView } from "../lib/protocol";
  * Hibernate asks first (like Stop), and says so when the agent is mid-turn. */
 export function HibernateButton({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
+  const live = useLive();
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const [busy, setBusy] = useState(false);
@@ -64,7 +65,7 @@ export function HibernateButton({ t }: { t: TaskView }) {
     <>
       <button
         className="btn btn-small"
-        disabled={busy}
+        disabled={busy || !live}
         onClick={asleep ? run : () => setConfirm(true)}
         title={asleep ? "Resume the agent's session" : "Stop the process, keep the session to resume later"}
       >

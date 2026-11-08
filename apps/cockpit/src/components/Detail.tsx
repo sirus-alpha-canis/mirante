@@ -1,5 +1,5 @@
 import { type KeyboardEvent, memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { shallow, useEnv, useSelect } from "../env";
+import { shallow, useEnv, useLive, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { collapseRepeats, summarizeSteps } from "../lib/feed";
 import { inboxOf } from "../lib/inbox";
@@ -201,12 +201,15 @@ function StepsPanel({ taskId, feed }: { taskId: string; feed: FeedItem[] }) {
 /** Interrupt / Stop / Resume: one at a time; Stop asks first; a new action clears the error. */
 function Actions({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
+  // Off while the daemon is away (nothing could carry them out).
+  const live = useLive();
   const [error, setError] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
   const inFlight = useRef(false);
-  const [busy, setBusy] = useState(false);
+  const [state, setBusy] = useState(false);
+  const busy = state || !live;
   const run = async (method: string) => {
-    if (inFlight.current) return;
+    if (inFlight.current || !live) return;
     inFlight.current = true;
     setBusy(true);
     setError(null);

@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { useEnv } from "../env";
+import { useEnv, useLive } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { M, RpcCode } from "../lib/protocol";
 
@@ -7,6 +7,7 @@ import { M, RpcCode } from "../lib/protocol";
  * answer per card: the buttons stay off once it is sent, until the boot event removes it. */
 export function TrustCard({ taskId }: { taskId: string }) {
   const { rpc } = useEnv();
+  const live = useLive();
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<"idle" | "busy" | "done">("idle");
   const sending = useRef(false);
@@ -26,7 +27,7 @@ export function TrustCard({ taskId }: { taskId: string }) {
       sending.current = conflict;
     }
   };
-  const off = phase !== "idle";
+  const off = phase !== "idle" || !live;
   return (
     <div className="perm" role="group" aria-label="Trust this folder">
       <div className="perm-what">

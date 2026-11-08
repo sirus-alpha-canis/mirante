@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { useEnv } from "../env";
+import { useEnv, useLive } from "../env";
 import { DaemonError } from "../lib/daemon";
-import { permissionScope } from "../lib/labels";
+import { GRANT_ROOT_TOOL, permissionScope } from "../lib/labels";
 import { type AgentKind, M, RpcCode } from "../lib/protocol";
 import type { Perm } from "../store/state";
 
@@ -24,6 +24,7 @@ export function PermissionCard({
   compact?: boolean;
 }) {
   const { rpc } = useEnv();
+  const live = useLive();
   // "idle" | in flight | answered (sent, or already answered elsewhere): the card stays
   // until the closing event removes it, so a sent answer keeps its buttons off.
   const [phase, setPhase] = useState<"idle" | "busy" | "sent" | "done">("idle");
@@ -54,12 +55,12 @@ export function PermissionCard({
       sending.current = code === RpcCode.CONFLICT;
     }
   };
-  const off = phase !== "idle";
+  const off = phase !== "idle" || !live;
   return (
     <div className={`perm ${compact ? "perm-compact" : ""}`} role="group" aria-label={`Permission request: ${perm.tool}`}>
       <div className="perm-what">
         <strong>{perm.tool}</strong>
-        <span className={`tag ${scope.text === "once" ? "" : "tag-warn"}`} title={scope.title}>
+        <span className={`tag ${perm.tool === GRANT_ROOT_TOOL ? "tag-warn" : ""}`} title={scope.title}>
           {scope.text}
         </span>
         <code className="perm-detail">{perm.detail}</code>
