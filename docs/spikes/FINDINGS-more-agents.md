@@ -52,3 +52,10 @@ Other facts for the profile:
 - A tool call goes `pending` → `in_progress` **before** its `session/request_permission`. The bypass detector must flag only a `completed` edit/execute that had no permission request, not an `in_progress` one.
 - Even with `--pure`, OpenCode writes into the user's config dir: it creates `$XDG_CONFIG_HOME/opencode/opencode.jsonc`, `.gitignore` and `package.json` and runs an npm install of `@opencode-ai/plugin` there (network, ~110 MB npm cache). Sessions, a shadow git snapshot of the worktree (`$XDG_DATA_HOME/opencode/snapshot/`), logs and the model cache land under the user's XDG dirs.
 - Two `opencode acp` processes sharing one data dir ran concurrently without trouble (the second took a random port).
+
+## Gemini CLI and Antigravity (Task 3)
+
+- **Antigravity (`agy`): skipped.** Founder decision 3 (2026-11-08) puts it out for now (closed source). No `agy` spike was run; the `agy` on PATH (a cmux shim) was not invoked. Revisit later.
+- **Gemini CLI: pending.** `gemini` is not installed, and since 2026-06-18 it has no free Google login: it needs an AI Studio key (`GEMINI_API_KEY`). Nothing was run.
+  - To run after Task 0 Step 2: S0, S1, S3 (one run), S4, S5 and S6(a–d) with `spike-acp --bin $(which gemini) --arg --acp --arg --approval-mode --arg default` (fall back to `--experimental-acp`; record which one 0.67.0 accepts; never `yolo`), the key only in the spike's env (`--env GEMINI_API_KEY=…`), and the same temp `HOME`/XDG isolation as OpenCode. Record whether ACP mode honours `--sandbox`, and G1–G5.
+- Task 15 (Gemini/Antigravity profiles) stays gated: no agent other than OpenCode has a verdict.
