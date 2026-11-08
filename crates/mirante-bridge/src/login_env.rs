@@ -172,7 +172,6 @@ pub fn daemon_env() -> &'static [(String, String)] {
 mod tests {
     use super::*;
     use mirante_ipc::test_dir::TestDir;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
     const SHELLS: &str = "# List of acceptable shells\n/bin/bash\n/bin/zsh\n/opt/homebrew/bin/fish\n";
@@ -263,9 +262,9 @@ mod tests {
 
     fn fake_shell(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
-        // Called as `fake-shell -l -i -c <script>`: the script is $4.
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Called as `fake-shell -l -i -c <script>`: the script is $4. Warmed up once, so
+        // macOS's first-exec scan is not charged to the timeouts below.
+        mirante_core::test_script::write_sh(&p, body, 0o755);
         p
     }
 

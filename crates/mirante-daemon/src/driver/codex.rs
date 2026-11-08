@@ -1809,17 +1809,16 @@ mod tests {
     /// A fake `codex app-server`: answers the handshake (request ids 0 and 1), then runs
     /// `rest`. It writes one line to stderr first.
     fn fake_app_server(dir: &Path, rest: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join("codex");
         let script = format!(
-            "#!/bin/sh\necho 'fake codex: starting' >&2\n\
+            "echo 'fake codex: starting' >&2\n\
              read l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\n\
              read l\n\
              read l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"thread\":{{\"id\":\"th-1\"}},\"approvalPolicy\":\"on-request\",\"approvalsReviewer\":\"user\",\"sandbox\":{{\"type\":\"workspaceWrite\"}}}}}}'\n\
-             {rest}\n"
+             {rest}"
         );
-        std::fs::write(&p, script).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Warmed up once, so macOS's first-exec scan is not charged to the 2 s handshake.
+        mirante_core::test_script::write_sh(&p, &script, 0o755);
         p
     }
 

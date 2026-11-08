@@ -17,6 +17,10 @@ pub mod store;
 pub mod transcript_tail;
 pub mod worktree;
 
+/// Test-only helper shared with the other crates' tests; not part of the API.
+#[doc(hidden)]
+pub mod test_script;
+
 pub use error::{CoreError, Result};
 
 #[cfg(test)]

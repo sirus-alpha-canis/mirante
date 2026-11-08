@@ -622,8 +622,8 @@ pub(crate) mod tests {
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Warmed up once, so macOS's first-exec scan is not charged to the probe timeouts.
+        mirante_core::test_script::write_sh(&p, body, 0o755);
         p
     }
 

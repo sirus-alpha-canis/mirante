@@ -452,8 +452,8 @@ mod tests {
 
     fn fake(dir: &Path, script: &str) -> PathBuf {
         let bin = dir.join("fake-keygen");
-        std::fs::write(&bin, format!("#!/bin/sh\n{script}")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Warmed up once, so macOS's first-exec scan is not charged to the signer timeouts.
+        crate::test_script::write_sh(&bin, script, 0o700);
         bin
     }
 
