@@ -57,6 +57,9 @@ impl SeenHooks {
     }
 }
 
+/// How often the daemon does its database housekeeping.
+const MAINTENANCE_EVERY: Duration = Duration::from_secs(24 * 3600);
+
 /// Why a launch is refused once [`Hub::shutdown`] began.
 pub(crate) const SHUTTING_DOWN: &str = "the daemon is shutting down";
 /// Longest wait of a shutdown for agents being spawned.
@@ -881,6 +884,9 @@ impl Hub {
             let _ = st.finish_session(&task_id, &session_id, "mirante:daemon_shutdown");
         }
         st.publish();
+        if let Err(e) = st.store.maintain() {
+            st.log_error(None, "database maintenance at shutdown", &e);
+        }
     }
 
     /// One Claude hook payload without an event id (see [`Hub::apply_hook_envelope`]).
@@ -1079,6 +1085,20 @@ impl Hub {
         while let Ok((session_id, event)) = rx.try_recv() {
             self.handle_driver_event_guarded(&session_id, event);
         }
+    }
+
+    /// Database housekeeping once a day while the daemon runs (`Store::maintain`; the
+    /// shutdown does it too).
+    pub fn spawn_maintenance(self: &Arc<Self>) {
+        let hub = Arc::downgrade(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(MAINTENANCE_EVERY);
+            let Some(hub) = hub.upgrade() else { return };
+            let mut st = hub.lock();
+            if let Err(e) = st.store.maintain() {
+                st.log_error(None, "daily database maintenance", &e);
+            }
+        });
     }
 
     /// The thread that applies driver events. It only ends if the channel closes (never:
@@ -1661,6 +1681,16 @@ mod tests {
         assert_eq!(status(&k, &b.id), Status::Ended);
         assert_eq!(k.calls().iter().filter(|c| *c == "stop").count(), 2);
         assert_eq!(k.hub.status().live_sessions, 0);
+    }
+
+    #[test]
+    fn shutdown_leaves_the_database_checkpointed() {
+        let k = Kit::with_store(|p| mirante_core::store::Store::open(&p.database()).unwrap());
+        k.started(AgentKind::Codex, "c");
+        let wal = std::path::PathBuf::from(format!("{}-wal", k.hub.paths().database().display()));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        k.hub.shutdown();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
     }
 
     #[test]

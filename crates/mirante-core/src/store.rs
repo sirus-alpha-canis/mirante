@@ -109,6 +109,8 @@ impl Store {
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         check_journal_mode(&mode)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // A checkpoint truncates the WAL back to this size, so it never stays at its peak.
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
         // Leaves foreign keys on.
         migrate(&mut conn)?;
         Ok(Store { conn, boot_id: new_id() })
@@ -133,6 +135,15 @@ impl Store {
         }
     }
 
+    /// Housekeeping for a long-running daemon (at shutdown and once a day): the WAL is
+    /// checkpointed and truncated, and SQLite refreshes its query statistics.
+    pub fn maintain(&self) -> Result<()> {
+        // Statistics first: what they write is checkpointed with the rest.
+        self.conn.execute_batch("PRAGMA optimize")?;
+        self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     pub fn schema_version(&self) -> Result<i64> {
         Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
@@ -141,6 +152,9 @@ impl Store {
         Ok(self.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?)
     }
 }
+
+/// Bytes the WAL is truncated to after a checkpoint (64 MiB).
+pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// `0600` on the database file and its existing `-wal` / `-shm` sidecars.
 fn make_private(path: &Path) -> Result<()> {
@@ -1116,6 +1130,22 @@ mod permission_tests {
         assert!(s.pending_permissions(&t.id).unwrap().is_empty());
         let again = s.answer_permission(&p.id, PermissionStatus::AllowedOnce).unwrap_err();
         assert!(matches!(again, CoreError::InvalidTransition { kind: "permission", .. }), "{again}");
+    }
+
+    #[test]
+    fn the_wal_is_bounded_and_truncated_by_maintenance() {
+        let dir = TempDir::new("store-wal");
+        let path = dir.path().join("m.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let limit: i64 = s.conn.query_row("PRAGMA journal_size_limit", [], |r| r.get(0)).unwrap();
+        assert_eq!(limit, JOURNAL_SIZE_LIMIT);
+        for i in 0..200 {
+            s.create_task(sample_task(&format!("feat-{i}"))).unwrap();
+        }
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        s.maintain().unwrap();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
     }
 
     #[test]

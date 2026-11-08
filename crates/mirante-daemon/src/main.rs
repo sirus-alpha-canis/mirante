@@ -109,6 +109,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("mirante-daemon: recovered {report:?}");
     let pump = hub.spawn_pump(rx);
     hub.spawn_miner();
+    hub.spawn_maintenance();
     // The memory guard: measure and act (nothing is limited up front; see hub::memory).
     // `MIRANTE_MEMGUARD=off` disables it (tests that must not depend on this machine's memory).
     let memguard = std::env::var("MIRANTE_MEMGUARD").as_deref() != Ok("off");
