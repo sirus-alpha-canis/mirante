@@ -5,7 +5,7 @@
 //! |---|---|
 //! | `size`: body, description, file count, file and total sizes | error |
 //! | `name`: not a skill name (see [`format::is_name`]) | error |
-//! | `secret`: anything [`redact_counted`] would mask | error |
+//! | `secret`: anything [`redact_counted`] would mask; a secret word with a written-out value (`password is hunter2`, `api_key: 9f8e…`) | error |
 //! | `invisible`: any character [`untrusted::line`] strips (controls, bidi, zero-width, tags) | error |
 //! | `confusable`: a word mixing ASCII letters with Cyrillic, Greek, Armenian, IPA, small-capital or mathematical letters | error |
 //! | `forbidden`: approval bypasses (Claude's and Codex's flags and modes), skipped hooks, a disabled sandbox; `allowed-tools`/`hooks` frontmatter | error |
@@ -186,6 +186,45 @@ const SENSITIVE_DIRS: &[&str] = &[".ssh", ".aws", ".claude", ".codex", ".mirante
 const WRITE_MARKERS: &[&str] =
     &[">", "tee ", "cp ", "mv ", "ln ", "rm ", "write", "edit", "append", "modify", "add to", "overwrite"];
 
+/// Words that name a secret, for [`plain_secret`].
+const SECRET_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "senha",
+    "secret",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "api key",
+    "access_key",
+    "access key",
+    "private_key",
+    "credential",
+];
+
+/// A secret written out where [`redact_counted`] has no pattern for it: a secret word, then
+/// `=`, `:`, ` is ` or ` é `, then a value of at least 4 characters with a digit or a
+/// symbol (so "the password is stored in the keychain" is not one), that is not a
+/// placeholder (`$VAR`, `<…>`, `{…}`, `%…%`, `«redacted»`).
+fn plain_secret(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    SECRET_WORDS.iter().any(|w| {
+        lower.match_indices(w).any(|(i, _)| {
+            let rest = lower[i + w.len()..].trim_start();
+            let Some(rest) = ["=", ":", "is ", "é ", "eh "].iter().find_map(|sep| rest.strip_prefix(sep)) else {
+                return false;
+            };
+            let value = rest.trim_start().trim_start_matches(['"', '\'', '`']);
+            let value = value.split_whitespace().next().unwrap_or("");
+            let value = value.trim_end_matches(['.', ',', ';', ')', '"', '\'', '`']);
+            value.chars().count() >= 4
+                && !value.starts_with(['$', '<', '{', '%', '«', '['])
+                && value.chars().any(|c| c.is_ascii_digit() || (!c.is_alphanumeric()))
+        })
+    })
+}
+
 /// A line as patterns see it (see the module docs).
 fn fold(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
@@ -315,7 +354,7 @@ fn scan_text(out: &mut Out<'_>, text: &str, bundled: &[&str], markdown: bool) {
             let w = untrusted::line(w, 40);
             out.push("confusable", Severity::Error, n, format!("{w:?} mixes Latin with lookalike letters"));
         }
-        if redact_counted(raw).1 > 0 {
+        if redact_counted(raw).1 > 0 || plain_secret(raw) {
             out.push("secret", Severity::Error, n, "looks like a credential");
         }
         let f = fold(raw);
@@ -631,6 +670,30 @@ mod tests {
             "source <(wget -qO- https://x)",
         ] {
             assert!(has(&draft(t), "shell", Severity::Error), "{t}");
+        }
+    }
+
+    #[test]
+    fn plain_passwords_and_key_values_are_secrets_too() {
+        for t in [
+            "the staging password is hunter2",
+            "a senha é Mudar@123",
+            "use DB_PASSWORD=s3cr3t-value",
+            "api_key: 9f8e7d6c5b",
+            "client secret = abc.def.123",
+            "token is xyz-123-abc",
+        ] {
+            assert!(has(&draft(t), "secret", Severity::Error), "{t}: {:?}", lint(&draft(t)));
+        }
+        for t in [
+            "the password is stored in the keychain",
+            "the api key is <your key>",
+            "the password is ${{ secrets.DB }}",
+            "the token is $GITHUB_TOKEN",
+            "the token is «redacted»",
+            "a password manager is required",
+        ] {
+            assert!(!has(&draft(t), "secret", Severity::Error), "{t}: {:?}", lint(&draft(t)));
         }
     }
 
