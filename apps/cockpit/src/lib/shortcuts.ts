@@ -9,18 +9,19 @@
 // Inside the terminal: off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K kills
 // a line, Ctrl+G…), so the caller leaves mod chords there to the terminal. On macOS ⌘ is not
 // a terminal key, so ⌘K opens the command bar even with the terminal focused.
-export type ShortcutAction = "palette" | "grid" | "home" | "escape" | "theme";
+export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme";
 
 type KeyLike = Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey"> & Partial<Pick<KeyboardEvent, "code" | "repeat">>;
 
 const BY_CODE: Record<string, { action: Exclude<ShortcutAction, "escape">; shift: boolean }> = {
   KeyK: { action: "palette", shift: false },
   KeyG: { action: "grid", shift: false },
+  KeyB: { action: "brain", shift: false },
   Digit1: { action: "home", shift: false },
   KeyJ: { action: "theme", shift: true },
 };
 
-const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", "1": "Digit1", j: "KeyJ" };
+const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ" };
 
 export function shortcutFor(e: KeyLike, mac: boolean): ShortcutAction | null {
   if (e.repeat) return null;
@@ -64,6 +65,6 @@ export type ShortcutHints = Record<Exclude<ShortcutAction, "escape">, string>;
 
 export function hintsFor(mac: boolean): ShortcutHints {
   return mac
-    ? { palette: "⌘K", grid: "⌘G", home: "⌘1", theme: "⇧⌘J" }
-    : { palette: "Ctrl+K", grid: "Ctrl+G", home: "Ctrl+1", theme: "Ctrl+Shift+J" };
+    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J" }
+    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J" };
 }

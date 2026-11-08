@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Brain } from "./components/Brain";
 import { CommandBar, type Command } from "./components/CommandBar";
 import { Detail } from "./components/Detail";
 import { Grid } from "./components/Grid";
@@ -13,7 +14,7 @@ import { useCockpitState } from "./store/cockpit";
 import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
 import type { State } from "./store/state";
 
-export type Mode = "home" | "detail" | "grid";
+export type Mode = "home" | "detail" | "grid" | "brain";
 
 export const STATUS_POLL_MS = 5000;
 /** Tasks that start needing the user within this window share one decision: past two, a
@@ -22,6 +23,8 @@ export const NOTIFY_BATCH_MS = 250;
 
 /** The task ids whose card, tile or detail is on screen in this mode. */
 export function visibleTasks(s: State, mode: Mode, project: string | null, taskId: string | null): Set<string> {
+  // The brain shows notes, no task: every task that starts needing you is off screen.
+  if (mode === "brain") return new Set();
   if (mode === "detail") return new Set(taskId ? [taskId] : []);
   if (mode === "grid") return new Set(gridTasks(s).map((t) => t.id));
   return new Set(Object.values(s.tasks).filter((t) => t.repo_path === project && t.lifecycle !== "archived").map((t) => t.id));
@@ -62,6 +65,9 @@ export function App({ env }: { env: Env }) {
   const s = useCockpitState(env.cockpit);
   const [mode, setMode] = useState<Mode>("home");
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
+  const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
+  // Bumped by every "Review memory": the brain reopens on its review queue.
+  const [reviewNonce, setReviewNonce] = useState(0);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [detailTab, setDetailTab] = useState<"Terminal" | undefined>(undefined);
   // Bumped by every "Answer in terminal": Detail re-selects its Terminal tab on each new value.
@@ -157,6 +163,24 @@ export function App({ env }: { env: Env }) {
       setMode("grid");
     }
   }, [mode, beforeGrid]);
+  const toggleBrain = useCallback(() => {
+    if (mode === "brain") {
+      setMode(beforeBrain);
+    } else {
+      setBeforeBrain(mode);
+      setReviewNonce(0);
+      setMode("brain");
+    }
+  }, [mode, beforeBrain]);
+  const openReview = useCallback(
+    (path?: string) => {
+      if (path) setProject(path);
+      if (mode !== "brain") setBeforeBrain(mode);
+      setReviewNonce((n) => n + 1);
+      setMode("brain");
+    },
+    [mode],
+  );
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -175,18 +199,28 @@ export function App({ env }: { env: Env }) {
       e.preventDefault();
       if (a === "palette") setPalette((p) => !p);
       if (a === "grid") toggleGrid();
+      if (a === "brain") toggleBrain();
       if (a === "home") setMode("home");
       if (a === "theme") setTheme(nextTheme);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, mode, toggleGrid, mac]);
+  }, [palette, mode, toggleGrid, toggleBrain, mac]);
 
   const inlineAnswers = status?.claude_inline_answers ?? false;
   const commands: Command[] = useMemo(
     () => [
       { id: "home", label: "Go to Home", hint: hints.home, run: () => setMode("home") },
       { id: "grid", label: "Toggle agent grid", hint: hints.grid, run: toggleGrid },
+      {
+        id: "brain",
+        label: "Go to Brain",
+        hint: hints.brain,
+        run: () => {
+          if (mode !== "brain") toggleBrain();
+        },
+      },
+      { id: "review", label: "Review memory", run: () => openReview() },
       { id: "theme", label: `Theme: ${nextTheme(theme)}`, hint: hints.theme, run: () => setTheme(nextTheme) },
       ...projs.map((p) => ({
         id: `p-${p.path}`,
@@ -206,7 +240,7 @@ export function App({ env }: { env: Env }) {
             : { id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) },
         ),
     ],
-    [projs, s.tasks, theme, open, toggleGrid, hints, inlineAnswers],
+    [projs, s.tasks, theme, open, toggleGrid, toggleBrain, openReview, mode, hints, inlineAnswers],
   );
 
   return (
@@ -224,6 +258,9 @@ export function App({ env }: { env: Env }) {
             <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
               Grid <kbd>{hints.grid}</kbd>
             </button>
+            <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
+              Brain <kbd>{hints.brain}</kbd>
+            </button>
           </nav>
           <button className="btn btn-small" onClick={() => setPalette(true)}>
             Commands <kbd>{hints.palette}</kbd>
@@ -240,6 +277,7 @@ export function App({ env }: { env: Env }) {
             onProject={setProject}
             onReposChanged={setRepos}
             onOpen={open}
+            onReview={openReview}
             status={status}
             draft={draft}
             onDraft={setDraft}
@@ -255,6 +293,7 @@ export function App({ env }: { env: Env }) {
           />
         )}
         {mode === "grid" && <Grid onOpen={open} status={status} />}
+        {mode === "brain" && <Brain key={`${current}-${reviewNonce}`} repo={current} review={reviewNonce > 0} />}
         {palette && (
           <CommandBar
             commands={commands}

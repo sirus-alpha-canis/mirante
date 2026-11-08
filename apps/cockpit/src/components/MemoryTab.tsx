@@ -125,46 +125,49 @@ function AskToPropose({ t }: { t: TaskView }) {
   );
 }
 
-export function MemoryTab({ t, mem, reload, version }: { t: TaskView; mem: TaskMemory; reload(): void; version: number }) {
+/** What enabling repo memory does, and the explicit button that does it (`dna.enable`). */
+export function EnableMemory({ repo, onEnabled }: { repo: string; onEnabled(): void }) {
   const { rpc } = useEnv();
-  const [open, setOpen] = useState<string | null>(null);
   const [enabling, setEnabling] = useState(false);
   const [enableError, setEnableError] = useState<string | null>(null);
+  const enable = async () => {
+    setEnabling(true);
+    setEnableError(null);
+    try {
+      await dnaEnable(rpc, repo);
+      onEnabled();
+    } catch (e) {
+      setEnableError(dnaErrorText(e));
+    } finally {
+      setEnabling(false);
+    }
+  };
+  return (
+    <div className="dna-off">
+      <p>
+        Repo memory is off for <code>{repo}</code>. Enabling it creates .mirante/memory/ in the repo (Markdown notes that
+        cite code, committed with it like any file) and gives this repo&apos;s new agent sessions a memory tool. Nothing
+        changes in your global Claude or Codex settings, and agents only propose: a person reviews every note.
+      </p>
+      <button className="btn btn-primary" disabled={enabling} onClick={enable}>
+        Enable repo memory
+      </button>
+      {enableError && (
+        <p className="error" role="alert">
+          {enableError}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function MemoryTab({ t, mem, reload, version }: { t: TaskView; mem: TaskMemory; reload(): void; version: number }) {
+  const [open, setOpen] = useState<string | null>(null);
   if (mem.state === "loading") return <p className="muted">Reading repo memory…</p>;
   if (mem.state === "unavailable") return <p className="muted">This daemon has no repo memory. Update Mirante to use it.</p>;
   if (mem.state === "error") return <p className="error">Repo memory unavailable: {mem.error}</p>;
   const { ctx } = mem;
-  if (!ctx.enabled) {
-    const enable = async () => {
-      setEnabling(true);
-      setEnableError(null);
-      try {
-        await dnaEnable(rpc, t.repo_path);
-        reload();
-      } catch (e) {
-        setEnableError(dnaErrorText(e));
-      } finally {
-        setEnabling(false);
-      }
-    };
-    return (
-      <div className="dna-off">
-        <p>
-          Repo memory is off for <code>{t.repo_path}</code>. Enabling it creates .mirante/memory/ in the repo (Markdown notes
-          that cite code, committed with it like any file) and gives this repo&apos;s new agent sessions a memory tool. Nothing
-          changes in your global Claude or Codex settings, and agents only propose: a person reviews every note.
-        </p>
-        <button className="btn btn-primary" disabled={enabling} onClick={enable}>
-          Enable repo memory
-        </button>
-        {enableError && (
-          <p className="error" role="alert">
-            {enableError}
-          </p>
-        )}
-      </div>
-    );
-  }
+  if (!ctx.enabled) return <EnableMemory repo={t.repo_path} onEnabled={reload} />;
   if (open) {
     return (
       <div className="dna-open">

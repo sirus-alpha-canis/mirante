@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { hintsFor, isMacPlatform, isTypingTarget, shortcutFor } from "./shortcuts";
 
-const CODE: Record<string, string> = { k: "KeyK", g: "KeyG", "1": "Digit1", j: "KeyJ", J: "KeyJ", Escape: "Escape" };
+const CODE: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ", J: "KeyJ", Escape: "Escape" };
 const k = (key: string, o: Partial<KeyboardEvent> = {}) => ({
   key,
   code: CODE[key] ?? "",
@@ -20,6 +20,12 @@ describe("shortcutFor", () => {
     expect(shortcutFor(k("g", { ctrlKey: true }), false)).toBe("grid");
     expect(shortcutFor(k("1", { metaKey: true }), true)).toBe("home");
     expect(shortcutFor(k("J", { metaKey: true, shiftKey: true }), true)).toBe("theme");
+  });
+
+  it("mod+B is brain", () => {
+    expect(shortcutFor(k("b", { metaKey: true }), true)).toBe("brain");
+    expect(shortcutFor(k("b", { ctrlKey: true }), false)).toBe("brain");
+    expect(shortcutFor(k("b"), true)).toBeNull();
   });
 
   it("plain keys and Alt combos are left to inputs; Escape always counts", () => {
@@ -53,8 +59,8 @@ describe("platform", () => {
   });
 
   it("hints name the keys of the platform", () => {
-    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", home: "⌘1", theme: "⇧⌘J" });
-    expect(hintsFor(false)).toEqual({ palette: "Ctrl+K", grid: "Ctrl+G", home: "Ctrl+1", theme: "Ctrl+Shift+J" });
+    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J" });
+    expect(hintsFor(false)).toEqual({ palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J" });
   });
 });
 

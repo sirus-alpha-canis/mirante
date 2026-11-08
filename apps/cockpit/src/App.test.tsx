@@ -286,5 +286,21 @@ describe("App", () => {
     const s = h.env.cockpit.getState();
     expect([...visibleTasks(s, "home", "/x", null)]).toEqual(["b"]);
     expect([...visibleTasks(s, "detail", null, "a")]).toEqual(["a"]);
+    expect([...visibleTasks(s, "brain", "/x", "a")]).toEqual([]);
+  });
+
+  it("⌘B toggles the brain and back; the command bar opens it and the review queue", async () => {
+    setup({ "dna.status": { repo: "/repos/other", enabled: true, dir: true, notes: 0, stale: 0, unreviewed: 0, pending: 1, invalid: 0, head: null }, "dna.graph": { nodes: [], links: [] }, "dna.proposals": [] });
+    fireEvent.keyDown(window, { key: "b", ...mod });
+    expect(screen.getByRole("button", { name: /Brain/ })).toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByRole("main", { name: "Brain" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "b", ...mod });
+    expect(screen.getByRole("button", { name: /Home/ })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    await userEvent.type(screen.getByRole("combobox"), "Review memory{Enter}");
+    expect(await screen.findByRole("region", { name: "Memory review queue" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    await userEvent.type(screen.getByRole("combobox"), "Go to Brain{Enter}");
+    expect(screen.getByRole("button", { name: /Brain/ })).toHaveAttribute("aria-pressed", "true");
   });
 });

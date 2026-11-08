@@ -15,6 +15,8 @@ export function Home(props: {
   onReposChanged(repos: string[]): void;
   /** `tab: "Terminal"` opens V1 on that task's Terminal tab (Claude answered there). */
   onOpen(taskId: string, tab?: "Terminal"): void;
+  /** Opens the memory review queue of a project. */
+  onReview?(path: string): void;
   status: DaemonStatus | null;
   draft: string;
   onDraft(v: string): void;
@@ -52,6 +54,7 @@ export function Home(props: {
         onSelect={props.onProject}
         onReposChanged={props.onReposChanged}
         onMention={mention}
+        onReview={props.onReview}
         status={props.status}
       />
       <main className="feed" aria-label="Project feed">
