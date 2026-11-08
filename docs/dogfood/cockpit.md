@@ -141,6 +141,37 @@ the app open and note what the app showed.
       hand.
 - [ ] The two-week log below, and the Plan 2b verdict.
 
+## J. Performance
+
+What changed in the terminal path and the views (2026-11-08), measured in tests; the by-hand
+checks below are the part only a real window can show.
+
+| What | Before | After | Where it is measured |
+|---|---|---|---|
+| Channel messages for a 1 MiB burst (daemon writes 8 KiB at a time) | 128, each base64 in JSON (eval + fetch round trip each), decoded with `atob` | 16 raw `ArrayBuffer`s (batches up to 64 KiB) | `mirante-bridge` `a_burst_reaches_the_frontend_in_few_large_messages` |
+| Keystroke echo through the bridge (p50, fake daemon, release) | 7 µs | 8–18 µs (no coalescing wait for small reads) | `small_output_is_not_held_back_for_coalescing` |
+| Output handed to a webview that acks nothing | unbounded (every read sent on) | exactly 256 KiB, then the daemon is held back and skips to a repaint; typing still arrives | `without_acks_reading_stops_and_typed_keys_still_get_through`, daemon `a_flood_toward_a_stalled_client_…` |
+| `session.resize` (a full agent redraw) per link hover | 2 (hint pushed the terminal one line shorter, then back) | 0 (hint floats over it) | `TerminalTab` "hovering a link sends no session.resize" |
+| Terminal tab switch away and back | new xterm, new attach, an `attached` event in the log, repaint without history | nothing (the terminal stays mounted and attached) | `Detail` "keeps one terminal per task across tab switches" |
+| Coming back to a task's terminal after leaving the detail | screen only | screen plus up to 1000 rows of scrollback | daemon `attach_replays_the_scrollback_before_the_screen` |
+| Card renders for a step event on one of 5 tasks (Home / Grid) | 5 / 5 | 1 / 1 | `renders.test.tsx` |
+| Card renders for a `task.get` that changed nothing | 5 | 0 | `renders.test.tsx` |
+| Detail renders for an event on another task | 1 | 0 | `renders.test.tsx` |
+
+By hand, with a real Claude session:
+
+- [ ] `cat` a large file (or `yes | head -200000`) in the terminal: the window stays
+      responsive, typing during the flood is echoed, and the screen ends right (a repaint may
+      skip some of the scroll).
+- [ ] Hover links in the terminal: the hint shows at the bottom left and Claude does not
+      redraw.
+- [ ] A permission card arriving while on the Terminal tab floats at the top right; the
+      terminal keeps its size.
+- [ ] Switch Terminal → Steps → Terminal: the same screen and scrollback, instantly.
+- [ ] Leave the detail and come back: the terminal shows its scrollback (scroll up).
+- [ ] Scrolling a long scrollback is smooth (the WebGL renderer; in a `tauri dev` build the
+      Web Inspector shows a `canvas` inside `.xterm-screen`).
+
 ## Log
 
 | Date | Section | Result | Notes |
