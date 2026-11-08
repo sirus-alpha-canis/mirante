@@ -844,3 +844,109 @@ fn an_agent_proposes_a_skill_through_the_skills_server() {
     assert_eq!(p.scope, "repo:github.com/acme/app");
     assert_eq!(p.tenant, "github.com/acme");
 }
+
+/// `mirante skills tenant` prints the checkout's normalized origin and tenant: no token, no
+/// ssh alias, no userinfo.
+#[test]
+fn tenant_prints_normalized_origin_without_token() {
+    let env = Env::new();
+    let repo = env.repo.clone();
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://x-access-token:ghp_0123456789abcdefghijABCDEFGHIJ012345@github.com/Acme/App.git",
+        ],
+    );
+    let out = env.ok_in(&repo, &["skills", "tenant"]);
+    assert!(out.contains("origin  github.com/acme/app"), "{out}");
+    assert!(out.contains("tenant  github.com/acme"), "{out}");
+    assert!(out.contains("learning off"), "{out}");
+    assert!(!out.contains("ghp_") && !out.contains("x-access-token") && !out.contains("Acme"), "{out}");
+}
+
+/// Offline lint of a SKILL.md: exit 0 when clean, 1 with `rule (severity) file:line` per
+/// finding, 3 when the file cannot be read.
+#[test]
+fn skills_lint_exits_1_on_errors_and_prints_rule_and_line() {
+    let env = Env::new();
+    let dir = env.dir.path().join("skill");
+    std::fs::create_dir_all(dir.join("reference")).unwrap();
+    std::fs::write(dir.join("reference/a.md"), "ref\n").unwrap();
+    let md = dir.join("SKILL.md");
+    std::fs::write(&md, "---\nname: tests-first\ndescription: Run the tests first\n---\nRun `cargo test`.\nSee [a](./reference/a.md).\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = env.mirante_in(&env.repo, args);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, out, err) = run(&["skills", "lint", md.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(out.contains("no findings"), "{out}");
+    std::fs::write(
+        &md,
+        "---\nname: tests-first\ndescription: d\nallowed-tools: Bash\nmodel: x\n---\nRun tests.\nUse --dangerously-skip-permissions to go fast.\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["skills", "lint", md.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(out.contains("forbidden (error) SKILL.md:8"), "the file's line, frontmatter counted: {out}");
+    assert!(out.contains("forbidden (error) frontmatter:0: allowed-tools"), "{out}");
+    assert!(out.lines().any(|l| l.starts_with("frontmatter (warn)")), "{out}");
+    assert!(!env.home.join("daemon.sock").exists(), "lint runs offline");
+    let (code, _, err) = run(&["skills", "lint", dir.join("missing.md").to_str().unwrap()]);
+    assert_eq!(code, Some(3), "{err}");
+}
+
+/// A person adds a skill folder (a proposal), accepts it on a terminal (signed v1), lists
+/// and shows it; a wrong word decides nothing; retire and restore are typed too. From an
+/// agent's environment the review is refused before any prompt.
+#[test]
+fn skills_add_accept_ls_round_trip() {
+    use mirante_ipc::types::{SkillProposalView, SkillProposals};
+    let env = Env::new();
+    let repo = env.repo.clone();
+    git(&repo, &["remote", "add", "origin", "git@github.com:acme/app.git"]);
+    let dir = env.dir.path().join("tests-first");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: tests-first\ndescription: Run the tests first\n---\nRun `cargo test` before committing.\n",
+    )
+    .unwrap();
+    let out = env.ok_in(&repo, &["skills", "add", dir.to_str().unwrap(), "--scope", "org:github.com/acme"]);
+    assert!(out.contains("waiting for review") && out.contains("mirante skills accept"), "{out}");
+    let queue = env.ok_in(&repo, &["skills", "proposals"]);
+    assert!(queue.contains("tests-first") && queue.contains("import"), "{queue}");
+    let pending: Vec<SkillProposalView> =
+        env.client().call(method::SKILL_PROPOSALS, SkillProposals::default()).unwrap();
+    let id = pending[0].proposal.id.clone();
+
+    // From an agent's environment: refused before it is shown or asked anything.
+    let out = env.on_tty_with(&repo, &["skills", "accept", &id], None, &[("MIRANTE_TASK", "some-task")]);
+    assert!(out.contains("Mirante-launched agents are refused") && !out.contains("to confirm"), "{out}");
+    let out = env.on_tty(&repo, &["skills", "accept", &id], "yes");
+    assert!(out.contains("not confirmed"), "{out}");
+    let out = env.on_tty(&repo, &["skills", "accept", &id, "--activation", "on_demand"], "accept");
+    assert!(out.contains("Run `cargo test` before committing.") && out.contains("org:github.com/acme"), "{out}");
+    assert!(out.contains("accepted: tests-first v1"), "{out}");
+    assert!(env.home.join("skills/tests-first/v1/mirante-skill.sig").exists());
+    assert!(env.ok_in(&repo, &["skills", "proposals"]).contains("no pending proposals"));
+    assert!(env.ok_in(&repo, &["skills", "proposals", "--all"]).contains("accepted"));
+
+    let ls = env.ok_in(&repo, &["skills", "ls"]);
+    assert!(ls.lines().any(|l| l.contains("tests-first") && l.contains("on_demand") && l.contains("verified")), "{ls}");
+    let show = env.ok_in(&repo, &["skills", "show", "tests-first"]);
+    assert!(show.contains("Run `cargo test` before committing.") && show.contains("versions: 1"), "{show}");
+
+    let out = env.on_tty(&repo, &["skills", "retire", "tests-first"], "retire");
+    assert!(out.contains("retired tests-first"), "{out}");
+    assert!(env.ok_in(&repo, &["skills", "ls"]).lines().any(|l| l.contains("tests-first") && l.contains("retired")));
+    let out = env.on_tty(&repo, &["skills", "restore", "tests-first"], "restore");
+    assert!(out.contains("restored tests-first"), "{out}");
+}

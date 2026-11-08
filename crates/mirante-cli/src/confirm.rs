@@ -50,7 +50,7 @@ impl Tty for DevTty {
 /// The refusal when there is no terminal to ask on.
 pub fn no_tty(e: io::Error) -> String {
     format!(
-        "a memory review needs you at a terminal: it asks on /dev/tty, and this process has none ({e}). \
+        "a review (memory or skills) needs you at a terminal: it asks on /dev/tty, and this process has none ({e}). \
 Review in the cockpit, or run this in a terminal you opened yourself (Mirante-launched agents are refused \
 either way)"
     )

@@ -15,13 +15,17 @@ use mirante_ipc::types::{
     DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus, DoctorReport,
     EditQueued, KillOrphan, ListParams, NoteAction, NoteSummary, NoteView, OrphanView, PermissionView, ProposalView,
     ProposeAnchor, QueueRef, QueuedMessage, QueuedRef, ReorderQueue, ResizeParams, SendMessage, SendMode, SendResult,
-    Snapshot, StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
+    SkillAction, SkillActionKind, SkillAdd, SkillEdits, SkillGet, SkillLearn, SkillListParams, SkillMine, SkillMined,
+    SkillProposalView, SkillProposals, SkillReview, SkillSummary, SkillView, Snapshot, StartResult, StartSession,
+    SubscribeParams, SystemView, TaskRef, TaskView, TenantView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
-use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, USAGE};
-use mirante_cli::{confirm, daemon_ctl, memcheck, render, term};
+use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd, USAGE};
+use mirante_cli::{confirm, daemon_ctl, memcheck, render, skilllint, term};
+use mirante_core::skills::lint::has_errors;
+use mirante_core::skills::origin;
 
 type Res = Result<(), Box<dyn Error>>;
 
@@ -522,6 +526,224 @@ fn memory(paths: &Paths, m: MemoryCmd) -> Res {
     }
 }
 
+/// `skills.may_review`: whether this process may make a person's skill decision, asked
+/// before anything is shown (the daemon is the boundary; the typed word only an intent check).
+fn may_review_skills(c: &mut Client) -> Res {
+    c.call::<Value>(method::SKILL_MAY_REVIEW, json!({}))?;
+    Ok(())
+}
+
+/// The checkout's origin key and tenant, as Mirante reads them (raw `remote.origin.url`,
+/// normalized with this user's ssh aliases; no token or alias kept).
+fn origin_and_tenant(repo: Option<String>) -> Result<(String, String), Box<dyn Error>> {
+    let repo = repo_or_cwd(repo)?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let aliases = home.map(|h| origin::read_aliases(&h)).unwrap_or_default();
+    let key = origin::origin_of(std::path::Path::new(&repo), &aliases);
+    let tenant = origin::tenant(&key);
+    Ok((key, tenant))
+}
+
+/// `mirante skills lint` found an error: exit 1 (any other failure of lint exits 3).
+#[derive(Debug)]
+struct LintErrors(String);
+
+impl std::fmt::Display for LintErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for LintErrors {}
+
+/// `mirante skills accept|reject`: like memory's, typed on the controlling terminal after
+/// the daemon said this process may review.
+fn skill_review(
+    paths: &Paths,
+    id: String,
+    accept: bool,
+    scope: Option<String>,
+    activation: Option<String>,
+    note: Option<String>,
+) -> Res {
+    let mut tty = confirm::DevTty::open()?;
+    let mut c = client(paths)?;
+    may_review_skills(&mut c)?;
+    let q = SkillProposals { id: Some(id.clone()), status: Some("all".into()), ..Default::default() };
+    let found: Vec<SkillProposalView> = c.call(method::SKILL_PROPOSALS, q)?;
+    let p = found.into_iter().next().ok_or_else(|| format!("no skill proposal {id}"))?;
+    let word = if accept { "accept" } else { "reject" };
+    confirm::typed(&mut tty, &render::skill_proposal(&p, scope.as_deref(), activation.as_deref()), word)?;
+    let edits =
+        (scope.is_some() || activation.is_some()).then(|| SkillEdits { scope, activation, ..Default::default() });
+    let d: SkillProposalView = c.call(method::SKILL_REVIEW, SkillReview { id: p.proposal.id, accept, edits, note })?;
+    match (d.proposal.status.as_str(), d.proposal.version) {
+        ("accepted", Some(v)) => println!(
+            "accepted: {} v{v} written and signed in the skill library ({})",
+            mirante_core::dna::untrusted::line(&d.proposal.name, 64),
+            d.proposal.scope
+        ),
+        _ => println!("rejected {}", render::short(&d.proposal.id)),
+    }
+    Ok(())
+}
+
+/// `mirante skills retire|restore|rescope|rollback`: typed like accept; the action carries
+/// the hash of the version the person was shown.
+fn skill_action(paths: &Paths, name: String, op: SkillOp) -> Res {
+    let mut tty = confirm::DevTty::open()?;
+    let mut c = client(paths)?;
+    may_review_skills(&mut c)?;
+    let v: SkillView = c.call(method::SKILL_GET, SkillGet { name: name.clone(), version: None })?;
+    let (word, action, scope, version) = match op {
+        SkillOp::Retire => ("retire", SkillActionKind::Retire, None, None),
+        SkillOp::Restore => ("restore", SkillActionKind::Restore, None, None),
+        SkillOp::Rescope(s) => ("rescope", SkillActionKind::Rescope, Some(s), None),
+        SkillOp::Rollback(n) => ("rollback", SkillActionKind::Rollback, None, Some(n)),
+    };
+    let mut summary = render::skill_view(&v);
+    if let Some(s) = &scope {
+        summary.push_str(&format!("\nnew scope: {}\n", mirante_core::dna::untrusted::line(s, 200)));
+    }
+    if let Some(n) = version {
+        summary.push_str(&format!("\nroll back to the content of v{n} (as a new version)\n"));
+    }
+    confirm::typed(&mut tty, &summary, word)?;
+    let a = SkillAction { name, action, scope, version, expect_hash: v.summary.manifest_hash };
+    let after: SkillView = c.call(method::SKILL_ACTION, a)?;
+    let k = &after.summary;
+    let done = match word {
+        "retire" => "retired",
+        "restore" => "restored",
+        "rescope" => "rescoped",
+        _ => "rolled back",
+    };
+    println!("{done} {}: v{} {} {}", k.name, k.version, k.scope, k.status);
+    Ok(())
+}
+
+fn skills(paths: &Paths, k: SkillsCmd) -> Res {
+    match k {
+        SkillsCmd::Lint { file } => {
+            let findings = skilllint::lint_file(std::path::Path::new(&file))?;
+            for f in &findings {
+                println!("{}", skilllint::finding_line(f));
+            }
+            if has_errors(&findings) {
+                let n = findings.iter().filter(|f| f.severity == mirante_core::skills::lint::Severity::Error).count();
+                return Err(Box::new(LintErrors(format!("{n} lint error(s): a person could not accept this skill"))));
+            }
+            if findings.is_empty() {
+                println!("no findings");
+            }
+            Ok(())
+        }
+        SkillsCmd::Tenant { repo } => {
+            let (key, tenant) = origin_and_tenant(repo)?;
+            let tenants: Vec<TenantView> = client(paths)?.call(method::SKILL_TENANTS, json!({}))?;
+            let t = tenants.iter().find(|t| t.tenant == tenant);
+            let learning = if t.is_some_and(|t| t.learning) { "learning on" } else { "learning off" };
+            println!("origin  {key}");
+            println!(
+                "tenant  {tenant}  ({learning}; {} tasks, {} skills)",
+                t.map_or(0, |t| t.tasks),
+                t.map_or(0, |t| t.skills)
+            );
+            Ok(())
+        }
+        SkillsCmd::Learn { on, repo } => {
+            let mut tty = confirm::DevTty::open()?;
+            let (key, tenant) = origin_and_tenant(repo)?;
+            let mut c = client(paths)?;
+            may_review_skills(&mut c)?;
+            let summary = if on {
+                format!(
+                    "Turn skill learning on for {tenant} (this repo: {key}).\nMirante reads your goals, messages and \
+denied permissions in this client's tasks, on this machine only, to propose skills for your review. Agents may \
+propose skills for their own task (skill_propose)."
+                )
+            } else {
+                format!(
+                    "Turn skill learning off for {tenant} (this repo: {key}). Accepted skills stay and still apply."
+                )
+            };
+            let word = if on { "enable" } else { "disable" };
+            confirm::typed(&mut tty, &summary, word)?;
+            let t: TenantView = c.call(method::SKILL_LEARN, SkillLearn { tenant, enabled: on })?;
+            println!("skill learning {} for {}", if t.learning { "on" } else { "off" }, t.tenant);
+            Ok(())
+        }
+        SkillsCmd::Ls => {
+            let list: Vec<SkillSummary> = client(paths)?.call(method::SKILL_LIST, SkillListParams::default())?;
+            if list.is_empty() {
+                println!("no skills yet");
+            } else {
+                print!("{}", render::skills_table(&list));
+            }
+            Ok(())
+        }
+        SkillsCmd::Show { name, version } => {
+            let v: SkillView = client(paths)?.call(method::SKILL_GET, SkillGet { name, version })?;
+            print!("{}", render::skill_view(&v));
+            Ok(())
+        }
+        SkillsCmd::Proposals { all } => {
+            let mut c = client(paths)?;
+            let mut list: Vec<SkillProposalView> = Vec::new();
+            loop {
+                let q = SkillProposals {
+                    status: all.then(|| "all".to_string()),
+                    after: list.last().map(|p| p.proposal.id.clone()),
+                    limit: Some(200),
+                    ..Default::default()
+                };
+                let page: Vec<SkillProposalView> = c.call(method::SKILL_PROPOSALS, q)?;
+                let more = page.len() == 200;
+                list.extend(page);
+                if !more {
+                    break;
+                }
+            }
+            if list.is_empty() {
+                println!("{}", if all { "no skill proposals" } else { "no pending proposals" });
+            } else {
+                print!("{}", render::skill_proposals_table(&list));
+            }
+            Ok(())
+        }
+        SkillsCmd::Review { id, accept, scope, activation, note } => {
+            skill_review(paths, id, accept, scope, activation, note)
+        }
+        SkillsCmd::Action { name, op } => skill_action(paths, name, op),
+        SkillsCmd::Mine { repo } => {
+            let (_, tenant) = origin_and_tenant(repo)?;
+            let m: SkillMined = client(paths)?.call(method::SKILL_MINE, SkillMine { tenant })?;
+            println!(
+                "{}: {} new proposal(s), {} updated, {} skipped (mirante skills proposals)",
+                m.tenant, m.proposed, m.updated, m.skipped
+            );
+            Ok(())
+        }
+        SkillsCmd::Add { dir, scope, activation } => {
+            let dir = std::fs::canonicalize(&dir).map_err(|e| format!("{dir}: {e}"))?;
+            let add = SkillAdd { dir: Some(dir.to_string_lossy().into_owned()), inline: None, scope, activation };
+            let p: SkillProposalView = client(paths)?.call(method::SKILL_ADD, add)?;
+            let errors =
+                p.proposal.lint.iter().filter(|f| f.severity == mirante_core::skills::lint::Severity::Error).count();
+            let lint = if errors > 0 {
+                format!(" ({errors} lint error(s): fix them before accepting)")
+            } else {
+                String::new()
+            };
+            println!(
+                "proposal {} waiting for review{lint}: mirante skills accept|reject {}",
+                p.proposal.id, p.proposal.id
+            );
+            Ok(())
+        }
+    }
+}
+
 fn run(cmd: Cmd) -> Res {
     let paths = Paths::from_env()?;
     let color = term::is_tty(1);
@@ -673,6 +895,7 @@ fn run(cmd: Cmd) -> Res {
             println!("killed pid {}", k.pid);
         }
         Cmd::Memory(m) => memory(&paths, m)?,
+        Cmd::Skills(k) => skills(&paths, k)?,
         Cmd::Archive { task } => {
             let v: TaskView = client(&paths)?.call(method::TASK_ARCHIVE, TaskRef { task })?;
             println!("{} archived (branch {} kept)", render::short(&v.task.id), v.task.branch);
@@ -689,12 +912,12 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         Ok(cmd) => {
-            let check = matches!(cmd, Cmd::Memory(MemoryCmd::Check { .. }));
+            let check = matches!(cmd, Cmd::Memory(MemoryCmd::Check { .. }) | Cmd::Skills(SkillsCmd::Lint { .. }));
             match run(cmd) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("mirante: {e}");
-                    if check && !e.is::<Findings>() {
+                    if check && !e.is::<Findings>() && !e.is::<LintErrors>() {
                         ExitCode::from(EXIT_CHECK_FAILED_TO_RUN)
                     } else {
                         ExitCode::FAILURE

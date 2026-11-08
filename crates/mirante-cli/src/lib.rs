@@ -5,4 +5,5 @@ pub mod confirm;
 pub mod daemon_ctl;
 pub mod memcheck;
 pub mod render;
+pub mod skilllint;
 pub mod term;

@@ -2,8 +2,8 @@
 use mirante_core::dna::untrusted::line;
 use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
 use mirante_ipc::types::{
-    AnchorView, BootState, DoctorReport, MemView, NoteSummary, NoteView, PermissionView, ProposalView, SystemView,
-    TaskView,
+    AnchorView, BootState, DoctorReport, MemView, NoteSummary, NoteView, PermissionView, ProposalView,
+    SkillProposalView, SkillSummary, SkillView, SystemView, TaskView,
 };
 
 /// A proposal as the review prompt shows it: status, title (or the person's new title),
@@ -377,6 +377,150 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
     out
 }
 
+/// Indented body lines (at most `max` of them), each cleaned for the terminal.
+fn body_lines(out: &mut String, body: &str, max: usize) {
+    for l in body.lines().take(max) {
+        out.push_str(&format!("  | {}\n", line(l, 300)));
+    }
+    if body.lines().count() > max {
+        out.push_str("  | …\n");
+    }
+}
+
+/// `mirante skills ls`: one skill per line, with its verification and 30-day usage.
+pub fn skills_table(skills: &[SkillSummary]) -> String {
+    let mut out = format!(
+        "{}{}{}{}{}{}{}\n",
+        fit("NAME", 26),
+        fit("VER", 5),
+        fit("SCOPE", 36),
+        fit("ACTIVATION", 11),
+        fit("STATUS", 9),
+        fit("CHECK", 10),
+        "INJECTED/USED 30d"
+    );
+    for k in skills {
+        out.push_str(&format!(
+            "{}{}{}{}{}{}{}/{}\n",
+            fit(&line(&k.name, 64), 26),
+            fit(&format!("v{}", k.version), 5),
+            fit(&line(&k.scope, 200), 36),
+            fit(&line(&k.activation, 20), 11),
+            fit(&line(&k.status, 20), 9),
+            fit(if k.verified { "verified" } else { "MODIFIED" }, 10),
+            k.injected_30d,
+            k.used_30d
+        ));
+    }
+    out
+}
+
+/// `mirante skills show`: the summary, its verification, `SKILL.md` and bundled files.
+pub fn skill_view(v: &SkillView) -> String {
+    let k = &v.summary;
+    let mut out = format!(
+        "{} v{} (current v{}, {})\n  scope: {}\n  activation: {}\n  description: {}\n",
+        line(&k.name, 64),
+        v.shown_version,
+        k.version,
+        line(&k.status, 20),
+        line(&k.scope, 200),
+        line(&k.activation, 20),
+        line(&k.description, 1024)
+    );
+    match (&k.reason, k.verified) {
+        (Some(r), _) => out.push_str(&format!("  NOT VERIFIED: {} (never injected until re-reviewed)\n", line(r, 300))),
+        (None, true) => out.push_str("  verified: signed, and the version a person accepted\n"),
+        (None, false) => out.push_str("  NOT VERIFIED\n"),
+    }
+    let versions: Vec<String> = v.versions.iter().map(u32::to_string).collect();
+    out.push_str(&format!("  versions: {}\n", versions.join(", ")));
+    out.push_str(&format!("  used in the last 30 days: injected {}, used {}\n", k.injected_30d, k.used_30d));
+    for w in &v.warnings {
+        out.push_str(&format!("  warning: {}\n", line(w, 300)));
+    }
+    if !v.skill_md.is_empty() {
+        out.push('\n');
+        body_lines(&mut out, &v.skill_md, 200);
+    }
+    for f in &v.files {
+        out.push_str(&format!("\n  file {}:\n", line(&f.path, 200)));
+        body_lines(&mut out, &f.text, 40);
+    }
+    out
+}
+
+/// `mirante skills proposals`: one proposal per line, with its lint errors counted.
+pub fn skill_proposals_table(ps: &[SkillProposalView]) -> String {
+    let mut out = format!(
+        "{}{}{}{}{}{}{}\n",
+        fit("ID", 38),
+        fit("STATUS", 10),
+        fit("FROM", 7),
+        fit("KIND", 5),
+        fit("NAME", 26),
+        fit("SCOPE", 36),
+        "LINT"
+    );
+    for v in ps {
+        let p = &v.proposal;
+        let errors = p.lint.iter().filter(|f| f.severity == mirante_core::skills::lint::Severity::Error).count();
+        let lint = if errors > 0 { format!("{errors} error(s)") } else { "ok".to_string() };
+        out.push_str(&format!(
+            "{}{}{}{}{}{}{lint}\n",
+            fit(&line(&p.id, 37), 38),
+            fit(&line(&p.status, 9), 10),
+            fit(&line(&p.origin, 6), 7),
+            fit(&line(&p.kind, 4), 5),
+            fit(&line(&p.name, 64), 26),
+            fit(&line(&p.scope, 200), 36),
+        ));
+    }
+    out
+}
+
+/// A skill proposal as a person reviews it: who proposed it, where it applies, its text,
+/// lint findings, evidence and warnings. Everything in it may come from an agent: cleaned.
+pub fn skill_proposal(v: &SkillProposalView, scope: Option<&str>, activation: Option<&str>) -> String {
+    let p = &v.proposal;
+    let mut out = format!(
+        "Skill proposal {} ({}, {} from {}, tenant {})\n  name: {}\n  description: {}\n",
+        line(&p.id, 64),
+        line(&p.status, 20),
+        line(&p.kind, 20),
+        line(&p.origin, 20),
+        line(&p.tenant, 200),
+        line(&p.name, 64),
+        line(&p.description, 1024)
+    );
+    match scope {
+        Some(s) => out.push_str(&format!("  scope: {} (was {})\n", line(s, 200), line(&p.scope, 200))),
+        None => out.push_str(&format!("  scope: {}\n", line(&p.scope, 200))),
+    }
+    match activation {
+        Some(a) => out.push_str(&format!("  activation: {} (was {})\n", line(a, 20), line(&p.activation, 20))),
+        None => out.push_str(&format!("  activation: {}\n", line(&p.activation, 20))),
+    }
+    if p.redactions > 0 {
+        out.push_str(&format!("  redactions: {} secret(s) masked\n", p.redactions));
+    }
+    for w in &v.warnings {
+        out.push_str(&format!("  warning: {}\n", line(w, 300)));
+    }
+    for f in &p.lint {
+        out.push_str(&format!("  lint: {}\n", crate::skilllint::finding_line(f)));
+    }
+    for e in p.evidence.iter().take(5) {
+        out.push_str(&format!("  seen in task {}: {}\n", line(short(&e.task), 8), line(&e.text, 200)));
+    }
+    out.push('\n');
+    body_lines(&mut out, &p.body, 60);
+    for f in &p.files {
+        out.push_str(&format!("  + file {}\n", line(&f.path, 200)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +751,26 @@ mod tests {
         assert!(t.contains("abcdef12") && t.contains("rm -rf build") && !t.contains("second line"));
         assert!(t.contains("mirante allow <perm>"));
         assert_eq!(perms_table(&[]), "no pending permission requests\n");
+    }
+    #[test]
+    fn a_skill_proposal_card_cleans_what_an_agent_wrote() {
+        let v: SkillProposalView = serde_json::from_value(serde_json::json!({
+            "id": "sp-1", "origin": "agent", "task_id": "t1", "tenant": "github.com/acme", "kind": "new",
+            "name": "x", "base_hash": null, "scope": "repo:github.com/acme/app", "activation": "always",
+            "description": "d\u{1b}[2J", "body": "line one\n\u{1b}]0;title\u{7}two\u{202e}\n",
+            "files": [], "evidence": [], "fingerprint": null,
+            "lint": [{"rule": "injection", "severity": "error", "file": "SKILL.md", "line": 2, "message": "m"}],
+            "redactions": 1, "status": "pending", "version": null, "decision_note": "", "created_at": 0,
+            "decided_at": null, "warnings": ["learned in github.com/acme"]
+        }))
+        .unwrap();
+        let card = skill_proposal(&v, Some("personal"), None);
+        assert!(!card.contains('\u{1b}') && !card.contains('\u{7}') && !card.contains('\u{202e}'), "{card:?}");
+        assert!(card.contains("scope: personal (was repo:github.com/acme/app)"), "{card}");
+        assert!(card.contains("lint: injection (error) SKILL.md:2: m"), "{card}");
+        assert!(card.contains("warning: learned in github.com/acme") && card.contains("1 secret(s) masked"), "{card}");
+        assert!(card.contains("  | line one\n"), "{card}");
+        let table = skill_proposals_table(&[v]);
+        assert!(table.contains("1 error(s)") && table.contains("agent"), "{table}");
     }
 }

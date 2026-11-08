@@ -55,11 +55,29 @@ usage: mirante <command>
   memory propose --task <task> --title <t> --kind fact|decision|pattern|gotcha
                  --cite <path:start-end[#symbol]>... <body...>
                          propose a note yourself, citing committed code in the task worktree
+  skills tenant [<repo>]  the repo's normalized origin and client (tenant), and its learning state
+  skills learn on|off [<repo>]
+                         let Mirante read this client's goals, messages and denied permissions
+                         (on this machine only) to find repeated instructions; typed on the terminal
+  skills ls | skills show <name> [--version <n>]
+                         the library: scope, activation, verification, 30-day usage
+  skills proposals [--all]
+                         the review queue (--all: decided ones too)
+  skills accept <proposal> [--scope <s>] [--activation always|on_demand] [--note <why>]
+  skills reject <proposal> [--note <why>]
+  skills retire|restore <name> | skills rescope <name> <scope> | skills rollback <name> <version>
+                         a person's decision, typed on this terminal like memory's (accept writes
+                         and signs a new version; rescope and rollback make new versions)
+  skills mine [<repo>]   find instructions repeated in 3+ tasks of the repo's client (learning on)
+  skills add <dir> --scope <s> [--activation always|on_demand]
+                         propose a skill folder (SKILL.md + text files) for review
+  skills lint <SKILL.md> offline lint; exits 1 on an error finding, 3 when it could not run
   daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade
 
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
 <repo> defaults to the git checkout of the current directory.
+<scope> is personal, org:<host>/<owner>[/…] or repo:<host>/<path>.
 <perm> is a permission id or a unique suffix.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +150,59 @@ pub enum MemoryCmd {
     },
 }
 
+/// What `mirante skills retire|restore|rescope|rollback` does to a skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillOp {
+    Retire,
+    Restore,
+    Rescope(String),
+    Rollback(u32),
+}
+
+/// `mirante skills …`. A `repo` of `None` means the current directory's checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillsCmd {
+    Tenant {
+        repo: Option<String>,
+    },
+    Learn {
+        on: bool,
+        repo: Option<String>,
+    },
+    Ls,
+    Show {
+        name: String,
+        version: Option<u32>,
+    },
+    Proposals {
+        all: bool,
+    },
+    /// Accept (optionally rescoped / with another activation) or reject a proposal.
+    Review {
+        id: String,
+        accept: bool,
+        scope: Option<String>,
+        activation: Option<String>,
+        note: Option<String>,
+    },
+    Action {
+        name: String,
+        op: SkillOp,
+    },
+    Mine {
+        repo: Option<String>,
+    },
+    Add {
+        dir: String,
+        scope: String,
+        activation: Option<String>,
+    },
+    /// Offline lint of a `SKILL.md` (and the files beside it).
+    Lint {
+        file: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonCmd {
     Start,
@@ -198,6 +269,7 @@ pub enum Cmd {
     },
     Daemon(DaemonCmd),
     Memory(MemoryCmd),
+    Skills(SkillsCmd),
     Help,
 }
 
@@ -371,6 +443,102 @@ fn memory(args: &[String]) -> Result<MemoryCmd, String> {
     }
 }
 
+const SKILLS_VERBS: &str =
+    "tenant, learn, ls, show, proposals, accept, reject, retire, restore, rescope, rollback, mine, add, lint";
+
+/// `always` or `on_demand`.
+fn activation(v: Option<&String>) -> Result<Option<String>, String> {
+    match v.map(String::as_str) {
+        None => Ok(None),
+        Some(a @ ("always" | "on_demand")) => Ok(Some(a.to_string())),
+        Some(other) => Err(format!("unknown activation {other} (always or on_demand)")),
+    }
+}
+
+fn skills(args: &[String]) -> Result<SkillsCmd, String> {
+    let (op, rest) = args.split_first().ok_or(format!("skills <command> ({SKILLS_VERBS})"))?;
+    let none: &[&str] = &[];
+    let two = |p: &Parsed, second: &str| -> Result<(String, String), String> {
+        match p.positional.as_slice() {
+            [a, b] => Ok((a.clone(), b.clone())),
+            [] => Err("missing <name>".into()),
+            [_] => Err(format!("missing <{second}>")),
+            more => Err(format!("expected <name> <{second}>, got {} arguments", more.len())),
+        }
+    };
+    match op.as_str() {
+        "tenant" => Ok(SkillsCmd::Tenant { repo: repo_arg(&split(rest, none, none)?)? }),
+        "learn" => {
+            let usage = || "skills learn on|off [<repo>]".to_string();
+            let p = split(rest, none, none)?;
+            let (on, repo) = match p.positional.as_slice() {
+                [w, more @ ..] if w == "on" || w == "off" => (w == "on", more),
+                _ => return Err(usage()),
+            };
+            match repo {
+                [] => Ok(SkillsCmd::Learn { on, repo: None }),
+                [r] => Ok(SkillsCmd::Learn { on, repo: Some(r.clone()) }),
+                _ => Err(usage()),
+            }
+        }
+        "ls" | "list" => {
+            if !split(rest, none, none)?.positional.is_empty() {
+                return Err("ls takes no arguments".into());
+            }
+            Ok(SkillsCmd::Ls)
+        }
+        "show" => {
+            let p = split(rest, &["--version"], none)?;
+            let version = match p.values.get("--version") {
+                Some(v) => Some(v.parse::<u32>().map_err(|_| format!("--version needs a version number, got {v}"))?),
+                None => None,
+            };
+            Ok(SkillsCmd::Show { name: one(&p, "name")?, version })
+        }
+        "proposals" => {
+            let p = split(rest, none, &["--all"])?;
+            if !p.positional.is_empty() {
+                return Err("proposals takes no arguments".into());
+            }
+            Ok(SkillsCmd::Proposals { all: !p.bools.is_empty() })
+        }
+        "accept" | "reject" => {
+            let accept = op == "accept";
+            let flags: &[&str] = if accept { &["--scope", "--activation", "--note"] } else { &["--note"] };
+            let p = split(rest, flags, none)?;
+            Ok(SkillsCmd::Review {
+                id: one(&p, "proposal")?,
+                accept,
+                scope: p.values.get("--scope").cloned(),
+                activation: activation(p.values.get("--activation"))?,
+                note: p.values.get("--note").cloned(),
+            })
+        }
+        "retire" | "restore" => {
+            let name = one(&split(rest, none, none)?, "name")?;
+            Ok(SkillsCmd::Action { name, op: if op == "retire" { SkillOp::Retire } else { SkillOp::Restore } })
+        }
+        "rescope" => {
+            let (name, scope) = two(&split(rest, none, none)?, "scope")?;
+            Ok(SkillsCmd::Action { name, op: SkillOp::Rescope(scope) })
+        }
+        "rollback" => {
+            let (name, v) = two(&split(rest, none, none)?, "version")?;
+            let n = v.parse::<u32>().map_err(|_| format!("rollback needs a version number, got {v}"))?;
+            Ok(SkillsCmd::Action { name, op: SkillOp::Rollback(n) })
+        }
+        "mine" => Ok(SkillsCmd::Mine { repo: repo_arg(&split(rest, none, none)?)? }),
+        "add" => {
+            let p = split(rest, &["--scope", "--activation"], none)?;
+            let dir = one(&p, "dir")?;
+            let scope = p.values.get("--scope").cloned().ok_or("missing --scope personal|org:<prefix>|repo:<key>")?;
+            Ok(SkillsCmd::Add { dir, scope, activation: activation(p.values.get("--activation"))? })
+        }
+        "lint" => Ok(SkillsCmd::Lint { file: one(&split(rest, none, none)?, "SKILL.md")? }),
+        other => Err(format!("unknown skills command {other} ({SKILLS_VERBS})")),
+    }
+}
+
 fn queue(args: &[String]) -> Result<QueueCmd, String> {
     let none: &[&str] = &[];
     let (op, rest) = args.split_first().ok_or("queue ls|edit|rm|mv <task> ...")?;
@@ -455,6 +623,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         }
         "queue" => queue(rest).map(Cmd::Queue),
         "memory" => memory(rest).map(Cmd::Memory),
+        "skills" => skills(rest).map(Cmd::Skills),
         "perms" => Ok(Cmd::Perms),
         "allow" | "deny" => Ok(Cmd::Answer { id: one(&split(rest, none, none)?, "perm")?, allow: sub == "allow" }),
         "interrupt" => Ok(Cmd::Interrupt { task: one(&split(rest, none, none)?, "task")? }),
@@ -665,5 +834,81 @@ mod tests {
         assert!(p("stop a b").is_err());
         assert!(p("ls --bogus").is_err());
         assert!(p("frobnicate").is_err());
+    }
+    #[test]
+    fn skills_subcommands_parse() {
+        let k = |s: &str| {
+            p(s).map(|c| match c {
+                Cmd::Skills(k) => k,
+                other => panic!("{other:?}"),
+            })
+        };
+        assert_eq!(k("skills tenant").unwrap(), SkillsCmd::Tenant { repo: None });
+        assert_eq!(k("skills tenant ~/app").unwrap(), SkillsCmd::Tenant { repo: Some("~/app".into()) });
+        assert_eq!(k("skills learn on").unwrap(), SkillsCmd::Learn { on: true, repo: None });
+        assert_eq!(k("skills learn off /r").unwrap(), SkillsCmd::Learn { on: false, repo: Some("/r".into()) });
+        assert_eq!(k("skills ls").unwrap(), SkillsCmd::Ls);
+        assert_eq!(
+            k("skills show tests-first").unwrap(),
+            SkillsCmd::Show { name: "tests-first".into(), version: None }
+        );
+        assert_eq!(
+            k("skills show tests-first --version 2").unwrap(),
+            SkillsCmd::Show { name: "tests-first".into(), version: Some(2) }
+        );
+        assert_eq!(k("skills proposals").unwrap(), SkillsCmd::Proposals { all: false });
+        assert_eq!(k("skills proposals --all").unwrap(), SkillsCmd::Proposals { all: true });
+        assert_eq!(
+            k("skills accept p1 --scope org:github.com/acme --activation on_demand").unwrap(),
+            SkillsCmd::Review {
+                id: "p1".into(),
+                accept: true,
+                scope: Some("org:github.com/acme".into()),
+                activation: Some("on_demand".into()),
+                note: None
+            }
+        );
+        assert_eq!(
+            k("skills reject p1 --note dup").unwrap(),
+            SkillsCmd::Review {
+                id: "p1".into(),
+                accept: false,
+                scope: None,
+                activation: None,
+                note: Some("dup".into())
+            }
+        );
+        assert_eq!(k("skills retire a").unwrap(), SkillsCmd::Action { name: "a".into(), op: SkillOp::Retire });
+        assert_eq!(k("skills restore a").unwrap(), SkillsCmd::Action { name: "a".into(), op: SkillOp::Restore });
+        assert_eq!(
+            k("skills rescope a personal").unwrap(),
+            SkillsCmd::Action { name: "a".into(), op: SkillOp::Rescope("personal".into()) }
+        );
+        assert_eq!(k("skills rollback a 3").unwrap(), SkillsCmd::Action { name: "a".into(), op: SkillOp::Rollback(3) });
+        assert_eq!(k("skills mine").unwrap(), SkillsCmd::Mine { repo: None });
+        assert_eq!(k("skills mine /r").unwrap(), SkillsCmd::Mine { repo: Some("/r".into()) });
+        assert_eq!(
+            k("skills add ./my-skill --scope repo:github.com/acme/app").unwrap(),
+            SkillsCmd::Add { dir: "./my-skill".into(), scope: "repo:github.com/acme/app".into(), activation: None }
+        );
+        assert_eq!(
+            k("skills add d --scope personal --activation always").unwrap(),
+            SkillsCmd::Add { dir: "d".into(), scope: "personal".into(), activation: Some("always".into()) }
+        );
+        assert_eq!(k("skills lint x/SKILL.md").unwrap(), SkillsCmd::Lint { file: "x/SKILL.md".into() });
+        // Errors.
+        assert!(k("skills").is_err());
+        assert!(k("skills forget a").unwrap_err().starts_with("unknown skills command forget ("));
+        assert_eq!(k("skills learn maybe").unwrap_err(), "skills learn on|off [<repo>]");
+        assert_eq!(k("skills learn").unwrap_err(), "skills learn on|off [<repo>]");
+        assert_eq!(k("skills show a --version x").unwrap_err(), "--version needs a version number, got x");
+        assert_eq!(k("skills accept").unwrap_err(), "missing <proposal>");
+        assert_eq!(k("skills reject p1 --scope personal").unwrap_err(), "unknown option --scope");
+        assert!(k("skills accept p1 --activation sometimes").unwrap_err().contains("always or on_demand"));
+        assert_eq!(k("skills rescope a").unwrap_err(), "missing <scope>");
+        assert_eq!(k("skills rollback a v2").unwrap_err(), "rollback needs a version number, got v2");
+        assert_eq!(k("skills add d").unwrap_err(), "missing --scope personal|org:<prefix>|repo:<key>");
+        assert_eq!(k("skills lint").unwrap_err(), "missing <SKILL.md>");
+        assert_eq!(k("skills ls x").unwrap_err(), "ls takes no arguments");
     }
 }
