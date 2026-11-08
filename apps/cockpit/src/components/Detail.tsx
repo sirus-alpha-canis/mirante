@@ -1,7 +1,8 @@
-import { type KeyboardEvent, memo, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { collapseRepeats, summarizeSteps } from "../lib/feed";
+import { inboxOf } from "../lib/inbox";
 import { M, type TaskView } from "../lib/protocol";
 import type { FeedItem, State } from "../store/state";
 import { useDnaKey, useDnaRev } from "../lib/useDna";
@@ -9,6 +10,7 @@ import { columnOf, COLUMN_LABEL, type Column, pendingPerms, repoName, turnsEnded
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
+import { ErrorRetry } from "./ErrorRetry";
 import { HibernateButton } from "./MemoryPanel";
 import { atRiskCount, MemoryTab, useTaskMemory } from "./MemoryTab";
 import { MessageComposer } from "./MessageComposer";
@@ -34,8 +36,9 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: "all", label: "Todos" },
 ];
 
-/** Every task's column, as one map: renders when one changes, not on every event. */
-const selectColumns = (s: State) => Object.fromEntries(Object.values(s.tasks).map((t) => [t.id, columnOf(t, s.feed[t.id])]));
+/** Every task's column, as one map (the inbox's, computed once per change): renders when
+ * one changes, not on every event. */
+const selectColumns = (s: State) => inboxOf(s).columns;
 
 const matches = (t: TaskView, q: string) =>
   !q || [t.title, t.branch, t.agent, repoName(t.repo_path)].some((x) => x.toLowerCase().includes(q));
@@ -121,23 +124,55 @@ const TaskList = memo(function TaskList({ selected, onSelect }: { selected: stri
   );
 });
 
-/** The Steps tab: runs of tool steps summed up ("leu 14 arquivos, rodou 3 comandos",
- * expandable to their lines), identical lines folded with ×N. */
+/** The Steps tab: runs of tool steps summed up ("read 14 files, ran 3 commands",
+ * expandable to their lines), identical lines folded with ×N. A run stays open while any of
+ * its lines is in the feed (its first may fall off the store's window). While scrolled to
+ * the bottom, new lines keep it there. */
 const Steps = memo(function Steps({ feed }: { feed: FeedItem[] }) {
   const entries = useMemo(() => summarizeSteps(feed), [feed]);
+  const [open, setOpen] = useState<ReadonlySet<number>>(() => new Set());
+  const list = useRef<HTMLOListElement>(null);
+  const atBottom = useRef(true);
+  useEffect(() => {
+    const pane = list.current?.closest<HTMLElement>(".panel");
+    if (!pane) return;
+    const onScroll = () => {
+      atBottom.current = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 24;
+    };
+    pane.addEventListener("scroll", onScroll);
+    return () => pane.removeEventListener("scroll", onScroll);
+  }, []);
+  useLayoutEffect(() => {
+    const pane = list.current?.closest<HTMLElement>(".panel");
+    if (pane && atBottom.current) pane.scrollTop = pane.scrollHeight;
+  }, [feed]);
+  const toggle = (items: FeedItem[], isOpen: boolean) =>
+    setOpen((cur) => {
+      const next = new Set(cur);
+      for (const i of items) {
+        if (isOpen) next.delete(i.seq);
+        else next.add(i.seq);
+      }
+      return next;
+    });
   return (
-    <ol className="lines lines-full">
-      {entries.map((e) => (e.type === "line" ? <FeedLine key={e.item.seq} item={e.item} count={e.count} /> : <StepRun key={e.items[0].seq} items={e.items} text={e.text} />))}
+    <ol className="lines lines-full" ref={list}>
+      {entries.map((e, n) => {
+        if (e.type === "line") return <FeedLine key={e.item.seq} item={e.item} count={e.count} />;
+        const isOpen = e.items.some((i) => open.has(i.seq));
+        // Keyed by position among runs: a run whose first line fell off keeps its row.
+        const runIndex = entries.slice(0, n).filter((x) => x.type === "run").length;
+        return <StepRun key={`run-${runIndex}`} items={e.items} text={e.text} open={isOpen} onToggle={() => toggle(e.items, isOpen)} />;
+      })}
     </ol>
   );
 });
 
-function StepRun({ items, text }: { items: FeedItem[]; text: string }) {
-  const [open, setOpen] = useState(false);
+function StepRun({ items, text, open, onToggle }: { items: FeedItem[]; text: string; open: boolean; onToggle(): void }) {
   const id = useId();
   return (
     <li className="line line-run">
-      <button type="button" className="btn btn-small btn-ghost" aria-expanded={open} aria-controls={id} onClick={() => setOpen((o) => !o)}>
+      <button type="button" className="btn btn-small btn-ghost" aria-expanded={open} aria-controls={id} onClick={onToggle}>
         <span aria-hidden="true">{open ? "▾" : "▸"}</span> {text}
       </button>
       {open && (
@@ -148,6 +183,18 @@ function StepRun({ items, text }: { items: FeedItem[]; text: string }) {
         </ol>
       )}
     </li>
+  );
+}
+
+/** Steps, or why the history is missing (with Retry). */
+function StepsPanel({ taskId, feed }: { taskId: string; feed: FeedItem[] }) {
+  const { cockpit } = useEnv();
+  const error = useSelect((s) => s.historyErrors[taskId]);
+  return (
+    <>
+      {error && <ErrorRetry text={`Could not load this task's history: ${error}`} onRetry={() => void cockpit.loadHistory(taskId)} />}
+      {feed.length === 0 ? !error && <p className="muted">No steps yet.</p> : <Steps feed={feed} />}
+    </>
   );
 }
 
@@ -279,6 +326,12 @@ export function Detail({
     e.preventDefault();
     selectTab(next);
   };
+  // The keyboard starts at the task (a screen reader reads where it landed), once per task.
+  const title = useRef<HTMLHeadingElement>(null);
+  const hasTask = !!t;
+  useEffect(() => {
+    if (hasTask) title.current?.focus();
+  }, [taskId, hasTask]);
   const onTerminal = tab === "Terminal";
   const notices = t && (
     <>
@@ -306,7 +359,9 @@ export function Detail({
       ) : (
         <main className="detail-main" aria-label={`Task ${t.title}`}>
           <header className="detail-head">
-            <h1>{t.title}</h1>
+            <h1 tabIndex={-1} ref={title}>
+              {t.title}
+            </h1>
             <TaskBadges t={t} />
             <StatusPill column={columnOf(t, feed)} />
             <SkillsChip key={`skills-${t.id}`} task={t.id} />
@@ -334,7 +389,7 @@ export function Detail({
           </div>
           <div className="panel-wrap">
             <section role="tabpanel" id="task-panel" aria-labelledby={`tab-${tab}`} className="panel">
-              {tab === "Steps" && (feed.length === 0 ? <p className="muted">No steps yet.</p> : <Steps feed={feed} />)}
+              {tab === "Steps" && <StepsPanel taskId={t.id} feed={feed} />}
               {/* Mounted on every tab (hidden off its own): coming back to it is no new
                   terminal, attach or repaint. */}
               <div className="terminal-slot" hidden={!onTerminal}>

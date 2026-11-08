@@ -29,6 +29,7 @@ import { ev, task } from "../test/fixtures";
 import { EnvContext, type Env } from "../env";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { Detail } from "./Detail";
+import { FEED_CAP } from "../store/state";
 
 // The same element type `renderWith` renders, so a rerender updates instead of remounting.
 const wrap = (env: Env, ui: ReactElement) => <EnvContext.Provider value={env}>{ui}</EnvContext.Provider>;
@@ -93,6 +94,53 @@ describe("Detail (V1 classic)", () => {
     await userEvent.click(run);
     expect(within(panel).getByText("$ npm test")).toBeInTheDocument();
     expect(within(panel).getByLabelText("3 times")).toHaveTextContent("×3");
+  });
+
+  it("a history that failed to load says so on Steps, with Retry", async () => {
+    let fail = true;
+    const h = makeEnv({ "task.events": () => (fail ? rpcError(1, "store locked") : [ev(3, "a", "step", { type: "command", command: "ls", exit_code: 0 })]) });
+    h.load([task("a")]);
+    act(() => h.env.cockpit.dispatch({ type: "historyFailed", taskId: "a", error: "store locked" }));
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    const panel = screen.getByRole("tabpanel");
+    expect(within(panel).getByRole("alert")).toHaveTextContent("Could not load this task's history: store locked");
+    expect(within(panel).queryByText("No steps yet.")).toBeNull();
+    fail = false;
+    await userEvent.click(within(panel).getByRole("button", { name: "Retry" }));
+    expect(await within(panel).findByText("$ ls")).toBeInTheDocument();
+    expect(within(panel).queryByRole("alert")).toBeNull();
+  });
+
+  it("an open run of steps stays open when the oldest lines fall off the feed", async () => {
+    const read = (seq: number) => ev(seq, "a", "step", { type: "tool", tool: "Read", summary: `src/f${seq}.ts`, ok: true });
+    const h = setup({}, [task("a", { status: "working" })], Array.from({ length: FEED_CAP }, (_, i) => read(i + 1)));
+    const panel = screen.getByRole("tabpanel");
+    await userEvent.click(within(panel).getByRole("button", { expanded: false }));
+    expect(within(panel).getByText("Read src/f1.ts")).toBeInTheDocument();
+    // One more line: the run's first one falls out of the store's window, the run goes on.
+    act(() => h.env.cockpit.dispatch({ type: "event", event: read(FEED_CAP + 1) }));
+    expect(within(panel).queryByText("Read src/f1.ts")).toBeNull();
+    expect(within(panel).getByText(`Read src/f${FEED_CAP + 1}.ts`)).toBeInTheDocument();
+  });
+
+  it("Steps follows new lines while scrolled to the bottom, and stays put once scrolled up", async () => {
+    const h = setup({}, [task("a", { status: "working" })], [ev(3, "a", "step", { type: "command", command: "ls", exit_code: 0 })]);
+    const panel = screen.getByRole("tabpanel");
+    let top = 0;
+    Object.defineProperty(panel, "scrollHeight", { configurable: true, get: () => 1000 });
+    Object.defineProperty(panel, "clientHeight", { configurable: true, get: () => 100 });
+    Object.defineProperty(panel, "scrollTop", { configurable: true, get: () => top, set: (v: number) => void (top = v) });
+    act(() => h.env.cockpit.dispatch({ type: "event", event: ev(4, "a", "step", { type: "command", command: "pwd", exit_code: 0 }) }));
+    expect(top).toBe(1000);
+    top = 200;
+    fireEvent.scroll(panel);
+    act(() => h.env.cockpit.dispatch({ type: "event", event: ev(5, "a", "step", { type: "command", command: "id", exit_code: 0 }) }));
+    expect(top).toBe(200);
+  });
+
+  it("the task's title takes focus when the detail opens", () => {
+    setup();
+    expect(screen.getByRole("heading", { level: 1, name: "goal of a" })).toHaveFocus();
   });
 
   it("tells the app which tab it shows; before the first snapshot it says loading, not gone", async () => {
