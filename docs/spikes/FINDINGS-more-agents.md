@@ -125,3 +125,10 @@ What would make it a go (founder's call):
 - Terms review: OpenCode Zen's free models are "for a limited time"; some use data for training; the plan's research notes 30-day retention for Nemotron. None of this was re-verified here, and the free list changed during the spike.
 
 - [ ] **Founder sign-off:** G1–G5 verdicts and the go/no-go above (name, date).
+
+## Founder decision (2026-11-08): paused
+
+Plan 5.5 is **paused** after Batch A. Focus returns to making the current product (Claude Code + Codex) solid first; we come back to more agents later.
+
+- **OpenCode:** G1–G4 pass with conditions (`task: deny`, `set_config_option` + `currentValue` check before every prompt, `permission` singular key, `--pure`). **G5 is open:** `opencode acp` always listens on `127.0.0.1:4096` (or a random port), documented as unauthenticated by default and able to answer permissions; `OPENCODE_SERVER_PASSWORD` leaks to tool processes. Before resuming: measure whether the listener answers without credentials from a tool call, then pick a mitigation (shell always asks / OS sandbox blocking loopback to that port / upstream fix).
+- **Other free models** (Gemini CLI with an AI Studio key, Ollama local models, OpenRouter free endpoints): pending the founder's Task 0 steps 2–4 when the plan resumes.

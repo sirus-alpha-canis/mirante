@@ -1,5 +1,7 @@
 # Plan 5.5: Mirante more agents (free and local models behind the same cockpit guarantees)
 
+> **Status (2026-11-08): PAUSED after Batch A** — see docs/spikes/FINDINGS-more-agents.md "Founder decision". Resume later.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to work through this plan task by task. Steps use checkbox (`- [ ]`) syntax for tracking. Only one committing agent runs at a time (Plan 2b lesson). Read-only reviewers may run in parallel. **Batch A (spikes) gates everything after it:** no driver code before `docs/spikes/FINDINGS-more-agents.md` says go.
 
 **Goal:** Dispatch tasks to agents backed by **free or local models** with the same guarantees Claude and Codex have:
