@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("migrations/0002_permission_answered_once.sql")),
     (3, include_str!("migrations/0003_lifecycle_archiving.sql")),
     (4, include_str!("migrations/0004_permission_allowed_session.sql")),
+    (5, include_str!("migrations/0005_dna.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -70,7 +71,7 @@ sql_text_enum!(Status, Lifecycle, AgentKind, PermissionStatus);
 /// Single owner of Mirante's durable state. Every mutation runs in one transaction that
 /// also appends its audit event, so state and trail never diverge.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
     boot_id: String,
 }
 
@@ -170,10 +171,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4);
+        assert_eq!(s.schema_version().unwrap(), 5);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4);
+        assert_eq!(s.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -1227,7 +1228,7 @@ mod hardening_tests {
                 .is_err());
         }
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4);
+        assert_eq!(s.schema_version().unwrap(), 5);
         let old = s.permissions_matching("old").unwrap();
         assert_eq!((old[0].status, old[0].created_at, old[0].answered_at), (PermissionStatus::Denied, 5, Some(6)));
         assert_eq!(
