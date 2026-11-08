@@ -54,6 +54,7 @@ function setup(answers: Record<string, unknown> = {}) {
       return s ? view(s) : rpcError(RpcCode.NOT_FOUND, "no skill");
     },
     "skill.proposals": [],
+    "skill.pending": { pending: 0 },
     ...answers,
   });
   renderWith(h.env, <Skills reviewNonce={0} />);
@@ -77,19 +78,41 @@ describe("Skills view", () => {
     expect(screen.getByRole("button", { name: /api-conventions/ })).toHaveTextContent("refused");
   });
 
-  it("a refused skill shows why and offers Re-review (calls skill.add with its folder)", async () => {
-    const h = setup({ "skill.add": { id: "sp-9" } });
+  it("a refused skill shows why and offers Re-review (skill.rereview: the daemon names the folder)", async () => {
+    const h = setup({ "skill.rereview": { id: "sp-9" } });
     await userEvent.click(await screen.findByRole("button", { name: /api-conventions/ }));
     expect(await screen.findByText(/modified on disk: SKILL.md/)).toBeInTheDocument();
     expect(screen.getByText(/not given to any agent until you review it again/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Re-review" }));
-    await waitFor(() =>
-      expect(h.calls).toContainEqual([
-        "skill.add",
-        { dir: "/home/.mirante/skills/api-conventions/v2", scope: "repo:github.com/acme/api", activation: "on_demand" },
-      ]),
-    );
+    await waitFor(() => expect(h.calls).toContainEqual(["skill.rereview", { name: "api-conventions", version: 2 }]));
+    expect(h.calls.some(([m]) => m === "skill.add")).toBe(false);
     expect(await screen.findByText(/queued for review/)).toBeInTheDocument();
+  });
+
+  it("the header counts what waits with skill.pending and the queue says when it shows fewer", async () => {
+    const many = Array.from({ length: 2 }, (_, i) => ({
+      id: `sp-${i}`, origin: "miner", task_id: null, tenant: "github.com/acme", kind: "new", name: `s-${i}`, base_hash: null,
+      scope: "org:github.com/acme", activation: "always", description: "d", body: "b\n", files: [], evidence: [], fingerprint: null,
+      lint: [], redactions: 0, status: "pending", version: null, decision_note: "", created_at: i, decided_at: null, warnings: [],
+    }));
+    const h = setup({ "skill.pending": { pending: 230 }, "skill.proposals": many });
+    expect(await screen.findByRole("button", { name: "Review (230)" })).toBeInTheDocument();
+    expect(await screen.findByText("Showing the oldest 2 of 230 proposals.")).toBeInTheDocument();
+    // One queue fetch for the panel; the header asked for a count only.
+    await waitFor(() => expect(h.calls.filter(([m]) => m === "skill.proposals")).toHaveLength(1));
+  });
+
+  it("a typed scope survives a refetch of the same version", async () => {
+    const h = setup();
+    await userEvent.click(await screen.findByRole("button", { name: /cargo-tests-first/ }));
+    const panel = await screen.findByRole("region", { name: "Skill cargo-tests-first" });
+    await userEvent.clear(within(panel).getByLabelText("New scope"));
+    await userEvent.type(within(panel).getByLabelText("New scope"), "repo:github.com/acme/x");
+    const gets = h.calls.filter(([m]) => m === "skill.get").length;
+    h.env.cockpit.dispatch({ type: "connected", snapshot: { boot_id: "b1", seq: 0, tasks: [], resumed: false } });
+    h.env.cockpit.dispatch({ type: "event", event: ev(1, null, "skill.mined", {}) });
+    await waitFor(() => expect(h.calls.filter(([m]) => m === "skill.get").length).toBeGreaterThan(gets));
+    expect(within(panel).getByLabelText("New scope")).toHaveValue("repo:github.com/acme/x");
   });
 
   it("tenant learning toggles are explicit and explain what is read", async () => {

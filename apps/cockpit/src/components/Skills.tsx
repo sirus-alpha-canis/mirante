@@ -12,19 +12,18 @@ import {
   scopeKind,
   scopeLabel,
   skillAction,
-  skillAdd,
   skillBody,
   skillErrorText,
   skillGet,
   skillLearn,
   skillList,
   skillMine,
-  skillProposals,
+  skillRereview,
   skillTenants,
   scopeTenant,
   wideningWarnings,
 } from "../lib/skills";
-import { useSkillsVersion } from "../lib/useSkills";
+import { usePendingSkills, useSkillsVersion } from "../lib/useSkills";
 import { SkillProposals } from "./SkillProposals";
 
 const KIND_ORDER = { personal: 0, org: 1, repo: 2 } as const;
@@ -131,13 +130,19 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
+  // The version the scope field was filled from: a refetch of the same one keeps what the
+  // person typed; a new version (or another skill) refills it.
+  const scopeOf = useRef<string | null>(null);
   useEffect(() => {
     let live = true;
     skillGet(rpc, name)
       .then((view) => {
         if (!live) return;
         setLoaded({ state: "ready", view });
-        setScope(view.scope);
+        if (scopeOf.current !== view.manifest_hash) {
+          scopeOf.current = view.manifest_hash;
+          setScope(view.scope);
+        }
       })
       .catch((e) => live && setLoaded({ state: "error", error: skillErrorText(e) }));
     return () => {
@@ -169,14 +174,15 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
     run(async () => {
       const next = await skillAction(rpc, v.name, action, v.manifest_hash, extra);
       setLoaded({ state: "ready", view: next });
+      scopeOf.current = next.manifest_hash;
       setScope(next.scope);
       onChanged();
       return action === "retire" ? "Retired: no new session gets it." : action === "restore" ? "Restored." : `Now v${next.version}.`;
     });
   const reReview = () =>
     run(async () => {
-      if (!v.dir) throw new Error("this daemon does not say where the skill's folder is; use `mirante skills add`");
-      const p = await skillAdd(rpc, { dir: v.dir, scope: v.scope, activation: v.activation });
+      // The daemon reads this version's own folder; the cockpit never names a path.
+      const p = await skillRereview(rpc, v.name, v.shown_version);
       onChanged();
       return `The folder on disk was queued for review${p?.id ? ` (proposal ${p.id})` : ""}: accept it to make it a new version.`;
     });
@@ -314,22 +320,13 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
   const [lib, setLib] = useState<Library>({ state: "loading" });
   // The panel: the review queue (null) or a selected skill.
   const [selected, setSelected] = useState<string | null>(null);
-  const [pending, setPending] = useState(0);
+  const pending = usePendingSkills(nonce);
   const seenReview = useRef(reviewNonce);
   useEffect(() => {
     if (reviewNonce === seenReview.current) return;
     seenReview.current = reviewNonce;
     setSelected(null);
   }, [reviewNonce]);
-  useEffect(() => {
-    let live = true;
-    skillProposals(rpc, { status: "pending", limit: 200 })
-      .then((l) => live && setPending((l ?? []).length))
-      .catch(() => live && setPending(0));
-    return () => {
-      live = false;
-    };
-  }, [rpc, version, nonce]);
   useEffect(() => {
     let live = true;
     (async () => {
@@ -391,7 +388,7 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
           <h1>Skills</h1>
           <span className="muted small">Reviewed instructions Mirante gives each matching session</span>
           <button className="btn btn-small" aria-pressed={selected === null} onClick={() => setSelected(null)}>
-            Review ({pending})
+            {pending === null ? "Review" : `Review (${pending})`}
           </button>
         </header>
         {body}
@@ -400,7 +397,7 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
         {selected ? (
           <SkillPanel key={selected} name={selected} version={version} onChanged={reload} />
         ) : (
-          <SkillProposals onDecided={reload} />
+          <SkillProposals onDecided={reload} pending={pending} />
         )}
       </aside>
     </main>

@@ -346,6 +346,8 @@ button.skill-chip { cursor: pointer; }
 .skills-pop { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; width: min(420px, 80vw); display: grid; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18); }
 .skills-pop p { margin: 0; overflow-wrap: anywhere; }
 .skill-confirm { border-left: 3px solid var(--needs); padding-left: 8px; }
+.skill-refine { display: grid; gap: 4px; width: 100%; }
+.skill-changes { display: grid; gap: 4px; border-top: 1px dashed var(--line); padding-top: 6px; margin-top: 4px; }
 
 /* Project colors: one per project, stable (lib/inbox projectColor). Readable on both themes. */
 :root { --p0: #0f766e; --p1: #7c3aed; --p2: #b45309; --p3: #1d4ed8; --p4: #be185d; --p5: #15803d; --p6: #9333ea; --p7: #c2410c; }

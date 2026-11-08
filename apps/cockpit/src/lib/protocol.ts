@@ -351,8 +351,8 @@ export interface SkillView extends SkillSummary {
   files: SkillFileView[];
   versions: number[];
   warnings: string[];
-  /** The version folder on disk (a re-review imports it with `skill.add`). Absent from
-   * older daemons. */
+  /** The version folder on disk (shown only; a re-review is `skill.rereview`, whose folder
+   * the daemon names). Absent from older daemons. */
   dir?: string | null;
 }
 
@@ -403,6 +403,30 @@ export interface SkillProposalView {
   created_at: number;
   decided_at: number | null;
   warnings: string[];
+  /** For a pending edit in the queue: the version it changes, as a person may trust it. */
+  base?: SkillBase | null;
+}
+
+/** `SkillBase`: the version an edit changes. Text only when it verifies (a folder changed
+ * outside Mirante is never a diff base). */
+export interface SkillBase {
+  version: number | null;
+  verified: boolean;
+  reason?: string | null;
+  /** The skill's current version is another one: an accept will be refused. */
+  moved: boolean;
+  description: string;
+  activation: Activation | string;
+  body: string;
+  files: SkillFileView[];
+}
+
+/** `RepoOrigin`: a checkout's pinned origin and its live one (normalized). */
+export interface RepoOrigin {
+  live: string;
+  live_tenant: string;
+  pinned?: string | null;
+  pinned_tenant?: string | null;
 }
 
 export interface SkillEdits {
@@ -526,8 +550,10 @@ export const M = {
   skillConfirmOrigin: "skill.confirm_origin",
   skillLint: "skill.lint",
   skillMine: "skill.mine",
-  skillAdd: "skill.add",
+  skillRereview: "skill.rereview",
+  skillRepoOrigin: "skill.repo_origin",
   skillProposals: "skill.proposals",
+  skillPending: "skill.pending",
   skillReview: "skill.review",
   skillAction: "skill.action",
 } as const;

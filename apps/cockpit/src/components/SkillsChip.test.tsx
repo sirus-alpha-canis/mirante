@@ -20,8 +20,14 @@ const TS: TaskSkills = {
   refused: [],
 };
 
+const ORIGINS = { live: "github.com/evil/app", live_tenant: "github.com/evil", pinned: "github.com/acme/app", pinned_tenant: "github.com/acme" };
+
 function setup(answer: unknown, events = [] as ReturnType<typeof ev>[]) {
-  const h = makeEnv({ "skill.task_skills": answer, "skill.confirm_origin": { origin: "github.com/acme/app", tenant: "github.com/acme", cleared: 1 } });
+  const h = makeEnv({
+    "skill.task_skills": answer,
+    "skill.confirm_origin": { origin: "github.com/acme/app", tenant: "github.com/acme", cleared: 1 },
+    "skill.repo_origin": ORIGINS,
+  });
   h.load([task("a")], events);
   renderWith(h.env, <SkillsChip task="a" />);
   return h;
@@ -44,7 +50,7 @@ describe("SkillsChip", () => {
       ev(2, "a", "skill.used", { session_id: "s1", name: "review-checklist", version: 1 }),
     ]);
     await userEvent.click(await screen.findByRole("button", { name: /Skills 3/ }));
-    const pop = screen.getByRole("group", { name: "Skills of this task" });
+    const pop = screen.getByRole("dialog", { name: "Skills of this task" });
     expect(pop).toHaveTextContent("Tenant: github.com/acme · learning on");
     const rows = within(within(pop).getByRole("list", { name: "Active skills" })).getAllByRole("listitem").map((li) => li.textContent);
     expect(rows).toEqual([
@@ -59,7 +65,22 @@ describe("SkillsChip", () => {
       pop.dispatchEvent(esc);
     });
     expect(esc.defaultPrevented).toBe(true);
-    expect(screen.queryByRole("group", { name: "Skills of this task" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Skills of this task" })).toBeNull();
+  });
+
+  it("is a dialog: focus goes in on open, Escape anywhere closes it and focus goes back to the chip", async () => {
+    setup(TS);
+    const chip = await screen.findByRole("button", { name: "Skills 3" });
+    await userEvent.click(chip);
+    const pop = screen.getByRole("dialog", { name: "Skills of this task" });
+    expect(pop.contains(document.activeElement)).toBe(true);
+    const esc = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => {
+      document.body.dispatchEvent(esc);
+    });
+    expect(esc.defaultPrevented).toBe(true);
+    expect(screen.queryByRole("dialog", { name: "Skills of this task" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
   });
 
   it("refetches on skill.injected", async () => {
@@ -81,12 +102,50 @@ describe("SkillsChip", () => {
     const chip = await screen.findByRole("button", { name: "Skills off: confirm origin" });
     expect(chip).toHaveClass("skill-chip-warn");
     await userEvent.click(chip);
-    const pop = screen.getByRole("group", { name: "Skills of this task" });
+    const pop = screen.getByRole("dialog", { name: "Skills of this task" });
     expect(pop).toHaveTextContent("github.com/evil/app");
-    expect(within(pop).getByRole("button", { name: "Use github.com/evil/app for new tasks" })).toBeInTheDocument();
+    expect(within(pop).getByRole("button", { name: "Use github.com/evil/app for new tasks…" })).toBeInTheDocument();
     await userEvent.click(within(pop).getByRole("button", { name: "Keep github.com/acme/app" }));
     expect(h.calls).toContainEqual(["skill.confirm_origin", { task: "a", origin: "github.com/acme/app" }]);
     expect(await within(pop).findByText(/Confirmed github.com\/acme\/app: 1 task gets skills again/)).toBeInTheDocument();
+  });
+
+  it("moving the checkout to the live origin is two steps that say which client new tasks move to", async () => {
+    const h = setup({ ...TS, confirmed: false, active: [], observed: "github.com/evil/app" });
+    await userEvent.click(await screen.findByRole("button", { name: "Skills off: confirm origin" }));
+    const pop = screen.getByRole("dialog", { name: "Skills of this task" });
+    // Two rows: the pinned origin and the remote now, each with its client.
+    const rows = within(await within(pop).findByRole("list", { name: "Origins of this checkout" }))
+      .getAllByRole("listitem")
+      .map((li) => li.textContent);
+    expect(rows).toEqual(["Pinned: github.com/acme/app (client github.com/acme)", "Remote now: github.com/evil/app (client github.com/evil)"]);
+    expect(h.calls).toContainEqual(["skill.repo_origin", { repo: "/repos/shop" }]);
+    await userEvent.click(within(pop).getByRole("button", { name: "Use github.com/evil/app for new tasks…" }));
+    expect(h.calls.some(([m]) => m === "skill.confirm_origin")).toBe(false);
+    expect(pop).toHaveTextContent(
+      "This moves new tasks of this checkout from client github.com/acme to github.com/evil: they get github.com/evil's skills and learning. This task stays on github.com/acme, without skills.",
+    );
+    await userEvent.click(within(pop).getByRole("button", { name: "Move new tasks to github.com/evil" }));
+    expect(h.calls).toContainEqual(["skill.confirm_origin", { task: "a", origin: "github.com/evil/app" }]);
+  });
+
+  it("what a confirmation said stays after the chip refetches", async () => {
+    let confirmed = false;
+    const h = makeEnv({
+      "skill.task_skills": () => ({ ...TS, confirmed, active: confirmed ? TS.active : [], observed: "github.com/evil/app" }),
+      "skill.confirm_origin": () => {
+        confirmed = true;
+        return { origin: "github.com/acme/app", tenant: "github.com/acme", cleared: 1, warning: "remote.origin.url still points to github.com/evil/app" };
+      },
+      "skill.repo_origin": ORIGINS,
+    });
+    h.load([task("a")]);
+    renderWith(h.env, <SkillsChip task="a" />);
+    await userEvent.click(await screen.findByRole("button", { name: "Skills off: confirm origin" }));
+    await userEvent.click(screen.getByRole("button", { name: "Keep github.com/acme/app" }));
+    expect(await screen.findByRole("button", { name: "Skills 3" })).toBeInTheDocument();
+    expect(screen.getByText(/1 task gets skills again/)).toBeInTheDocument();
+    expect(screen.getByText(/remote.origin.url still points to github.com\/evil\/app/)).toBeInTheDocument();
   });
 
   it("shows the confirm warning the daemon returns", async () => {

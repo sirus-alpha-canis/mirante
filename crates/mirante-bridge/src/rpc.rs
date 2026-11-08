@@ -51,9 +51,11 @@ pub const ALLOWED: &[&str] = &[
     method::DNA_REVIEW,
     method::DNA_NOTE_ACTION,
     // Skills. Never `skill.propose`: agents propose through their `mirante-skills` MCP
-    // server; a person imports or writes one with `skill.add`. Never `skill.may_review`
-    // (the CLI's check before prompting). The daemon still requires a person for
-    // learn, confirm_origin, mine, add, review and action.
+    // server. Never `skill.add`: its `dir` is any absolute path the caller names (the CLI's:
+    // a person in a terminal); the cockpit re-reviews a changed skill with `skill.rereview`,
+    // whose folder the daemon names. Never `skill.may_review` (the CLI's check before
+    // prompting). `skill.repo_origin` shows a checkout's pinned and live origins before a
+    // person moves it to another client. The daemon still requires a person for every one.
     method::SKILL_TENANTS,
     method::SKILL_LEARN,
     method::SKILL_LIST,
@@ -62,8 +64,10 @@ pub const ALLOWED: &[&str] = &[
     method::SKILL_CONFIRM_ORIGIN,
     method::SKILL_LINT,
     method::SKILL_MINE,
-    method::SKILL_ADD,
+    method::SKILL_REREVIEW,
+    method::SKILL_REPO_ORIGIN,
     method::SKILL_PROPOSALS,
+    method::SKILL_PENDING,
     method::SKILL_REVIEW,
     method::SKILL_ACTION,
     // "+ context" in the dispatch form: a repo's file paths matching a query (never contents).
@@ -197,8 +201,10 @@ mod tests {
             "skill.confirm_origin",
             "skill.lint",
             "skill.mine",
-            "skill.add",
+            "skill.rereview",
+            "skill.repo_origin",
             "skill.proposals",
+            "skill.pending",
             "skill.review",
             "skill.action",
             "repo.files",
@@ -220,6 +226,10 @@ mod tests {
             // Agents propose skills through their MCP server; the CLI asks may_review.
             method::SKILL_PROPOSE,
             method::SKILL_MAY_REVIEW,
+            // `skill.add {dir}` reads any absolute path the caller names: the CLI's (a person
+            // in a terminal), never the cockpit's, which re-reviews with `skill.rereview`
+            // (the daemon names the folder).
+            method::SKILL_ADD,
             "x.y",
         ];
         for m in refused {

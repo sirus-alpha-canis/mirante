@@ -14,6 +14,9 @@ export interface Transport {
 }
 
 export const REFRESH_MS = 120;
+/** A burst of skill events (a mine, a batch of proposals) refetches skills views once,
+ * this long after its first event. */
+export const SKILLS_COALESCE_MS = 250;
 /** History loads in flight at once after a snapshot (the daemon serves 64 connections). */
 export const HISTORY_CONCURRENCY = 4;
 /** Retries of a history load the daemon refused as busy (or could not take), with backoff. */
@@ -77,10 +80,17 @@ export function createCockpit(t: Transport): Cockpit {
   const watchers = new Set<(prev: State, next: State) => void>();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  let skillsTimer: ReturnType<typeof setTimeout> | null = null;
   const dispatch = (a: Action) => {
     const prev = state;
     state = reduce(state, a);
     if (state === prev) return;
+    if (state.skillsVersion !== state.skillsRev && !skillsTimer) {
+      skillsTimer = setTimeout(() => {
+        skillsTimer = null;
+        dispatch({ type: "skillsSettled" });
+      }, SKILLS_COALESCE_MS);
+    }
     for (const w of watchers) w(prev, state);
     for (const l of listeners) l();
   };

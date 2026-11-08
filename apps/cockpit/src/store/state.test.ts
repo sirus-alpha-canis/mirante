@@ -378,6 +378,47 @@ describe("skills (skill.*) events", () => {
     expect(line("skill.decided", { id: "p", accepted: false, name: "x", version: null })).toBe("skill proposal rejected");
     expect(line("step", { type: "skills_failed", error: "disk full" })).toBe("skills not given to this session: disk full");
   });
+
+  it("words versions, withdrawals, lost first turns and a session's failed bundle", () => {
+    const line = (kind: string, p: Record<string, unknown>) => feedItem(ev(1, "t1", kind, p));
+    expect(line("skill.injected", { session_id: "s", names: ["a", "b"], versions: [2, 1] })?.text).toBe("skills given to this session: a v2, b v1");
+    expect(line("skill.withdrawn", { session_id: "s", names: ["a", "b"] })?.text).toBe(
+      "skills withdrawn from this conversation (retired or changed since): a, b",
+    );
+    expect(line("step", { type: "skills_withdrawn", names: ["a"] })?.text).toBe(
+      "the agent was told to stop following withdrawn skills and their files were removed: a",
+    );
+    const lost = line("step", { type: "skills_maybe_lost", error: "timed out" });
+    expect(lost?.text).toBe("the first turn carrying this session's skills may not have reached the agent (not sent again): timed out");
+    expect(lost?.warn).toBe(true);
+    const failed = line("skill.unavailable", { session_id: "s", reason: "the skills could not be written for this session: disk full" });
+    expect(failed?.text).toBe("skills taken back from this session: the skills could not be written for this session: disk full");
+    expect(failed?.warn).toBe(true);
+  });
+
+  it("a withdrawal or a failed bundle takes the names back from what the session got", () => {
+    let s = connected();
+    s = reduce(s, { type: "event", event: ev(6, "t1", "skill.injected", { session_id: "s1", names: ["a", "b"] }) });
+    s = reduce(s, { type: "event", event: ev(7, "t1", "skill.withdrawn", { session_id: "s1", names: ["a"] }) });
+    expect(s.sessionSkills.t1.names).toEqual(["b"]);
+    expect(s.skillTaskVersion.t1).toBe(2);
+    s = reduce(s, { type: "event", event: ev(8, "t1", "skill.unavailable", { session_id: "s1", reason: "x" }) });
+    expect(s.sessionSkills.t1.names).toEqual([]);
+    // Another session's failure leaves this one alone.
+    s = reduce(s, { type: "event", event: ev(9, "t1", "skill.injected", { session_id: "s2", names: ["c"] }) });
+    s = reduce(s, { type: "event", event: ev(10, "t1", "skill.unavailable", { session_id: "s1", reason: "x" }) });
+    expect(s.sessionSkills.t1.names).toEqual(["c"]);
+  });
+
+  it("skillsRev follows skillsVersion only when the cockpit settles it", () => {
+    let s = connected();
+    s = reduce(s, { type: "event", event: ev(6, null, "skill.proposed", {}) });
+    s = reduce(s, { type: "event", event: ev(7, null, "skill.proposed", {}) });
+    expect([s.skillsVersion, s.skillsRev]).toEqual([2, 0]);
+    s = reduce(s, { type: "skillsSettled" });
+    expect(s.skillsRev).toBe(2);
+    expect(reduce(s, { type: "skillsSettled" })).toBe(s);
+  });
 });
 
 describe("no-op updates keep the state (nothing re-renders)", () => {

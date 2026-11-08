@@ -128,18 +128,23 @@ describe("Tauri security baseline", () => {
       "SKILL_CONFIRM_ORIGIN",
       "SKILL_LINT",
       "SKILL_MINE",
-      "SKILL_ADD",
+      "SKILL_REREVIEW",
+      "SKILL_REPO_ORIGIN",
       "SKILL_PROPOSALS",
+      "SKILL_PENDING",
       "SKILL_REVIEW",
       "SKILL_ACTION",
       "REPO_FILES",
     ]);
     // Never DNA_PROPOSE: agents propose through MCP; people write notes in their editor.
     expect(block).not.toContain("DNA_PROPOSE");
-    // Never SKILL_PROPOSE (agents propose through their MCP server; a person imports with
-    // skill.add) nor SKILL_MAY_REVIEW (the CLI's pre-prompt check).
+    // Never SKILL_PROPOSE (agents propose through their MCP server) nor SKILL_MAY_REVIEW
+    // (the CLI's pre-prompt check).
     expect(block).not.toContain("SKILL_PROPOSE");
     expect(block).not.toContain("SKILL_MAY_REVIEW");
+    // Never SKILL_ADD: its `dir` is any absolute path the caller names (the CLI's); the
+    // cockpit re-reviews with SKILL_REREVIEW, whose folder the daemon names.
+    expect(block).not.toContain("SKILL_ADD");
     // Every method the cockpit calls is one of them ("message.list_queued" is MESSAGE_LIST_QUEUED).
     const wire = new Set(allowed.map((c) => c.toLowerCase().replace("_", ".")));
     for (const m of Object.values(M)) expect(wire, m).toContain(m);

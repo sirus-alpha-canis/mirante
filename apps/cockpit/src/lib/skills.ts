@@ -6,6 +6,7 @@ import type { Rpc } from "./dna";
 import type {
   Finding,
   OriginConfirmed,
+  RepoOrigin,
   SkillActionKind,
   SkillEdits,
   SkillMined,
@@ -54,11 +55,13 @@ export const skillLint = (rpc: Rpc, p: { name: string; description: string; body
   rpc<Finding[]>(M.skillLint, p);
 export const skillMine = (rpc: Rpc, tenant: string) => rpc<SkillMined>(M.skillMine, { tenant });
 
-export type SkillAddParams = {
-  scope: string;
-  activation?: string;
-} & ({ dir: string } | { inline: { name: string; description: string; body: string } });
-export const skillAdd = (rpc: Rpc, p: SkillAddParams) => rpc<SkillProposalView>(M.skillAdd, p);
+/** Queues a skill version's folder, as it is on disk now, for review again. The daemon
+ * names the folder (the cockpit never sends a path) and refuses one that now names
+ * another skill. */
+export const skillRereview = (rpc: Rpc, name: string, version: number) =>
+  rpc<SkillProposalView>(M.skillRereview, { name, version });
+/** A checkout's pinned origin and its live one. */
+export const skillRepoOrigin = (rpc: Rpc, repo: string) => rpc<RepoOrigin>(M.skillRepoOrigin, { repo });
 
 export interface SkillProposalQuery {
   tenant?: string;
@@ -69,6 +72,20 @@ export interface SkillProposalQuery {
   limit?: number;
 }
 export const skillProposals = (rpc: Rpc, q: SkillProposalQuery = {}) => rpc<SkillProposalView[]>(M.skillProposals, q);
+
+/** How many proposals wait, every client's; null from a daemon that cannot count them. */
+export async function skillPending(rpc: Rpc): Promise<number | null> {
+  try {
+    const r = await rpc<{ pending: number }>(M.skillPending, {});
+    return typeof r?.pending === "number" ? r.pending : null;
+  } catch (e) {
+    if (isOlderDaemon(e)) return null;
+    throw e;
+  }
+}
+
+/** The tenant (client) of an origin key: its host and first segment. */
+export const originTenant = (origin: string) => origin.split("/").slice(0, 2).join("/");
 
 export interface SkillReviewParams {
   id: string;

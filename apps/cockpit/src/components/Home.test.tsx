@@ -617,17 +617,19 @@ describe("Home (V3 group chat)", () => {
 
 describe("the rail's skills entry", () => {
   it("shows how many skill proposals wait and opens the Skills view", async () => {
-    const h = makeEnv({ "skill.proposals": [{ id: "sp-1" }, { id: "sp-2" }] });
+    const h = makeEnv({ "skill.pending": { pending: 2 } });
     h.load([task("a")]);
     let opened = 0;
     renderWith(h.env, <Harness env={h.env} onSkills={() => opened++} />);
     await userEvent.click(await screen.findByRole("button", { name: "Skills (2 to review)" }));
     expect(opened).toBe(1);
-    expect(h.calls).toContainEqual(["skill.proposals", { status: "pending", limit: 200 }]);
+    // A count, not the queue: the rail never loads 200 proposals to show a number.
+    expect(h.calls).toContainEqual(["skill.pending", {}]);
+    expect(h.calls.some(([m]) => m === "skill.proposals")).toBe(false);
   });
 
   it("an older daemon without skills shows a plain Skills entry", async () => {
-    const h = makeEnv({ "skill.proposals": rpcError(RpcCode.METHOD_NOT_FOUND, "unknown method") });
+    const h = makeEnv({ "skill.pending": rpcError(RpcCode.METHOD_NOT_FOUND, "unknown method") });
     h.load([task("a")]);
     renderWith(h.env, <Harness env={h.env} onSkills={() => {}} />);
     expect(await screen.findByRole("button", { name: "Skills" })).toBeInTheDocument();

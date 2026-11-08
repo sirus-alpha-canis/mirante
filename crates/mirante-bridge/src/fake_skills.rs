@@ -355,6 +355,31 @@ impl SkillsDemo {
                 }
             }
             method::SKILL_ADD => self.add(p),
+            method::SKILL_REREVIEW => {
+                let name = s("name");
+                let sk = self
+                    .skills
+                    .iter()
+                    .find(|x| x.name == name)
+                    .map(|x| (x.version, x.scope.clone(), x.activation.clone()));
+                match sk {
+                    Some((v, scope, activation)) if p["version"].as_u64() == Some(u64::from(v)) => self
+                        .add(&json!({"dir": format!("{LIB}/{name}/v{v}"), "scope": scope, "activation": activation})),
+                    Some(_) => Err(RpcError::new(code::NOT_FOUND, format!("no such version of {name} on disk"))),
+                    None => Err(RpcError::new(code::NOT_FOUND, format!("no skill {name}"))),
+                }
+            }
+            method::SKILL_REPO_ORIGIN => {
+                let repo = s("repo");
+                match self.repos.iter().find(|r| r.path == repo) {
+                    Some(r) => Ok(json!({"live": r.live, "live_tenant": tenant_of(&r.live),
+                                         "pinned": r.pinned, "pinned_tenant": tenant_of(&r.pinned)})),
+                    None => Err(invalid(&format!("{repo} is not a demo checkout"))),
+                }
+            }
+            method::SKILL_PENDING => {
+                Ok(json!({"pending": self.proposals.iter().filter(|x| x["status"] == "pending").count()}))
+            }
             method::SKILL_PROPOSALS => {
                 let status = p["status"].as_str().unwrap_or("pending");
                 let out: Vec<Value> = self
@@ -364,7 +389,13 @@ impl SkillsDemo {
                     .filter(|x| p["tenant"].as_str().is_none_or(|t| x["tenant"] == t))
                     .filter(|x| p["task"].as_str().is_none_or(|t| x["task_id"] == t))
                     .filter(|x| p["id"].as_str().is_none_or(|i| x["id"] == i))
-                    .cloned()
+                    .map(|x| {
+                        let mut x = x.clone();
+                        if x["kind"] == "edit" && x["status"] == "pending" {
+                            x["base"] = self.base(&x);
+                        }
+                        x
+                    })
                     .collect();
                 Ok(json!(out))
             }
@@ -372,6 +403,22 @@ impl SkillsDemo {
             method::SKILL_ACTION => self.action(p),
             _ => return None,
         })
+    }
+
+    /// The version an edit changes, as the daemon gives it: its text only when it verifies.
+    fn base(&self, x: &Value) -> Value {
+        let Some(sk) = self.skills.iter().find(|s| x["base_hash"].as_str() == Some(hash(&s.name, s.version).as_str()))
+        else {
+            return json!({"version": null, "verified": false, "moved": true, "description": "", "activation": "",
+                          "body": "", "files": [],
+                          "reason": "no reviewed version of this skill matches the one the proposal changes"});
+        };
+        match sk.broken {
+            Some(why) => json!({"version": sk.version, "verified": false, "moved": false, "reason": why,
+                                "description": "", "activation": "", "body": "", "files": []}),
+            None => json!({"version": sk.version, "verified": true, "moved": false, "description": sk.description,
+                           "activation": sk.activation, "body": sk.body, "files": []}),
+        }
     }
 
     fn confirm_origin(&mut self, task: &str, origin: &str, tasks: &[Value]) -> Result<Value, RpcError> {
@@ -603,6 +650,41 @@ mod tests {
         assert!(c["warning"].as_str().unwrap().contains("github.com/someone-else/shop"));
         let w = call(&mut d, method::SKILL_TASK_SKILLS, json!({"task": "t-claude-2"})).unwrap();
         assert_eq!(w["confirmed"], true);
+    }
+
+    #[test]
+    fn rereview_pending_repo_origin_and_the_edit_s_base() {
+        let mut d = SkillsDemo::default();
+        assert_eq!(call(&mut d, method::SKILL_PENDING, json!({})).unwrap(), json!({"pending": 3}));
+        // The agent's edit carries the version it changes, verified; the refused skill's
+        // re-review has no trusted base.
+        let q = call(&mut d, method::SKILL_PROPOSALS, json!({"id": "sp-2"})).unwrap();
+        let b = &q[0]["base"];
+        assert_eq!((b["version"].as_u64(), b["verified"].as_bool()), (Some(3), Some(true)));
+        assert_eq!(b["body"], CARGO_BODY);
+        let p = call(&mut d, method::SKILL_REREVIEW, json!({"name": "api-conventions", "version": 2})).unwrap();
+        assert_eq!(
+            (p["kind"].as_str(), p["origin"].as_str(), p["scope"].as_str(), p["activation"].as_str()),
+            (Some("edit"), Some("import"), Some("repo:github.com/acme/mirante"), Some("on_demand"))
+        );
+        let q = call(&mut d, method::SKILL_PROPOSALS, json!({"id": p["id"]})).unwrap();
+        assert_eq!(q[0]["base"]["verified"], false);
+        assert!(q[0]["base"]["reason"].as_str().is_some_and(|r| r.contains("modified")), "{q}");
+        assert_eq!(call(&mut d, method::SKILL_PENDING, json!({})).unwrap(), json!({"pending": 4}));
+        let e = call(&mut d, method::SKILL_REREVIEW, json!({"name": "api-conventions", "version": 1})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        let e = call(&mut d, method::SKILL_REREVIEW, json!({"name": "nope", "version": 1})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        let o = call(&mut d, method::SKILL_REPO_ORIGIN, json!({"repo": "/repos/shop"})).unwrap();
+        assert_eq!(
+            (o["pinned"].as_str(), o["pinned_tenant"].as_str(), o["live"].as_str(), o["live_tenant"].as_str()),
+            (
+                Some("dev.azure.com/globex/shop/shop"),
+                Some("dev.azure.com/globex"),
+                Some("github.com/someone-else/shop"),
+                Some("github.com/someone-else")
+            )
+        );
     }
 
     #[test]

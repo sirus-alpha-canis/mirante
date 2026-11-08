@@ -16,7 +16,7 @@ export interface FeedItem {
   phase?: "started" | "ended";
   /** A tool step's tool name (`Read`, `Bash`…). */
   tool?: string;
-  /** A line that warns (the agent left manual permission mode). */
+  /** A line that warns (the agent left manual permission mode, skills may be lost or taken back). */
   warn?: boolean;
 }
 
@@ -76,6 +76,9 @@ export interface State {
   /** Skills: bumped on library, proposal, learning and origin events, so skills views
    * refetch (skills are global; their keys are tenants, not repos). */
   skillsVersion: number;
+  /** `skillsVersion` as views see it: the cockpit settles it a moment after a burst of
+   * skill events (see `SKILLS_COALESCE_MS`), so a burst refetches once. */
+  skillsRev: number;
   /** Per task: bumped on its `skill.injected` / `refused` / `unavailable` / `used`. */
   skillTaskVersion: Record<string, number>;
   /** Per task: what its latest session was given (from its `skill.injected` and
@@ -107,6 +110,7 @@ export const initialState: State = {
   dnaVersion: {},
   dnaKeys: {},
   skillsVersion: 0,
+  skillsRev: 0,
   skillTaskVersion: {},
   sessionSkills: {},
 };
@@ -122,7 +126,7 @@ const SKILLS_REFETCH = new Set([
   "skill.origin_pinned",
 ]);
 /** Events about one task's session skills. */
-const SKILL_TASK = new Set(["skill.injected", "skill.refused", "skill.unavailable", "skill.used"]);
+const SKILL_TASK = new Set(["skill.injected", "skill.refused", "skill.unavailable", "skill.used", "skill.withdrawn"]);
 
 type SkillSlice = Pick<State, "skillsVersion" | "skillTaskVersion" | "sessionSkills">;
 
@@ -146,6 +150,12 @@ function skillEffect(state: SkillSlice, e: DaemonEvent): SkillSlice {
     sessionSkills = { ...sessionSkills, [id]: { ...base, refused } };
   } else if (e.kind === "skill.used" && cur && cur.session === session && !cur.used.includes(str(p.name))) {
     sessionSkills = { ...sessionSkills, [id]: { ...cur, used: [...cur.used, str(p.name)] } };
+  } else if (e.kind === "skill.withdrawn" && cur && cur.session === session) {
+    const gone = new Set(Array.isArray(p.names) ? p.names.map(str) : []);
+    sessionSkills = { ...sessionSkills, [id]: { ...cur, names: cur.names.filter((n) => !gone.has(n)) } };
+  } else if (e.kind === "skill.unavailable" && session && cur && cur.session === session) {
+    // The session's bundle failed after it was announced: it holds none of them.
+    sessionSkills = { ...sessionSkills, [id]: { ...cur, names: [], used: [] } };
   }
   return { ...s, skillTaskVersion, sessionSkills };
 }
@@ -184,7 +194,9 @@ export type Action =
   | { type: "queue"; taskId: string; list: QueuedMessage[] }
   | { type: "historyFailed"; taskId: string; error: string }
   /** `path`'s memory is the daemon's `key` (a `dna.status` reply said so). */
-  | { type: "dnaKey"; path: string; key: string };
+  | { type: "dnaKey"; path: string; key: string }
+  /** Skills views may refetch now (`skillsRev` catches up with `skillsVersion`). */
+  | { type: "skillsSettled" };
 
 /** Events that close a card. `permission_answered` always comes first from the daemon; the
  * others refine it (or stand alone when the answer was lost or is outside the page). */
@@ -206,6 +218,7 @@ const QUEUE_CHANGE_TEXT: Record<string, string> = {
 export const SELF_APPROVING = new Set(["auto", "bypassPermissions", "acceptEdits"]);
 
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
+const names = (p: Record<string, unknown>) => (Array.isArray(p.names) ? p.names.map(str) : []);
 
 /** The feed line an event adds, if any. */
 export function feedItem(e: DaemonEvent): FeedItem | null {
@@ -222,6 +235,19 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
           return { ...base, kind: "agent_message", text: str(p.text) };
         case "skills_failed":
           return { ...base, kind: "system", text: `skills not given to this session: ${str(p.error)}` };
+        case "skills_withdrawn":
+          return {
+            ...base,
+            kind: "system",
+            text: `the agent was told to stop following withdrawn skills and their files were removed: ${names(p).join(", ")}`,
+          };
+        case "skills_maybe_lost":
+          return {
+            ...base,
+            kind: "system",
+            warn: true,
+            text: `the first turn carrying this session's skills may not have reached the agent (not sent again): ${str(p.error)}`,
+          };
         default:
           return { ...base, kind: "system", text: [str(p.type), str(p.error)].filter(Boolean).join(": ") };
       }
@@ -280,13 +306,19 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
     case "session.auto_resume_failed":
       return { ...base, kind: "system", text: `could not resume after the daemon restarted: ${str(p.error)}` };
     case "skill.injected": {
-      const names = Array.isArray(p.names) ? p.names.map(str) : [];
-      return { ...base, kind: "system", text: `skills given to this session: ${names.join(", ")}` };
+      const versions = Array.isArray(p.versions) ? p.versions : [];
+      const list = names(p).map((n, i) => (versions[i] == null ? n : `${n} v${str(versions[i])}`));
+      return { ...base, kind: "system", text: `skills given to this session: ${list.join(", ")}` };
     }
+    case "skill.withdrawn":
+      return { ...base, kind: "system", text: `skills withdrawn from this conversation (retired or changed since): ${names(p).join(", ")}` };
     case "skill.refused":
       return { ...base, kind: "system", text: `skill ${str(p.name)} refused: ${str(p.reason)}` };
     case "skill.unavailable":
-      return { ...base, kind: "system", text: `no skills: ${str(p.reason)}` };
+      // With a session: its skills were announced, then could not be written.
+      return p.session_id
+        ? { ...base, kind: "system", warn: true, text: `skills taken back from this session: ${str(p.reason)}` }
+        : { ...base, kind: "system", text: `no skills: ${str(p.reason)}` };
     case "skill.used":
       return { ...base, kind: "system", text: `skill ${str(p.name)} used` };
     case "skill.proposed":
@@ -553,5 +585,7 @@ export function reduce(s: State, a: Action): State {
       return { ...s, historyErrors: { ...s.historyErrors, [a.taskId]: a.error } };
     case "dnaKey":
       return s.dnaKeys[a.path] === a.key ? s : { ...s, dnaKeys: { ...s.dnaKeys, [a.path]: a.key } };
+    case "skillsSettled":
+      return s.skillsRev === s.skillsVersion ? s : { ...s, skillsRev: s.skillsVersion };
   }
 }

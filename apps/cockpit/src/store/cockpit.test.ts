@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamMsg } from "../lib/protocol";
 import { ev, snapshot, task } from "../test/fixtures";
-import { createCockpit, HISTORY_CONCURRENCY, HISTORY_RETRIES, REFRESH_MS } from "./cockpit";
+import { createCockpit, HISTORY_CONCURRENCY, HISTORY_RETRIES, REFRESH_MS, SKILLS_COALESCE_MS } from "./cockpit";
 
 function fakeTransport(answers: Record<string, unknown>) {
   let push: (m: StreamMsg) => void = () => {};
@@ -273,5 +273,24 @@ describe("queue refresh", () => {
     replies[0]([{ id: "old", text: "old" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(c.getState().queues.t1).toEqual([{ id: "new", text: "new" }]);
+  });
+
+  it("coalesces a burst of skill events into one skills refetch", async () => {
+    const t = fakeTransport({ "task.events": [], "permission.list": [] });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([], 0) });
+    const revs: number[] = [];
+    c.onChange((prev, next) => {
+      if (prev.skillsRev !== next.skillsRev) revs.push(next.skillsRev);
+    });
+    for (let i = 1; i <= 5; i++) t.push({ type: "event", event: ev(i, null, "skill.proposed", { name: `p${i}` }) });
+    await vi.advanceTimersByTimeAsync(SKILLS_COALESCE_MS - 10);
+    expect(revs).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(revs).toEqual([5]);
+    t.push({ type: "event", event: ev(6, null, "skill.decided", {}) });
+    await vi.advanceTimersByTimeAsync(SKILLS_COALESCE_MS + 1);
+    expect(revs).toEqual([5, 6]);
   });
 });

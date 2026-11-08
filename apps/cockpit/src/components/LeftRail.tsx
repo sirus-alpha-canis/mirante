@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useEnv, useSelect } from "../env";
-import { DaemonError } from "../lib/daemon";
 import { dnaStatus } from "../lib/dna";
-import { type DaemonSettings, M, RpcCode } from "../lib/protocol";
-import { skillProposals } from "../lib/skills";
-import { useSkillsVersion } from "../lib/useSkills";
+import { type DaemonSettings, M } from "../lib/protocol";
+import { usePendingSkills } from "../lib/useSkills";
 import type { AgentKind, DaemonStatus, TaskView } from "../lib/protocol";
 import { addRepo, expandHome, loadRepos, normaliseRepoPath, removeRepo } from "../lib/repos";
 import { needsYou, type Project, repoName } from "../store/select";
@@ -275,23 +273,10 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
   );
 }
 
-/** "Skills (n to review)": skill proposals waiting for a person, across all clients. */
+/** "Skills (n to review)": skill proposals waiting for a person, across all clients (a
+ * count, shared with the Skills view; an older daemon shows no count). */
 function SkillsEntry({ onOpen }: { onOpen(): void }) {
-  const { rpc } = useEnv();
-  const version = useSkillsVersion();
-  const [pending, setPending] = useState(0);
-  useEffect(() => {
-    let live = true;
-    skillProposals(rpc, { status: "pending", limit: 200 })
-      .then((l) => live && setPending((l ?? []).length))
-      .catch((e) => {
-        // An older daemon has no skills; any other failure shows no count either.
-        if (live && !(e instanceof DaemonError && e.code === RpcCode.METHOD_NOT_FOUND)) setPending(0);
-      });
-    return () => {
-      live = false;
-    };
-  }, [rpc, version]);
+  const pending = usePendingSkills() ?? 0;
   return (
     <>
       <h2>Skills</h2>
