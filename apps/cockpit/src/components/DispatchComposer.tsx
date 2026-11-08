@@ -21,6 +21,7 @@ import {
   GOAL_HELP,
   isPowerSyntax,
   matchProjects,
+  mayHoldSecrets,
   nextFreeBranch,
   parseDispatch,
   resolveRepo,
@@ -154,6 +155,13 @@ export function DispatchComposer(props: {
       if (!p.ok) return setError(p.error);
       const r = resolveRepo(p.value.repo, props.projects);
       if (!r.ok) return setError(r.error);
+      // Files and notes were picked in the form's repo: elsewhere they name nothing (or
+      // something else).
+      const local = sentRefs.filter((x) => x.kind !== "skill");
+      if (local.length > 0 && r.path !== repo) {
+        const from = props.projects.find((x) => x.path === repo)?.name ?? repo ?? "another repo";
+        return setError(`The attached files and notes are from ${from}, not ${p.value.repo}: remove them, or dispatch to ${from}.`);
+      }
       // "shop/" with no branch: named from the goal, like the form's.
       renames = p.value.branch === "";
       const b = renames ? nextFreeBranch(branchFromGoal(p.value.goal), takenIn(r.path)) : p.value.branch;
@@ -488,7 +496,15 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
       if (tab === "files") {
         if (!repo) return { list: [], note: "Pick a repository first." };
         const files = (await rpc<string[]>(M.repoFiles, { repo, query: q, limit: 20 })) ?? [];
-        return { list: files.map((path) => ({ key: `file:${path}`, ref: { kind: "file", path } as ContextRef, label: path })), note: files.length ? null : "No matching file." };
+        return {
+          list: files.map((path) => ({
+            key: `file:${path}`,
+            ref: { kind: "file", path } as ContextRef,
+            label: path,
+            detail: mayHoldSecrets(path) ? "⚠ may hold secrets" : undefined,
+          })),
+          note: files.length ? null : "No matching file.",
+        };
       }
       if (tab === "notes") {
         if (!repo) return { list: [], note: "Pick a repository first." };

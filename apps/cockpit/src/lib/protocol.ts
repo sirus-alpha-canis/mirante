@@ -136,11 +136,15 @@ export interface DaemonStatus {
   claude_inline_answers?: boolean;
   /** Sessions the daemon ended come back when it starts again (absent from older daemons). */
   auto_resume?: boolean | null;
+  /** `MIRANTE_AUTO_RESUME=off` keeps auto-resume off for this daemon (absent when not). */
+  auto_resume_forced_off?: boolean | null;
 }
 
 /** `daemon.settings`. */
 export interface DaemonSettings {
   auto_resume: boolean;
+  /** `MIRANTE_AUTO_RESUME=off` keeps it off for this daemon (the choice is saved for later). */
+  forced_by_env?: boolean;
 }
 
 export interface StartResult {

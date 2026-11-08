@@ -379,8 +379,9 @@ describe("Home (V3 group chat)", () => {
     await waitFor(() => expect(sent(h).map((c) => c[0])).toContain("task.create"));
     const goal = String(sent(h).find((c) => c[0] === "task.create")?.[1].goal);
     expect(goal.split("\n")[0]).toBe("Fix the login");
-    expect(goal).toContain("- file: src/login.ts");
-    expect(goal).toContain("- skill: cargo-tests-first (run the tests first)");
+    expect(goal).toContain('- file: "src/login.ts"');
+    expect(goal).toContain('- skill: "cargo-tests-first"');
+    expect(goal).not.toContain("run the tests first");
     await waitFor(() => expect(screen.queryByRole("list", { name: "Attached context" })).toBeNull());
   });
 
@@ -391,6 +392,35 @@ describe("Home (V3 group chat)", () => {
     };
     setup({}, [], [], paused);
     expect(screen.getByText("Memory is tight: new sessions wait until it eases")).toBeInTheDocument();
+  });
+
+  it("files that may hold secrets are flagged in the picker", async () => {
+    setup({ "repo.files": ["src/env.ts", "config/.env"] });
+    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    const dialog = screen.getByRole("dialog", { name: "Add context" });
+    const secret = await within(dialog).findByRole("button", { name: /^config\/\.env/ });
+    expect(secret).toHaveTextContent("may hold secrets");
+    expect(within(dialog).getByRole("button", { name: /^src\/env\.ts/ })).not.toHaveTextContent("may hold secrets");
+  });
+
+  it("a power dispatch to another repo refuses files and notes attached for this one", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" }, "repo.files": ["src/login.ts"] }, [task("x", { repo_path: "/repos/api" })]);
+    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    const dialog = screen.getByRole("dialog", { name: "Add context" });
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
+    await userEvent.keyboard("{Escape}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@claude api/feat/y do it{Meta>}{Enter}{/Meta}");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/attached .* shop.*api|from shop/);
+    expect(sent(h).map((c) => c[0])).not.toContain("task.create");
+  });
+
+  it("with MIRANTE_AUTO_RESUME=off the setting is shown off and cannot be changed here", () => {
+    setup({}, [], [], { ...daemonStatus(false), auto_resume: false, auto_resume_forced_off: true });
+    const settings = screen.getByRole("region", { name: "Sessions" });
+    const box = within(settings).getByRole("checkbox", { name: "Resume sessions after a daemon restart" });
+    expect(box).not.toBeChecked();
+    expect(box).toBeDisabled();
+    expect(settings).toHaveTextContent("MIRANTE_AUTO_RESUME=off");
   });
 
   it("the rail says closing the app keeps agents running, and switches auto-resume through the daemon", async () => {

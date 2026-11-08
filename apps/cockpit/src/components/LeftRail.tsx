@@ -238,6 +238,8 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const known = typeof status?.auto_resume === "boolean" ? status.auto_resume : null;
+  // The daemon's environment turned it off: nothing to switch here.
+  const forced = status?.auto_resume_forced_off === true;
   const on = mine ?? known;
   useEffect(() => setMine(null), [known]);
   const change = async (want: boolean) => {
@@ -260,10 +262,11 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
         <p className="small muted">This daemon does not bring sessions back after a restart.</p>
       ) : (
         <label className="small check">
-          <input type="checkbox" checked={on ?? false} disabled={!status || busy} onChange={(e) => void change(e.target.checked)} />{" "}
+          <input type="checkbox" checked={!forced && (on ?? false)} disabled={!status || busy || forced} onChange={(e) => void change(e.target.checked)} />{" "}
           Resume sessions after a daemon restart
         </label>
       )}
+      {forced && <p className="small muted">Off for this daemon: it was started with MIRANTE_AUTO_RESUME=off.</p>}
       {error && (
         <p className="error small" role="alert">
           {error}
