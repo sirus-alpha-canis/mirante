@@ -289,6 +289,18 @@ mod tests {
     }
 
     #[test]
+    fn a_planted_replace_ref_cannot_make_a_stale_anchor_fresh() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let c1 = head(&r);
+        let a = cite(&r, &c1, "a.rs", None, 1, 1).unwrap();
+        commit_file(&r, "a.rs", "two\n");
+        let c2 = head(&r);
+        plain(&r, &["replace", &c2, &c1]);
+        let rep = check_all(&r, "HEAD", &[a]).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0].state);
+    }
+
+    #[test]
     fn dirty_path_is_reported() {
         let r = repo_with(&[("a.rs", "x\n")]);
         assert!(!is_dirty(&r, "a.rs").unwrap());

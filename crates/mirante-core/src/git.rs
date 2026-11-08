@@ -10,7 +10,10 @@
 //!   `.smudge`, `.process` set to empty, `.required=false`), read with `git config`, which
 //!   executes nothing. [`Git::checkout`] skips this step (see below);
 //! - clears the `GIT_*` variables that redirect git or name programs, and sets
-//!   [`ENV`] (no optional locks, no prompt, no pager, no system config, `LC_ALL=C`).
+//!   [`ENV`] (no optional locks, no prompt, no pager, no system config, `LC_ALL=C`, and
+//!   no replace refs or grafts: an agent can plant `refs/replace/*` or `info/grafts` in the
+//!   shared repository to make one commit read as another, so a stale anchor would read
+//!   as fresh and a task diff would hide changes).
 //!
 //! Diff commands add `--no-ext-diff --no-textconv` themselves (see the daemon's `diff`).
 //!
@@ -28,6 +31,7 @@ use std::process::{Command, Output, Stdio};
 /// `-c` overrides on every git invocation. Each key is valid on git 2.44.
 pub const HARDENING: &[&str] = &[
     "core.fsmonitor=false",
+    "core.useReplaceRefs=false",
     "core.pager=cat",
     "color.ui=never",
     "diff.external=",
@@ -45,6 +49,8 @@ pub const ENV: &[(&str, &str)] = &[
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_PAGER", "cat"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_GRAFT_FILE", "/dev/null"),
     ("LC_ALL", "C"),
 ];
 
@@ -58,6 +64,7 @@ const ENV_CLEARED: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_REPLACE_REF_BASE",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
@@ -196,6 +203,32 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
         let out = Git::new(dir.path()).args(["config", "--get", "filter.a.b.required"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "false");
+    }
+
+    #[test]
+    fn replace_refs_and_grafts_are_ignored() {
+        let dir = TempDir::new("git-replace");
+        let c = |args: &[&str]| plain(dir.path(), &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat());
+        plain(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join("a"), "old\n").unwrap();
+        c(&["add", "a"]);
+        c(&["commit", "-q", "-m", "old"]);
+        std::fs::write(dir.path().join("a"), "new\n").unwrap();
+        c(&["commit", "-q", "-am", "new"]);
+        // A planted replace ref makes HEAD read as its parent to plain git.
+        c(&["replace", "HEAD", "HEAD~1"]);
+        let shown = Git::new(dir.path()).args(["cat-file", "-p", "HEAD:a"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&shown.stdout), "new\n");
+        let diff = Git::new(dir.path()).args(["diff", "--name-only", "HEAD~1", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&diff.stdout).trim(), "a");
+        // A planted graft file is ignored too: HEAD keeps its parent.
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        let head = Git::new(dir.path()).args(["rev-parse", "HEAD"]).output().unwrap();
+        std::fs::write(dir.path().join(".git/info/grafts"), head.stdout).unwrap();
+        let count = Git::new(dir.path()).args(["rev-list", "--count", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+        let cmd = Git::global().command();
+        assert!(cmd.get_envs().any(|(k, v)| k == "GIT_REPLACE_REF_BASE" && v.is_none()));
     }
 
     #[test]
