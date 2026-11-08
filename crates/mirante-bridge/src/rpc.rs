@@ -48,6 +48,22 @@ pub const ALLOWED: &[&str] = &[
     method::DNA_PROPOSALS,
     method::DNA_REVIEW,
     method::DNA_NOTE_ACTION,
+    // Skills. Never `skill.propose`: agents propose through their `mirante-skills` MCP
+    // server; a person imports or writes one with `skill.add`. Never `skill.may_review`
+    // (the CLI's check before prompting). The daemon still requires a person for
+    // learn, confirm_origin, mine, add, review and action.
+    method::SKILL_TENANTS,
+    method::SKILL_LEARN,
+    method::SKILL_LIST,
+    method::SKILL_GET,
+    method::SKILL_TASK_SKILLS,
+    method::SKILL_CONFIRM_ORIGIN,
+    method::SKILL_LINT,
+    method::SKILL_MINE,
+    method::SKILL_ADD,
+    method::SKILL_PROPOSALS,
+    method::SKILL_REVIEW,
+    method::SKILL_ACTION,
 ];
 
 /// `session.start` waits for the agent to boot (up to 45 s in the daemon).
@@ -168,6 +184,18 @@ mod tests {
             "dna.proposals",
             "dna.review",
             "dna.note_action",
+            "skill.tenants",
+            "skill.learn",
+            "skill.list",
+            "skill.get",
+            "skill.task_skills",
+            "skill.confirm_origin",
+            "skill.lint",
+            "skill.mine",
+            "skill.add",
+            "skill.proposals",
+            "skill.review",
+            "skill.action",
         ];
         assert_eq!(ALLOWED, expected);
     }
@@ -183,6 +211,9 @@ mod tests {
             method::EVENTS_SUBSCRIBE,
             method::ATTACH,
             method::DNA_PROPOSE,
+            // Agents propose skills through their MCP server; the CLI asks may_review.
+            method::SKILL_PROPOSE,
+            method::SKILL_MAY_REVIEW,
             "x.y",
         ];
         for m in refused {

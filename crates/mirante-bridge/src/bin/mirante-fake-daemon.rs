@@ -1,6 +1,6 @@
-//! `mirante-fake-daemon <socket>`: the scripted fake daemon with demo tasks and a demo repo
-//! memory (`dna.*`), for working on the cockpit UI without agents and for the app smoke
-//! test. Prints `call <method>` for every request it receives. Not a daemon: it never starts agents or touches git.
+//! `mirante-fake-daemon <socket>`: the scripted fake daemon with demo tasks, a demo repo
+//! memory (`dna.*`) and demo skills (`skill.*`), for working on the cockpit UI without
+//! agents and for the app smoke test. Prints `call <method>` for every request it receives. Not a daemon: it never starts agents or touches git.
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -30,6 +30,21 @@ fn main() {
         Some("t-claude-1"),
         "dna.proposed",
         json!({"id": "p-1", "title": "Login tokens are refreshed by the session layer", "repo": "/repos/mirante"}),
+    );
+    fake.push_event(
+        Some("t-claude-1"),
+        "skill.injected",
+        json!({"session_id": "s-1", "names": ["cargo-tests-first", "review-checklist"]}),
+    );
+    fake.push_event(
+        Some("t-claude-1"),
+        "skill.refused",
+        json!({"session_id": "s-1", "name": "api-conventions", "reason": "modified on disk: SKILL.md"}),
+    );
+    fake.push_event(
+        Some("t-claude-1"),
+        "skill.proposed",
+        json!({"id": "sp-2", "name": "cargo-tests-first", "origin": "agent", "tenant": "github.com/acme"}),
     );
     println!("fake daemon on {}", socket.display());
     let mut seen = 0;

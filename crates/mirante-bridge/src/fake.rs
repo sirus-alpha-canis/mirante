@@ -20,6 +20,7 @@ struct Shared {
     subscribers: Vec<UnixStream>,
     open: Vec<UnixStream>,
     dna: crate::fake_dna::DnaDemo,
+    skills: crate::fake_skills::SkillsDemo,
 }
 
 #[derive(Clone)]
@@ -137,6 +138,9 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
     let mut s = shared.lock().unwrap();
     let s = &mut *s;
     if let Some(r) = s.dna.answer(m, p, &s.tasks) {
+        return r;
+    }
+    if let Some(r) = s.skills.answer(m, p, &s.tasks) {
         return r;
     }
     match m {
