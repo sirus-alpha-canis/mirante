@@ -1365,6 +1365,34 @@ impl Hub {
         (!injected.is_empty()).then_some(r.injected)
     }
 
+    /// The `mirante-skills` server (`skill_propose`) for a session of `task`: only when its
+    /// origin is confirmed and its client has skill learning on (the daemon would refuse
+    /// every proposal otherwise), and the `mirante-mcp` binary exists.
+    pub(crate) fn skills_server_for(&self, task: &Task) -> Option<PathBuf> {
+        let on = {
+            let st = self.lock();
+            match st.store.skill_origin_of(&task.id) {
+                Ok(Some(o)) if o.observed.is_none() => st.store.skill_learning(&o.tenant).unwrap_or(false),
+                _ => false,
+            }
+        };
+        if !on {
+            return None;
+        }
+        match self.factory.memory_server() {
+            Ok(bin) => Some(bin),
+            Err(reason) => {
+                let mut st = self.lock();
+                st.log_error(
+                    Some(&task.id),
+                    "skills server",
+                    &format!("skill_propose is off for this session: {reason}"),
+                );
+                None
+            }
+        }
+    }
+
     /// `skill.task_skills`: what the task's next session would get (nothing recorded).
     pub fn skill_task_skills(&self, p: SkillTaskParams) -> Result<TaskSkills> {
         let task = self.lock().resolve(&p.task)?;
@@ -2357,6 +2385,35 @@ pub(crate) mod tests {
             assert_eq!(spawned(&k).is_some(), again, "{agent:?}");
             assert_eq!(k.payloads("skill.injected").len(), before + usize::from(again), "{agent:?}");
         }
+    }
+
+    /// The `mirante-skills` server (skill_propose) goes to a session only when its task's
+    /// client has learning on and its origin is confirmed (else the daemon would refuse
+    /// every proposal anyway).
+    #[test]
+    fn the_skills_server_goes_only_to_confirmed_learning_tenants() {
+        let k = Kit::new();
+        *k.factory.mcp_bin.lock().unwrap() = Some(PathBuf::from("/opt/m/mirante-mcp"));
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        let t = k.started(AgentKind::Claude, "off").task;
+        let last = || k.factory.skill_mcps.lock().unwrap().last().cloned().flatten();
+        assert_eq!(last(), None, "learning is off");
+        assert_eq!(k.factory.mcps.lock().unwrap().last().cloned().flatten(), None, "memory stays off");
+        k.hub.skill_learn(&Caller::Person, SkillLearn { tenant: "github.com/acme".into(), enabled: true }).unwrap();
+        k.emit(crate::driver::DriverEvent::Exited { code: Some(0) });
+        start(&k, &t.id);
+        assert_eq!(last(), Some(PathBuf::from("/opt/m/mirante-mcp")));
+        // No binary: no server (and the session still starts).
+        *k.factory.mcp_bin.lock().unwrap() = None;
+        k.emit(crate::driver::DriverEvent::Exited { code: Some(0) });
+        start(&k, &t.id);
+        assert_eq!(last(), None);
+        // An unconfirmed origin: none either.
+        *k.factory.mcp_bin.lock().unwrap() = Some(PathBuf::from("/opt/m/mirante-mcp"));
+        set_origin(&k.repo, "git@github.com:other/app.git");
+        let t2 = k.started(AgentKind::Codex, "moved").task;
+        assert!(k.hub.lock().store.skill_origin_of(&t2.id).unwrap().unwrap().observed.is_some());
+        assert_eq!(last(), None);
     }
 
     #[test]

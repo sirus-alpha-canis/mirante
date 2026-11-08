@@ -152,18 +152,39 @@ pub fn settings_json(hook_cmd: &str, allow: &[String]) -> Value {
 /// is less likely to collide with it (Codex merges `-c` overrides into a same-named entry).
 pub const MCP_SERVER: &str = "mirante-memory";
 
-/// The per-task MCP config passed with `claude --mcp-config <file>`: one stdio server,
-/// `mirante-mcp` at `bin`, scoped to `task` and to the daemon under `home`, carrying the
-/// agent marker ([`AGENT_ENV`]) whatever the client passes down. Additive like
-/// `--settings`: the user's own MCP servers still load (no `--strict-mcp-config`), and
-/// nothing is written to `~/.claude`.
-pub fn mcp_json(bin: &Path, task: &str, home: &Path) -> Value {
-    json!({ "mcpServers": { MCP_SERVER: {
+/// Name of the skills MCP server (`mirante-mcp --surface skills`), which offers only
+/// `skill_propose`. A separate server, so its tool is never mistaken for memory and can be
+/// given to a task without memory (and the reverse).
+pub const SKILLS_SERVER: &str = "mirante-skills";
+
+/// The arguments of the skills server.
+pub const SKILLS_SERVER_ARGS: [&str; 2] = ["--surface", "skills"];
+
+/// One stdio server: `mirante-mcp` at `bin` with `args`, scoped to `task` and to the daemon
+/// under `home`, carrying the agent marker ([`AGENT_ENV`]) whatever the client passes down.
+fn mcp_server(bin: &Path, args: &[&str], task: &str, home: &Path) -> Value {
+    json!({
         "type": "stdio",
         "command": bin.to_string_lossy(),
-        "args": [],
+        "args": args,
         "env": { TASK_ENV: task, "MIRANTE_HOME": home.to_string_lossy(), AGENT_ENV: task },
-    }}})
+    })
+}
+
+/// The per-task MCP config passed with `claude --mcp-config <file>`: the memory server
+/// ([`MCP_SERVER`]) when `memory` is set, the skills server ([`SKILLS_SERVER`]) when
+/// `skills` is set (each the `mirante-mcp` binary). Additive like `--settings`: the user's
+/// own MCP servers still load (no `--strict-mcp-config`), and nothing is written to
+/// `~/.claude`.
+pub fn mcp_json(memory: Option<&Path>, skills: Option<&Path>, task: &str, home: &Path) -> Value {
+    let mut servers = serde_json::Map::new();
+    if let Some(bin) = memory {
+        servers.insert(MCP_SERVER.to_string(), mcp_server(bin, &[], task, home));
+    }
+    if let Some(bin) = skills {
+        servers.insert(SKILLS_SERVER.to_string(), mcp_server(bin, &SKILLS_SERVER_ARGS, task, home));
+    }
+    json!({ "mcpServers": servers })
 }
 
 /// The memory tools Claude may call without asking: the read-only ones. `memory_propose`
@@ -451,7 +472,7 @@ mod tests {
 
     #[test]
     fn mcp_json_scopes_the_server_to_the_task() {
-        let v = mcp_json(Path::new("/opt/m/mirante-mcp"), "t1", Path::new("/h/.mirante"));
+        let v = mcp_json(Some(Path::new("/opt/m/mirante-mcp")), None, "t1", Path::new("/h/.mirante"));
         assert_eq!(v["mcpServers"]["mirante-memory"]["type"], "stdio");
         assert_eq!(v["mcpServers"]["mirante-memory"]["command"], "/opt/m/mirante-mcp");
         assert_eq!(v["mcpServers"]["mirante-memory"]["args"], json!([]));
@@ -544,5 +565,26 @@ mod tests {
         // Nothing that would load code or grant anything: no hooks, MCP servers, commands
         // or agents declared.
         assert_eq!(v.as_object().unwrap().len(), 3, "{v}");
+    }
+    #[test]
+    fn mcp_json_has_both_servers_when_both_are_on_and_one_when_one() {
+        let (bin, home) = (Path::new("/opt/m/mirante-mcp"), Path::new("/h/.mirante"));
+        let both = mcp_json(Some(bin), Some(bin), "t1", home);
+        let servers = both["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), ["mirante-memory", "mirante-skills"]);
+        assert_eq!(both["mcpServers"]["mirante-memory"]["args"], json!([]));
+        assert_eq!(both["mcpServers"]["mirante-skills"]["args"], json!(["--surface", "skills"]));
+        for name in ["mirante-memory", "mirante-skills"] {
+            let s = &both["mcpServers"][name];
+            assert_eq!((s["type"].as_str(), s["command"].as_str()), (Some("stdio"), Some("/opt/m/mirante-mcp")));
+            assert_eq!(s["env"], json!({"MIRANTE_TASK_ID": "t1", "MIRANTE_HOME": "/h/.mirante", "MIRANTE_TASK": "t1"}));
+        }
+        let skills = mcp_json(None, Some(bin), "t1", home);
+        assert_eq!(skills["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mirante-skills"]);
+        let memory = mcp_json(Some(bin), None, "t1", home);
+        assert_eq!(memory["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mirante-memory"]);
+        assert_eq!(SKILLS_SERVER, "mirante-skills");
+        // skill_propose is never pre-allowed: Claude asks the operator for each proposal.
+        assert!(!memory_allow().iter().any(|t| t.contains("skill")));
     }
 }

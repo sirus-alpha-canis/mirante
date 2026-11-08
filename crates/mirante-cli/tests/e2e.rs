@@ -777,3 +777,70 @@ fn an_agent_tree_reaches_its_memory_server_but_no_lifecycle_method() {
     let tasks: Vec<TaskView> = env.client().call(method::TASK_LIST, Value::Null).unwrap();
     assert_eq!(tasks.len(), 1);
 }
+
+/// The `mirante-skills` server from an agent's tree: `skill_propose` reaches the daemon for
+/// its own task only (an agent proposal of the task's repo), and the CLI from that tree
+/// still cannot review it.
+#[test]
+fn an_agent_proposes_a_skill_through_the_skills_server() {
+    use mirante_core::model::AgentKind;
+    use mirante_ipc::types::{CreateTask, SkillLearn, SkillProposalView, SkillProposals};
+    use std::io::Write;
+    let env = Env::new();
+    let repo = env.repo.clone();
+    let git = |args: &[&str]| assert!(Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+    git(&["remote", "add", "origin", "https://x-access-token:ghp_secret@github.com/Acme/App.git"]);
+    env.ok(&["daemon", "start"]);
+    let create = |branch: &str| CreateTask {
+        repo: repo.to_string_lossy().into_owned(),
+        agent: AgentKind::Codex,
+        branch: branch.into(),
+        base: None,
+        goal: "g".into(),
+        title: None,
+    };
+    let t: TaskView = env.client().call(method::TASK_CREATE, create("agent")).unwrap();
+    let other: TaskView = env.client().call(method::TASK_CREATE, create("other")).unwrap();
+    let learn = SkillLearn { tenant: "github.com/acme".into(), enabled: true };
+    let _: Value = env.client().call(method::SKILL_LEARN, learn).unwrap();
+
+    let mut mcp = env
+        .cmd(&bin("mirante-mcp"))
+        .args(["--surface", "skills"])
+        .env("MIRANTE_TASK_ID", &t.task.id)
+        .env("MIRANTE_TASK", &t.task.id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let args = json!({"name": "tests-first", "description": "Run the tests first", "body": "Run `cargo test` first.\n",
+                      "task": other.task.id});
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "skill_propose", "arguments": args}}),
+    ];
+    {
+        let mut stdin = mcp.stdin.take().unwrap();
+        for line in &input {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let out = mcp.wait_with_output().unwrap();
+    let replies: Vec<Value> =
+        String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 3, "{replies:?}");
+    assert_eq!(replies[1]["result"]["tools"][0]["name"], "skill_propose");
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(replies[2]["result"]["isError"], false, "{}", replies[2]);
+    let text = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("(new skill tests-first) is waiting for a person's review"), "{text}");
+    let pending: Vec<SkillProposalView> =
+        env.client().call(method::SKILL_PROPOSALS, SkillProposals::default()).unwrap();
+    assert_eq!(pending.len(), 1);
+    let p = &pending[0].proposal;
+    assert_eq!((p.origin.as_str(), p.task_id.as_deref()), ("agent", Some(t.task.id.as_str())), "its own task");
+    assert_eq!(p.scope, "repo:github.com/acme/app");
+    assert_eq!(p.tenant, "github.com/acme");
+}

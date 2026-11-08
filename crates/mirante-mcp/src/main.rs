@@ -1,13 +1,15 @@
 //! `mirante-mcp`: the stdio MCP server Mirante injects into one task's agent session (see
 //! the library docs). It does nothing without `MIRANTE_TASK_ID`, like `mirante-hook`.
-//! stdout carries only protocol messages; logs go to stderr.
+//! `--surface memory` (the default) serves repo memory, `--surface skills` serves
+//! `skill_propose`; anything else exits 2. stdout carries only protocol messages; logs go
+//! to stderr.
 use std::io::{self, BufReader, Write};
 use std::time::Duration;
 
 use mirante_core::claude_launch::TASK_ENV;
 use mirante_ipc::rpc::code;
 use mirante_ipc::{Client, ClientError, Paths, RpcError};
-use mirante_mcp::{read_line_capped, too_long_reply, Backend, Line, Server, MAX_LINE};
+use mirante_mcp::{read_line_capped, too_long_reply, Backend, Line, Server, Surface, MAX_LINE};
 use serde_json::Value;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,7 +34,26 @@ impl Backend for DaemonBackend {
     }
 }
 
+/// The `--surface` argument (`--surface x` or `--surface=x`), memory when absent.
+fn surface(args: &[String]) -> Result<Surface, String> {
+    let value = match args {
+        [] => return Ok(Surface::Memory),
+        [flag, v] if flag == "--surface" => v.as_str(),
+        [one] => one.strip_prefix("--surface=").ok_or_else(|| format!("unknown argument {one}"))?,
+        _ => return Err("usage: mirante-mcp [--surface memory|skills]".into()),
+    };
+    Surface::parse(value).ok_or_else(|| format!("unknown surface {value} (memory or skills)"))
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let surface = match surface(&args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mirante-mcp: {e}");
+            std::process::exit(2);
+        }
+    };
     let task = match std::env::var(TASK_ENV) {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
@@ -47,7 +68,7 @@ fn main() {
             return;
         }
     };
-    let server = Server::new(DaemonBackend { paths }, &task);
+    let server = Server::with_surface(DaemonBackend { paths }, &task, surface);
     let mut input = BufReader::new(io::stdin().lock());
     let mut out = io::stdout().lock();
     loop {

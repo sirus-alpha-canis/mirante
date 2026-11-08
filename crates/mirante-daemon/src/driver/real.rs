@@ -31,7 +31,8 @@ use std::sync::Arc;
 
 use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
 use mirante_core::claude_launch::{
-    launch_spec, mcp_json, memory_allow, settings_json, AlwaysOn, LaunchInput, AGENT_ENV, MCP_SERVER, TASK_ENV,
+    launch_spec, mcp_json, memory_allow, settings_json, AlwaysOn, LaunchInput, AGENT_ENV, MCP_SERVER, SKILLS_SERVER,
+    SKILLS_SERVER_ARGS, TASK_ENV,
 };
 use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
@@ -93,49 +94,61 @@ pub fn toml_str(s: &str) -> Result<String, String> {
     Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
 }
 
-/// The per-task memory server for `codex app-server`, as `-c` config overrides (nothing is
-/// written to `~/.codex`). Codex hands an MCP server only a few variables of its own
-/// environment, so the task, the daemon's home and the agent marker go in `env`.
+/// The per-task memory server (`memory`) and skills server (`skills`) for `codex
+/// app-server`, as `-c` config overrides (nothing is written to `~/.codex`). Codex hands an
+/// MCP server only a few variables of its own environment, so the task, the daemon's home
+/// and the agent marker go in `env`.
 ///
-/// `-c` merges into the user's `config.toml`: `args` is set (empty) so a same-named user
+/// `-c` merges into the user's `config.toml`: `args` is always set so a same-named user
 /// entry's arguments cannot reach the binary. Other keys of such an entry (`url`, `cwd`,
-/// tool filters) cannot be removed with `-c`; the distinct server name makes that
+/// tool filters) cannot be removed with `-c`; the distinct server names make that
 /// collision unlikely.
-pub fn codex_mcp_args(bin: &Path, task: &str, home: &Path) -> Result<Vec<String>, String> {
-    let (bin, task, home) = (toml_str(&bin.to_string_lossy())?, toml_str(task)?, toml_str(&home.to_string_lossy())?);
-    Ok(vec![
-        "-c".to_string(),
-        format!("mcp_servers.{MCP_SERVER}.command={bin}"),
-        "-c".to_string(),
-        format!("mcp_servers.{MCP_SERVER}.args=[]"),
-        "-c".to_string(),
-        format!("mcp_servers.{MCP_SERVER}.env={{{TASK_ENV}={task},{HOME_ENV}={home},{AGENT_ENV}={task}}}"),
-    ])
+pub fn codex_mcp_args(
+    memory: Option<&Path>,
+    skills: Option<&Path>,
+    task: &str,
+    home: &Path,
+) -> Result<Vec<String>, String> {
+    let (task, home) = (toml_str(task)?, toml_str(&home.to_string_lossy())?);
+    let mut out = Vec::new();
+    for (name, bin, args) in [(MCP_SERVER, memory, &[][..]), (SKILLS_SERVER, skills, &SKILLS_SERVER_ARGS[..])] {
+        let Some(bin) = bin else { continue };
+        let bin = toml_str(&bin.to_string_lossy())?;
+        let args: Vec<String> = args.iter().map(|a| toml_str(a)).collect::<Result<_, _>>()?;
+        out.extend([
+            "-c".to_string(),
+            format!("mcp_servers.{name}.command={bin}"),
+            "-c".to_string(),
+            format!("mcp_servers.{name}.args=[{}]", args.join(",")),
+            "-c".to_string(),
+            format!("mcp_servers.{name}.env={{{TASK_ENV}={task},{HOME_ENV}={home},{AGENT_ENV}={task}}}"),
+        ]);
+    }
+    Ok(out)
 }
 
 /// Writes Claude's per-task config into the session dir: the settings (hook for every
-/// event; the memory read tools pre-allowed when memory is on) and, when `req.mcp` is set,
-/// `mcp.json`; otherwise a previous session's `mcp.json` is removed. Returns their paths.
+/// event; the memory read tools pre-allowed when memory is on, `skill_propose` never) and,
+/// when `req.mcp` or `req.skills_mcp` is set, `mcp.json` with those servers; otherwise a
+/// previous session's `mcp.json` is removed. Returns their paths.
 pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(PathBuf, Option<PathBuf>)> {
     let dir = req.paths.session_dir(&req.task.id);
     let settings = dir.join("claude-settings.json");
     let hook = hook.to_string_lossy();
-    let mcp = match &req.mcp {
-        Some(bin) => {
-            let path = dir.join("mcp.json");
-            write_private(&path, &mcp_json(bin, &req.task.id, req.paths.home()).to_string())?;
-            write_private(&settings, &settings_json(&hook, &memory_allow()).to_string())?;
-            Some(path)
+    let allow = if req.mcp.is_some() { memory_allow() } else { Vec::new() };
+    let mcp = if req.mcp.is_some() || req.skills_mcp.is_some() {
+        let path = dir.join("mcp.json");
+        let json = mcp_json(req.mcp.as_deref(), req.skills_mcp.as_deref(), &req.task.id, req.paths.home());
+        write_private(&path, &json.to_string())?;
+        Some(path)
+    } else {
+        match std::fs::remove_file(dir.join("mcp.json")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
         }
-        None => {
-            match std::fs::remove_file(dir.join("mcp.json")) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-            write_private(&settings, &settings_json(&hook, &[]).to_string())?;
-            None
-        }
+        None
     };
+    write_private(&settings, &settings_json(&hook, &allow).to_string())?;
     Ok((settings, mcp))
 }
 
@@ -342,10 +355,8 @@ impl RealFactory {
         let env_remove = codex_env_to_scrub(parent_env());
         let bundle = codex_skill_bundle(req, &sink);
         let first_turn = bundle.as_ref().and_then(|b| b.preamble.as_deref());
-        let extra_args = match &req.mcp {
-            Some(mcp) => codex_mcp_args(mcp, &req.task.id, req.paths.home()).map_err(DriverError::Failed)?,
-            None => Vec::new(),
-        };
+        let extra_args = codex_mcp_args(req.mcp.as_deref(), req.skills_mcp.as_deref(), &req.task.id, req.paths.home())
+            .map_err(DriverError::Failed)?;
         let d = CodexDriver::spawn(
             &bin,
             &req.task.worktree_path,
@@ -436,6 +447,7 @@ mod tests {
             resume: resume.map(String::from),
             paths: Paths::new(Path::new("/h")),
             mcp: None,
+            skills_mcp: None,
             skills: None,
         }
     }
@@ -473,7 +485,7 @@ mod tests {
 
     #[test]
     fn codex_mcp_args_are_toml_overrides() {
-        let a = codex_mcp_args(Path::new("/opt/m/mirante-mcp"), "t1", Path::new("/h/.mirante")).unwrap();
+        let a = codex_mcp_args(Some(Path::new("/opt/m/mirante-mcp")), None, "t1", Path::new("/h/.mirante")).unwrap();
         assert_eq!(
             a,
             [
@@ -491,9 +503,9 @@ mod tests {
     fn toml_strings_escape_quotes_and_backslashes() {
         assert_eq!(toml_str(r#"/a "b"\c"#).unwrap(), r#""/a \"b\"\\c""#);
         assert!(toml_str("a\nb").is_err() && toml_str("a\u{7f}").is_err() && toml_str("\u{1b}[2J").is_err());
-        let a = codex_mcp_args(Path::new("/x/o\"brien/mirante-mcp"), "t1", Path::new("/h")).unwrap();
+        let a = codex_mcp_args(Some(Path::new("/x/o\"brien/mirante-mcp")), None, "t1", Path::new("/h")).unwrap();
         assert_eq!(a[1], "mcp_servers.mirante-memory.command=\"/x/o\\\"brien/mirante-mcp\"");
-        assert!(codex_mcp_args(Path::new("/x\ny/mirante-mcp"), "t1", Path::new("/h")).is_err());
+        assert!(codex_mcp_args(Some(Path::new("/x\ny/mirante-mcp")), None, "t1", Path::new("/h")).is_err());
     }
 
     #[test]
@@ -644,5 +656,42 @@ mod tests {
         resumed.session_id = "sess-43".into();
         assert_eq!(codex_skill_bundle(&resumed, &sink), None);
         assert!(first.dir.join("lookup-api/SKILL.md").exists(), "the first turn's paths still resolve");
+    }
+    #[test]
+    fn codex_mcp_args_cover_both_servers() {
+        let bin = Path::new("/opt/m/mirante-mcp");
+        let a = codex_mcp_args(Some(bin), Some(bin), "t1", Path::new("/h")).unwrap();
+        assert_eq!(a.len(), 12, "{a:?}");
+        assert!(a.iter().step_by(2).all(|f| f == "-c"), "{a:?}");
+        assert_eq!(a[7], "mcp_servers.mirante-skills.command=\"/opt/m/mirante-mcp\"");
+        assert_eq!(a[9], "mcp_servers.mirante-skills.args=[\"--surface\",\"skills\"]");
+        assert_eq!(
+            a[11],
+            "mcp_servers.mirante-skills.env={MIRANTE_TASK_ID=\"t1\",MIRANTE_HOME=\"/h\",MIRANTE_TASK=\"t1\"}"
+        );
+        let only = codex_mcp_args(None, Some(bin), "t1", Path::new("/h")).unwrap();
+        assert_eq!(only, a[6..]);
+        assert!(codex_mcp_args(None, None, "t1", Path::new("/h")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_gets_the_skills_server_without_memory_and_never_pre_allows_propose() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.paths = Paths::new(&d.path().join("home"));
+        req.skills_mcp = Some(PathBuf::from("/opt/m/mirante-mcp"));
+        let (settings, mcp) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
+        let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(mcp.unwrap()).unwrap()).unwrap();
+        assert_eq!(m["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mirante-skills"]);
+        assert_eq!(m["mcpServers"]["mirante-skills"]["args"], serde_json::json!(["--surface", "skills"]));
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(s["permissions"]["allow"], serde_json::json!([]));
+        // Both on: one file, two servers; only memory's read tools are pre-allowed.
+        req.mcp = req.skills_mcp.clone();
+        let (settings, mcp) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
+        let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(mcp.unwrap()).unwrap()).unwrap();
+        assert_eq!(m["mcpServers"].as_object().unwrap().len(), 2);
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(!s["permissions"]["allow"].to_string().contains("skill"), "{s}");
     }
 }

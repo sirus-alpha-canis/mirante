@@ -6,8 +6,13 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 fn run(task: Option<&str>, input: &str) -> (Option<i32>, String) {
+    run_with(&[], task, input)
+}
+
+fn run_with(args: &[&str], task: Option<&str>, input: &str) -> (Option<i32>, String) {
     let home = mirante_ipc::test_dir::TestDir::new();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mirante-mcp"));
+    cmd.args(args);
     cmd.env_clear().env("MIRANTE_HOME", home.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     if let Some(t) = task {
         cmd.env("MIRANTE_TASK_ID", t);
@@ -40,4 +45,21 @@ fn answers_the_handshake_and_reports_an_absent_daemon_as_a_tool_error() {
     assert_eq!(lines.len(), 2, "{out}");
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!((lines[1]["id"].clone(), lines[1]["result"]["isError"].clone()), (Value::from(2), Value::Bool(true)));
+}
+
+#[test]
+fn surface_skills_serves_only_skill_propose_and_a_bad_surface_exits_2() {
+    let list = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+    let names = |out: &str| -> Vec<String> {
+        let v: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    let (code, out) = run_with(&["--surface", "skills"], Some("t1"), list);
+    assert_eq!((code, names(&out)), (Some(0), vec!["skill_propose".to_string()]));
+    let (code, out) = run_with(&["--surface=memory"], Some("t1"), list);
+    assert_eq!((code, names(&out).len()), (Some(0), 3));
+    let (code, out) = run_with(&["--surface", "everything"], Some("t1"), list);
+    assert_eq!((code, out.as_str()), (Some(2), ""));
+    let (code, _) = run_with(&["--surface"], Some("t1"), list);
+    assert_eq!(code, Some(2));
 }

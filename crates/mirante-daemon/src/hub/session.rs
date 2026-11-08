@@ -501,6 +501,7 @@ impl Hub {
             (task, session.id, native, sink)
         };
         let mcp = self.memory_server_for(&task);
+        let skills_mcp = self.skills_server_for(&task);
         // A resumed Codex thread has its skills in its history (its first turn carried
         // them); a resumed Claude session gets its plugin and always-on text again.
         let skills = match (task.agent, &native) {
@@ -513,6 +514,7 @@ impl Hub {
             resume: native.clone(),
             paths: self.paths.clone(),
             mcp,
+            skills_mcp,
             skills,
         };
         match self.factory.spawn(req, sink) {

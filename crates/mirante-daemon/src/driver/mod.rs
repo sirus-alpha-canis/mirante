@@ -334,6 +334,10 @@ pub struct SpawnRequest {
     /// `--mcp-config`, Codex: `-c mcp_servers.mirante-memory.*`). Set only for repos whose memory
     /// was explicitly enabled; `None` launches the agent exactly as before.
     pub mcp: Option<std::path::PathBuf>,
+    /// The `mirante-mcp` binary to give this session as its `mirante-skills` server
+    /// (`skill_propose`): set only when the task's client has skill learning on and its
+    /// origin is confirmed.
+    pub skills_mcp: Option<std::path::PathBuf>,
     /// The verified skills whose scope matches the task's origin (see
     /// `Hub::skills_for`); `None` when there are none.
     pub skills: Option<InjectedSkills>,
