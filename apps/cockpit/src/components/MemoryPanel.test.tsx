@@ -21,7 +21,7 @@ describe("MemoryPanel", () => {
     const h = makeEnv();
     h.load([task("a")]);
     renderWith(h.env, <MemoryPanel status={null} />);
-    expect(screen.getByText("Memory status unknown.")).toBeInTheDocument();
+    expect(screen.getByText("System memory status unknown.")).toBeInTheDocument();
     expect(screen.queryByText(/not available/)).toBeNull();
   });
 
@@ -55,7 +55,7 @@ describe("MemoryPanel", () => {
     h.load([task("a", { memory })], [ev(1, "a", "memory.offer_hibernate", { reason: "memory pressure elevated" })]);
     const sys = { level: "elevated", total: 16 * GB, free: 512 * 2 ** 20, swap_used: 0, swap_total: 0, paused: true };
     renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys }} />);
-    expect(screen.getByText("Memory tight (little free memory) · new sessions paused until it eases")).toBeInTheDocument();
+    expect(screen.getByText("System memory tight (little free memory) · new sessions paused until it eases")).toBeInTheDocument();
     expect(screen.getByText("512 MB free of 16.0 GB")).toBeInTheDocument();
     expect(screen.getByText("3072 MB / 4096 MB")).toBeInTheDocument();
     expect(screen.getByText("feat/a: hibernate suggested: memory pressure elevated")).toBeInTheDocument();

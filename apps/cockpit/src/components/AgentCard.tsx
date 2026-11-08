@@ -4,7 +4,8 @@ import { lastAnswer } from "../lib/feed";
 import { agentModeLabel } from "../lib/labels";
 import type { TaskView } from "../lib/protocol";
 import { columnOf, pendingPerms, turnsEnded } from "../store/select";
-import type { FeedItem } from "../store/state";
+import { feedText, type FeedItem } from "../store/state";
+import { useT } from "../lib/i18n";
 import { AutoModeBadge, StatusPill } from "./Badges";
 import { DoneCard } from "./DoneCard";
 import { LastAnswer } from "./LastAnswer";
@@ -15,13 +16,14 @@ import { TrustCard } from "./TrustCard";
 
 /** One feed line; `count` > 1 when identical lines in a row were folded into it. */
 export const FeedLine = memo(function FeedLine({ item, count = 1 }: { item: FeedItem; count?: number }) {
-  const who = item.kind === "message" ? (item.mode === "queue" ? "you · queued" : "you · steer") : null;
+  const t = useT();
+  const who = item.kind === "message" ? t(item.mode === "queue" ? "card.youQueued" : "card.youSteer") : null;
   return (
     <li className={`line line-${item.kind} ${item.ok === false ? "line-failed" : ""} ${item.warn ? "line-warn" : ""}`}>
       {who && <span className="who">{who}</span>}
-      <span className="text">{item.text}</span>
+      <span className="text">{feedText(item)}</span>
       {count > 1 && (
-        <span className="repeat" aria-label={`${count} times`}>
+        <span className="repeat" aria-label={t("card.times", { n: count })}>
           ×{count}
         </span>
       )}
@@ -46,6 +48,7 @@ export const AgentCard = memo(function AgentCard({
   /** `daemon.status.claude_inline_answers` (false when unknown). */
   inlineAnswers?: boolean;
 }) {
+  const tt = useT();
   // Its own task's slices only: another task's event does not render this card.
   const feed = useSelect((s) => s.feed[t.id]);
   const col = columnOf(t, feed);
@@ -56,7 +59,7 @@ export const AgentCard = memo(function AgentCard({
   const answer = lastAnswer(feed);
   const mode = agentModeLabel(t.agent);
   return (
-    <article className={`card card-${col}`} aria-label={`${t.agent} on ${t.branch}`} data-task={t.id}>
+    <article className={`card card-${col}`} aria-label={tt("card.label", { agent: t.agent, branch: t.branch })} data-task={t.id}>
       <header className="card-head">
         <ProjectChip path={t.repo_path} />
         <button className="link" onClick={() => onOpen(t.id)}>
@@ -76,9 +79,9 @@ export const AgentCard = memo(function AgentCard({
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
       {unexplained && (
         <p className="perm perm-compact">
-          <span className="muted">Waiting for you in the agent's terminal.</span>{" "}
+          <span className="muted">{tt("card.waitingTerminal")}</span>{" "}
           <button className="btn btn-small" onClick={() => onOpen(t.id, "Terminal")}>
-            Open terminal
+            {tt("card.openTerminal")}
           </button>
         </p>
       )}

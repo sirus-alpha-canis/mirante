@@ -4,6 +4,7 @@ import { DaemonError } from "../lib/daemon";
 import { GRANT_ROOT_TOOL, permissionScope } from "../lib/labels";
 import { type AgentKind, M, RpcCode } from "../lib/protocol";
 import type { Perm } from "../store/state";
+import { useT } from "../lib/i18n";
 
 /**
  * A pending permission request. Answers are one-time; there is no "always allow". A Claude
@@ -24,6 +25,7 @@ export function PermissionCard({
   compact?: boolean;
 }) {
   const { rpc } = useEnv();
+  const t = useT();
   const live = useLive();
   // "idle" | in flight | answered (sent, or already answered elsewhere): the card stays
   // until the closing event removes it, so a sent answer keeps its buttons off.
@@ -50,14 +52,14 @@ export function PermissionCard({
     } catch (e) {
       const code = e instanceof DaemonError ? e.code : null;
       if (code === RpcCode.ANSWER_IN_TERMINAL) setRefused(true);
-      setError(code === RpcCode.CONFLICT ? "already answered" : String(e instanceof Error ? e.message : e));
+      setError(code === RpcCode.CONFLICT ? t("ui.alreadyAnswered") : String(e instanceof Error ? e.message : e));
       setPhase(code === RpcCode.CONFLICT ? "done" : "idle");
       sending.current = code === RpcCode.CONFLICT;
     }
   };
   const off = phase !== "idle" || !live;
   return (
-    <div className={`perm ${compact ? "perm-compact" : ""}`} role="group" aria-label={`Permission request: ${perm.tool}`}>
+    <div className={`perm ${compact ? "perm-compact" : ""}`} role="group" aria-label={t("perm.label", { tool: perm.tool })}>
       <div className="perm-what">
         <strong>{perm.tool}</strong>
         <span className={`tag ${perm.tool === GRANT_ROOT_TOOL ? "tag-warn" : ""}`} title={scope.title}>
@@ -70,10 +72,10 @@ export function PermissionCard({
           <button
             ref={terminalButton}
             className="btn btn-primary"
-            title="Mirante does not type this answer: answer the dialog in Claude's own terminal."
+            title={t("perm.terminalTitle")}
             onClick={onAnswerInTerminal}
           >
-            Answer in terminal
+            {t("perm.answerInTerminal")}
           </button>
         ) : (
           <>
@@ -81,11 +83,11 @@ export function PermissionCard({
               {scope.allow}
             </button>
             <button className="btn" disabled={off} onClick={() => answer(false)}>
-              Deny
+              {t("perm.deny")}
             </button>
             {phase === "sent" && (
               <span className="muted small" role="status">
-                sent…
+                {t("perm.sent")}
               </span>
             )}
           </>

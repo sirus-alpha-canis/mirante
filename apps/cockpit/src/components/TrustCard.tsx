@@ -2,11 +2,13 @@ import { useRef, useState } from "react";
 import { useEnv, useLive } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { M, RpcCode } from "../lib/protocol";
+import { useT } from "../lib/i18n";
 
 /** Claude's workspace-trust dialog: only the user answers it (never auto-accepted). One
  * answer per card: the buttons stay off once it is sent, until the boot event removes it. */
 export function TrustCard({ taskId }: { taskId: string }) {
   const { rpc } = useEnv();
+  const t = useT();
   const live = useLive();
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<"idle" | "busy" | "done">("idle");
@@ -22,24 +24,24 @@ export function TrustCard({ taskId }: { taskId: string }) {
       setPhase("done");
     } catch (e) {
       const conflict = e instanceof DaemonError && e.code === RpcCode.CONFLICT;
-      setError(conflict ? "already answered" : e instanceof Error ? e.message : String(e));
+      setError(conflict ? t("ui.alreadyAnswered") : e instanceof Error ? e.message : String(e));
       setPhase(conflict ? "done" : "idle");
       sending.current = conflict;
     }
   };
   const off = phase !== "idle" || !live;
   return (
-    <div className="perm" role="group" aria-label="Trust this folder">
+    <div className="perm" role="group" aria-label={t("trust.label")}>
       <div className="perm-what">
-        <strong>Claude asks whether to trust this worktree folder.</strong>
-        <span className="muted">Declining ends the session.</span>
+        <strong>{t("trust.question")}</strong>
+        <span className="muted">{t("trust.declineEnds")}</span>
       </div>
       <div className="perm-actions">
         <button className="btn btn-primary" disabled={off} onClick={() => answer(true)}>
-          Trust folder
+          {t("trust.accept")}
         </button>
         <button className="btn" disabled={off} onClick={() => answer(false)}>
-          Decline
+          {t("trust.decline")}
         </button>
       </div>
       {error && (

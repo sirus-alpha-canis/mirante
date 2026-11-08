@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { shallow, useEnv, useLive, useSelect } from "../env";
-import { same, type State } from "../store/state";
+import { feedText, type FeedMsg, same, type State } from "../store/state";
+import { useT } from "../lib/i18n";
 import { DaemonError } from "../lib/daemon";
 import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
 import type { DaemonStatus, TaskView } from "../lib/protocol";
@@ -11,6 +12,7 @@ import type { DaemonStatus, TaskView } from "../lib/protocol";
 export function HibernateButton({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
   const live = useLive();
+  const tt = useT();
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const [busy, setBusy] = useState(false);
@@ -27,7 +29,7 @@ export function HibernateButton({ t }: { t: TaskView }) {
     } catch (e) {
       setError(
         e instanceof DaemonError && e.unsupported
-          ? "memory guard not available in this daemon"
+          ? tt("mem.unavailableGuard")
           : e instanceof Error
             ? e.message
             : String(e),
@@ -46,15 +48,15 @@ export function HibernateButton({ t }: { t: TaskView }) {
   if (confirm && !asleep) {
     return (
       <>
-        <span role="group" aria-label="Confirm hibernate">
+        <span role="group" aria-label={tt("mem.confirmHibernate")}>
           <span className="small">
-            {t.status === "working" ? "The agent is mid-turn; hibernating ends this turn." : "Hibernate? Wake resumes the session later."}
+            {tt(t.status === "working" ? "mem.midTurn" : "mem.hibernateQuestion")}
           </span>{" "}
           <button className="btn btn-small btn-warn" disabled={busy} onClick={run}>
-            Hibernate now
+            {tt("mem.hibernateNow")}
           </button>
           <button className="btn btn-small" onClick={() => setConfirm(false)}>
-            Cancel
+            {tt("ui.cancel")}
           </button>
         </span>
         {alert}
@@ -67,9 +69,9 @@ export function HibernateButton({ t }: { t: TaskView }) {
         className="btn btn-small"
         disabled={busy || !live}
         onClick={asleep ? run : () => setConfirm(true)}
-        title={asleep ? "Resume the agent's session" : "Stop the process, keep the session to resume later"}
+        title={tt(asleep ? "mem.wakeTitle" : "mem.hibernateTitle")}
       >
-        {asleep ? "Wake" : "Hibernate"}
+        {tt(asleep ? "mem.wake" : "mem.hibernate")}
       </button>
       {alert}
     </>
@@ -85,47 +87,49 @@ function selectHeavy(s: State): TaskView[] {
 }
 
 /** The latest three memory-guard notices, newest first, with their task's branch. */
-function selectNotices(s: State): { seq: number; text: string; branch: string | null }[] {
+function selectNotices(s: State): { seq: number; text: string; msg?: FeedMsg; branch: string | null }[] {
   return s.memory
     .slice(-3)
     .reverse()
-    .map((n) => ({ seq: n.seq, text: n.text, branch: n.task_id ? (s.tasks[n.task_id]?.branch ?? null) : null }));
+    .map((n) => ({ seq: n.seq, text: n.text, msg: n.msg, branch: n.task_id ? (s.tasks[n.task_id]?.branch ?? null) : null }));
 }
 
 /** The daemon's memory guard: machine pressure, the heaviest sessions, the latest notices. */
 export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; onOpen?(taskId: string): void }) {
+  const tt = useT();
+  const t = tt;
   const heavy = useSelect(selectHeavy, shallow);
   const notices = useSelect(selectNotices, same);
   const sys = systemMemory(status);
   return (
-    <section className="memory" aria-label="Memory guard">
-      <h2>System memory</h2>
+    <section className="memory" aria-label={t("mem.guard")}>
+      <h2>{t("mem.heading")}</h2>
       {!status ? (
-        <p className="muted small">Memory status unknown.</p>
+        <p className="muted small">{t("mem.unknown")}</p>
       ) : !sys ? (
-        <p className="muted small">Memory guard not available in this daemon.</p>
+        <p className="muted small">{t("mem.notAvailable")}</p>
       ) : (
         <>
           <p className={`small level-${sys.level}`}>{pressureText(sys).main}</p>
-          <p className="small muted" title="Available is what the system can hand out now (macOS counts the file cache it gives back). It is not what pauses sessions: the system's pressure is.">
+          <p className="small muted" title={t("mem.availableTitle")}>
             {pressureText(sys).secondary}
           </p>
         </>
       )}
       {heavy.length > 0 && (
-        <ul className="mem-list" aria-label="Sessions by memory">
+        <ul className="mem-list" aria-label={t("mem.byMemory")}>
           {heavy.map((t) => {
             const m = taskMemory(t);
             return (
               <li key={t.id} className={m ? `mem-${m.state}` : ""}>
                 {onOpen ? (
-                  <button className="mem-name link" title={`Open ${t.title}`} onClick={() => onOpen(t.id)}>
+                  <button className="mem-name link" title={tt("mem.open", { title: t.title })} onClick={() => onOpen(t.id)}>
                     {t.branch}
                   </button>
                 ) : (
                   <span className="mem-name">{t.branch}</span>
                 )}
-                <span className="muted small">{m ? `${mb(m.bytes)} / ${mb(m.budget)}` : "hibernated"}</span>
+                <span className="muted small">{m ? `${mb(m.bytes)} / ${mb(m.budget)}` : tt("mem.hibernated")}</span>
                 <HibernateButton t={t} />
               </li>
             );
@@ -133,11 +137,11 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
         </ul>
       )}
       {notices.length > 0 && (
-        <ul className="mem-notices" aria-label="Memory notices">
+        <ul className="mem-notices" aria-label={t("mem.notices")}>
           {notices.map((n) => (
             <li key={n.seq} className="small">
               {n.branch ? `${n.branch}: ` : ""}
-              {n.text}
+              {feedText(n)}
             </li>
           ))}
         </ul>

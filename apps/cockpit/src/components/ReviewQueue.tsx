@@ -10,6 +10,7 @@ import { RpcCode } from "../lib/protocol";
 import { useDnaRev } from "../lib/useDna";
 import { redactedText } from "./MemoryTab";
 import { ErrorRetry } from "./ErrorRetry";
+import { t as tr, useT } from "../lib/i18n";
 
 export const PAGE = 50;
 /** The daemon's largest page (`dna.proposals` limit). */
@@ -21,6 +22,7 @@ export type Decision = { conflict: false; result: ReviewedView } | { conflict: t
 
 function ProposalCard({ p, onDecided }: { p: ProposalView; onDecided(d: Decision): void }) {
   const { rpc } = useEnv();
+  const t = useT();
   const branchOf = useSelect((s) => (p.task_id ? s.tasks[p.task_id]?.branch : undefined));
   const [title, setTitle] = useState(p.title);
   const [body, setBody] = useState(p.body);
@@ -55,18 +57,18 @@ function ProposalCard({ p, onDecided }: { p: ProposalView; onDecided(d: Decision
     <article className="dna-proposal" aria-label={p.title}>
       <div className="dna-note-head">
         <span className="tag">{p.kind}</span>
-        <span className="muted small">{branch ? `from task ${branch}` : p.origin === "cli" ? "from the CLI" : `from ${p.origin}`}</span>
+        <span className="muted small">{branch ? t("review.fromTask", { branch }) : p.origin === "cli" ? t("review.fromCli") : t("review.from", { origin: p.origin })}</span>
         {p.redactions > 0 && <span className="tag tag-warn">{redactedText(p.redactions)}</span>}
       </div>
       <label htmlFor={`${ids}-title`} className="small muted">
-        Title
+        {t("review.title")}
       </label>
       <input id={`${ids}-title`} className="dna-input" value={title} maxLength={120} onChange={(e) => setTitle(e.target.value)} />
       <label htmlFor={`${ids}-body`} className="small muted">
-        Body
+        {t("review.body")}
       </label>
       <textarea id={`${ids}-body`} className="dna-input" rows={5} value={body} onChange={(e) => setBody(e.target.value)} />
-      <ul className="dna-anchors" aria-label="Cites">
+      <ul className="dna-anchors" aria-label={t("note.cites")}>
         {p.anchors.map((a, i) => (
           <li key={i} className="dna-anchor">
             <code>{citation(a)}</code> <span className="muted">@{shortCommit(a.commit)}</span>
@@ -76,29 +78,29 @@ function ProposalCard({ p, onDecided }: { p: ProposalView; onDecided(d: Decision
       {rejecting ? (
         <div className="dna-actions">
           <label htmlFor={`${ids}-note`} className="sr-only">
-            Why (optional)
+            {t("review.why")}
           </label>
           <input
             id={`${ids}-note`}
             className="dna-input"
-            placeholder="Why (optional)"
+            placeholder={t("review.why")}
             value={note}
             onChange={(e) => setNote(e.target.value)}
           />
           <button className="btn btn-small btn-warn" disabled={busy} onClick={() => decide(false)}>
-            Reject proposal
+            {t("review.rejectProposal")}
           </button>
           <button className="btn btn-small" disabled={busy} onClick={() => setRejecting(false)}>
-            Cancel
+            {t("review.cancel")}
           </button>
         </div>
       ) : (
         <div className="dna-actions">
           <button className="btn btn-small btn-primary" disabled={busy} onClick={() => decide(true)}>
-            Accept
+            {t("review.accept")}
           </button>
           <button className="btn btn-small" disabled={busy} onClick={() => setRejecting(true)}>
-            Reject
+            {t("review.reject")}
           </button>
         </div>
       )}
@@ -118,16 +120,17 @@ type Loaded =
 
 /** What a person reads after deciding. */
 function decisionText(d: ReviewedView): string {
-  if (d.status !== "accepted") return "Rejected.";
+  if (d.status !== "accepted") return tr("review.rejected");
   const redacted = d.redacted ?? 0;
-  const head = `Accepted as ${d.slug ?? "a note"}.`;
-  return redacted > 0 ? `${head} ${redactedText(redacted)} from your edits.` : head;
+  const slug = d.slug ?? tr("review.aNote");
+  return redacted > 0 ? tr("review.acceptedRedacted", { slug, redacted: redactedText(redacted) }) : tr("review.accepted", { slug });
 }
 
 /** The pending proposals of `repo`, oldest first, `PAGE` at a time. `onDecided`: a proposal
  * was decided here. */
 export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): void }) {
   const { rpc } = useEnv();
+  const t = useT();
   const boot = useBoot();
   const version = useDnaRev(repo);
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
@@ -167,7 +170,7 @@ export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): v
   };
   const decided = (id: string, d: Decision) => {
     if (d.conflict) {
-      setNotice("That proposal was already decided elsewhere; the queue was refreshed.");
+      setNotice(t("review.conflict"));
       setNonce((n) => n + 1);
       return;
     }
@@ -176,22 +179,19 @@ export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): v
     onDecided?.();
   };
   return (
-    <section className="dna-review" aria-label="Memory review queue">
-      <h2>Review memory</h2>
-      <p className="muted small">
-        Proposals become notes in <code>.mirante/memory/</code> only when you accept them. Edit the title or body first if
-        needed.
-      </p>
+    <section className="dna-review" aria-label={t("review.aria")}>
+      <h2>{t("review.heading")}</h2>
+      <p className="muted small">{t("review.intro")}</p>
       {notice && (
         <p className="muted small" role="status">
           {notice}
         </p>
       )}
-      {loaded.state === "loading" && <p className="muted">Reading the queue…</p>}
-      {loaded.state === "error" && <ErrorRetry text={`Review queue unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />}
+      {loaded.state === "loading" && <p className="muted">{t("review.loading")}</p>}
+      {loaded.state === "error" && <ErrorRetry text={t("review.error", { error: loaded.error })} onRetry={() => setNonce((n) => n + 1)} />}
       {loaded.state === "ready" &&
         (loaded.list.length === 0 ? (
-          <p className="muted">Nothing waits for review.</p>
+          <p className="muted">{t("review.empty")}</p>
         ) : (
           <>
             {loaded.list.map((p) => (
@@ -199,7 +199,7 @@ export function ReviewQueue({ repo, onDecided }: { repo: string; onDecided?(): v
             ))}
             {loaded.more && (
               <button className="btn btn-small" onClick={more}>
-                Load more
+                {t("review.more")}
               </button>
             )}
           </>

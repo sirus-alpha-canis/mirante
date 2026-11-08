@@ -6,6 +6,7 @@ import type { Finding, SkillBase, SkillProposalView, TaskSkills } from "../lib/p
 import { RpcCode } from "../lib/protocol";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
+import { setLang } from "../lib/i18n";
 import { SkillProposals } from "./SkillProposals";
 
 const prop = (id: string, over: Partial<SkillProposalView> = {}): SkillProposalView => ({
@@ -56,6 +57,27 @@ function setup(answers: Record<string, unknown>, tasks = [task("t1", { branch: "
 const card = (name: string) => screen.findByRole("article", { name: `Proposal ${name}` });
 
 describe("SkillProposals", () => {
+  it("the activation choices read as words, not raw values", async () => {
+    setup({ "skill.proposals": [prop("w")], "skill.pending": { pending: 1 } });
+    const c = await card("skill-w");
+    const options = within(within(c).getByLabelText("Activation")).getAllByRole("option");
+    expect(options.map((o) => [o.getAttribute("value"), o.textContent])).toEqual([
+      ["always", "always on"],
+      ["on_demand", "on demand"],
+    ]);
+  });
+
+  it("in Portuguese the queue and its choices are Portuguese; the client's name and the skill's text are not translated", async () => {
+    setLang("pt");
+    setup({ "skill.proposals": [prop("w")], "skill.pending": { pending: 1 } });
+    expect(await screen.findByRole("region", { name: "Fila de revisão de skills" })).toBeInTheDocument();
+    const c = await screen.findByRole("article", { name: "Proposta skill-w" });
+    expect(within(within(c).getByLabelText("Ativação")).getAllByRole("option").map((o) => o.textContent)).toEqual(["sempre ativa", "sob demanda"]);
+    expect(c).toHaveTextContent("Cliente github.com/acme");
+    expect(c).toHaveTextContent("Body of w.");
+    expect(within(c).getByRole("button", { name: "Aceitar" })).toBeInTheDocument();
+  });
+
   it("miner card shows N tasks and up to 5 redacted examples", async () => {
     const evidence = ["t1", "t2", "t3", "t3", "t4", "t5"].map((t, i) => ({ task: t, text: `example ${i} TOKEN=«redacted»` }));
     setup({ "skill.proposals": [prop("a", { evidence })] });

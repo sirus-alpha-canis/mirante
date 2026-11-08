@@ -342,7 +342,7 @@ describe("Home (V3 group chat)", () => {
     const row = within(working).getByRole("article", { name: "claude on feat/w" });
     // One line, in plain words: never the raw command.
     expect(row).toHaveTextContent("@claude");
-    expect(row).toHaveTextContent("rodando um comando");
+    expect(row).toHaveTextContent("running a command");
     expect(row).not.toHaveTextContent("rm -rf");
     // Idle tasks wait folded away.
     expect(within(inbox).getByText(/^Idle \(1\)$/)).toBeInTheDocument();
@@ -365,7 +365,7 @@ describe("Home (V3 group chat)", () => {
     expect(screen.queryByRole("button", { name: "Edit branch" })).toBeNull();
     await userEvent.type(screen.getByLabelText("Goal"), "Fix the login");
     expect(screen.getByText("mirante/fix-the-login")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.type(within(dialog).getByLabelText("Search Files"), "log");
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
@@ -391,12 +391,12 @@ describe("Home (V3 group chat)", () => {
       memory: { level: "elevated", total: 1, free: 1, swap_used: 0, swap_total: 0, paused: true },
     };
     setup({}, [], [], paused);
-    expect(screen.getByText("Memory is tight: new sessions wait until it eases")).toBeInTheDocument();
+    expect(screen.getByText("System memory is tight: new sessions wait until it eases")).toBeInTheDocument();
   });
 
   it("files that may hold secrets are flagged in the picker", async () => {
     setup({ "repo.files": ["src/env.ts", "config/.env"] });
-    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     const secret = await within(dialog).findByRole("button", { name: /^config\/\.env/ });
     expect(secret).toHaveTextContent("may hold secrets");
@@ -405,7 +405,7 @@ describe("Home (V3 group chat)", () => {
 
   it("a power dispatch to another repo refuses files and notes attached for this one", async () => {
     const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" }, "repo.files": ["src/login.ts"] }, [task("x", { repo_path: "/repos/api" })]);
-    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
     await userEvent.keyboard("{Escape}");
@@ -419,7 +419,7 @@ describe("Home (V3 group chat)", () => {
       "/repos/shop",
       "/repos/api",
     ]);
-    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
     await userEvent.keyboard("{Escape}");
@@ -440,7 +440,7 @@ describe("Home (V3 group chat)", () => {
       ],
     });
     const count = (m: string) => h.calls.filter(([x]) => x === m).length;
-    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await waitFor(() => expect(count("repo.files")).toBe(1));
     await userEvent.type(within(dialog).getByLabelText("Search Files"), "login");

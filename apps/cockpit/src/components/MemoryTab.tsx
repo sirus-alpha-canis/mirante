@@ -9,6 +9,7 @@ import { M, RpcCode } from "../lib/protocol";
 import { turnsEnded } from "../store/select";
 import { NoteView, StatePill } from "./NoteView";
 import { ErrorRetry } from "./ErrorRetry";
+import { t as tr, tn, useT } from "../lib/i18n";
 
 export type TaskMemory =
   | { state: "loading" }
@@ -23,7 +24,7 @@ export const PROPOSE_REQUEST =
   "Operator request: if you learned durable facts about this repo in this task, propose them with the memory_propose tool, citing committed code (path and line range). Do not propose secrets or task-specific details.";
 
 export function redactedText(n: number): string {
-  return n === 1 ? "1 secret was redacted" : `${n} secrets were redacted`;
+  return tn(n, "memtab.redacted.one", "memtab.redacted.many");
 }
 
 /** `dna.task_context` for `taskId`, refetched when `version` changes or on `reload()`. */
@@ -81,12 +82,18 @@ function NoteRow({ n, reason, onOpen }: { n: NoteSummary; reason?: string; onOpe
   );
 }
 
+/** A proposal's status (`pending`, `accepted`, `rejected`) in the current language. */
+export function proposalStatus(status: string): string {
+  return status === "pending" ? tr("memtab.status.pending") : status === "accepted" ? tr("memtab.status.accepted") : status === "rejected" ? tr("memtab.status.rejected") : status;
+}
+
 function ProposalRow({ p }: { p: ProposalView }) {
+  const t = useT();
   return (
     <li className="dna-row">
-      <span className="dna-title">{p.title}</span> <span className="tag">{p.status}</span> <span className="tag tag-muted">{p.kind}</span>
+      <span className="dna-title">{p.title}</span> <span className="tag">{proposalStatus(p.status)}</span> <span className="tag tag-muted">{p.kind}</span>
       {p.redactions > 0 && <span className="tag tag-warn">{redactedText(p.redactions)}</span>}
-      {p.slug && <span className="muted small"> saved as {p.slug}</span>}
+      {p.slug && <span className="muted small"> {t("memtab.savedAs", { slug: p.slug })}</span>}
     </li>
   );
 }
@@ -106,6 +113,7 @@ function Section({ title, empty, children, count }: { title: string; empty: stri
  * task's turns ends (the agent has had its chance to propose). */
 function AskToPropose({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
+  const tt = useT();
   const ended = useSelect((s) => turnsEnded(s.feed[t.id]));
   const [busy, setBusy] = useState(false);
   const [sentAt, setSentAt] = useState<number | null>(null);
@@ -120,7 +128,7 @@ function AskToPropose({ t }: { t: TaskView }) {
     try {
       await rpc(M.messageSend, { task: t.id, text: PROPOSE_REQUEST, mode: "queue" });
       setSentAt(ended);
-      setResult({ ok: true, text: "Request queued for the agent (delivered when its turn ends). Its proposals arrive in the review queue." });
+      setResult({ ok: true, text: tr("memtab.asked") });
     } catch (e) {
       setResult({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -134,9 +142,9 @@ function AskToPropose({ t }: { t: TaskView }) {
         className="btn btn-small"
         disabled={busy || waiting || !t.live}
         onClick={ask}
-        title={!t.live ? "Resume the session first" : waiting ? "Asked already: waiting for the agent's turn to end" : undefined}
+        title={!t.live ? tt("memtab.resumeFirst") : waiting ? tt("memtab.askedWaiting") : undefined}
       >
-        Ask agent to propose memory
+        {tt("memtab.ask")}
       </button>{" "}
       {result && <span className={result.ok ? "muted small" : "error"}>{result.text}</span>}
     </p>
@@ -146,6 +154,8 @@ function AskToPropose({ t }: { t: TaskView }) {
 /** What enabling repo memory does, and the explicit button that does it (`dna.enable`). */
 export function EnableMemory({ repo, onEnabled }: { repo: string; onEnabled(): void }) {
   const { rpc } = useEnv();
+  const t = useT();
+  const [before, after] = t("memtab.off", { repo: "\u0000" }).split("\u0000");
   const [enabling, setEnabling] = useState(false);
   const [enableError, setEnableError] = useState<string | null>(null);
   const enable = async () => {
@@ -163,12 +173,12 @@ export function EnableMemory({ repo, onEnabled }: { repo: string; onEnabled(): v
   return (
     <div className="dna-off">
       <p>
-        Repo memory is off for <code>{repo}</code>. Enabling it creates .mirante/memory/ in the repo (Markdown notes that
-        cite code, committed with it like any file) and gives this repo&apos;s new agent sessions a memory tool. Nothing
-        changes in your global Claude or Codex settings, and agents only propose: a person reviews every note.
+        {before}
+        <code>{repo}</code>
+        {after}
       </p>
       <button className="btn btn-primary" disabled={enabling} onClick={enable}>
-        Enable repo memory
+        {t("memtab.enable")}
       </button>
       {enableError && (
         <p className="error" role="alert">
@@ -180,17 +190,18 @@ export function EnableMemory({ repo, onEnabled }: { repo: string; onEnabled(): v
 }
 
 export function MemoryTab({ t, mem, reload, version }: { t: TaskView; mem: TaskMemory; reload(): void; version: number }) {
+  const tt = useT();
   const [open, setOpen] = useState<string | null>(null);
-  if (mem.state === "loading") return <p className="muted">Reading repo memory…</p>;
-  if (mem.state === "unavailable") return <p className="muted">This daemon has no repo memory. Update Mirante to use it.</p>;
-  if (mem.state === "error") return <ErrorRetry text={`Repo memory unavailable: ${mem.error}`} onRetry={reload} />;
+  if (mem.state === "loading") return <p className="muted">{tt("brain.loading")}</p>;
+  if (mem.state === "unavailable") return <p className="muted">{tt("brain.unavailable")}</p>;
+  if (mem.state === "error") return <ErrorRetry text={tt("brain.error", { error: mem.error })} onRetry={reload} />;
   const { ctx } = mem;
   if (!ctx.enabled) return <EnableMemory repo={t.repo_path} onEnabled={reload} />;
   if (open) {
     return (
       <div className="dna-open">
         <button className="btn btn-small" onClick={() => setOpen(null)}>
-          ← Task memory
+          {tt("memtab.back")}
         </button>
         <NoteView at={{ task: t.id }} repo={t.repo_path} slug={open} version={version} onOpen={setOpen} />
       </div>
@@ -198,17 +209,17 @@ export function MemoryTab({ t, mem, reload, version }: { t: TaskView; mem: TaskM
   }
   return (
     <div className="dna-tab">
-      <Section title="At risk from this task" count={ctx.at_risk.length} empty="This task's branch changes no code a note cites.">
+      <Section title={tt("memtab.atRisk")} count={ctx.at_risk.length} empty={tt("memtab.atRiskEmpty")}>
         {ctx.at_risk.map((n) => (
           <NoteRow key={n.slug} n={n} reason={n.reason} onOpen={setOpen} />
         ))}
       </Section>
-      <Section title="Relevant notes" count={ctx.relevant.length} empty="No notes cite this task's files or match its goal yet.">
+      <Section title={tt("memtab.relevant")} count={ctx.relevant.length} empty={tt("memtab.relevantEmpty")}>
         {ctx.relevant.map((n) => (
           <NoteRow key={n.slug} n={n} onOpen={setOpen} />
         ))}
       </Section>
-      <Section title="Proposals from this task" count={ctx.proposals.length} empty="This task has proposed no memory.">
+      <Section title={tt("memtab.proposals")} count={ctx.proposals.length} empty={tt("memtab.proposalsEmpty")}>
         {ctx.proposals.map((p) => (
           <ProposalRow key={p.id} p={p} />
         ))}

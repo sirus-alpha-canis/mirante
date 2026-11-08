@@ -4,6 +4,7 @@ import { DaemonError } from "./daemon";
 import { RpcCode } from "./protocol";
 import {
   activationLabel,
+  activationShort,
   hasLintErrors,
   scopeKind,
   scopeLabel,
@@ -25,6 +26,7 @@ describe("skills helpers", () => {
   it("says where an always-on skill goes", () => {
     expect(activationLabel("always")).toMatch(/system prompt/);
     expect(activationLabel("on_demand")).toMatch(/when relevant/);
+    expect([activationShort("always"), activationShort("on_demand")]).toEqual(["always on", "on demand"]);
   });
 
   it("takes the body out of a rendered SKILL.md", () => {

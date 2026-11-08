@@ -1,6 +1,7 @@
 // Native notification when a task starts needing the user, unless that task is already on
 // screen in the focused window (the decision is the client's: only it knows what is shown).
 import { isPermissionGranted, onAction, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { t as tr } from "./i18n";
 import type { TaskView } from "./protocol";
 
 export interface Note {
@@ -29,14 +30,14 @@ export function clean(text: string): string {
 }
 
 export function notificationFor(t: TaskView): Note {
-  const why = t.boot === "trust_prompt" ? "asks to trust its folder" : "needs you";
-  return { title: clean(`${t.branch} ${why}`), body: clean(t.title), taskId: t.id };
+  const title = tr(t.boot === "trust_prompt" ? "notify.trust" : "notify.needs", { branch: t.branch });
+  return { title: clean(title), body: clean(t.title), taskId: t.id };
 }
 
 /** What to show for the tasks that just started needing the user, all at once. */
 export function notificationsFor(tasks: TaskView[]): Note[] {
   if (tasks.length <= SUMMARY_OVER) return tasks.map(notificationFor);
-  return [{ title: `${tasks.length} agents need you`, body: clean(tasks.map((t) => t.branch).join(", ")) }];
+  return [{ title: tr("notify.many", { n: tasks.length }), body: clean(tasks.map((t) => t.branch).join(", ")) }];
 }
 
 export interface NotificationApi {

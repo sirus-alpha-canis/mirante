@@ -12,8 +12,10 @@ import { DaemonError } from "../lib/daemon";
 import { lineDiff, splitLines } from "../lib/lineDiff";
 import type { Finding, ProposalFile, SkillBase, SkillEdits, SkillProposalView } from "../lib/protocol";
 import { M, RpcCode } from "../lib/protocol";
+import { t, tn, useT } from "../lib/i18n";
 import {
   activationLabel,
+  activationShort,
   findingText,
   hasLintErrors,
   scopeLabel,
@@ -44,11 +46,11 @@ const SKILL_MD_FIELDS = new Set(["SKILL.md", "description", "name", "frontmatter
 function originText(p: SkillProposalView, branch: string | null): string {
   if (p.origin === "miner") {
     const tasks = new Set(p.evidence.map((e) => e.task)).size;
-    return `Found in your messages: repeated in ${tasks} ${tasks === 1 ? "task" : "tasks"}`;
+    return tn(tasks, "skillProp.foundIn.one", "skillProp.foundIn.many");
   }
-  if (p.origin === "agent") return branch ? `from task ${branch}` : "from an agent";
-  if (p.origin === "import") return "imported by you";
-  return "written by you (CLI)";
+  if (p.origin === "agent") return branch ? t("skillProp.fromTask", { branch }) : t("skillProp.fromAgent");
+  if (p.origin === "import") return t("skillProp.imported");
+  return t("skillProp.cli");
 }
 
 /** The scopes a person can pick for a proposal: as proposed, the client's org, personal. */
@@ -58,8 +60,6 @@ function scopeChoices(p: SkillProposalView): string[] {
   out.push("personal");
   return [...new Set(out)];
 }
-
-const shortActivation = (a: string) => (a === "always" ? "always on" : "on demand");
 
 /** Who wrote a proposal's text, as the refine request names it. */
 function author(p: SkillProposalView): string {
@@ -128,31 +128,32 @@ function Changes({
   body: string;
   files: ProposalFile[];
 }) {
+  useT();
   const before = new Map(base.files.map((f) => [f.path, f.text]));
   const after = new Map(files.map((f) => [f.path, f.text]));
   const paths = [...new Set([...before.keys(), ...after.keys()])].sort();
   return (
-    <section className="skill-changes" aria-label="What this edit changes">
-      <p className="small muted">Changes from v{base.version}:</p>
-      {description !== base.description && <p className="small">{`Description: was "${base.description}", now "${description}"`}</p>}
+    <section className="skill-changes" aria-label={t("skillProp.changesAria")}>
+      <p className="small muted">{t("skillProp.changesFrom", { v: base.version ?? "?" })}</p>
+      {description !== base.description && <p className="small">{t("skillProp.descChanged", { was: base.description, now: description })}</p>}
       {activation !== base.activation && (
-        <p className="small">{`Activation: was ${shortActivation(base.activation)}, now ${shortActivation(activation)}`}</p>
+        <p className="small">{t("skillProp.actChanged", { was: activationShort(base.activation), now: activationShort(activation) })}</p>
       )}
       {body === base.body ? (
-        <p className="small muted">SKILL.md body: unchanged</p>
+        <p className="small muted">{t("skillProp.bodyUnchanged")}</p>
       ) : (
-        <Diff before={base.body} after={body} label={`Changes from v${base.version}`} />
+        <Diff before={base.body} after={body} label={t("skillProp.changesFromLabel", { v: base.version ?? "?" })} />
       )}
       {paths.map((path) => {
         const was = before.get(path);
         const now = after.get(path);
         if (was === now) return null;
-        if (was === undefined) return <p key={path} className="small warn">{`${path}: added (its full text is above)`}</p>;
-        if (now === undefined) return <p key={path} className="small">{`${path}: removed`}</p>;
+        if (was === undefined) return <p key={path} className="small warn">{t("skillProp.fileAdded", { path })}</p>;
+        if (now === undefined) return <p key={path} className="small">{t("skillProp.fileRemoved", { path })}</p>;
         return (
           <div key={path}>
-            <p className="small">{`${path}: changed`}</p>
-            <Diff before={was} after={now} label={`Changes to ${path}`} />
+            <p className="small">{t("skillProp.fileChanged", { path })}</p>
+            <Diff before={was} after={now} label={t("skillProp.changesTo", { path })} />
           </div>
         );
       })}
@@ -166,14 +167,15 @@ const eligible = (ts: Ts, tenant: string) => !!ts && ts.confirmed && ts.learning
 
 /** Why a task can no longer be asked, from its `skill.task_skills` now. */
 function ineligibleWhy(ts: Ts, tenant: string): string {
-  if (!ts) return "That task's skills could not be read";
-  if (!ts.confirmed) return "That task's origin is no longer confirmed";
-  if (!ts.learning) return "That task's client no longer has learning on";
-  return `That task is no longer in ${tenant}`;
+  if (!ts) return t("skillProp.noRead");
+  if (!ts.confirmed) return t("skillProp.notConfirmed");
+  if (!ts.learning) return t("skillProp.noLearning");
+  return t("skillProp.notIn", { client: tenant });
 }
 
 function Refine({ p, description, body }: { p: SkillProposalView; description: string; body: string }) {
   const { rpc } = useEnv();
+  useT();
   // Live, unarchived tasks as one string ("id\tbranch\tagent" lines): a status change of a
   // task is not a new list, so nothing is asked again and the pick stays.
   const list = useSelect((s) =>
@@ -228,12 +230,12 @@ function Refine({ p, description, body }: { p: SkillProposalView; description: s
       // Checked again now: the task may have changed client or learning since the list.
       const ts = await taskSkills(rpc, pick).catch(() => null);
       if (!eligible(ts, p.tenant)) {
-        setNote(`${ineligibleWhy(ts, p.tenant)}: nothing was queued. Pick another task.`);
+        setNote(t("skillProp.notQueued", { why: ineligibleWhy(ts, p.tenant) }));
         setTasks((cur) => cur?.filter((t) => t.id !== pick) ?? cur);
         return;
       }
       await rpc(M.messageSend, { task: pick, text: message, mode: "queue" });
-      setNote("Queued for the agent. Its answer comes back here as a new proposal.");
+      setNote(t("skillProp.queued"));
     } catch (e) {
       setNote(skillErrorText(e));
     } finally {
@@ -243,24 +245,22 @@ function Refine({ p, description, body }: { p: SkillProposalView; description: s
   if (!open) {
     return (
       <button className="btn btn-small" onClick={() => setOpen(true)}>
-        Refine with agent
+        {t("skillProp.refine")}
       </button>
     );
   }
   const id = `refine-${p.id}`;
   return (
-    <div className="skill-refine" role="group" aria-label="Refine with agent">
+    <div className="skill-refine" role="group" aria-label={t("skillProp.refine")}>
       {tasks === null ? (
-        <span className="muted small">Finding tasks of {p.tenant}…</span>
+        <span className="muted small">{t("skillProp.finding", { client: p.tenant })}</span>
       ) : tasks.length === 0 ? (
-        <span className="muted small">
-          No live task of {p.tenant} with learning on and a confirmed origin: only such a task's agent may see this text.
-        </span>
+        <span className="muted small">{t("skillProp.noTask", { client: p.tenant })}</span>
       ) : (
         <>
           <div className="dna-actions">
             <label htmlFor={id} className="small muted">
-              Task to ask
+              {t("skillProp.taskToAsk")}
             </label>
             <select id={id} value={pick} onChange={(e) => setPick(e.target.value)}>
               {tasks.map((t) => (
@@ -270,17 +270,17 @@ function Refine({ p, description, body }: { p: SkillProposalView; description: s
               ))}
             </select>
           </div>
-          <p className="small muted">The agent gets exactly this message, queued after its current turn:</p>
-          <pre className="dna-body skill-body" aria-label="Message to queue">
+          <p className="small muted">{t("skillProp.exactMessage")}</p>
+          <pre className="dna-body skill-body" aria-label={t("skillProp.messageAria")}>
             {message}
           </pre>
           <button className="btn btn-small" onClick={send}>
-            {p.origin === "agent" ? "Queue the request (contains agent-written text)" : "Queue the request (contains the proposal's text)"}
+            {t(p.origin === "agent" ? "skillProp.queueAgent" : "skillProp.queueText")}
           </button>
         </>
       )}
       <button className="btn btn-small" onClick={() => setOpen(false)}>
-        Close
+        {t("skillProp.close")}
       </button>
       {note && (
         <span className="muted small" role="status">
@@ -293,6 +293,7 @@ function Refine({ p, description, body }: { p: SkillProposalView; description: s
 
 function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: string, conflict: boolean): void }) {
   const { rpc } = useEnv();
+  useT();
   const branchOf = useSelect((s) => (p.task_id ? s.tasks[p.task_id]?.branch : undefined));
   const [name, setName] = useState(p.name);
   const [description, setDescription] = useState(p.description);
@@ -349,7 +350,7 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
   const chosen = [
     ...(scope !== p.scope ? wideningWarnings(scope, p.tenant === "personal" ? null : p.tenant) : []),
     ...(activation === "always" && p.activation !== "always"
-      ? ["Always on: this text goes into the system prompt of every matching session, every turn of it."]
+      ? [t("skillProp.alwaysWarn")]
       : []),
   ];
 
@@ -370,12 +371,10 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
         if (Object.keys(edits).length > 0) params.edits = edits;
       } else if (note.trim()) params.note = note.trim();
       const r = await skillReview(rpc, params);
-      onDecided(r?.status === "accepted" ? `Accepted as ${r.name} v${r.version ?? "?"}.` : "Rejected.", false);
+      onDecided(r?.status === "accepted" ? t("skillProp.accepted", { name: r.name, v: r.version ?? "?" }) : t("skillProp.rejected"), false);
     } catch (e) {
       if (e instanceof DaemonError && e.code === RpcCode.CONFLICT) {
-        setError(
-          "The skill changed since this proposal (or it was decided elsewhere): the diff was reloaded. Read it again before accepting.",
-        );
+        setError(t("skillProp.conflict"));
         setReloading(true);
         onDecided("", true);
       } else setError(skillErrorText(e));
@@ -389,15 +388,15 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
   const examples = p.evidence.slice(0, MAX_EXAMPLES);
   const base = p.base ?? null;
   return (
-    <article className="dna-proposal skill-proposal" aria-label={`Proposal ${p.name}`}>
+    <article className="dna-proposal skill-proposal" aria-label={t("skillProp.cardAria", { name: p.name })}>
       <div className="dna-note-head">
-        <span className="tag">{p.kind === "edit" ? "edit" : "new skill"}</span>
+        <span className="tag">{t(p.kind === "edit" ? "skillProp.edit" : "skillProp.newSkill")}</span>
         <strong>{p.name}</strong>
         <span className="muted small">{originText(p, branch)}</span>
-        {p.redactions > 0 && <span className="tag tag-warn">{p.redactions === 1 ? "1 secret was redacted" : `${p.redactions} secrets were redacted`}</span>}
+        {p.redactions > 0 && <span className="tag tag-warn">{tn(p.redactions, "skillProp.redacted.one", "skillProp.redacted.many")}</span>}
       </div>
       <p className="small">
-        <strong>{scopeLabel(scope)}</strong> · Client {p.tenant === "personal" ? "none (personal)" : p.tenant}
+        <strong>{scopeLabel(scope)}</strong> · {t("skillProp.client", { client: p.tenant === "personal" ? t("skillProp.clientNone") : p.tenant })}
       </p>
       <p className="small">{activationLabel(activation)}</p>
       {p.warnings.length > 0 && (
@@ -416,8 +415,8 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
       )}
       {examples.length > 0 && (
         <>
-          <p className="small muted">What you said (redacted):</p>
-          <ul className="skill-examples" aria-label="Examples">
+          <p className="small muted">{t("skillProp.said")}</p>
+          <ul className="skill-examples" aria-label={t("skillProp.examplesAria")}>
             {examples.map((e, i) => (
               <li key={i}>{e.text}</li>
             ))}
@@ -425,16 +424,16 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
         </>
       )}
       <label htmlFor={`${ids}-name`} className="small muted">
-        Name
+        {t("skillProp.name")}
       </label>
       <input id={`${ids}-name`} className="dna-input" value={name} maxLength={64} onChange={(e) => setName(e.target.value)} />
       <label htmlFor={`${ids}-desc`} className="small muted">
-        Description
+        {t("skillProp.desc")}
       </label>
       <input id={`${ids}-desc`} className="dna-input" value={description} maxLength={1024} onChange={(e) => setDescription(e.target.value)} />
       <div className="dna-actions">
         <label htmlFor={`${ids}-scope`} className="small muted">
-          Scope
+          {t("skillProp.scope")}
         </label>
         <select id={`${ids}-scope`} value={scope} onChange={(e) => setScope(e.target.value)}>
           {scopeChoices(p).map((c) => (
@@ -444,35 +443,34 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
           ))}
         </select>
         <label htmlFor={`${ids}-act`} className="small muted">
-          Activation
+          {t("skillProp.activation")}
         </label>
         <select id={`${ids}-act`} value={activation} onChange={(e) => setActivation(e.target.value)}>
-          <option value="always">always</option>
-          <option value="on_demand">on_demand</option>
+          <option value="always">{activationShort("always")}</option>
+          <option value="on_demand">{activationShort("on_demand")}</option>
         </select>
       </div>
       <div className="dna-actions">
-        <span className="small muted">SKILL.md body</span>
+        <span className="small muted">{t("skillProp.bodyLabel")}</span>
         <button className="btn btn-small" onClick={() => setEditing((v) => !v)} disabled={collapsed}>
-          {editing ? "Done editing" : "Edit"}
+          {t(editing ? "skillProp.doneEditing" : "skillProp.editBtn")}
         </button>
         {long && (
           <button className="btn btn-small" onClick={() => setCollapsed((v) => !v)}>
-            {collapsed ? "Expand" : "Collapse"}
+            {t(collapsed ? "skillProp.expand" : "skillProp.collapse")}
           </button>
         )}
       </div>
       {collapsed ? (
         <p className="warn small">
-          {splitLines(body).length} lines and {p.files.length} bundled {p.files.length === 1 ? "file" : "files"} hidden. Expand to read
-          everything before accepting.
+          {t("skillProp.hidden", { lines: splitLines(body).length, files: tn(p.files.length, "skillProp.bundled.one", "skillProp.bundled.many") })}
         </p>
       ) : (
         <>
           {editing ? (
             <>
               <label htmlFor={`${ids}-body`} className="sr-only">
-                Body
+                {t("skillProp.bodyAria")}
               </label>
               <textarea
                 id={`${ids}-body`}
@@ -484,16 +482,16 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
               />
             </>
           ) : (
-            <pre className="dna-body skill-body" aria-label="Proposed SKILL.md body">
+            <pre className="dna-body skill-body" aria-label={t("skillProp.proposedBody")}>
               {body}
             </pre>
           )}
           {p.files.map((f) => (
             <div key={f.path}>
               <p className="small">
-                Bundled file <code>{f.path}</code>
+                {t("skillProp.bundledFile")} <code>{f.path}</code>
               </p>
-              <pre className="dna-body skill-body" aria-label={`File ${f.path}`}>
+              <pre className="dna-body skill-body" aria-label={t("skillProp.fileAria", { path: f.path })}>
                 {f.text}
               </pre>
             </div>
@@ -503,18 +501,18 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
       {p.kind === "edit" &&
         (base?.verified ? (
           <>
-            {base.moved && <p className="warn small">The skill moved on since this proposal: Accept will be refused.</p>}
+            {base.moved && <p className="warn small">{t("skillProp.moved")}</p>}
             <Changes base={base} description={description} activation={activation} body={shownBody} files={p.files} />
           </>
         ) : (
           <p className="warn small">
             {base
-              ? `Current version does not verify${base.reason ? ` (${base.reason})` : ""}: no trusted base; read the full text.`
-              : "This daemon does not say which version this edit changes: no trusted base; read the full text."}
+              ? t("skillProp.noVerify", { reason: base.reason ? ` (${base.reason})` : "" })
+              : t("skillProp.noBase")}
           </p>
         ))}
       {findings.length > 0 && (
-        <ul className="dna-anchors" aria-label="Lint">
+        <ul className="dna-anchors" aria-label={t("skillProp.lintAria")}>
           {findings.map((f, i) => (
             <li key={i} className={f.severity === "error" ? "error" : "warn"}>
               {findingText(f)}
@@ -525,28 +523,28 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
       {rejecting ? (
         <div className="dna-actions">
           <label htmlFor={`${ids}-note`} className="sr-only">
-            Why (optional)
+            {t("skillProp.why")}
           </label>
-          <input id={`${ids}-note`} className="dna-input" placeholder="Why (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
+          <input id={`${ids}-note`} className="dna-input" placeholder={t("skillProp.why")} value={note} onChange={(e) => setNote(e.target.value)} />
           <button className="btn btn-small btn-warn" disabled={busy} onClick={() => decide(false)}>
-            Reject proposal
+            {t("skillProp.rejectProposal")}
           </button>
           <button className="btn btn-small" onClick={() => setRejecting(false)}>
-            Cancel
+            {t("skillProp.cancel")}
           </button>
         </div>
       ) : (
         <div className="dna-actions">
           <button className="btn btn-small btn-primary" disabled={busy || blocked} onClick={() => decide(true)}>
-            Accept
+            {t("skillProp.accept")}
           </button>
           <button className="btn btn-small" disabled={busy} onClick={() => setRejecting(true)}>
-            Reject
+            {t("skillProp.reject")}
           </button>
           <Refine p={p} description={description} body={body} />
         </div>
       )}
-      {hasLintErrors(findings) && <p className="small warn">Fix the lint errors to accept.</p>}
+      {hasLintErrors(findings) && <p className="small warn">{t("skillProp.fixLint")}</p>}
       {error && (
         <p className="error" role="status">
           {error}
@@ -562,6 +560,7 @@ type Loaded = { state: "loading" } | { state: "ready"; list: SkillProposalView[]
  * all (the view's count); asked here when not given. */
 export function SkillProposals({ onDecided, pending: given }: { onDecided?(): void; pending?: number | null }) {
   const { rpc } = useEnv();
+  useT();
   const boot = useBoot();
   const version = useSkillsVersion();
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
@@ -598,26 +597,23 @@ export function SkillProposals({ onDecided, pending: given }: { onDecided?(): vo
     onDecided?.();
   };
   return (
-    <section className="dna-review" aria-label="Skill review queue">
-      <h2>Review skills</h2>
-      <p className="muted small">
-        A proposal becomes a signed skill only when you accept it. Read all of it: an always-on skill goes into the system prompt of
-        every matching session.
-      </p>
+    <section className="dna-review" aria-label={t("skillProp.queueAria")}>
+      <h2>{t("skillProp.title")}</h2>
+      <p className="muted small">{t("skillProp.intro")}</p>
       {notice && (
         <p className="muted small" role="status">
           {notice}
         </p>
       )}
-      {loaded.state === "loading" && <p className="muted">Reading the queue…</p>}
-      {loaded.state === "error" && <ErrorRetry text={`Review queue unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />}
-      {loaded.state === "ready" && refreshError && <ErrorRetry small text={`Could not refresh the queue: ${refreshError}`} onRetry={() => setNonce((n) => n + 1)} />}
+      {loaded.state === "loading" && <p className="muted">{t("skillProp.readingQueue")}</p>}
+      {loaded.state === "error" && <ErrorRetry text={t("skillProp.queueUnavailable", { error: loaded.error })} onRetry={() => setNonce((n) => n + 1)} />}
+      {loaded.state === "ready" && refreshError && <ErrorRetry small text={t("skillProp.refreshFailed", { error: refreshError })} onRetry={() => setNonce((n) => n + 1)} />}
       {loaded.state === "ready" && pending !== null && pending > loaded.list.length && loaded.list.length > 0 && (
-        <p className="muted small">{`Showing the oldest ${loaded.list.length} of ${pending} proposals.`}</p>
+        <p className="muted small">{t("skillProp.showing", { shown: loaded.list.length, total: pending })}</p>
       )}
       {loaded.state === "ready" &&
         (loaded.list.length === 0 ? (
-          <p className="muted">Nothing waits for review.</p>
+          <p className="muted">{t("skillProp.nothing")}</p>
         ) : (
           loaded.list.map((p) => <ProposalCard key={p.id} p={p} onDecided={(t, c) => decided(p.id, t, c)} />)
         ))}

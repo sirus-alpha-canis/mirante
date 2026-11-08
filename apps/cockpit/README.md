@@ -88,17 +88,20 @@ whether it is a git checkout is checked when you dispatch a task to it.
 
 ## Home: an inbox of every project
 
-Home lists what needs you first, across all projects: **Precisa de você** (each card with
-its one action: Allow / Deny for Codex, Answer in terminal for Claude, Trust, or Open
-terminal), **Pronto para revisar** (the agent's last answer in two lines, expandable, and
-Review diff), **Trabalhando** (one line each: title, agent, time on the turn, what it is
-doing in plain words; the raw steps stay in the task's detail), and the idle ones folded
-away, all grouped by project with a color per project. Past 10 minutes it says how many
-agents have waited on you. **Próximo** (⌘J) opens the next task that needs you (Claude's on
-its Terminal tab) and says where you are ("2 de 5"). The detail's task list groups by
-project then state, with filters (Precisa de você / Trabalhando / Pronto / Todos) and a
-search; its Steps tab sums runs of tool steps up ("leu 14 arquivos, rodou 3 comandos",
-click to see them) and folds repeated lines (×N). A Claude session that leaves manual
+Home lists what needs you first, across all projects: **Needs you** (each card with its one
+action: Allow / Deny for Codex, Answer in terminal for Claude, Trust, or Open terminal),
+**Ready for review** (the agent's last answer in two lines, expandable, and Review diff),
+**Working** (one line each: title, agent, time on the turn, what it is doing in plain words;
+the raw steps stay in the task's detail), and the **Idle** ones folded away, all grouped by
+project with a color per project. Past 10 minutes it says how many agents have waited on
+you. **Next** (⌘J) opens the next task that needs you (Claude's on its Terminal tab) and
+says where you are ("2 of 5"). Escape leaves a task's detail for the view it was opened
+from, and Home puts the keyboard back on that task's card. The detail's task list groups by
+project then state, with filters (Needs you / Working / Ready / All) and a search; its Steps
+tab sums runs of tool steps up ("read 14 files, ran 3 commands", click to see them), folds
+repeated lines (×N), follows new lines while scrolled to the bottom, and says when a task's
+history could not be loaded (with Retry). Every view that loads from the daemon offers
+Retry when that fails, and loads again when the daemon restarts. A Claude session that leaves manual
 permission mode gets a red **auto mode on** badge (from the `permission_mode` its hooks and
 transcript report); switch back with Shift+Tab in its terminal.
 
@@ -108,6 +111,25 @@ restarts (an upgrade, a reboot, a crash), the sessions it ended are resumed on t
 conversations, one at a time while memory allows; turn that off under Sessions on the left
 (or `MIRANTE_AUTO_RESUME=off`). Stopped and hibernated tasks are never resumed by it.
 
+While the daemon is not reachable the banner counts down to the next try, and actions that
+need it (dispatch, steer and queue, answers, session actions) are off. A task's terminal
+attaches again on its own when its stream ends while the task is live (after 0.5, 1, 2 and
+5 s, then a **Reconnect** button) and at once when the daemon restarts; the daemon repaints
+the screen, so the terminal is cleared first. ⌘/Ctrl-click opens a terminal link in the
+browser only for github.com and local dev servers (`http://localhost:<port>` or
+`http://127.0.0.1:<port>`); any other link says to copy it. A click on a task's
+notification opens that task.
+
+## Language
+
+The interface speaks English or Portuguese (Brazil): the **EN / PT** menu at the right of
+the top bar (or "Language" in the command bar) switches it, and the choice is remembered on
+this machine. Until you choose, a system language starting with `pt` gives Portuguese,
+anything else English. Every word the app shows lives in `src/lib/i18n.ts` (`en` is
+complete and the fallback; `pt` translates every key, checked by `i18n.test.ts`). What
+Mirante sends to agents (the dispatch's context references, memory and skill requests)
+stays in English whatever the interface's language.
+
 ## Dispatch
 
 Home's form is one box: write the goal, then use the chips below it. **Agent** (Claude or
@@ -116,10 +138,12 @@ your Projects; it starts on the one selected on the left; type to filter), the b
 appears once there is a goal: `mirante/<words-of-the-goal>`, accents dropped, about 40
 characters; a name another task of the repo uses, or one git already has, moves on to `-2`,
 `-3`…; **edit** to type your own, and an existing branch is then checked out as it is), and
-**+ contexto**: attach repo files (searched by path), repo memory notes or skills; they are
+**+ context**: attach repo files (searched by path), repo memory notes or skills; they are
 added after the goal as a labeled list of references for the agent ("Context attached in
-Mirante"), nothing else is read or sent. While the memory guard pauses new sessions the
-form says so. Text starting with `@claude` or `@codex` is the one-line form,
+Mirante"), nothing else is read or sent. Files and notes belong to the repository they were
+picked in: a dispatch to another repository is refused until they are removed. The form
+(goal, attached context, edited branch, picked repository) is kept while you visit other
+views. While the memory guard pauses new sessions the form says so. Text starting with `@claude` or `@codex` is the one-line form,
 `@claude shop/feat/login add a login page`: typing `@` suggests the agents, then the
 Projects (filtered as you type; ↑/↓, Enter or Tab picks, Esc closes); `shop/` with no
 branch gets one named from the goal.
@@ -131,8 +155,9 @@ branch gets one named from the goal.
 | ⌘K | Command bar (tasks, projects, `@claude repo/branch goal` into the dispatch form) |
 | ⌘G | Toggle the agent grid |
 | ⌘1 | Home |
-| ⌘J | Próximo: the next task that needs you |
-| Esc | Leave a task's detail |
+| ⌘J | Next: the next task that needs you |
+| ⌘L | Skills |
+| Esc | Leave a task's detail (back to the view it was opened from) |
 | ⇧⌘J | Theme: system → light → dark |
 | ⌘↵ | In Home's dispatch form: dispatch (Enter is a new line of the goal) |
 | ⌘↵ / ⌥↵ | In a task's composer: steer now / queue |

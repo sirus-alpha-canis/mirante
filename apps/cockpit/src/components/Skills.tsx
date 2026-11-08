@@ -7,8 +7,10 @@ import { useBoot, useEnv } from "../env";
 import { DaemonError } from "../lib/daemon";
 import type { SkillSummary, SkillView, TenantView } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
+import { t as tr, tn, useT } from "../lib/i18n";
 import {
   activationLabel,
+  activationShort,
   scopeKind,
   scopeLabel,
   skillAction,
@@ -38,10 +40,9 @@ export function groupByScope(list: SkillSummary[]): { scope: string; skills: Ski
     .map(([scope, skills]) => ({ scope, skills: skills.sort((x, y) => x.name.localeCompare(y.name)) }));
 }
 
-const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
-
 function TenantRow({ t, onChanged }: { t: TenantView; onChanged(): void }) {
   const { rpc } = useEnv();
+  useT();
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const inFlight = useRef(false);
@@ -68,28 +69,25 @@ function TenantRow({ t, onChanged }: { t: TenantView; onChanged(): void }) {
   const mine = () =>
     run(async () => {
       const r = await skillMine(rpc, t.tenant);
-      return `${plural(r.proposed, "new proposal")}, ${r.updated} updated, ${r.skipped} skipped`;
+      return tr("skills.mined", { proposals: tn(r.proposed, "skills.newProposal.one", "skills.newProposal.many"), updated: r.updated, skipped: r.skipped });
     });
   return (
     <li className="dna-row skill-tenant" role="group" aria-label={t.tenant}>
       <div className="dna-note-head">
         <strong>{t.tenant}</strong>
-        <span className={`tag ${t.learning ? "tag-on" : ""}`}>{t.learning ? "Learning on" : "Learning off"}</span>
+        <span className={`tag ${t.learning ? "tag-on" : ""}`}>{tr(t.learning ? "skills.learningOn" : "skills.learningOff")}</span>
         <span className="muted small">
-          {plural(t.tasks, "task")} · {plural(t.skills, "skill")}
+          {tn(t.tasks, "skills.tasks.one", "skills.tasks.many")} · {tn(t.skills, "skills.skills.one", "skills.skills.many")}
         </span>
       </div>
-      <p className="muted small">
-        Mirante reads your goals, messages and denied permissions in this client's tasks, on this machine only, to find
-        instructions you repeat. Nothing is read while learning is off.
-      </p>
+      <p className="muted small">{tr("skills.learnExplain")}</p>
       <div className="dna-actions">
         <button className="btn btn-small" disabled={busy} onClick={learn}>
-          {t.learning ? `Stop learning from ${t.tenant}` : `Start learning from ${t.tenant}`}
+          {tr(t.learning ? "skills.stopLearning" : "skills.startLearning", { client: t.tenant })}
         </button>
         {t.learning && (
           <button className="btn btn-small" disabled={busy} onClick={mine}>
-            Find repeated instructions
+            {tr("skills.findRepeated")}
           </button>
         )}
       </div>
@@ -103,14 +101,15 @@ function TenantRow({ t, onChanged }: { t: TenantView; onChanged(): void }) {
 }
 
 function SkillRow({ s, selected, onSelect }: { s: SkillSummary; selected: boolean; onSelect(): void }) {
+  const t = useT();
   return (
     <li className="dna-row">
       <button className="link skill-row" aria-pressed={selected} onClick={onSelect}>
         <span className="dna-title">{s.name}</span>{" "}
         <span className="muted small">
-          v{s.version} · {s.activation === "always" ? "always on" : "on demand"} ·{" "}
-          <span className={s.verified ? "" : "skill-refused"}>{s.verified ? "verified" : "refused"}</span>
-          {s.status === "retired" ? " · retired" : ""} · injected {s.injected_30d} · used {s.used_30d} (30 days)
+          v{s.version} · {activationShort(s.activation)} ·{" "}
+          <span className={s.verified ? "" : "skill-refused"}>{t(s.verified ? "skills.verified" : "skills.refused")}</span>
+          {s.status === "retired" ? ` · ${t("skills.retired")}` : ""} · {t("skills.rowUsage", { i: s.injected_30d, u: s.used_30d })}
         </span>
       </button>
     </li>
@@ -123,6 +122,7 @@ type Loaded = { state: "loading" } | { state: "ready"; view: SkillView } | { sta
  * (each sends the `manifest_hash` it was shown). */
 export function SkillPanel({ name, version, onChanged }: { name: string; version: number; onChanged(): void }) {
   const { rpc } = useEnv();
+  const t = useT();
   const boot = useBoot();
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [nonce, setNonce] = useState(0);
@@ -151,8 +151,8 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
       live = false;
     };
   }, [rpc, name, version, nonce, boot]);
-  if (loaded.state === "loading") return <p className="muted">Reading {name}…</p>;
-  if (loaded.state === "error") return <ErrorRetry text={`Skill unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />;
+  if (loaded.state === "loading") return <p className="muted">{t("skills.reading", { name })}</p>;
+  if (loaded.state === "error") return <ErrorRetry text={t("skills.unavailable", { error: loaded.error })} onRetry={() => setNonce((n) => n + 1)} />;
   const v = loaded.view;
   const run = async (fn: () => Promise<string | null>) => {
     if (inFlight.current) return;
@@ -164,7 +164,7 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
       setNotice(await fn());
     } catch (e) {
       if (e instanceof DaemonError && e.code === RpcCode.CONFLICT) {
-        setError("The skill changed since it was shown; it was reloaded. Check it and try again.");
+        setError(t("skills.conflict"));
         setNonce((n) => n + 1);
       } else setError(skillErrorText(e));
     } finally {
@@ -179,14 +179,14 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
       scopeOf.current = next.manifest_hash;
       setScope(next.scope);
       onChanged();
-      return action === "retire" ? "Retired: no new session gets it." : action === "restore" ? "Restored." : `Now v${next.version}.`;
+      return action === "retire" ? t("skills.retiredDone") : action === "restore" ? t("skills.restoredDone") : t("skills.nowVersion", { v: next.version });
     });
   const reReview = () =>
     run(async () => {
       // The daemon reads this version's own folder; the cockpit never names a path.
       const p = await skillRereview(rpc, v.name, v.shown_version);
       onChanged();
-      return `The folder on disk was queued for review${p?.id ? ` (proposal ${p.id})` : ""}: accept it to make it a new version.`;
+      return t("skills.requeued", { proposal: p?.id ? t("skills.requeuedId", { id: p.id }) : "" });
     });
   const learnedIn = v.manifest?.provenance.learned_in ?? null;
   const scopeChanged = scope.trim() !== "" && scope.trim() !== v.scope;
@@ -194,20 +194,18 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
   const older = v.versions.filter((n) => n < v.version);
   const body = skillBody(v.skill_md);
   return (
-    <section className="skill-panel" aria-label={`Skill ${v.name}`}>
+    <section className="skill-panel" aria-label={t("skills.panelAria", { name: v.name })}>
       <div className="dna-note-head">
         <h3>{v.name}</h3>
         <span className="tag">v{v.shown_version}</span>
-        <span className={`tag ${v.verified ? "tag-on" : "tag-warn"}`}>{v.verified ? "verified" : "refused"}</span>
-        {v.status === "retired" && <span className="tag">retired</span>}
+        <span className={`tag ${v.verified ? "tag-on" : "tag-warn"}`}>{t(v.verified ? "skills.verified" : "skills.refused")}</span>
+        {v.status === "retired" && <span className="tag">{t("skills.retired")}</span>}
       </div>
       <p>{v.description}</p>
       <p className="small">
         <strong>{scopeLabel(v.scope)}</strong> · {activationLabel(v.activation)}
       </p>
-      <p className="muted small">
-        Injected {v.injected_30d} · used {v.used_30d} in the last 30 days
-      </p>
+      <p className="muted small">{t("skills.usage30", { i: v.injected_30d, u: v.used_30d })}</p>
       {v.warnings.map((w) => (
         <p key={w} className="warn small">
           {w}
@@ -215,13 +213,10 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
       ))}
       {!v.verified ? (
         <div className="skill-refusal">
-          <p className="warn">Refused: {v.reason ?? "it does not verify"}.</p>
-          <p className="small">
-            The folder on disk is not what a person accepted, so it is not given to any agent until you review it again. Re-review
-            queues the folder's current text as a proposal: read it there before accepting.
-          </p>
+          <p className="warn">{t("skills.refusedWhy", { why: v.reason ?? t("skills.notVerify") })}</p>
+          <p className="small">{t("skills.refusalExplain")}</p>
           <button className="btn btn-small" disabled={busy} onClick={reReview}>
-            Re-review
+            {t("skills.rereview")}
           </button>
         </div>
       ) : (
@@ -242,11 +237,11 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
       <div className="dna-actions">
         {v.status === "retired" ? (
           <button className="btn btn-small" disabled={busy} onClick={() => act("restore")}>
-            Restore
+            {t("skills.restore")}
           </button>
         ) : (
           <button className="btn btn-small btn-warn" disabled={busy} onClick={() => act("retire")}>
-            Retire
+            {t("skills.retire")}
           </button>
         )}
       </div>
@@ -258,17 +253,17 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
         }}
       >
         <label htmlFor={`scope-${v.name}`} className="small muted">
-          New scope
+          {t("skills.newScope")}
         </label>
         <input
           id={`scope-${v.name}`}
           className="dna-input"
-          placeholder="personal, org:host/owner or repo:host/owner/repo"
+          placeholder={t("skills.scopePlaceholder")}
           value={scope}
           onChange={(e) => setScope(e.target.value)}
         />
         <button className="btn btn-small" type="submit" disabled={busy || !scopeChanged}>
-          Rescope
+          {t("skills.rescope")}
         </button>
       </form>
       {widen.map((w) => (
@@ -279,10 +274,10 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
       {older.length > 0 && (
         <div className="dna-actions">
           <label htmlFor={`back-${v.name}`} className="small muted">
-            Roll back to
+            {t("skills.rollBackTo")}
           </label>
           <select id={`back-${v.name}`} value={back} onChange={(e) => setBack(e.target.value)}>
-            <option value="">version…</option>
+            <option value="">{t("skills.versionPick")}</option>
             {older.map((n) => (
               <option key={n} value={String(n)}>
                 {n}
@@ -290,7 +285,7 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
             ))}
           </select>
           <button className="btn btn-small" disabled={busy || !back} onClick={() => act("rollback", { version: Number(back) })}>
-            Roll back
+            {t("skills.rollBack")}
           </button>
         </div>
       )}
@@ -317,6 +312,7 @@ type Library =
 /** The skills view. `reviewNonce`: each new value opens the review queue. */
 export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
   const { rpc } = useEnv();
+  const t = useT();
   const boot = useBoot();
   const version = useSkillsVersion();
   const [nonce, setNonce] = useState(0);
@@ -333,10 +329,10 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
   useEffect(() => {
     let live = true;
     (async () => {
-      const t = await skillTenants(rpc);
-      if (!t.available) return live && setLib({ state: "unavailable" });
+      const got = await skillTenants(rpc);
+      if (!got.available) return live && setLib({ state: "unavailable" });
       const skills = (await skillList(rpc)) ?? [];
-      if (live) setLib({ state: "ready", tenants: t.tenants, skills });
+      if (live) setLib({ state: "ready", tenants: got.tenants, skills });
     })().catch((e) => live && setLib({ state: "error", error: skillErrorText(e) }));
     return () => {
       live = false;
@@ -346,28 +342,28 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
   const reload = () => setNonce((n) => n + 1);
 
   let body: React.ReactNode;
-  if (lib.state === "loading") body = <p className="muted">Reading the skill library…</p>;
-  else if (lib.state === "unavailable") body = <p className="muted">This daemon predates skills. Update Mirante to use them.</p>;
-  else if (lib.state === "error") body = <ErrorRetry text={`Skills unavailable: ${lib.error}`} onRetry={reload} />;
+  if (lib.state === "loading") body = <p className="muted">{t("skills.loadingLibrary")}</p>;
+  else if (lib.state === "unavailable") body = <p className="muted">{t("skills.predates")}</p>;
+  else if (lib.state === "error") body = <ErrorRetry text={t("skills.libUnavailable", { error: lib.error })} onRetry={reload} />;
   else
     body = (
       <>
-        <section aria-label="Clients" className="dna-section">
-          <h2>Clients</h2>
+        <section aria-label={t("skills.clients")} className="dna-section">
+          <h2>{t("skills.clients")}</h2>
           {lib.tenants.length === 0 ? (
-            <p className="muted">No client yet: a task's repo origin names its client when you create the task.</p>
+            <p className="muted">{t("skills.noClient")}</p>
           ) : (
             <ul className="dna-list">
-              {lib.tenants.map((t) => (
-                <TenantRow key={t.tenant} t={t} onChanged={reload} />
+              {lib.tenants.map((x) => (
+                <TenantRow key={x.tenant} t={x} onChanged={reload} />
               ))}
             </ul>
           )}
         </section>
-        <section aria-label="Skill library" className="dna-section">
-          <h2>Library</h2>
+        <section aria-label={t("skills.libraryAria")} className="dna-section">
+          <h2>{t("skills.library")}</h2>
           {groups.length === 0 ? (
-            <p className="muted">No skills yet. Accepted proposals become skills here.</p>
+            <p className="muted">{t("skills.noSkills")}</p>
           ) : (
             groups.map((g) => (
               <div key={g.scope} className="dna-section">
@@ -385,18 +381,18 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
     );
 
   return (
-    <main className="brain" aria-label="Skills">
+    <main className="brain" aria-label={t("skills.title")}>
       <section className="brain-main">
         <header className="feed-head">
-          <h1>Skills</h1>
-          <span className="muted small">Reviewed instructions Mirante gives each matching session</span>
+          <h1>{t("skills.title")}</h1>
+          <span className="muted small">{t("skills.subtitle")}</span>
           <button className="btn btn-small" aria-pressed={selected === null} onClick={() => setSelected(null)}>
-            {pending === null ? "Review" : `Review (${pending})`}
+            {pending === null ? t("skills.review") : t("skills.reviewN", { n: pending })}
           </button>
         </header>
         {body}
       </section>
-      <aside className="brain-panel" aria-label="Selected">
+      <aside className="brain-panel" aria-label={t("skills.selected")}>
         {selected ? (
           <SkillPanel key={selected} name={selected} version={version} onChanged={reload} />
         ) : (

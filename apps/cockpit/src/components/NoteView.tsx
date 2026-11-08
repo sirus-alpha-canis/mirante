@@ -18,6 +18,7 @@ import {
 import type { AnchorView, NoteSummary, NoteView as Note } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
 import { ErrorRetry } from "./ErrorRetry";
+import { useT } from "../lib/i18n";
 
 /** "stale", "unreviewed", "retired"…: the class that colors a note's state. */
 export function stateClass(n: Pick<NoteSummary, "state" | "reviewed" | "status">): string {
@@ -28,18 +29,38 @@ export function stateClass(n: Pick<NoteSummary, "state" | "reviewed" | "status">
 }
 
 export function StatePill({ n }: { n: Pick<NoteSummary, "state" | "reviewed" | "status"> }) {
+  useT();
   return <span className={`dna-pill ${stateClass(n)}`}>{stateLabel(n)}</span>;
 }
 
+/** An anchor's state (`fresh`, `stale`, `relocated`…) in the current language. */
+function anchorState(t: ReturnType<typeof useT>, state: string): string {
+  switch (state) {
+    case "fresh":
+      return t("note.anchor.fresh");
+    case "stale":
+      return t("note.anchor.stale");
+    case "relocated":
+      return t("note.anchor.relocated");
+    case "unverifiable":
+      return t("note.anchor.unverifiable");
+    case "unchecked":
+      return t("note.anchor.unchecked");
+    default:
+      return state;
+  }
+}
+
 export function AnchorLine({ a }: { a: AnchorView }) {
+  const t = useT();
   return (
     <li className="dna-anchor">
       <code>{citation(a)}</code> <span className="muted">@{shortCommit(a.commit)}</span>{" "}
-      <span className={`dna-anchor-state dna-a-${a.state}`}>{a.state}</span>
+      <span className={`dna-anchor-state dna-a-${a.state}`}>{anchorState(t, a.state)}</span>
       {a.state === "relocated" && a.now_start != null && (
         <span className="muted">
           {" "}
-          now L{a.now_start}-{a.now_end}
+          {t("note.anchor.now", { start: a.now_start, end: a.now_end ?? "" })}
         </span>
       )}
       {a.reason && <span className="muted small"> {a.reason}</span>}
@@ -49,11 +70,12 @@ export function AnchorLine({ a }: { a: AnchorView }) {
 
 /** The body as text nodes and link buttons (`white-space: pre-wrap` keeps its lines). */
 export function NoteBody({ body, onOpen }: { body: string; onOpen(slug: string): void }) {
+  const t = useT();
   return (
     <div className="dna-body">
       {linkParts(body).map((p, i) =>
         "link" in p ? (
-          <button key={i} type="button" className="dna-link" title={`Open ${p.link}`} onClick={() => onOpen(p.link)}>
+          <button key={i} type="button" className="dna-link" title={t("note.open", { slug: p.link })} onClick={() => onOpen(p.link)}>
             {p.label}
           </button>
         ) : (
@@ -90,6 +112,7 @@ export function NoteView({
   onOpen(slug: string): void;
 }) {
   const { rpc } = useEnv();
+  const t = useT();
   const boot = useBoot();
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [reload, setReload] = useState(0);
@@ -114,7 +137,7 @@ export function NoteView({
       .catch((e) => {
         if (!live) return;
         const missing = e instanceof DaemonError && e.code === RpcCode.NOT_FOUND;
-        const error = missing ? `No note named ${slug} (a link to a missing note).` : dnaErrorText(e);
+        const error = missing ? t("note.missing", { slug }) : dnaErrorText(e);
         // A failed refetch of the same note keeps it on screen, with why it may be out of date.
         setLoaded((cur) => (cur.state === "ready" && cur.note.slug === slug && !missing ? { ...cur, stale: error } : { state: "error", error }));
       });
@@ -123,7 +146,7 @@ export function NoteView({
     };
   }, [rpc, atKey, slug, version, reload, boot]);
 
-  if (loaded.state === "loading") return <p className="muted">Reading the note…</p>;
+  if (loaded.state === "loading") return <p className="muted">{t("note.loading")}</p>;
   if (loaded.state === "error") return <ErrorRetry text={loaded.error} onRetry={() => setReload((n) => n + 1)} />;
   const n = loaded.note;
   const act = async (action: NoteActionKind) => {
@@ -148,9 +171,9 @@ export function NoteView({
         <h3>{n.title}</h3>
         <span className="tag">{n.kind}</span>
         <StatePill n={n} />
-        <span className={`tag ${n.reviewed ? "" : "tag-warn"}`}>{n.reviewed ? "reviewed" : "not reviewed by a person"}</span>
+        <span className={`tag ${n.reviewed ? "" : "tag-warn"}`}>{t(n.reviewed ? "note.reviewed" : "note.notReviewed")}</span>
       </header>
-      <ul className="dna-anchors" aria-label="Cites">
+      <ul className="dna-anchors" aria-label={t("note.cites")}>
         {n.anchors.map((a, i) => (
           <AnchorLine key={i} a={a} />
         ))}
@@ -158,7 +181,7 @@ export function NoteView({
       <NoteBody body={n.body} onOpen={onOpen} />
       {n.backlinks.length > 0 && (
         <p className="small">
-          <span className="muted">Linked from </span>
+          <span className="muted">{t("note.linkedFrom")} </span>
           {n.backlinks.map((b) => (
             <button key={b} type="button" className="dna-link" onClick={() => onOpen(b)}>
               {b}
@@ -171,17 +194,17 @@ export function NoteView({
       </p>
       {n.status !== "retired" && (
         <div className="dna-actions">
-          <button className="btn btn-small" disabled={busy} onClick={() => act("confirm")} title="Re-anchor at the checkout's HEAD and mark this content reviewed">
-            Confirm
+          <button className="btn btn-small" disabled={busy} onClick={() => act("confirm")} title={t("note.confirmTitle")}>
+            {t("note.confirm")}
           </button>
-          <button className="btn btn-small" disabled={busy} onClick={() => act("retire")} title="Set status: retired; the file stays">
-            Retire
+          <button className="btn btn-small" disabled={busy} onClick={() => act("retire")} title={t("note.retireTitle")}>
+            {t("note.retire")}
           </button>
         </div>
       )}
       {loaded.stale && (
         <p className="error small" role="status">
-          Could not refresh this note: {loaded.stale}
+          {t("note.stale", { error: loaded.stale })}
         </p>
       )}
       {error && (
@@ -189,7 +212,7 @@ export function NoteView({
           {error.text}{" "}
           {error.reload && (
             <button className="btn btn-small" onClick={() => setReload((r) => r + 1)}>
-              Reload
+              {t("note.reload")}
             </button>
           )}
         </p>

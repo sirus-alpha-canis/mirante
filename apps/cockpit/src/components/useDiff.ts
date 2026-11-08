@@ -71,4 +71,3 @@ export function diffTotals(d: TaskDiff): { changed: number; untracked: number; a
   return { changed: d.files.length, untracked: d.untracked.length, added, removed };
 }
 
-export const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;

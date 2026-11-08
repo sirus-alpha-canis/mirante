@@ -231,7 +231,7 @@ describe("App", () => {
     expect(polls()).toBe(2);
     act(() => h.env.cockpit.dispatch({ type: "disconnected", error: "gone", retryMs: 1000 }));
     // No stale numbers while the daemon is away.
-    expect(screen.getByText("Memory status unknown.")).toBeInTheDocument();
+    expect(screen.getByText("System memory status unknown.")).toBeInTheDocument();
     await act(async () => vi.advanceTimersByTimeAsync(STATUS_POLL_MS * 3));
     expect(polls()).toBe(2);
   });
@@ -464,7 +464,7 @@ describe("App", () => {
       const name = screen.getByLabelText("Branch");
       await userEvent.clear(name);
       await userEvent.type(name, "feat/mine");
-      await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+      await userEvent.click(screen.getByRole("button", { name: "+ context" }));
       const dialog = screen.getByRole("dialog", { name: "Add context" });
       await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
       await userEvent.keyboard("{Escape}");
@@ -558,6 +558,7 @@ describe("App", () => {
       expect(h.env.storage.getItem("mirante.lang")).toBe("pt");
       expect(screen.getByRole("heading", { name: /^Precisa de você/ })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /^Próximo/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Despachar" })).toBeInTheDocument();
       await userEvent.selectOptions(screen.getByRole("combobox", { name: "Idioma" }), "en");
       expect(screen.getByRole("heading", { name: /^Needs you/ })).toBeInTheDocument();
     });

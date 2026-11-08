@@ -87,7 +87,7 @@ describe("nextNeeding", () => {
 
 describe("elapsed", () => {
   it("reads short", () => {
-    expect(elapsed(10_000)).toBe("agora");
+    expect(elapsed(10_000)).toBe("now");
     expect(elapsed(3 * 60_000)).toBe("3 min");
     expect(elapsed(65 * 60_000)).toBe("1 h 5 min");
     expect(elapsed(120 * 60_000)).toBe("2 h");

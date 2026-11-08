@@ -3,6 +3,7 @@ import { shallow, useEnv, useLive, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { collapseRepeats, summarizeSteps } from "../lib/feed";
 import { inboxOf } from "../lib/inbox";
+import { type Key, useLang, useT } from "../lib/i18n";
 import { M, type TaskView } from "../lib/protocol";
 import type { FeedItem, State } from "../store/state";
 import { useDnaKey, useDnaRev } from "../lib/useDna";
@@ -29,12 +30,14 @@ const NO_FEED: FeedItem[] = [];
 
 /** The task list's filters: one column, or everything not archived. */
 type Filter = "needs_you" | "working" | "review" | "all";
-const FILTERS: { id: Filter; label: string }[] = [
-  { id: "needs_you", label: "Precisa de você" },
-  { id: "working", label: "Trabalhando" },
-  { id: "review", label: "Pronto" },
-  { id: "all", label: "Todos" },
-];
+const FILTERS: Filter[] = ["needs_you", "working", "review", "all"];
+const FILTER_KEY: Record<Filter, Key> = {
+  needs_you: "detail.filter.needs_you",
+  working: "detail.filter.working",
+  review: "detail.filter.review",
+  all: "detail.filter.all",
+};
+const TAB_KEY: Record<Tab, Key> = { Steps: "detail.tab.Steps", Terminal: "detail.tab.Terminal", Diff: "detail.tab.Diff", Memory: "detail.tab.Memory" };
 
 /** Every task's column, as one map (the inbox's, computed once per change): renders when
  * one changes, not on every event. */
@@ -45,6 +48,7 @@ const matches = (t: TaskView, q: string) =>
 
 /** The left list: by project, then by state; filter chips and a search. */
 const TaskList = memo(function TaskList({ selected, onSelect }: { selected: string; onSelect(id: string): void }) {
+  const tt = useT();
   const tasks = useSelect((s) => s.tasks);
   const columns = useSelect(selectColumns, shallow);
   const [filter, setFilter] = useState<Filter>("all");
@@ -77,21 +81,21 @@ const TaskList = memo(function TaskList({ selected, onSelect }: { selected: stri
       }));
   }, [tasks, columns, filter, q]);
   return (
-    <nav className="tasklist" aria-label="Tasks">
+    <nav className="tasklist" aria-label={tt("detail.tasks")}>
       <div className="tasklist-tools">
         <label htmlFor="task-search" className="sr-only">
-          Search tasks
+          {tt("detail.search")}
         </label>
-        <input id="task-search" type="search" placeholder="Search tasks" value={query} onChange={(e) => setQuery(e.target.value)} />
-        <div className="filters" role="group" aria-label="Filter tasks">
+        <input id="task-search" type="search" placeholder={tt("detail.search")} value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="filters" role="group" aria-label={tt("detail.filterTasks")}>
           {FILTERS.map((f) => (
-            <button key={f.id} type="button" className="tchip" aria-pressed={filter === f.id} onClick={() => setFilter(f.id)}>
-              {f.label} ({counts[f.id]})
+            <button key={f} type="button" className="tchip" aria-pressed={filter === f} onClick={() => setFilter(f)}>
+              {tt(FILTER_KEY[f])} ({counts[f]})
             </button>
           ))}
         </div>
       </div>
-      {projects.length === 0 && <p className="muted small">No task matches.</p>}
+      {projects.length === 0 && <p className="muted small">{tt("detail.noMatch")}</p>}
       {projects.map(({ path, groups }) => (
         <section key={path} aria-label={repoName(path)} className="tasklist-project">
           <h2>
@@ -129,7 +133,9 @@ const TaskList = memo(function TaskList({ selected, onSelect }: { selected: stri
  * its lines is in the feed (its first may fall off the store's window). While scrolled to
  * the bottom, new lines keep it there. */
 const Steps = memo(function Steps({ feed }: { feed: FeedItem[] }) {
-  const entries = useMemo(() => summarizeSteps(feed), [feed]);
+  // Run summaries are words: said again when the language changes.
+  const lang = useLang();
+  const entries = useMemo(() => summarizeSteps(feed), [feed, lang]);
   const [open, setOpen] = useState<ReadonlySet<number>>(() => new Set());
   const list = useRef<HTMLOListElement>(null);
   const atBottom = useRef(true);
@@ -189,11 +195,12 @@ function StepRun({ items, text, open, onToggle }: { items: FeedItem[]; text: str
 /** Steps, or why the history is missing (with Retry). */
 function StepsPanel({ taskId, feed }: { taskId: string; feed: FeedItem[] }) {
   const { cockpit } = useEnv();
+  const t = useT();
   const error = useSelect((s) => s.historyErrors[taskId]);
   return (
     <>
-      {error && <ErrorRetry text={`Could not load this task's history: ${error}`} onRetry={() => void cockpit.loadHistory(taskId)} />}
-      {feed.length === 0 ? !error && <p className="muted">No steps yet.</p> : <Steps feed={feed} />}
+      {error && <ErrorRetry text={t("detail.historyFailed", { error })} onRetry={() => void cockpit.loadHistory(taskId)} />}
+      {feed.length === 0 ? !error && <p className="muted">{t("detail.noSteps")}</p> : <Steps feed={feed} />}
     </>
   );
 }
@@ -201,6 +208,7 @@ function StepsPanel({ taskId, feed }: { taskId: string; feed: FeedItem[] }) {
 /** Interrupt / Stop / Resume: one at a time; Stop asks first; a new action clears the error. */
 function Actions({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
+  const tt = useT();
   // Off while the daemon is away (nothing could carry them out).
   const live = useLive();
   const [error, setError] = useState<string | null>(null);
@@ -229,26 +237,26 @@ function Actions({ t }: { t: TaskView }) {
         // A hibernated session is resumed by Wake (below), which keeps the memory guard's mark.
         !isHibernated(t) && (
           <button className="btn btn-small" disabled={busy} onClick={() => run(M.sessionResume)}>
-            Resume
+            {tt("detail.resume")}
           </button>
         )
       ) : confirmStop ? (
-        <span role="group" aria-label="Confirm stop">
-          <span className="small">Stop the agent? The task stays; resume it later.</span>{" "}
+        <span role="group" aria-label={tt("detail.confirmStop")}>
+          <span className="small">{tt("detail.stopQuestion")}</span>{" "}
           <button className="btn btn-small btn-warn" disabled={busy} onClick={() => run(M.sessionStop)}>
-            Stop the session
+            {tt("detail.stopSession")}
           </button>
           <button className="btn btn-small" onClick={() => setConfirmStop(false)}>
-            Cancel
+            {tt("ui.cancel")}
           </button>
         </span>
       ) : (
         <>
           <button className="btn btn-small" disabled={busy} onClick={() => run(M.sessionInterrupt)}>
-            Interrupt
+            {tt("detail.interrupt")}
           </button>
           <button className="btn btn-small" disabled={busy} onClick={() => setConfirmStop(true)}>
-            Stop
+            {tt("detail.stop")}
           </button>
         </>
       )}
@@ -301,7 +309,8 @@ export function Detail({
   const dnaVersion = useDnaRev(t?.repo_path ?? null);
   const memory = useTaskMemory(taskId, dnaVersion + turnsEnded(feed));
   const atRisk = atRiskCount(memory.mem);
-  const tabLabel = (name: Tab) => (name === "Memory" && atRisk > 0 ? `Memory (${atRisk} at risk)` : name);
+  const tt = useT();
+  const tabLabel = (name: Tab) => (name === "Memory" && atRisk > 0 ? tt("detail.memoryAtRisk", { n: atRisk }) : tt(TAB_KEY[name]));
   const tabRefs = useRef(new Map<Tab, HTMLButtonElement>());
   const seenNonce = useRef(focusTerminalNonce);
   useEffect(() => {
@@ -357,10 +366,10 @@ export function Detail({
       <TaskList selected={taskId} onSelect={onSelect} />
       {!t ? (
         <main className="detail-main">
-          <p className="muted">{loaded ? "This task is gone." : "Loading…"}</p>
+          <p className="muted">{tt(loaded ? "detail.gone" : "detail.loading")}</p>
         </main>
       ) : (
-        <main className="detail-main" aria-label={`Task ${t.title}`}>
+        <main className="detail-main" aria-label={tt("detail.task", { title: t.title })}>
           <header className="detail-head">
             <h1 tabIndex={-1} ref={title}>
               {t.title}
@@ -371,7 +380,7 @@ export function Detail({
             <Actions key={t.id} t={t} />
           </header>
           {!onTerminal && notices}
-          <div role="tablist" aria-label="Task views" className="tabs" onKeyDown={onTabKey}>
+          <div role="tablist" aria-label={tt("detail.views")} className="tabs" onKeyDown={onTabKey}>
             {TABS.map((name) => (
               <button
                 key={name}

@@ -4,6 +4,7 @@
 // none of these: the panel then says "not available" (only once a status has loaded; with
 // no status at all it says "unknown") and the actions answer
 // METHOD_NOT_FOUND, which the UI reports instead of failing.
+import { type Key, type Params, t } from "./i18n";
 import type { DaemonStatus, TaskView } from "./protocol";
 import { M } from "./protocol";
 
@@ -50,30 +51,35 @@ export function systemMemory(status: DaemonStatus | null): SystemMemory | null {
 
 const KERNEL_NAME: Record<string, string> = { macos: "macOS", "linux-psi": "Linux (PSI)" };
 
+/** A pressure level in words (an unknown one says so). */
+function levelText(l: Pressure): string {
+  return t(l === "normal" ? "mem.level.normal" : l === "elevated" ? "mem.level.elevated" : l === "critical" ? "mem.level.critical" : "mem.level.unknown");
+}
+
 /** Why new sessions wait (or that they do not), from the daemon's numbers only; the room
  * left is secondary: what the OS calls available (macOS counts the file cache it gives
  * back), else the strict free pages from an older daemon. */
 export function pressureText(m: SystemMemory): { main: string; secondary: string } {
-  const swap = m.swapTotal > 0 ? `swap ${Math.round((m.swapUsed * 100) / m.swapTotal)}%` : null;
-  const who = m.kernelLevel ? (KERNEL_NAME[m.kernelSource ?? ""] ?? "The system") : null;
+  const swap = m.swapTotal > 0 ? t("mem.swap", { pct: Math.round((m.swapUsed * 100) / m.swapTotal) }) : null;
+  const who = m.kernelLevel ? (KERNEL_NAME[m.kernelSource ?? ""] ?? t("mem.theSystem")) : null;
   const parts: string[] = [];
   if (!m.paused) {
-    parts.push(`Memory pressure ${m.level}${who ? ` (${who})` : ""}`);
+    parts.push(who ? t("mem.pressureBy", { level: levelText(m.level), who }) : t("mem.pressure", { level: levelText(m.level) }));
     if (swap) parts.push(swap);
   } else if (who && m.kernelLevel === "normal") {
-    parts.push(`${who} reports normal memory pressure again`);
+    parts.push(t("mem.normalAgain", { who }));
     if (swap) parts.push(swap);
-    parts.push("new sessions paused until it settles");
+    parts.push(t("mem.pausedSettles"));
   } else if (who) {
-    parts.push(`${who} reported ${m.kernelLevel === "critical" ? "critical " : ""}memory pressure`);
+    parts.push(t(m.kernelLevel === "critical" ? "mem.reportedCritical" : "mem.reported", { who }));
     if (swap) parts.push(swap);
-    parts.push("new sessions paused until it eases");
+    parts.push(t("mem.pausedEases"));
   } else {
-    parts.push(swap ? `Memory tight (${swap} used, little free)` : "Memory tight (little free memory)");
-    parts.push("new sessions paused until it eases");
+    parts.push(swap ? t("mem.tightSwap", { swap }) : t("mem.tight"));
+    parts.push(t("mem.pausedEases"));
   }
-  const room = m.available !== null ? `${size(m.available)} available` : `${size(m.free)} free`;
-  return { main: parts.join(" · "), secondary: `${room} of ${size(m.total)}` };
+  const room = m.available !== null ? t("mem.available", { size: size(m.available), total: size(m.total) }) : t("mem.free", { size: size(m.free), total: size(m.total) });
+  return { main: parts.join(" · "), secondary: room };
 }
 
 /** Bytes as MB, or GB with one decimal from 1 GB. */
@@ -101,31 +107,38 @@ export function isMemoryEvent(kind: string): boolean {
   return kind.startsWith("memory.");
 }
 
-/** One line for the feed / memory panel. */
-export function describeMemoryEvent(kind: string, p: Record<string, unknown>): string {
+/** What a memory event says, as a key and its parameters (so a line can be said again in
+ * another language). Daemon words (states, reasons) pass through. */
+export function memoryMsg(kind: string, p: Record<string, unknown>): { key: Key; params?: Params } | null {
   const reason = typeof p.reason === "string" ? `: ${p.reason}` : "";
   switch (kind) {
     case "memory.warn":
-      return `memory ${String(p.state ?? "warning")} (${mb(p.bytes)} of ${mb(p.budget)})`;
+      return { key: "mem.ev.warn", params: { state: typeof p.state === "string" ? p.state : t("mem.ev.warning"), bytes: mb(p.bytes), budget: mb(p.budget) } };
     case "memory.level":
-      return `system memory pressure ${String(p.to ?? "changed")}`;
+      return { key: "mem.ev.level", params: { to: p.to == null ? t("mem.ev.changed") : String(p.to) } };
     case "memory.paused":
-      return "new sessions and queued deliveries paused (memory pressure)";
+      return { key: "mem.ev.paused" };
     case "memory.resumed":
-      return "new sessions and queued deliveries resumed";
+      return { key: "mem.ev.resumed" };
     case "memory.offer_hibernate":
-      return `hibernate suggested${reason}`;
+      return { key: "mem.ev.offerHibernate", params: { reason } };
     case "memory.hibernated":
-      return `hibernated (${mb(p.bytes)} freed)`;
+      return { key: "mem.ev.hibernated", params: { bytes: mb(p.bytes) } };
     case "memory.auto_hibernated":
-      return `hibernated automatically${reason}`;
+      return { key: "mem.ev.autoHibernated", params: { reason } };
     case "memory.refused":
-      return `not hibernated${reason}`;
+      return { key: "mem.ev.refused", params: { reason } };
     case "memory.leak":
-      return `memory keeps growing (${String(p.mb_per_min ?? "?")} MB/min while idle)`;
+      return { key: "mem.ev.leak", params: { rate: String(p.mb_per_min ?? "?") } };
     default:
-      return kind;
+      return null;
   }
+}
+
+/** One line for the feed / memory panel (an unknown kind is shown as it is). */
+export function describeMemoryEvent(kind: string, p: Record<string, unknown>): string {
+  const m = memoryMsg(kind, p);
+  return m ? t(m.key, m.params) : kind;
 }
 
 export function mb(v: unknown): string {

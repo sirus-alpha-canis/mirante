@@ -12,6 +12,7 @@ import {
 } from "react";
 import { shallow, useEnv, useLive, useSelect } from "../env";
 import { hintsFor, onMac } from "../lib/shortcuts";
+import { type Key, t, useT } from "../lib/i18n";
 import { DaemonError } from "../lib/daemon";
 import {
   AGENT_OPTIONS,
@@ -65,13 +66,9 @@ function branchExists(e: unknown): boolean {
 /** What `task.create` fixed for the new task's skills, in a person's words. */
 export function originText(branch: string, o: CreatedOrigin): { text: string; warn: boolean } {
   if (o.observed) {
-    return {
-      text: `${branch} gets no skills until you confirm its origin: the checkout is pinned to ${o.origin}, but its remote now says ${o.observed}. Confirm it from the task's Skills chip.`,
-      warn: true,
-    };
+    return { text: t("dispatch.originUnconfirmed", { branch, origin: o.origin, observed: o.observed }), warn: true };
   }
-  const pinned = o.pinned ? ", pinned for this checkout now" : "";
-  return { text: `Skills: ${branch} follows ${o.origin} (client ${o.tenant})${pinned}.`, warn: false };
+  return { text: t(o.pinned ? "dispatch.originPinned" : "dispatch.origin", { branch, origin: o.origin, client: o.tenant }), warn: false };
 }
 
 /** Where the last agent picked in the form is remembered (per viewer, this machine). */
@@ -128,6 +125,7 @@ export function DispatchComposer(props: {
   onForm?(update: (cur: ComposerForm) => ComposerForm): void;
 }) {
   const { rpc, cockpit } = useEnv();
+  const t = useT();
   const live = useLive();
   const hints = useMemo(() => hintsFor(onMac()), []);
   const [ownForm, setOwnForm] = useState<ComposerForm>(EMPTY_FORM);
@@ -170,7 +168,7 @@ export function DispatchComposer(props: {
   const refs = form.refs;
   const attach = (r: ContextRef) => setForm((f) => (f.refs.some((x) => contextKey(x) === contextKey(r)) ? f : { ...f, refs: [...f.refs, r] }));
   const detach = (key: string) => setForm((f) => ({ ...f, refs: f.refs.filter((x) => contextKey(x) !== key) }));
-  const repoLabel = (path: string | null) => props.projects.find((x) => x.path === path)?.name ?? path ?? "another repo";
+  const repoLabel = (path: string | null) => props.projects.find((x) => x.path === path)?.name ?? path ?? t("dispatch.anotherRepo");
 
   /** task.create; an auto-named branch git already has moves on to -2, -3… */
   const create = async (target: { repo: string; agent: AgentKind; branch: string; goal: string }, renames: boolean) => {
@@ -205,7 +203,7 @@ export function DispatchComposer(props: {
       const other = foreignRepo(sentRefs, r.path);
       if (other) {
         const from = repoLabel(other);
-        return setError(`The attached files and notes are from ${from}, not ${p.value.repo}: remove them, or dispatch to ${from}.`);
+        return setError(t("dispatch.foreignRefs", { from, to: p.value.repo }));
       }
       // "shop/" with no branch: named from the goal, like the form's.
       renames = p.value.branch === "";
@@ -213,14 +211,14 @@ export function DispatchComposer(props: {
       target = { repo: r.path, agent: p.value.agent, branch: b, goal: withContext(p.value.goal, sentRefs) };
     } else {
       const goal = sent.trim();
-      if (!goal) return setError("say what the agent should do");
-      if (!repo) return setError("Add a repository under Projects first.");
+      if (!goal) return setError(t("dispatch.noGoal"));
+      if (!repo) return setError(t("dispatch.noRepo"));
       const bad = branchProblem(branch);
       if (bad) return setError(bad);
       const other = foreignRepo(sentRefs, repo);
       if (other) {
         const from = repoLabel(other);
-        return setError(`The attached files and notes are from ${from}, not ${repoLabel(repo)}: remove them, or dispatch to ${from}.`);
+        return setError(t("dispatch.foreignRefs", { from, to: repoLabel(repo) }));
       }
       target = { repo, agent: props.agent, branch, goal: withContext(goal, sentRefs) };
       renames = edited === null;
@@ -241,7 +239,7 @@ export function DispatchComposer(props: {
       props.onDispatched?.(v.id);
       // Boot can take up to 45 s; progress arrives as events, so do not wait here.
       rpc<StartResult>(M.sessionStart, { task: v.id, prompt: target.goal }).catch((e) =>
-        setError(`${made} was created but the agent did not start: ${e instanceof Error ? e.message : e}`),
+        setError(t("dispatch.notStarted", { branch: made, error: e instanceof Error ? e.message : String(e) })),
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -321,7 +319,7 @@ export function DispatchComposer(props: {
   return (
     <form
       className="composer dispatch"
-      aria-label="Dispatch an agent"
+      aria-label={t("dispatch.form")}
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
@@ -329,15 +327,15 @@ export function DispatchComposer(props: {
     >
       <div className="composer-box">
         {refs.length > 0 && (
-          <ul className="attached" aria-label="Attached context">
+          <ul className="attached" aria-label={t("dispatch.attached")}>
             {refs.map((r) => (
               <li key={contextKey(r)} className="attached-chip">
-                <span className="muted small">{r.kind === "file" ? "file" : r.kind === "note" ? "note" : "skill"}</span>{" "}
+                <span className="muted small">{t(r.kind === "file" ? "context.kindFile" : r.kind === "note" ? "context.kindNote" : "context.kindSkill")}</span>{" "}
                 <span>{r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name}</span>
                 <button
                   type="button"
                   className="btn btn-small btn-ghost"
-                  aria-label={`Remove ${r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name}`}
+                  aria-label={t("dispatch.remove", { name: r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name })}
                   onClick={() => detach(contextKey(r))}
                 >
                   ×
@@ -347,7 +345,7 @@ export function DispatchComposer(props: {
           </ul>
         )}
         <label htmlFor="dispatch" className="sr-only">
-          Goal
+          {t("dispatch.goal")}
         </label>
         <textarea
           id="dispatch"
@@ -368,26 +366,26 @@ export function DispatchComposer(props: {
           aria-controls={sugg ? listId : undefined}
           aria-activedescendant={sugg ? optionId(active) : undefined}
         />
-        {sugg && <OptionList id={listId} label="Suggestions" items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
-        <div className="composer-toolbar" role="group" aria-label="Dispatch options">
+        {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
+        <div className="composer-toolbar" role="group" aria-label={t("dispatch.options")}>
           <AgentPicker value={props.agent} disabled={power} onPick={props.onAgent} />
           <RepoBox projects={props.projects} value={repo} disabled={power} onPick={setPicked} />
           <span id="dispatch-branch" className="small muted dispatch-branch">
             {power ? (
-              <>Agent, repo and branch come from the @ line.</>
+              <>{t("dispatch.fromAtLine")}</>
             ) : !hasGoal ? null : edited === null ? (
               <span className="tchip tchip-static">
                 <span aria-hidden="true">⎇</span> <code>{auto}</code>{" "}
-                <button type="button" className="btn btn-small btn-ghost" aria-label="Edit branch" onClick={() => setEdited(auto)}>
-                  edit
+                <button type="button" className="btn btn-small btn-ghost" aria-label={t("dispatch.editBranch")} onClick={() => setEdited(auto)}>
+                  {t("dispatch.edit")}
                 </button>
               </span>
             ) : (
               <span className="tchip tchip-static">
-                <label htmlFor="dispatch-branch-name">Branch</label>{" "}
+                <label htmlFor="dispatch-branch-name">{t("dispatch.branch")}</label>{" "}
                 <input id="dispatch-branch-name" value={edited} onChange={(e) => setEdited(e.target.value)} spellCheck={false} />{" "}
                 <button type="button" className="btn btn-small btn-ghost" onClick={() => setEdited(null)}>
-                  use {auto}
+                  {t("dispatch.useAuto", { branch: auto })}
                 </button>
               </span>
             )}
@@ -396,16 +394,16 @@ export function DispatchComposer(props: {
           <span className="toolbar-spacer" />
           {props.paused && (
             <span className="small warn" role="status">
-              Memory is tight: new sessions wait until it eases
+              {t("dispatch.paused")}
             </span>
           )}
           <button
             className="btn btn-primary"
             type="submit"
             disabled={busy || !hasGoal || !live}
-            title={live ? `Dispatch (${hints.send})` : "The daemon is not reachable"}
+            title={live ? t("dispatch.sendTitle", { key: hints.send }) : t("dispatch.offline")}
           >
-            Dispatch
+            {t("dispatch.send")}
           </button>
         </div>
       </div>
@@ -485,6 +483,7 @@ function Popover(props: { label: string; open: boolean; onClose(): void; trigger
 
 /** Which agent runs the task: a menu (Claude, Codex; more agents join `AGENT_OPTIONS`). */
 function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: boolean; onPick(a: AgentKind): void }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const id = useId();
   const choose = (a: AgentKind) => {
@@ -493,7 +492,7 @@ function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: 
   };
   return (
     <Popover
-      label="Agent"
+      label={t("dispatch.agent")}
       open={open}
       onClose={() => setOpen(false)}
       trigger={
@@ -505,13 +504,13 @@ function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: 
           aria-controls={open ? id : undefined}
           disabled={disabled}
           onClick={() => setOpen((o) => !o)}
-          title="Agent and model"
+          title={t("dispatch.agentTitle")}
         >
-          Agent: {agentLabel(value)} <span aria-hidden="true">▾</span>
+          {t("dispatch.agentChip", { agent: agentLabel(value) })} <span aria-hidden="true">▾</span>
         </button>
       }
     >
-      <ul id={id} className="menu" role="group" aria-label="Agents">
+      <ul id={id} className="menu" role="group" aria-label={t("dispatch.agents")}>
         {AGENT_OPTIONS.map((o) => (
           <li key={o.id}>
             <button type="button" className="menu-item" aria-pressed={o.id === value} onClick={() => choose(o.id)}>
@@ -527,16 +526,17 @@ function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: 
 type ContextTab = "files" | "notes" | "skills";
 /** A file or note search goes out once typing has paused this long. */
 export const CONTEXT_DEBOUNCE_MS = 150;
-const CONTEXT_TABS: { id: ContextTab; label: string }[] = [
-  { id: "files", label: "Files" },
-  { id: "notes", label: "Memory notes" },
-  { id: "skills", label: "Skills" },
+const CONTEXT_TABS: { id: ContextTab; label: Key }[] = [
+  { id: "files", label: "context.files" },
+  { id: "notes", label: "context.notes" },
+  { id: "skills", label: "context.skills" },
 ];
 
 /** "+ contexto": search the repo's files (`repo.files`), its memory notes (`dna.search`) or
  * the skills (`skill.list`) and attach one. Names only: nothing is read here. */
 function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAttach(r: ContextRef): void; attached: ContextRef[] }) {
   const { rpc } = useEnv();
+  const t = useT();
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ContextTab>("files");
   const [query, setQuery] = useState("");
@@ -561,25 +561,25 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
     const q = query.trim();
     const run = async () => {
       if (tab === "files") {
-        if (!repo) return { list: [], note: "Pick a repository first." };
+        if (!repo) return { list: [], note: t("context.pickRepo") };
         const files = (await rpc<string[]>(M.repoFiles, { repo, query: q, limit: 20 })) ?? [];
         return {
           list: files.map((path) => ({
             key: `file:${path}`,
             ref: { kind: "file", path, repo } as ContextRef,
             label: path,
-            detail: mayHoldSecrets(path) ? "⚠ may hold secrets" : undefined,
+            detail: mayHoldSecrets(path) ? t("context.secrets") : undefined,
           })),
-          note: files.length ? null : "No matching file.",
+          note: files.length ? null : t("context.noFile"),
         };
       }
       if (tab === "notes") {
-        if (!repo) return { list: [], note: "Pick a repository first." };
-        if (!q) return { list: [], note: "Type to search the repo's memory." };
+        if (!repo) return { list: [], note: t("context.pickRepo") };
+        if (!q) return { list: [], note: t("context.typeNotes") };
         const notes = (await rpc<NoteSummary[]>(M.dnaSearch, { repo, query: q, limit: 10 })) ?? [];
         return {
           list: notes.map((n) => ({ key: `note:${n.slug}`, ref: { kind: "note", slug: n.slug, title: n.title, repo } as ContextRef, label: n.title, detail: n.slug })),
-          note: notes.length ? null : "No matching note.",
+          note: notes.length ? null : t("context.noNote"),
         };
       }
       if (!skills.current) {
@@ -593,7 +593,7 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
       const found = (await skills.current).filter((x) => !needle || x.name.toLowerCase().includes(needle) || x.description.toLowerCase().includes(needle));
       return {
         list: found.slice(0, 20).map((x) => ({ key: `skill:${x.name}`, ref: { kind: "skill", name: x.name, description: x.description } as ContextRef, label: x.name, detail: x.description })),
-        note: found.length ? null : "No matching skill.",
+        note: found.length ? null : t("context.noSkill"),
       };
     };
     const go = () =>
@@ -623,46 +623,46 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
   const taken = new Set(attached.map(contextKey));
   return (
     <Popover
-      label="Add context"
+      label={t("context.dialog")}
       open={open}
       onClose={() => setOpen(false)}
       trigger={
         <button type="button" className="tchip" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
-          + contexto
+          {t("context.button")}
         </button>
       }
     >
-      <div className="seg" role="group" aria-label="Kind of context">
-        {CONTEXT_TABS.map((t) => (
+      <div className="seg" role="group" aria-label={t("context.kind")}>
+        {CONTEXT_TABS.map((c) => (
           <button
-            key={t.id}
+            key={c.id}
             type="button"
             className="btn btn-small"
-            aria-pressed={tab === t.id}
+            aria-pressed={tab === c.id}
             onClick={() => {
-              setTab(t.id);
+              setTab(c.id);
               setQuery("");
             }}
           >
-            {t.label}
+            {t(c.label)}
           </button>
         ))}
       </div>
       <label htmlFor={searchId} className="sr-only">
-        Search {CONTEXT_TABS.find((t) => t.id === tab)?.label}
+        {t("context.search", { what: t(CONTEXT_TABS.find((c) => c.id === tab)!.label) })}
       </label>
       <input
         id={searchId}
         ref={search}
         className="popover-search"
-        placeholder={tab === "files" ? "Search files by path" : tab === "notes" ? "Search memory notes" : "Search skills"}
+        placeholder={t(tab === "files" ? "context.searchFiles" : tab === "notes" ? "context.searchNotes" : "context.searchSkills")}
         value={query}
         autoFocus
         spellCheck={false}
         onChange={(e) => setQuery(e.target.value)}
       />
       {note && <p className="small muted">{note}</p>}
-      <ul className="menu" aria-label="Results">
+      <ul className="menu" aria-label={t("context.results")}>
         {hits.map((h) => (
           <li key={h.key}>
             <button
@@ -677,7 +677,7 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
             >
               <span>{h.label}</span>
               {h.detail && <span className="muted small">{h.detail}</span>}
-              {taken.has(h.key) && <span className="muted small">attached</span>}
+              {taken.has(h.key) && <span className="muted small">{t("context.attachedMark")}</span>}
             </button>
           </li>
         ))}
@@ -688,6 +688,7 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
 
 /** The form's repository: a combobox over the Projects, filtered by folder name as typed. */
 function RepoBox(props: { projects: Project[]; value: string | null; disabled: boolean; onPick(path: string): void }) {
+  const t = useT();
   // null: not searching (the box shows the chosen project's name).
   const [query, setQuery] = useState<string | null>(null);
   const [active, setActive] = useState(0);
@@ -727,7 +728,7 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
   return (
     <span className="repo-box tchip tchip-static">
       <label htmlFor={id} className="small muted">
-        Repository
+        {t("dispatch.repository")}
       </label>
       <input
         id={id}
@@ -737,7 +738,7 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
         aria-autocomplete="list"
         aria-activedescendant={open ? optionId(at) : undefined}
         title={chosen?.path}
-        placeholder={props.projects.length === 0 ? "No projects yet" : "Search projects"}
+        placeholder={t(props.projects.length === 0 ? "dispatch.noProjects" : "dispatch.searchProjects")}
         disabled={props.disabled || props.projects.length === 0}
         value={query ?? chosen?.name ?? ""}
         spellCheck={false}
@@ -752,7 +753,7 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
       {open && (
         <OptionList
           id={listId}
-          label="Projects"
+          label={t("dispatch.projects")}
           items={items.map((p) => ({ label: p.name, detail: p.path, insert: p.path }))}
           active={at}
           optionId={optionId}

@@ -10,9 +10,11 @@ import { StatusPill, TaskBadges } from "./Badges";
 import { HibernateButton } from "./MemoryPanel";
 import { PermissionCard } from "./PermissionCard";
 import { TrustCard } from "./TrustCard";
+import { useT } from "../lib/i18n";
 
 const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onOpen(id: string, tab?: "Terminal"): void; inlineAnswers: boolean }) {
   const { rpc } = useEnv();
+  const tt = useT();
   const feed = useSelect((s) => s.feed[t.id]);
   const [text, setText] = useState("");
   const [note, setNote] = useState<string | null>(null);
@@ -30,16 +32,16 @@ const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onO
     try {
       const r = await rpc<SendResult>(M.messageSend, { task: t.id, text: msg, mode });
       setText((cur) => (cur === msg ? "" : cur));
-      setNote(r?.delivered === "steer" ? "sent" : "queued");
+      setNote(tt(r?.delivered === "steer" ? "grid.sent" : "grid.queued"));
     } catch (e) {
       const err = e instanceof DaemonError ? e : null;
-      setNote(err?.code === RpcCode.NEEDS_YOU ? "answer the open request first" : String(err?.message ?? (e instanceof Error ? e.message : e)));
+      setNote(err?.code === RpcCode.NEEDS_YOU ? tt("grid.answerFirst") : String(err?.message ?? (e instanceof Error ? e.message : e)));
     } finally {
       inFlight.current = false;
     }
   };
   return (
-    <article className={`tile card-${col}`} aria-label={`${t.agent} on ${t.branch}`}>
+    <article className={`tile card-${col}`} aria-label={tt("card.label", { agent: t.agent, branch: t.branch })}>
       <header className="card-head">
         <button className="link" onClick={() => onOpen(t.id)}>
           {t.title}
@@ -57,9 +59,9 @@ const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onO
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
       {unexplained && (
         <p className="perm perm-compact">
-          <span className="muted">Waiting for you in the agent's terminal.</span>{" "}
+          <span className="muted">{tt("card.waitingTerminal")}</span>{" "}
           <button className="btn btn-small" onClick={() => onOpen(t.id, "Terminal")}>
-            Open terminal
+            {tt("card.openTerminal")}
           </button>
         </p>
       )}
@@ -76,8 +78,8 @@ const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onO
       {t.live && (
         <input
           className="mini"
-          aria-label={`Message ${t.branch} (Enter steer, Alt+Enter queue)`}
-          placeholder="Enter steer · ⌥↵ queue"
+          aria-label={tt("grid.messageLabel", { branch: t.branch })}
+          placeholder={tt("grid.messagePlaceholder")}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -104,11 +106,12 @@ const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onO
 
 /** V2, the agent grid: up to six tiles, needs-you first, then working, then recently finished. */
 export function Grid({ onOpen, status }: { onOpen(id: string, tab?: "Terminal"): void; status: DaemonStatus | null }) {
+  const t = useT();
   const tiles = useSelect(gridTasks, shallow);
   const inlineAnswers = status?.claude_inline_answers ?? false;
-  if (tiles.length === 0) return <main className="grid-empty muted">No active agents. Dispatch one from Home ({hintsFor(onMac()).home}).</main>;
+  if (tiles.length === 0) return <main className="grid-empty muted">{t("grid.empty", { key: hintsFor(onMac()).home })}</main>;
   return (
-    <main className={`grid grid-${Math.max(2, tiles.length)}`} aria-label="Agent grid">
+    <main className={`grid grid-${Math.max(2, tiles.length)}`} aria-label={t("grid.label")}>
       {tiles.map((t) => (
         <Tile key={t.id} t={t} onOpen={onOpen} inlineAnswers={inlineAnswers} />
       ))}

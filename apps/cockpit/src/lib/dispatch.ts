@@ -2,6 +2,7 @@
 // "feat/login", goal "add a login page". The repo is everything before the first "/";
 // the branch is the rest of that word (it may contain "/"; empty, as in "shop/", leaves it to
 // be named from the goal); the goal is the rest of the text.
+import { t } from "./i18n";
 import type { AgentKind } from "./protocol";
 
 export interface Dispatch {
@@ -13,29 +14,30 @@ export interface Dispatch {
 
 export type Parsed = { ok: true; value: Dispatch } | { ok: false; error: string };
 
-export const DISPATCH_HELP = "@claude <repo>/<branch> <goal>  or  @codex <repo>/<branch> <goal>";
+/** The one-line syntax, in the current language. */
+export const dispatchHelp = () => t("dispatch.help");
 
 /** The goal box's hint: plain words, with the one-line syntax as a shortcut. `send`: the
  * platform's send chord (⌘↵ on macOS, Ctrl+↵ elsewhere). */
 export function goalHelp(send: string): string {
-  return `What should the agent do? (${send} to dispatch; power users: @claude repo/branch goal)`;
+  return t("dispatch.goalHelp", { send });
 }
 
 const AGENTS: Record<string, AgentKind> = { "@claude": "claude", "@codex": "codex" };
 
 // git check-ref-format, as far as a typed branch name needs it.
 export function branchProblem(b: string): string | null {
-  if (b.startsWith("-")) return "a branch cannot start with '-'";
-  if (b.startsWith("/")) return "a branch cannot start with '/'";
-  if (b.includes("..")) return "a branch cannot contain '..'";
-  if (b === "@") return `"${b}" is not a valid branch name`;
-  if (/[~^:?*[\\\x00-\x20\x7f]/.test(b)) return `"${b}" has a character git does not allow in branch names`;
-  if (b.includes("@{")) return `"${b}" is not a valid branch name`;
-  if (b.endsWith("/") || b.endsWith(".")) return `"${b}" is not a valid branch name`;
+  if (b.startsWith("-")) return t("branch.dash");
+  if (b.startsWith("/")) return t("branch.slash");
+  if (b.includes("..")) return t("branch.dots");
+  if (b === "@") return t("branch.invalid", { b });
+  if (/[~^:?*[\\\x00-\x20\x7f]/.test(b)) return t("branch.badChar", { b });
+  if (b.includes("@{")) return t("branch.invalid", { b });
+  if (b.endsWith("/") || b.endsWith(".")) return t("branch.invalid", { b });
   for (const part of b.split("/")) {
-    if (part === "") return `"${b}" has an empty component (doubled '/')`;
-    if (part.startsWith(".")) return `"${b}": a component cannot start with '.'`;
-    if (part.endsWith(".lock")) return `"${b}": a component cannot end with '.lock'`;
+    if (part === "") return t("branch.empty", { b });
+    if (part.startsWith(".")) return t("branch.dotStart", { b });
+    if (part.endsWith(".lock")) return t("branch.lock", { b });
   }
   return null;
 }
@@ -43,21 +45,21 @@ export function branchProblem(b: string): string | null {
 export function parseDispatch(input: string): Parsed {
   const text = input.trim();
   const m = /^(\S+)(?:\s+(\S+))?(?:\s+([\s\S]*))?$/.exec(text);
-  if (!text.startsWith("@") || !m) return { ok: false, error: `start with an agent: ${DISPATCH_HELP}` };
+  if (!text.startsWith("@") || !m) return { ok: false, error: t("dispatch.parseAgent", { help: dispatchHelp() }) };
   const agent = AGENTS[m[1].toLowerCase()];
-  if (!agent) return { ok: false, error: `unknown agent "${m[1]}": use @claude or @codex` };
+  if (!agent) return { ok: false, error: t("dispatch.parseUnknownAgent", { agent: m[1] }) };
   const target = m[2];
-  if (!target) return { ok: false, error: `say where: ${DISPATCH_HELP}` };
+  if (!target) return { ok: false, error: t("dispatch.parseWhere", { help: dispatchHelp() }) };
   const slash = target.indexOf("/");
   if (slash <= 0) {
-    return { ok: false, error: `"${target}" must be <repo>/<branch>, e.g. shop/feat/login` };
+    return { ok: false, error: t("dispatch.parseTarget", { target }) };
   }
   const repo = target.slice(0, slash);
   const branch = target.slice(slash + 1);
   const bad = branch === "" ? null : branchProblem(branch);
   if (bad) return { ok: false, error: bad };
   const goal = (m[3] ?? "").trim();
-  if (!goal) return { ok: false, error: "say what the agent should do after the branch" };
+  if (!goal) return { ok: false, error: t("dispatch.parseGoal") };
   return { ok: true, value: { agent, repo, branch, goal } };
 }
 
@@ -68,9 +70,9 @@ export function resolveRepo(name: string, known: { name: string; path: string }[
   const hits = known.filter((p) => p.name === name);
   if (hits.length === 1) return { ok: true, path: hits[0].path };
   if (hits.length > 1) {
-    return { ok: false, error: `"${name}" names several repos (${hits.map((h) => h.path).join(", ")}); rename one folder` };
+    return { ok: false, error: t("dispatch.repoAmbiguous", { name, paths: hits.map((h) => h.path).join(", ") }) };
   }
-  return { ok: false, error: `unknown repo "${name}": add it under Projects first` };
+  return { ok: false, error: t("dispatch.repoUnknown", { name }) };
 }
 
 /** Where auto-named branches live. */
@@ -235,11 +237,23 @@ export function withContext(goal: string, refs: ContextRef[]): string {
 export interface AgentOption {
   id: AgentKind;
   label: string;
-  /** The model it runs, in a person's words (its own default for now). */
-  model: string;
+  /** The model it runs, in a person's words (its own default for now), in the current language. */
+  readonly model: string;
 }
 
 export const AGENT_OPTIONS: AgentOption[] = [
-  { id: "claude", label: "Claude", model: "Claude Code's default model" },
-  { id: "codex", label: "Codex", model: "Codex's default model" },
+  {
+    id: "claude",
+    label: "Claude",
+    get model() {
+      return t("agent.claudeModel");
+    },
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    get model() {
+      return t("agent.codexModel");
+    },
+  },
 ];

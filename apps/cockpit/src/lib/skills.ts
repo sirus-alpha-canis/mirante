@@ -16,6 +16,7 @@ import type {
   TaskSkills,
   TenantView,
 } from "./protocol";
+import { t } from "./i18n";
 import { M, RpcCode } from "./protocol";
 
 function isOlderDaemon(e: unknown): boolean {
@@ -117,19 +118,22 @@ const scopeValue = (scope: string) => scope.slice(scope.indexOf(":") + 1);
 export function scopeLabel(scope: string): string {
   switch (scopeKind(scope)) {
     case "org":
-      return `Org ${scopeValue(scope)}`;
+      return t("skills.scopeOrg", { v: scopeValue(scope) });
     case "repo":
-      return `Repo ${scopeValue(scope)}`;
+      return t("skills.scopeRepo", { v: scopeValue(scope) });
     default:
-      return "Personal (every repo)";
+      return t("skills.scopePersonal");
   }
 }
 
 /** Where a skill goes in the agent's session. */
 export function activationLabel(a: string): string {
-  return a === "always"
-    ? "Always on: added to the agent's system prompt in every matching session"
-    : "On demand: listed for the agent, which loads it when relevant";
+  return a === "always" ? t("skills.activationAlways") : t("skills.activationOnDemand");
+}
+
+/** An activation in a word or two ("always on", "on demand"), never the raw value. */
+export function activationShort(a: string): string {
+  return a === "always" ? t("skills.short.always") : t("skills.short.on_demand");
 }
 
 /** The body of a rendered `SKILL.md` (Mirante writes only name and description above it). */
@@ -150,20 +154,18 @@ export function wideningWarnings(scope: string, learnedIn: string | null | undef
   const kind = scopeKind(scope);
   if (kind === "personal") {
     return [
-      learnedIn
-        ? `Learned in ${learnedIn}; personal skills reach every repo, including other clients'.`
-        : "Personal skills reach every repo, including other clients'.",
+      learnedIn ? t("skills.widenPersonalFrom", { from: learnedIn }) : t("skills.widenPersonal"),
     ];
   }
-  const t = scopeTenant(scope);
-  return learnedIn && t && t !== learnedIn ? [`Learned in ${learnedIn}; scoped to ${t}, another client's.`] : [];
+  const to = scopeTenant(scope);
+  return learnedIn && to && to !== learnedIn ? [t("skills.widenOther", { from: learnedIn, to })] : [];
 }
 
 export const hasLintErrors = (f: readonly Finding[]) => f.some((x) => x.severity === "error");
 
 /** `rule (error, SKILL.md line 3): message`. */
 export function findingText(f: Finding): string {
-  const where = f.line > 0 ? `${f.file} line ${f.line}` : f.file;
+  const where = f.line > 0 ? t("skills.findingWhere", { file: f.file, line: f.line }) : f.file;
   return `${f.rule} (${f.severity}, ${where}): ${f.message}`;
 }
 
@@ -171,7 +173,7 @@ export function findingText(f: Finding): string {
 export function skillErrorText(e: unknown): string {
   const err = e instanceof DaemonError ? e : null;
   if (err?.code === RpcCode.FORBIDDEN) {
-    return "Reviewing skills is a person's decision and cannot be made from an agent session. Mirante also refuses a caller it cannot check: use the cockpit or `mirante skills` in a terminal you opened yourself.";
+    return t("skillErr.forbidden");
   }
   return e instanceof Error ? e.message : String(e);
 }

@@ -1,8 +1,9 @@
 // How a task's feed reads to a person: repeated lines folded ("×N"), runs of tool steps
-// summed up in plain words ("leu 14 arquivos, rodou 3 comandos"), the current step said
+// summed up in plain words ("read 14 files, ran 3 commands"), the current step said
 // without raw commands, and the agent's last answer. Pure functions over feed items; the
 // text they return is shown as text nodes only.
 import type { FeedItem } from "../store/state";
+import { t, tn } from "./i18n";
 
 export interface Folded {
   /** The newest line of the run (its seq keys the row). */
@@ -48,10 +49,8 @@ function bucket(i: FeedItem): Bucket {
   return "other";
 }
 
-const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
-
-/** "leu 14 arquivos, rodou 3 comandos": what a run of tool steps did. Files are counted
- * once each; searches, commands and other tools per call. */
+/** "read 14 files, ran 3 commands": what a run of tool steps did. Files are counted once
+ * each; searches, commands and other tools per call. */
 export function describeRun(items: FeedItem[]): string {
   const files = { read: new Set<string>(), edit: new Set<string>() };
   let search = 0;
@@ -67,13 +66,13 @@ export function describeRun(items: FeedItem[]): string {
     else other++;
   }
   const parts = [
-    files.read.size > 0 && `leu ${plural(files.read.size, "arquivo", "arquivos")}`,
-    files.edit.size > 0 && `editou ${plural(files.edit.size, "arquivo", "arquivos")}`,
-    search > 0 && `buscou ${plural(search, "vez", "vezes")}`,
-    run > 0 && `rodou ${plural(run, "comando", "comandos")}`,
-    other > 0 && `usou ${plural(other, "ferramenta", "ferramentas")}`,
+    files.read.size > 0 && tn(files.read.size, "run.readOne", "run.readMany"),
+    files.edit.size > 0 && tn(files.edit.size, "run.editOne", "run.editMany"),
+    search > 0 && tn(search, "run.searchOne", "run.searchMany"),
+    run > 0 && tn(run, "run.runOne", "run.runMany"),
+    other > 0 && tn(other, "run.otherOne", "run.otherMany"),
   ].filter(Boolean);
-  return parts.join(", ") + (failed > 0 ? ` (${failed} ${failed === 1 ? "falhou" : "falharam"})` : "");
+  return parts.join(", ") + (failed > 0 ? tn(failed, "run.failedOne", "run.failedMany") : "");
 }
 
 export type StepEntry = { type: "line"; item: FeedItem; count: number } | { type: "run"; items: FeedItem[]; text: string };
@@ -113,35 +112,35 @@ const baseName = (p: string) => p.replace(/\/+$/, "").split("/").pop() || p;
 
 /** What the agent is doing, in a few plain words (never the raw command). */
 export function plainStep(i: FeedItem | undefined): string {
-  if (!i) return "começando";
+  if (!i) return t("step.starting");
   switch (i.kind) {
     case "command":
-      return "rodando um comando";
+      return t("step.command");
     case "agent_message":
-      return "escrevendo";
+      return t("step.writing");
     case "turn":
-      return i.phase === "ended" ? "terminou um turno" : "começou um turno";
+      return t(i.phase === "ended" ? "step.turnEnded" : "step.turnStarted");
     case "message":
-      return "recebeu sua mensagem";
+      return t("step.message");
     case "permission":
-      return "pediu permissão";
+      return t("step.permission");
     case "tool": {
       const { tool, what } = toolOf(i);
       switch (bucket(i)) {
         case "read":
-          return what ? `lendo ${baseName(what)}` : "lendo arquivos";
+          return what ? t("step.reading", { file: baseName(what) }) : t("step.readingFiles");
         case "edit":
-          return what ? `editando ${baseName(what)}` : "editando arquivos";
+          return what ? t("step.editing", { file: baseName(what) }) : t("step.editingFiles");
         case "search":
-          return "buscando no código";
+          return t("step.searching");
         case "run":
-          return "rodando um comando";
+          return t("step.command");
         default:
-          return `usando ${tool}`;
+          return t("step.using", { tool });
       }
     }
     default:
-      return "trabalhando";
+      return t("step.working");
   }
 }
 

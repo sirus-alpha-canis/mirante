@@ -7,13 +7,14 @@
 import { useEffect, useRef, useState } from "react";
 import { useEnv, useSelect } from "../env";
 import type { RepoOrigin, TaskSkills } from "../lib/protocol";
-import { confirmOrigin, originTenant, skillErrorText, skillRepoOrigin, taskSkills } from "../lib/skills";
+import { t, tn, useT } from "../lib/i18n";
+import { activationShort, confirmOrigin, originTenant, skillErrorText, skillRepoOrigin, taskSkills } from "../lib/skills";
 import { useTaskSkillsVersion } from "../lib/useSkills";
 
 function chipText(ts: TaskSkills): string {
-  if (!ts.confirmed) return "Skills off: confirm origin";
-  const refused = ts.refused.length > 0 ? ` · ${ts.refused.length} refused` : "";
-  return `Skills ${ts.active.length}${refused}`;
+  if (!ts.confirmed) return t("skillChip.off");
+  const refused = ts.refused.length > 0 ? t("skillChip.refused", { n: ts.refused.length }) : "";
+  return `${t("skillChip.count", { n: ts.active.length })}${refused}`;
 }
 
 /** What a confirmation said: kept by the chip, so it survives the refetch that follows. */
@@ -21,6 +22,7 @@ type Notes = { text: string; warn: boolean }[];
 
 function ConfirmOrigin({ task, ts, onDone }: { task: string; ts: TaskSkills; onDone(notes: Notes): void }) {
   const { rpc } = useEnv();
+  useT();
   const repo = useSelect((s) => s.tasks[task]?.repo_path ?? "");
   const [busy, setBusy] = useState(false);
   const [moving, setMoving] = useState(false);
@@ -51,8 +53,8 @@ function ConfirmOrigin({ task, ts, onDone }: { task: string; ts: TaskSkills; onD
       const r = await confirmOrigin(rpc, task, origin);
       const head =
         origin === ts.origin
-          ? `Confirmed ${r.origin}: ${r.cleared} ${r.cleared === 1 ? "task gets" : "tasks get"} skills again.`
-          : `New tasks of this checkout now belong to ${r.tenant}. This task stays without skills (it was fixed to ${ts.origin}).`;
+          ? tn(r.cleared, "skillChip.confirmed.one", "skillChip.confirmed.many", { origin: r.origin })
+          : t("skillChip.moved", { client: r.tenant, origin: ts.origin });
       onDone([{ text: head, warn: false }, ...(r.warning ? [{ text: r.warning, warn: true }] : [])]);
     } catch (e) {
       onDone([{ text: skillErrorText(e), warn: true }]);
@@ -64,36 +66,33 @@ function ConfirmOrigin({ task, ts, onDone }: { task: string; ts: TaskSkills; onD
   };
   return (
     <div className="skill-confirm">
-      <p className="warn small">
-        This task gets no skills: its checkout's origin is not confirmed. A changed remote can move a task into another client's
-        skills, so a person decides.
-      </p>
-      <ul className="dna-list" aria-label="Origins of this checkout">
-        <li className="small">{`Pinned: ${pinned} (client ${pinnedTenant})`}</li>
-        <li className="small">{`Remote now: ${now} (client ${nowTenant})`}</li>
+      <p className="warn small">{t("skillChip.noSkills")}</p>
+      <ul className="dna-list" aria-label={t("skillChip.originsAria")}>
+        <li className="small">{t("skillChip.pinned", { origin: pinned, client: pinnedTenant })}</li>
+        <li className="small">{t("skillChip.remote", { origin: now, client: nowTenant })}</li>
       </ul>
       {moving && live ? (
         <>
           <p className="warn small">
-            {`This moves new tasks of this checkout from client ${originTenant(ts.origin)} to ${originTenant(live)}: they get ${originTenant(live)}'s skills and learning. This task stays on ${originTenant(ts.origin)}, without skills.`}
+            {t("skillChip.moveWarn", { from: originTenant(ts.origin), to: originTenant(live) })}
           </p>
           <div className="dna-actions">
             <button className="btn btn-small btn-warn" disabled={busy} onClick={() => confirm(live)}>
-              Move new tasks to {originTenant(live)}
+              {t("skillChip.moveTo", { client: originTenant(live) })}
             </button>
             <button className="btn btn-small" disabled={busy} onClick={() => setMoving(false)}>
-              Cancel
+              {t("skillChip.cancel")}
             </button>
           </div>
         </>
       ) : (
         <div className="dna-actions">
           <button className="btn btn-small" disabled={busy} onClick={() => confirm(ts.origin)}>
-            Keep {ts.origin}
+            {t("skillChip.keep", { origin: ts.origin })}
           </button>
           {live && (
             <button className="btn btn-small" disabled={busy} onClick={() => setMoving(true)}>
-              Use {live} for new tasks…
+              {t("skillChip.use", { origin: live })}
             </button>
           )}
         </div>
@@ -107,6 +106,7 @@ function ConfirmOrigin({ task, ts, onDone }: { task: string; ts: TaskSkills; onD
  * skills. */
 export function SkillsChip({ task }: { task: string }) {
   const { rpc } = useEnv();
+  useT();
   const session = useSelect((s) => s.sessionSkills[task]);
   const version = useTaskSkillsVersion(task);
   const [ts, setTs] = useState<TaskSkills | null>(null);
@@ -143,11 +143,11 @@ export function SkillsChip({ task }: { task: string }) {
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [open]);
-  if (!ts) return error ? <span className="skill-chip skill-chip-warn" title={error}>Skills unavailable</span> : null;
+  if (!ts) return error ? <span className="skill-chip skill-chip-warn" title={error}>{t("skillChip.unavailable")}</span> : null;
   const warn = !ts.confirmed || ts.refused.length > 0;
   const state = (name: string) => {
-    if (!session?.names.includes(name)) return "next session";
-    return session.used.includes(name) ? "injected, used" : "injected";
+    if (!session?.names.includes(name)) return t("skillChip.next");
+    return t(session.used.includes(name) ? "skillChip.injectedUsed" : "skillChip.injected");
   };
   const close = () => {
     setOpen(false);
@@ -165,11 +165,11 @@ export function SkillsChip({ task }: { task: string }) {
         {chipText(ts)}
       </button>
       {open && (
-        <div className="skills-pop" role="dialog" aria-label="Skills of this task" ref={pop} tabIndex={-1}>
+        <div className="skills-pop" role="dialog" aria-label={t("skillChip.popAria")} ref={pop} tabIndex={-1}>
           <p className="small">
-            Tenant: {ts.tenant || "none"} · learning {ts.learning ? "on" : "off"}
+            {t("skillChip.client", { client: ts.tenant || t("skillChip.none"), state: t(ts.learning ? "skillChip.on" : "skillChip.off2") })}
           </p>
-          <p className="muted small">Origin: {ts.origin || "none recorded"}</p>
+          <p className="muted small">{t("skillChip.origin", { origin: ts.origin || t("skillChip.noneRecorded") })}</p>
           {ts.unavailable && <p className="warn small">{ts.unavailable}</p>}
           {!ts.confirmed && (
             <ConfirmOrigin
@@ -187,24 +187,24 @@ export function SkillsChip({ task }: { task: string }) {
             </p>
           ))}
           {ts.active.length > 0 && (
-            <ul className="dna-list" aria-label="Active skills">
+            <ul className="dna-list" aria-label={t("skillChip.activeAria")}>
               {ts.active.map((a) => (
                 <li key={a.name} className="small">
-                  {`${a.name} v${a.version} · ${a.activation === "always" ? "always on" : "on demand"} · ${state(a.name)}`}
+                  {`${a.name} v${a.version} · ${activationShort(a.activation)} · ${state(a.name)}`}
                 </li>
               ))}
             </ul>
           )}
-          {ts.confirmed && ts.active.length === 0 && <p className="muted small">No skill applies to this task.</p>}
+          {ts.confirmed && ts.active.length === 0 && <p className="muted small">{t("skillChip.noneApply")}</p>}
           {ts.refused.length > 0 && (
-            <ul className="dna-list" aria-label="Refused skills">
+            <ul className="dna-list" aria-label={t("skillChip.refusedAria")}>
               {ts.refused.map((r) => (
                 <li key={r.name} className="small warn">{`${r.name}: ${r.reason}`}</li>
               ))}
             </ul>
           )}
           <button className="btn btn-small" onClick={close}>
-            Close
+            {t("skillChip.close")}
           </button>
         </div>
       )}
@@ -214,12 +214,13 @@ export function SkillsChip({ task }: { task: string }) {
 
 /** The agent card's count: what the task's latest session was given (from its events). */
 export function SkillsCount({ task }: { task: string }) {
+  useT();
   const got = useSelect((s) => s.sessionSkills[task]);
   if (!got) return null;
-  const refused = got.refused.length > 0 ? ` · ${got.refused.length} refused` : "";
+  const refused = got.refused.length > 0 ? t("skillChip.refused", { n: got.refused.length }) : "";
   return (
-    <span className={`skill-chip ${got.refused.length > 0 ? "skill-chip-warn" : ""}`} title="Skills given to this task's session">
-      {`Skills ${got.names.length}${refused}`}
+    <span className={`skill-chip ${got.refused.length > 0 ? "skill-chip-warn" : ""}`} title={t("skillChip.countTitle")}>
+      {`${t("skillChip.count", { n: got.names.length })}${refused}`}
     </span>
   );
 }

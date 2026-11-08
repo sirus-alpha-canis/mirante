@@ -44,14 +44,14 @@ describe("SkillsChip", () => {
     expect(await screen.findByRole("button", { name: "Skills 3 · 1 refused" })).toHaveClass("skill-chip-warn");
   });
 
-  it("the popover lists name, version, activation, used/injected, and the tenant with its learning state", async () => {
+  it("the popover lists name, version, activation, used/injected, and the client with its learning state", async () => {
     setup({ ...TS, refused: [{ name: "x", reason: "over budget" }] }, [
       ev(1, "a", "skill.injected", { session_id: "s1", names: ["cargo-tests-first", "review-checklist"] }),
       ev(2, "a", "skill.used", { session_id: "s1", name: "review-checklist", version: 1 }),
     ]);
     await userEvent.click(await screen.findByRole("button", { name: /Skills 3/ }));
     const pop = screen.getByRole("dialog", { name: "Skills of this task" });
-    expect(pop).toHaveTextContent("Tenant: github.com/acme · learning on");
+    expect(pop).toHaveTextContent("Client: github.com/acme · learning on");
     const rows = within(within(pop).getByRole("list", { name: "Active skills" })).getAllByRole("listitem").map((li) => li.textContent);
     expect(rows).toEqual([
       "cargo-tests-first v3 · always on · injected",

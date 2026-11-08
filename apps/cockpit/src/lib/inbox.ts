@@ -1,6 +1,7 @@
 // Home as an inbox across every project: what needs the person first (oldest wait first),
 // then what is ready for review, then what is working, each grouped by project with a
-// stable color per project. Plus the focus-mode order behind "Próximo ⌘J".
+// stable color per project. Plus the focus-mode order behind "Next ⌘J".
+import { t } from "./i18n";
 import type { TaskView } from "./protocol";
 import { columnOf, type Column, pendingPerms, repoName } from "../store/select";
 import type { State } from "../store/state";
@@ -139,9 +140,9 @@ export function waitingLongerThan(s: Slices, now: number, ms: number): number {
 /** "3 min", "1 h 5 min", "2 d": a short elapsed time. */
 export function elapsed(ms: number): string {
   const min = Math.max(0, Math.floor(ms / 60_000));
-  if (min < 1) return "agora";
-  if (min < 60) return `${min} min`;
+  if (min < 1) return t("inbox.now");
+  if (min < 60) return t("inbox.min", { m: min });
   const h = Math.floor(min / 60);
-  if (h < 24) return min % 60 ? `${h} h ${min % 60} min` : `${h} h`;
-  return `${Math.floor(h / 24)} d`;
+  if (h < 24) return min % 60 ? t("inbox.hMin", { h, m: min % 60 }) : t("inbox.h", { h });
+  return t("inbox.d", { d: Math.floor(h / 24) });
 }

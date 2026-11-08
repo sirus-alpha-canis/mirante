@@ -2,6 +2,7 @@
 // views share. Everything here returns data; nothing builds HTML. Note bodies are split
 // into text and [[link]] parts that components render as text nodes and buttons.
 import { DaemonError } from "./daemon";
+import { t } from "./i18n";
 import type {
   CheckReport,
   DnaGraph,
@@ -79,10 +80,10 @@ export const noteAction = (rpc: Rpc, repo: string, slug: string, action: NoteAct
 export function dnaErrorText(e: unknown): string {
   const err = e instanceof DaemonError ? e : null;
   if (err?.code === RpcCode.FORBIDDEN) {
-    return "Memory review is a person's decision and cannot be made from an agent session. Mirante also refuses a caller it cannot check: use the cockpit or `mirante memory` in a terminal you opened yourself.";
+    return t("dna.forbidden");
   }
   if (err?.code === RpcCode.CONFLICT && /changed on disk/.test(err.message)) {
-    return "The note changed since it was shown. Reload it and try again.";
+    return t("dna.changed");
   }
   return e instanceof Error ? e.message : String(e);
 }
@@ -182,16 +183,16 @@ export function linkParts(body: string): LinkPart[] {
 /** A note's state in a person's words (the reviewed badge is shown separately, but a
  * fresh note nobody reviewed is labeled unreviewed). */
 export function stateLabel(n: Pick<NoteSummary, "state" | "reviewed"> & { status?: string }): string {
-  if (n.status === "retired") return "retired";
+  if (n.status === "retired") return t("dna.state.retired");
   switch (n.state) {
     case "stale":
-      return "stale: cited code changed";
+      return t("dna.state.stale");
     case "unverifiable":
-      return "unverifiable: cited commit not found";
+      return t("dna.state.unverifiable");
     case "unchecked":
-      return "unchecked";
+      return t("dna.state.unchecked");
     default:
-      return n.reviewed ? "fresh" : "unreviewed";
+      return t(n.reviewed ? "dna.state.fresh" : "dna.state.unreviewed");
   }
 }
 

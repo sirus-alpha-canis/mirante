@@ -1,6 +1,7 @@
 // The only module that talks to Tauri. Everything else gets these functions injected
 // (store/cockpit.ts) or imports this module (and tests mock it).
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { t } from "./i18n";
 import type { BridgeError, StreamMsg } from "./protocol";
 import { RpcCode } from "./protocol";
 
@@ -30,15 +31,15 @@ export class DaemonError extends Error {
 function describe(e: BridgeError): string {
   switch (e.kind) {
     case "disconnected":
-      return `daemon not reachable: ${e.message}`;
+      return t("daemonErr.disconnected", { message: e.message });
     case "rpc":
       return e.message;
     case "protocol":
-      return `daemon protocol: ${e.message}`;
+      return t("daemonErr.protocol", { message: e.message });
     case "forbidden":
-      return `${e.method} is not allowed from the cockpit`;
+      return t("daemonErr.forbidden", { method: e.method });
     case "timeout":
-      return `daemon timed out: ${e.message}`;
+      return t("daemonErr.timeout", { message: e.message });
   }
 }
 

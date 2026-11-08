@@ -2,6 +2,7 @@ import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from
 import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { M, type QueuedMessage, RpcCode, type TaskView } from "../lib/protocol";
+import { useT } from "../lib/i18n";
 
 type Act = "edit" | "up" | "down";
 
@@ -13,6 +14,7 @@ type Act = "edit" | "up" | "down";
  */
 export function QueueList({ t }: { t: TaskView }) {
   const { rpc, cockpit } = useEnv();
+  const tt = useT();
   const list = useSelect((s) => s.queues[t.id]);
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +55,7 @@ export function QueueList({ t }: { t: TaskView }) {
       return true;
     } catch (e) {
       const conflict = e instanceof DaemonError && e.code === RpcCode.CONFLICT;
-      setError(conflict ? "That message is already being delivered (or was): it can no longer be changed." : e instanceof Error ? e.message : String(e));
+      setError(conflict ? tt("queue.conflict") : e instanceof Error ? e.message : String(e));
       if (conflict) cockpit.refreshQueue(t.id);
       return false;
     } finally {
@@ -90,8 +92,8 @@ export function QueueList({ t }: { t: TaskView }) {
   };
 
   return (
-    <section className="queue" aria-label="Queued messages" ref={root}>
-      <h2 className="small muted">Queued · delivered when the turn ends, in this order</h2>
+    <section className="queue" aria-label={tt("queue.label")} ref={root}>
+      <h2 className="small muted">{tt("queue.heading")}</h2>
       <ol>
         {list.map((m, i) => {
           const n = i + 1;
@@ -107,7 +109,7 @@ export function QueueList({ t }: { t: TaskView }) {
                   }}
                 >
                   <textarea
-                    aria-label={`Edit queued message ${n}`}
+                    aria-label={tt("queue.edit", { n })}
                     rows={2}
                     autoFocus
                     value={editing.text}
@@ -115,10 +117,10 @@ export function QueueList({ t }: { t: TaskView }) {
                     onKeyDown={(e) => onEditKey(e, m.id)}
                   />
                   <button className="btn btn-small btn-primary" type="submit" disabled={busy || !editing.text.trim()}>
-                    Save
+                    {tt("ui.save")}
                   </button>
                   <button className="btn btn-small" type="button" onClick={() => cancel(m.id)}>
-                    Cancel
+                    {tt("ui.cancel")}
                   </button>
                 </form>
               ) : (
@@ -128,7 +130,7 @@ export function QueueList({ t }: { t: TaskView }) {
                     <button
                       className="btn btn-small btn-ghost"
                       data-act="up"
-                      aria-label={`Move queued message ${n} up`}
+                      aria-label={tt("queue.up", { n })}
                       disabled={busy || i === 0}
                       onClick={() => move(i, -1)}
                     >
@@ -137,7 +139,7 @@ export function QueueList({ t }: { t: TaskView }) {
                     <button
                       className="btn btn-small btn-ghost"
                       data-act="down"
-                      aria-label={`Move queued message ${n} down`}
+                      aria-label={tt("queue.down", { n })}
                       disabled={busy || i === list.length - 1}
                       onClick={() => move(i, 1)}
                     >
@@ -146,19 +148,19 @@ export function QueueList({ t }: { t: TaskView }) {
                     <button
                       className="btn btn-small"
                       data-act="edit"
-                      aria-label={`Edit queued message ${n}`}
+                      aria-label={tt("queue.edit", { n })}
                       disabled={busy || editing !== null}
                       onClick={() => setEditing({ id: m.id, text: m.text })}
                     >
-                      Edit
+                      {tt("ui.edit")}
                     </button>
                     <button
                       className="btn btn-small"
-                      aria-label={`Remove queued message ${n}`}
+                      aria-label={tt("queue.remove", { n })}
                       disabled={busy}
                       onClick={() => void change(M.messageRemove, { id: m.id })}
                     >
-                      Remove
+                      {tt("ui.remove")}
                     </button>
                   </span>
                 </>

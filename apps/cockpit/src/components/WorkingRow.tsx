@@ -7,6 +7,7 @@ import { useNow } from "../lib/useNow";
 import { columnOf } from "../store/select";
 import type { FeedItem } from "../store/state";
 import { AutoModeBadge, StatusPill } from "./Badges";
+import { useT } from "../lib/i18n";
 
 /** The newest line that says what the agent does (not a turn marker). */
 function lastStep(feed: FeedItem[] | undefined): FeedItem | undefined {
@@ -31,8 +32,9 @@ export const WorkingRow = memo(function WorkingRow({ t, onOpen }: { t: TaskView;
   const since = useSelect((s) => turnStart(s.feed[t.id])) ?? t.updated_at;
   const col = useSelect((s) => columnOf(t, s.feed[t.id]));
   const now = useNow(30_000);
+  const tt = useT();
   return (
-    <article className="row" aria-label={`${t.agent} on ${t.branch}`} data-task={t.id}>
+    <article className="row" aria-label={tt("card.label", { agent: t.agent, branch: t.branch })} data-task={t.id}>
       <button className="link row-title" onClick={() => onOpen(t.id)}>
         {t.title}
       </button>

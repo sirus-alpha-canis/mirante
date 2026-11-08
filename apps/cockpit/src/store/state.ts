@@ -2,7 +2,8 @@
 // daemon's event stream is a hint (seq-ordered, may replay); task views fetched with
 // `task.get` / `task.list` are the authority and overwrite what events guessed.
 import type { DaemonEvent, PermissionView, QueuedMessage, SendMode, Snapshot, TaskView } from "../lib/protocol";
-import { describeMemoryEvent, isMemoryEvent } from "../lib/memguard";
+import { describeMemoryEvent, isMemoryEvent, memoryMsg } from "../lib/memguard";
+import { type Key, type Params, t } from "../lib/i18n";
 
 export type FeedKind = "tool" | "command" | "agent_message" | "message" | "turn" | "system" | "permission";
 
@@ -18,6 +19,13 @@ export interface FeedItem {
   tool?: string;
   /** A line that warns (the agent left manual permission mode, skills may be lost or taken back). */
   warn?: boolean;
+  /** A line in our words: how to say it in the current language (see `feedText`). */
+  msg?: FeedMsg;
+}
+
+export interface FeedMsg {
+  key: Key;
+  params?: Params;
 }
 
 export type PermState = "pending" | "allowed_once" | "allowed_session" | "denied" | "expired";
@@ -44,6 +52,8 @@ export interface MemoryNotice {
   task_id: string | null;
   kind: string;
   text: string;
+  /** How to say it in the current language (see `feedText`). */
+  msg?: FeedMsg;
 }
 
 export type Connection =
@@ -202,16 +212,16 @@ export type Action =
  * others refine it (or stand alone when the answer was lost or is outside the page). */
 const CLOSING = new Set(["permission_answered", "permission_settled", "permission_expired", "permission_superseded"]);
 
-const ANSWER_TEXT: Record<string, string> = {
-  allowed_once: "allowed once",
-  allowed_session: "allowed for this session",
-  denied: "denied",
+const ANSWER_KEY: Record<string, Key> = {
+  allowed_once: "feed.allowedOnce",
+  allowed_session: "feed.allowedSession",
+  denied: "feed.denied",
 };
 
-const QUEUE_CHANGE_TEXT: Record<string, string> = {
-  edited: "queued message edited",
-  removed: "queued message removed",
-  reordered: "queue reordered",
+const QUEUE_CHANGE_KEY: Record<string, Key> = {
+  edited: "feed.queueEdited",
+  removed: "feed.queueRemoved",
+  reordered: "feed.queueReordered",
 };
 
 /** Claude permission modes that approve on their own (the daemon's `self_approves`). */
@@ -220,10 +230,21 @@ export const SELF_APPROVING = new Set(["auto", "bypassPermissions", "acceptEdits
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
 const names = (p: Record<string, unknown>) => (Array.isArray(p.names) ? p.names.map(str) : []);
 
+/** A line in our words: its text now (the language of the moment) and how to say it again
+ * in another language (`feedText`). */
+const say = (key: Key, params?: Params): { text: string; msg: FeedMsg } => ({ text: t(key, params), msg: params ? { key, params } : { key } });
+
+/** What a feed line shows, in the current language (our words are said again; the agent's
+ * and the daemon's stay as they came). */
+export function feedText(item: Pick<FeedItem, "text" | "msg">): string {
+  return item.msg ? t(item.msg.key, item.msg.params) : item.text;
+}
+
 /** The feed line an event adds, if any. */
 export function feedItem(e: DaemonEvent): FeedItem | null {
   const p = e.payload ?? {};
   const base = { seq: e.seq, ts: e.ts_ms };
+  const sys = (key: Key, params?: Params, warn?: boolean): FeedItem => ({ ...base, kind: "system", ...say(key, params), ...(warn ? { warn } : {}) });
   switch (e.kind) {
     case "step": {
       switch (p.type) {
@@ -234,20 +255,11 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
         case "agent_message":
           return { ...base, kind: "agent_message", text: str(p.text) };
         case "skills_failed":
-          return { ...base, kind: "system", text: `skills not given to this session: ${str(p.error)}` };
+          return sys("feed.skillsFailed", { error: str(p.error) });
         case "skills_withdrawn":
-          return {
-            ...base,
-            kind: "system",
-            text: `the agent was told to stop following withdrawn skills and their files were removed: ${names(p).join(", ")}`,
-          };
+          return sys("feed.skillsWithdrawnStep", { names: names(p).join(", ") });
         case "skills_maybe_lost":
-          return {
-            ...base,
-            kind: "system",
-            warn: true,
-            text: `the first turn carrying this session's skills may not have reached the agent (not sent again): ${str(p.error)}`,
-          };
+          return sys("feed.skillsMaybeLost", { error: str(p.error) }, true);
         default:
           return { ...base, kind: "system", text: [str(p.type), str(p.error)].filter(Boolean).join(": ") };
       }
@@ -255,82 +267,75 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
     case "message_queued":
       return { ...base, kind: "message", mode: "queue", text: str(p.text) };
     case "message_sent":
-      return p.mode === "queue"
-        ? { ...base, kind: "system", text: "queued message delivered" }
-        : { ...base, kind: "message", mode: "steer", text: str(p.text) };
+      return p.mode === "queue" ? sys("feed.queuedDelivered") : { ...base, kind: "message", mode: "steer", text: str(p.text) };
     case "message_delivery":
-      return { ...base, kind: "system", text: `message ${str(p.delivery)}` };
+      return sys("feed.messageDelivery", { delivery: str(p.delivery) });
     case "message_failed":
-      return { ...base, kind: "system", text: `message failed: ${str(p.error)}` };
+      return sys("feed.messageFailed", { error: str(p.error) });
     case "queue_dropped":
-      return { ...base, kind: "system", text: "queued messages dropped (session ended)" };
+      return sys("feed.queueDropped");
     case "queue_changed":
-      return { ...base, kind: "system", text: QUEUE_CHANGE_TEXT[str(p.op)] ?? "queue changed" };
+      return sys(QUEUE_CHANGE_KEY[str(p.op)] ?? "feed.queueChanged");
     case "turn_started":
-      return { ...base, kind: "turn", phase: "started", text: "turn started" };
+      return { ...base, kind: "turn", phase: "started", ...say("feed.turnStarted") };
     case "turn_ended":
-      return { ...base, kind: "turn", phase: "ended", text: "turn ended" };
+      return { ...base, kind: "turn", phase: "ended", ...say("feed.turnEnded") };
     case "permission_requested":
-      return { ...base, kind: "permission", text: `asks: ${str(p.tool)} ${str(p.detail)}`.trim() };
+      return { ...base, kind: "permission", ...say("feed.asks", { what: `${str(p.tool)} ${str(p.detail)}`.trim() }) };
     case "permission_answered":
     case "permission_settled":
-      return { ...base, kind: "system", text: ANSWER_TEXT[str(p.answer)] ?? "denied" };
+      return sys(ANSWER_KEY[str(p.answer)] ?? "feed.denied");
     case "permission_expired":
-      return { ...base, kind: "system", text: "permission request expired" };
+      return sys("feed.permExpired");
     case "permission_superseded":
-      return { ...base, kind: "system", text: "permission request replaced by a newer one" };
+      return sys("feed.permSuperseded");
     case "boot":
-      return p.state === "trust_prompt" || p.state === "exited"
-        ? { ...base, kind: "system", text: p.state === "exited" ? "agent exited during start" : "asks to trust the folder" }
-        : null;
+      return p.state === "trust_prompt" || p.state === "exited" ? sys(p.state === "exited" ? "feed.exitedDuringStart" : "feed.asksTrust") : null;
     case "process_exited":
-      return { ...base, kind: "system", text: `agent exited (code ${str(p.code) || "none"})` };
+      return str(p.code) ? sys("feed.agentExited", { code: str(p.code) }) : sys("feed.agentExited", { code: t("feed.none") });
     case "interrupt_sent":
-      return { ...base, kind: "system", text: "interrupted" };
+      return sys("feed.interrupted");
     case "dna.proposed":
-      return { ...base, kind: "system", text: `proposed memory: ${str(p.title)} (awaiting review)` };
+      return sys("feed.dnaProposed", { title: str(p.title) });
     case "dna.decided":
-      return { ...base, kind: "system", text: p.accepted === true ? `memory proposal accepted as ${str(p.slug)}` : "memory proposal rejected" };
+      return p.accepted === true ? sys("feed.dnaAccepted", { slug: str(p.slug) }) : sys("feed.dnaRejected");
     case "dna.unavailable":
-      return { ...base, kind: "system", text: str(p.reason) || "repo memory is off for this session" };
+      return str(p.reason) ? { ...base, kind: "system", text: str(p.reason) } : sys("feed.dnaOff");
     case "permission_mode": {
       // Mirante starts Claude in manual mode: leaving it is worth a warning, going back a note.
-      if (p.self_approves === "commands") return { ...base, kind: "system", warn: true, text: "auto mode on — Claude approves its own commands" };
-      if (p.self_approves === "edits") return { ...base, kind: "system", warn: true, text: "accept-edits mode on — Claude edits files without asking" };
-      return SELF_APPROVING.has(str(p.from)) ? { ...base, kind: "system", text: "back to manual mode — Claude asks before acting" } : null;
+      if (p.self_approves === "commands") return sys("feed.autoOn", undefined, true);
+      if (p.self_approves === "edits") return sys("feed.editsOn", undefined, true);
+      return SELF_APPROVING.has(str(p.from)) ? sys("feed.manualBack") : null;
     }
     case "session.auto_resumed":
-      return { ...base, kind: "system", text: "resumed after the daemon restarted" };
+      return sys("feed.autoResumed");
     case "session.auto_resume_skipped":
-      return { ...base, kind: "system", text: `not resumed after the daemon restarted: ${str(p.reason)}` };
+      return sys("feed.autoResumeSkipped", { reason: str(p.reason) });
     case "session.auto_resume_failed":
-      return { ...base, kind: "system", text: `could not resume after the daemon restarted: ${str(p.error)}` };
+      return sys("feed.autoResumeFailed", { error: str(p.error) });
     case "skill.injected": {
       const versions = Array.isArray(p.versions) ? p.versions : [];
       const list = names(p).map((n, i) => (versions[i] == null ? n : `${n} v${str(versions[i])}`));
-      return { ...base, kind: "system", text: `skills given to this session: ${list.join(", ")}` };
+      return sys("feed.skillsGiven", { list: list.join(", ") });
     }
     case "skill.withdrawn":
-      return { ...base, kind: "system", text: `skills withdrawn from this conversation (retired or changed since): ${names(p).join(", ")}` };
+      return sys("feed.skillsWithdrawn", { names: names(p).join(", ") });
     case "skill.refused":
-      return { ...base, kind: "system", text: `skill ${str(p.name)} refused: ${str(p.reason)}` };
+      return sys("feed.skillRefused", { name: str(p.name), reason: str(p.reason) });
     case "skill.unavailable":
       // With a session: its skills were announced, then could not be written.
-      return p.session_id
-        ? { ...base, kind: "system", warn: true, text: `skills taken back from this session: ${str(p.reason)}` }
-        : { ...base, kind: "system", text: `no skills: ${str(p.reason)}` };
+      return p.session_id ? sys("feed.skillsTakenBack", { reason: str(p.reason) }, true) : sys("feed.noSkills", { reason: str(p.reason) });
     case "skill.used":
-      return { ...base, kind: "system", text: `skill ${str(p.name)} used` };
+      return sys("feed.skillUsed", { name: str(p.name) });
     case "skill.proposed":
-      return { ...base, kind: "system", text: `proposed skill: ${str(p.name)} (awaiting review)` };
+      return sys("feed.skillProposed", { name: str(p.name) });
     case "skill.decided":
-      return {
-        ...base,
-        kind: "system",
-        text: p.accepted === true ? `skill proposal accepted as ${str(p.name)} v${str(p.version)}` : "skill proposal rejected",
-      };
-    default:
-      return isMemoryEvent(e.kind) ? { ...base, kind: "system", text: describeMemoryEvent(e.kind, p) } : null;
+      return p.accepted === true ? sys("feed.skillAccepted", { name: str(p.name), version: str(p.version) }) : sys("feed.skillRejected");
+    default: {
+      if (!isMemoryEvent(e.kind)) return null;
+      const m = memoryMsg(e.kind, p);
+      return m ? sys(m.key, m.params) : { ...base, kind: "system", text: e.kind };
+    }
   }
 }
 
@@ -491,6 +496,11 @@ function keepSame<T>(prev: Record<string, T>, next: Record<string, T>): Record<s
   return changed ? next : prev;
 }
 
+function memoryNotice(e: DaemonEvent): MemoryNotice {
+  const m = memoryMsg(e.kind, e.payload ?? {});
+  return { seq: e.seq, task_id: e.task_id, kind: e.kind, text: describeMemoryEvent(e.kind, e.payload ?? {}), ...(m ? { msg: m } : {}) };
+}
+
 export function reduce(s: State, a: Action): State {
   switch (a.type) {
     case "connected": {
@@ -521,7 +531,7 @@ export function reduce(s: State, a: Action): State {
       const e = a.event;
       if (e.boot_id === s.bootId && e.seq <= s.seq) return s;
       const memory = isMemoryEvent(e.kind)
-        ? [...s.memory, { seq: e.seq, task_id: e.task_id, kind: e.kind, text: describeMemoryEvent(e.kind, e.payload ?? {}) }].slice(-20)
+        ? [...s.memory, memoryNotice(e)].slice(-20)
         : s.memory;
       let tasks = taskEffect(s.tasks, e);
       let perms = permEffect(s.perms, e, s.permRev + 1);

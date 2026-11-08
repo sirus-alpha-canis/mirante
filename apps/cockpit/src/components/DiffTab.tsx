@@ -2,6 +2,7 @@ import { memo, useMemo, useState } from "react";
 import { useEnv } from "../env";
 import { DiffCounts } from "./DoneCard";
 import { ErrorRetry } from "./ErrorRetry";
+import { useT } from "../lib/i18n";
 import { useDiff } from "./useDiff";
 
 function lineClass(l: string): string {
@@ -14,6 +15,7 @@ function lineClass(l: string): string {
 
 /** Up to 512 KiB of patch: split and rendered only when the patch itself changes. */
 const Patch = memo(function Patch({ patch }: { patch: string }) {
+  const t = useT();
   const lines = useMemo(
     () =>
       patch.split("\n").map((l, i) => (
@@ -24,7 +26,7 @@ const Patch = memo(function Patch({ patch }: { patch: string }) {
     [patch],
   );
   return (
-    <pre className="patch" aria-label="Patch">
+    <pre className="patch" aria-label={t("diff.patch")}>
       {lines}
     </pre>
   );
@@ -32,10 +34,11 @@ const Patch = memo(function Patch({ patch }: { patch: string }) {
 
 export function DiffTab({ taskId, version }: { taskId: string; version: number }) {
   const { openUrl } = useEnv();
+  const t = useT();
   const d = useDiff(taskId, version, true);
   const [openError, setOpenError] = useState(false);
-  if (d.state === "loading") return <p className="muted">Reading the diff…</p>;
-  if (d.state === "error") return <ErrorRetry text={`Diff unavailable: ${d.error}`} onRetry={d.retry} />;
+  if (d.state === "loading") return <p className="muted">{t("diff.reading")}</p>;
+  if (d.state === "error") return <ErrorRetry text={t("diff.unavailable", { error: d.error })} onRetry={d.retry} />;
   const { diff } = d;
   const openPr = (url: string) => {
     setOpenError(false);
@@ -48,19 +51,19 @@ export function DiffTab({ taskId, version }: { taskId: string; version: number }
           diff={diff}
           against={
             <>
-              against <code>{diff.base}</code> ({diff.merge_base.slice(0, 8)})
+              {t("diff.against")} <code>{diff.base}</code> ({diff.merge_base.slice(0, 8)})
             </>
           }
         />
         {diff.compare_url && (
           <button className="btn btn-small" disabled={!diff.pushed} onClick={() => openPr(diff.compare_url!)}>
-            {diff.pushed ? "Open PR" : "Open PR (push first)"}
+            {t(diff.pushed ? "diff.openPr" : "diff.openPrPush")}
           </button>
         )}
         {openError && (
           <span className="error" role="alert">
             {" "}
-            could not open the browser
+            {t("diff.browserFailed")}
           </span>
         )}
       </p>
@@ -68,18 +71,18 @@ export function DiffTab({ taskId, version }: { taskId: string; version: number }
         {diff.files.map((f) => (
           <li key={f.path}>
             <code>{f.path}</code>{" "}
-            {f.added === null ? <span className="muted">binary</span> : <span className="add">+{f.added}</span>}{" "}
+            {f.added === null ? <span className="muted">{t("diff.binary")}</span> : <span className="add">+{f.added}</span>}{" "}
             {f.removed !== null && <span className="del">−{f.removed}</span>}
           </li>
         ))}
         {diff.untracked.map((p) => (
           <li key={p}>
-            <code>{p}</code> <span className="muted">new, untracked</span>
+            <code>{p}</code> <span className="muted">{t("diff.untracked")}</span>
           </li>
         ))}
       </ul>
       <Patch patch={diff.patch} />
-      {diff.truncated && <p className="muted small">Patch cut at 512 KiB.</p>}
+      {diff.truncated && <p className="muted small">{t("diff.cut")}</p>}
     </div>
   );
 }

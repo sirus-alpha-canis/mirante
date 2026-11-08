@@ -41,7 +41,7 @@ describe("pressureText", () => {
   });
 
   it("judged from swap and free memory (no kernel measure): names those", () => {
-    expect(pressureText(sys({})).main).toBe("Memory tight (swap 92% used, little free) · new sessions paused until it eases");
+    expect(pressureText(sys({})).main).toBe("System memory tight (swap 92% used, little free) · new sessions paused until it eases");
   });
 
   it("what macOS says is available (its free percentage), not raw free pages, when the daemon sends it", () => {
@@ -54,8 +54,8 @@ describe("pressureText", () => {
 
   it("not paused: the level, swap only when there is swap", () => {
     expect(pressureText(sys({ level: "normal", paused: false, kernel_level: "normal", kernel_source: "macos" })).main).toBe(
-      "Memory pressure normal (macOS) · swap 92%",
+      "System memory pressure normal (macOS) · swap 92%",
     );
-    expect(pressureText(sys({ level: "normal", paused: false, swap_used: 0, swap_total: 0 })).main).toBe("Memory pressure normal");
+    expect(pressureText(sys({ level: "normal", paused: false, swap_used: 0, swap_total: 0 })).main).toBe("System memory pressure normal");
   });
 });

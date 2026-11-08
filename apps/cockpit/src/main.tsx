@@ -8,6 +8,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { type Env, safeStorage } from "./env";
 import { daemonStart, homeDir, pathKind, rpc, subscribe } from "./lib/daemon";
+import { t } from "./lib/i18n";
 import { notify, onNotificationClick } from "./lib/notify";
 import { createCockpit } from "./store/cockpit";
 
@@ -29,7 +30,7 @@ const env: Env = {
   notify: (n) => void notify(n).catch(() => {}),
   // The native picker: one folder, nothing else (the capability grants `dialog:allow-open` only).
   pickFolder: async () => {
-    const picked = await open({ directory: true, multiple: false, title: "Add a repository" });
+    const picked = await open({ directory: true, multiple: false, title: t("rail.pickerTitle") });
     return typeof picked === "string" ? picked : null;
   },
   homeDir,

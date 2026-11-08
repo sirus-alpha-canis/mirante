@@ -1,5 +1,7 @@
 // Repos the user added by path (tasks add theirs implicitly). Stored in the webview's
 // localStorage: per machine, never sent anywhere.
+import { t } from "./i18n";
+
 export const REPOS_KEY = "mirante.repos";
 
 type KV = Pick<Storage, "getItem" | "setItem">;
@@ -26,17 +28,17 @@ export type Added = { ok: true; repos: string[] } | { ok: false; error: string }
 /** `raw` as one absolute path: no doubled slashes or "." segments; ".." and "~" refused. */
 export function normaliseRepoPath(raw: string): { ok: true; path: string } | { ok: false; error: string } {
   const text = raw.trim();
-  if (text.startsWith("~")) return { ok: false, error: "'~user' is not expanded here: type the full path, e.g. /Users/me/code/shop" };
-  if (!text.startsWith("/")) return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
+  if (text.startsWith("~")) return { ok: false, error: t("repos.tilde") };
+  if (!text.startsWith("/")) return { ok: false, error: t("repos.absolute") };
   const parts = text.split("/").filter((p) => p !== "" && p !== ".");
-  if (parts.includes("..")) return { ok: false, error: "use a path without '..' segments" };
+  if (parts.includes("..")) return { ok: false, error: t("repos.dotdot") };
   return { ok: true, path: `/${parts.join("/")}` };
 }
 
 export function addRepo(store: KV, raw: string): Added {
   const n = normaliseRepoPath(raw);
   if (!n.ok) return n;
-  if (n.path === "/") return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
+  if (n.path === "/") return { ok: false, error: t("repos.absolute") };
   const repos = loadRepos(store);
   if (!repos.includes(n.path)) repos.push(n.path);
   save(store, repos);

@@ -61,16 +61,16 @@ describe("Detail (V1 classic)", () => {
     const names = () => within(nav).queryAllByRole("button", { name: /@claude/ }).map((b) => b.querySelector(".chip-title")?.textContent);
     const chips = within(nav).getByRole("group", { name: "Filter tasks" });
     expect(within(chips).getAllByRole("button").map((b) => b.textContent)).toEqual([
-      "Precisa de você (1)",
-      "Trabalhando (2)",
-      "Pronto (0)",
-      "Todos (3)",
+      "Needs you (1)",
+      "Working (2)",
+      "Ready (0)",
+      "All (3)",
     ]);
-    expect(within(chips).getByRole("button", { name: "Todos (3)" })).toHaveAttribute("aria-pressed", "true");
-    await userEvent.click(within(chips).getByRole("button", { name: "Trabalhando (2)" }));
+    expect(within(chips).getByRole("button", { name: "All (3)" })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(within(chips).getByRole("button", { name: "Working (2)" }));
     expect(names()).toEqual(["api docs", "goal of a"]);
     expect(within(nav).getAllByRole("region").map((r) => r.getAttribute("aria-label"))).toEqual(["api", "shop"]);
-    await userEvent.click(within(chips).getByRole("button", { name: "Todos (3)" }));
+    await userEvent.click(within(chips).getByRole("button", { name: "All (3)" }));
     await userEvent.type(within(nav).getByRole("searchbox", { name: "Search tasks" }), "CART");
     expect(names()).toEqual(["fix the cart"]);
     await userEvent.type(within(nav).getByRole("searchbox", { name: "Search tasks" }), "zzz");
@@ -88,7 +88,7 @@ describe("Detail (V1 classic)", () => {
       hib(23),
     ]);
     const panel = screen.getByRole("tabpanel");
-    const run = within(panel).getByRole("button", { name: /leu 3 arquivos, rodou 1 comando/ });
+    const run = within(panel).getByRole("button", { name: /read 3 files, ran 1 command/ });
     expect(run).toHaveAttribute("aria-expanded", "false");
     expect(within(panel).queryByText("$ npm test")).toBeNull();
     await userEvent.click(run);
@@ -156,7 +156,7 @@ describe("Detail (V1 classic)", () => {
   it("shows steps, switches tabs with arrows, and has a Memory tab", async () => {
     setup();
     expect(screen.getByText("$ npm test")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /rodou/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /ran \d+ command/ })).toBeNull();
     screen.getByRole("tab", { name: "Steps" }).focus();
     await userEvent.keyboard("{ArrowRight}");
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");

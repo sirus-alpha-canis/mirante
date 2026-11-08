@@ -11,6 +11,7 @@ import { columnLabel, needsYou, type Project, repoName } from "../store/select";
 import { inboxOf } from "../lib/inbox";
 import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
+import { tn, useT } from "../lib/i18n";
 
 const selectColumns = (s: State) => inboxOf(s).columns;
 
@@ -49,6 +50,7 @@ export function LeftRail(props: {
   status: DaemonStatus | null;
 }) {
   const { storage, rpc, cockpit, pickFolder, homeDir, pathKind } = useEnv();
+  const tr = useT();
   // Live sessions per agent (the task objects: kept while unchanged, so a step elsewhere
   // renders nothing here).
   const liveTasks = useSelect(selectLive, same);
@@ -100,8 +102,8 @@ export function LeftRail(props: {
       const n = normaliseRepoPath(expanded);
       if (!n.ok) return setError(n.error);
       const kind = await pathKind(n.path);
-      if (kind === "missing") return setError(`${n.path} does not exist`);
-      if (kind === "file") return setError(`${n.path} is a file, not a folder`);
+      if (kind === "missing") return setError(tr("rail.missing", { path: n.path }));
+      if (kind === "file") return setError(tr("rail.isFile", { path: n.path }));
       const r = addRepo(storage, n.path);
       if (!r.ok) return setError(r.error);
       setError(null);
@@ -124,8 +126,8 @@ export function LeftRail(props: {
   const remove = (p: string) => props.onReposChanged(removeRepo(storage, p));
 
   return (
-    <nav className="rail" aria-label="Projects and agents">
-      <h2>Projects</h2>
+    <nav className="rail" aria-label={tr("rail.aria")}>
+      <h2>{tr("rail.projects")}</h2>
       <ul>
         {props.projects.map((p) => (
           <li key={p.path} className="rail-row">
@@ -141,25 +143,25 @@ export function LeftRail(props: {
                   <span className="badge" aria-hidden="true">
                     {p.needsYou}
                   </span>
-                  <span className="sr-only">, {p.needsYou} {p.needsYou === 1 ? "needs" : "need"} you</span>
+                  <span className="sr-only">, {tn(p.needsYou, "rail.needsOne", "rail.needsMany")}</span>
                 </>
               )}
             </button>
             {pending?.path === p.path && pending.n > 0 && (
               <button
                 className="btn btn-small btn-ghost dna-pending"
-                title={`Memory proposals in ${p.path} waiting for your review`}
+                title={tr("rail.proposalsTitle", { path: p.path })}
                 disabled={!props.onReview}
                 onClick={() => props.onReview?.(p.path)}
               >
-                {pending.n} to review
+                {tr("rail.toReview", { n: pending.n })}
               </button>
             )}
             {added.has(p.path) && (
               <button
                 className="btn btn-small btn-ghost"
-                aria-label={`Remove ${p.name} from Projects`}
-                title={`Remove ${p.path} from Projects (nothing on disk changes)`}
+                aria-label={tr("rail.remove", { name: p.name })}
+                title={tr("rail.removeTitle", { path: p.path })}
                 onClick={() => remove(p.path)}
               >
                 ×
@@ -176,14 +178,14 @@ export function LeftRail(props: {
         }}
       >
         <label htmlFor="repo-path" className="sr-only">
-          Repository path
+          {tr("rail.repoPath")}
         </label>
-        <input id="repo-path" placeholder="/path/to/repo or ~/…" value={path} onChange={(e) => setPath(e.target.value)} />
-        <button className="btn btn-small" type="button" onClick={() => void choose()} title="Pick a repository folder">
-          Choose…
+        <input id="repo-path" placeholder={tr("rail.repoPlaceholder")} value={path} onChange={(e) => setPath(e.target.value)} />
+        <button className="btn btn-small" type="button" onClick={() => void choose()} title={tr("rail.chooseTitle")}>
+          {tr("rail.choose")}
         </button>
         <button className="btn btn-small" type="submit">
-          Add
+          {tr("rail.add")}
         </button>
         {error && (
           <p className="error" role="alert">
@@ -191,7 +193,7 @@ export function LeftRail(props: {
           </p>
         )}
       </form>
-      <h2>Agents</h2>
+      <h2>{tr("rail.agents")}</h2>
       <ul>
         {agents.map((a) => (
           <li
@@ -206,17 +208,17 @@ export function LeftRail(props: {
               aria-expanded={a.live.length > 1 ? picking === a.agent : undefined}
               title={
                 a.live.length === 0
-                  ? `Write a task for @${a.agent}`
+                  ? tr("rail.agentWrite", { agent: a.agent })
                   : a.live.length === 1
-                    ? `Open ${a.live[0].branch}`
-                    : `Pick one of the ${a.live.length} live @${a.agent} sessions`
+                    ? tr("rail.agentOpen", { branch: a.live[0].branch })
+                    : tr("rail.agentPick", { n: a.live.length, agent: a.agent })
               }
             >
               <span>@{a.agent}</span>
-              <span className="muted small">{a.live.length} live</span>
+              <span className="muted small">{tr("rail.live", { n: a.live.length })}</span>
             </button>
             {picking === a.agent && a.live.length > 1 && (
-              <ul className="rail-pick" aria-label={`Live @${a.agent} sessions`}>
+              <ul className="rail-pick" aria-label={tr("rail.liveList", { agent: a.agent })}>
                 {a.live.map((t) => (
                   <li key={t.id}>
                     <button className="rail-item" onClick={() => openTask(t)} title={t.title}>
@@ -235,7 +237,7 @@ export function LeftRail(props: {
                       props.onMention(a.agent);
                     }}
                   >
-                    New @{a.agent} task
+                    {tr("rail.newTask", { agent: a.agent })}
                   </button>
                 </li>
               </ul>
@@ -254,6 +256,7 @@ export function LeftRail(props: {
  * (`daemon.settings`) says whether they come back after the daemon itself restarts. */
 export function SessionSettings({ status }: { status: DaemonStatus | null }) {
   const { rpc } = useEnv();
+  const t = useT();
   // The answer of the last change, until the next status poll says the same.
   const [mine, setMine] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -276,18 +279,18 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
     }
   };
   return (
-    <section className="settings" aria-label="Sessions">
-      <h2>Sessions</h2>
-      <p className="small muted">Closing Mirante leaves your agents running: the daemon owns them.</p>
+    <section className="settings" aria-label={t("sessions.title")}>
+      <h2>{t("sessions.title")}</h2>
+      <p className="small muted">{t("sessions.keep")}</p>
       {status && on === null ? (
-        <p className="small muted">This daemon does not bring sessions back after a restart.</p>
+        <p className="small muted">{t("sessions.noResume")}</p>
       ) : (
         <label className="small check">
           <input type="checkbox" checked={!forced && (on ?? false)} disabled={!status || busy || forced} onChange={(e) => void change(e.target.checked)} />{" "}
-          Resume sessions after a daemon restart
+          {t("sessions.resume")}
         </label>
       )}
-      {forced && <p className="small muted">Off for this daemon: it was started with MIRANTE_AUTO_RESUME=off.</p>}
+      {forced && <p className="small muted">{t("sessions.forced")}</p>}
       {error && (
         <p className="error small" role="alert">
           {error}
@@ -300,12 +303,13 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
 /** "Skills (n to review)": skill proposals waiting for a person, across all clients (a
  * count, shared with the Skills view; an older daemon shows no count). */
 function SkillsEntry({ onOpen }: { onOpen(): void }) {
+  const t = useT();
   const pending = usePendingSkills() ?? 0;
   return (
     <>
-      <h2>Skills</h2>
-      <button className="rail-item" onClick={onOpen} title="Reviewed instructions Mirante gives matching sessions">
-        {pending > 0 ? `Skills (${pending} to review)` : "Skills"}
+      <h2>{t("skillsEntry.title")}</h2>
+      <button className="rail-item" onClick={onOpen} title={t("skillsEntry.tip")}>
+        {pending > 0 ? t("skillsEntry.pending", { n: pending }) : t("skillsEntry.title")}
       </button>
     </>
   );

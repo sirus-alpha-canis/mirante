@@ -13,6 +13,7 @@ import { EnableMemory } from "./MemoryTab";
 import { NoteView, StatePill } from "./NoteView";
 import { ReviewQueue } from "./ReviewQueue";
 import { ErrorRetry } from "./ErrorRetry";
+import { type Key, t as tr, tn, useT } from "../lib/i18n";
 
 const W = 820;
 const H = 540;
@@ -28,9 +29,20 @@ function matches(n: NoteSummary, f: Filter): boolean {
   return isRetired(n);
 }
 
+const FILTER_KEY: Record<Filter, Key> = { stale: "brain.filter.stale", unreviewed: "brain.filter.unreviewed", retired: "brain.filter.retired" };
+
+/** A note's freshness (`fresh`, `stale`, `unverifiable`…) in the current language. */
+export function stateText(state: string): string {
+  return state === "fresh" ? tr("note.state.fresh") : state === "stale" ? tr("note.state.stale") : state === "unverifiable" ? tr("note.state.unverifiable") : state;
+}
+
 /** "Hook spool, stale, reviewed" (", retired" when retired). */
 export function nodeName(n: NoteSummary): string {
-  return `${n.title}, ${n.state}, ${n.reviewed ? "reviewed" : "unreviewed"}${isRetired(n) ? ", retired" : ""}`;
+  return tr(isRetired(n) ? "brain.node.retired" : "brain.node", {
+    title: n.title,
+    state: stateText(n.state),
+    reviewed: tr(n.reviewed ? "brain.reviewed" : "brain.unreviewed"),
+  });
 }
 
 function nodeClass(n: NoteSummary): string {
@@ -47,16 +59,17 @@ const ghostsOf = (graph: DnaGraph) => [...new Set(graph.links.filter((l) => l.da
 const NO_HITS: ReadonlySet<string> = new Set();
 
 function Legend() {
+  const t = useT();
   const items: [string, string][] = [
-    ["node-fresh", "fresh"],
-    ["node-stale", "stale: cited code changed"],
-    ["node-unverifiable", "unverifiable or unchecked"],
-    ["node-fresh node-unreviewed", "unreviewed (ring)"],
-    ["node-fresh node-retired", "retired (faded)"],
-    ["node-ghost", "missing note (dashed link)"],
+    ["node-fresh", t("brain.legend.fresh")],
+    ["node-stale", t("brain.legend.stale")],
+    ["node-unverifiable", t("brain.legend.unverifiable")],
+    ["node-fresh node-unreviewed", t("brain.legend.unreviewed")],
+    ["node-fresh node-retired", t("brain.legend.retired")],
+    ["node-ghost", t("brain.legend.missing")],
   ];
   return (
-    <ul className="brain-legend" aria-label="Legend">
+    <ul className="brain-legend" aria-label={t("brain.legend")}>
       {items.map(([cls, label]) => (
         <li key={label}>
           <svg width="14" height="14" aria-hidden="true">
@@ -80,6 +93,7 @@ const Graph = memo(function Graph({
   hits: ReadonlySet<string>;
   onSelect(slug: string): void;
 }) {
+  const t = useT();
   const ghosts = useMemo(() => ghostsOf(graph), [graph]);
   const pos = useMemo(
     () =>
@@ -103,7 +117,7 @@ const Graph = memo(function Graph({
   return (
     // A group, not an image: an image's children are presentational, which would hide the
     // node buttons from assistive technology.
-    <svg className="brain-svg" viewBox={`0 0 ${W} ${H}`} role="group" aria-label={`Graph of ${graph.nodes.length} notes and their links`}>
+    <svg className="brain-svg" viewBox={`0 0 ${W} ${H}`} role="group" aria-label={t("brain.graph", { n: graph.nodes.length })}>
       <g aria-hidden="true">
         {graph.links.map((l, i) => {
           const a = pos[l.src];
@@ -166,6 +180,7 @@ type Panel = { kind: "note"; slug: string } | { kind: "review" } | null;
  * (above 0) switches the panel to the review queue, without starting the brain over. */
 export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNonce?: number }) {
   const { rpc, cockpit } = useEnv();
+  const t = useT();
   const boot = useBoot();
   const version = useDnaRev(repo);
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
@@ -213,8 +228,8 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
 
   if (!repo) {
     return (
-      <main className="brain" aria-label="Brain">
-        <p className="muted empty">Add a repository on the left (Home) to see its memory.</p>
+      <main className="brain" aria-label={t("brain.aria")}>
+        <p className="muted empty">{t("brain.noRepo")}</p>
       </main>
     );
   }
@@ -231,7 +246,7 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
     if (!q) return setHits(null);
     try {
       const found = (await dnaSearch(rpc, repo, q, 25)) ?? [];
-      setHits({ slugs: new Set(found.map((n) => n.slug)), text: found.length === 1 ? "1 match" : `${found.length} matches` });
+      setHits({ slugs: new Set(found.map((n) => n.slug)), text: tn(found.length, "brain.match.one", "brain.match.many") });
     } catch (e) {
       setHits({ slugs: new Set(), text: dnaErrorText(e) });
     }
@@ -240,7 +255,7 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
     setChecking(true);
     try {
       const r = await dnaCheck(rpc, repo);
-      setChecked(`Checked ${r.notes} notes: ${r.stale} stale, ${r.unreviewed} unreviewed, ${r.invalid?.length ?? 0} invalid`);
+      setChecked(t("brain.checked", { notes: r.notes, stale: r.stale, unreviewed: r.unreviewed, invalid: r.invalid?.length ?? 0 }));
       setNonce((n) => n + 1);
     } catch (e) {
       setChecked(dnaErrorText(e));
@@ -253,9 +268,9 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
   const selected = panel?.kind === "note" ? panel.slug : null;
 
   let body: React.ReactNode;
-  if (loaded.state === "loading") body = <p className="muted">Reading repo memory…</p>;
-  else if (loaded.state === "unavailable") body = <p className="muted">This daemon has no repo memory. Update Mirante to use it.</p>;
-  else if (loaded.state === "error") body = <ErrorRetry text={`Repo memory unavailable: ${loaded.error}`} onRetry={() => setNonce((n) => n + 1)} />;
+  if (loaded.state === "loading") body = <p className="muted">{t("brain.loading")}</p>;
+  else if (loaded.state === "unavailable") body = <p className="muted">{t("brain.unavailable")}</p>;
+  else if (loaded.state === "error") body = <ErrorRetry text={t("brain.error", { error: loaded.error })} onRetry={() => setNonce((n) => n + 1)} />;
   else if (loaded.state === "off") body = <EnableMemory repo={repo} onEnabled={() => setNonce((n) => n + 1)} />;
   else if (shown) {
     // Missing notes are drawn too: they count toward what the layout has to place.
@@ -273,8 +288,8 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
           >
             <input
               type="search"
-              aria-label="Search memory"
-              placeholder="Search memory"
+              aria-label={t("brain.search")}
+              placeholder={t("brain.search")}
               className="dna-input brain-search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -285,21 +300,21 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
               {hits.text}
             </span>
           )}
-          <span role="group" aria-label="Filters" className="brain-pills">
+          <span role="group" aria-label={t("brain.filters")} className="brain-pills">
             {FILTERS.map((f) => (
               <button key={f} className="btn btn-small" aria-pressed={filters.has(f)} onClick={() => toggle(f)}>
-                {f}
+                {t(FILTER_KEY[f])}
               </button>
             ))}
           </span>
           <button className="btn btn-small" aria-pressed={asList || tooLarge} disabled={tooLarge} onClick={() => setAsList((v) => !v)}>
-            List
+            {t("brain.list")}
           </button>
           <button className="btn btn-small" disabled={checking} onClick={recheck}>
-            Re-check
+            {t("brain.recheck")}
           </button>
           <button className="btn btn-small" aria-pressed={panel?.kind === "review"} onClick={() => setPanel({ kind: "review" })}>
-            Review ({loaded.pending})
+            {t("brain.review", { n: loaded.pending })}
           </button>
         </div>
         {checked && (
@@ -309,13 +324,13 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
         )}
         {tooLarge && (
           <p className="muted small">
-            The graph is too large to draw ({shown.nodes.length} notes, {drawn - shown.nodes.length} missing); here is the list.
+            {t("brain.tooLarge", { notes: shown.nodes.length, missing: drawn - shown.nodes.length })}
           </p>
         )}
         {loaded.graph.nodes.length === 0 ? (
-          <p className="muted">No notes yet. Agents propose them (review them here); you can also write them in .mirante/memory/.</p>
+          <p className="muted">{t("brain.empty")}</p>
         ) : asList || tooLarge ? (
-          <ul className="dna-list brain-list" aria-label="Notes">
+          <ul className="dna-list brain-list" aria-label={t("brain.notes")}>
             {shown.nodes.map((n) => (
               <li key={n.slug} className="dna-row">
                 <button className="link" aria-pressed={selected === n.slug} onClick={() => select(n.slug)}>
@@ -336,21 +351,21 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
   }
 
   return (
-    <main className="brain" aria-label="Brain">
+    <main className="brain" aria-label={t("brain.aria")}>
       <section className="brain-main">
         <header className="feed-head">
-          <h1>Memory of {repoName(repo)}</h1>
+          <h1>{t("brain.title", { name: repoName(repo) })}</h1>
           <span className="muted small">{repo}</span>
         </header>
         {body}
       </section>
-      <aside className="brain-panel" aria-label="Selected">
+      <aside className="brain-panel" aria-label={t("brain.selected")}>
         {panel?.kind === "review" ? (
           <ReviewQueue repo={repo} onDecided={decided} />
         ) : panel?.kind === "note" ? (
           <NoteView at={{ repo }} repo={repo} slug={panel.slug} version={version} onOpen={select} />
         ) : (
-          <p className="muted">Select a note to read it, or open the review queue.</p>
+          <p className="muted">{t("brain.pick")}</p>
         )}
       </aside>
     </main>

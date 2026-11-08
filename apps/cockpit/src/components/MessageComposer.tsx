@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { useEnv, useLive } from "../env";
 import { onMac } from "../lib/shortcuts";
+import { useT } from "../lib/i18n";
 import { DaemonError } from "../lib/daemon";
 import { M, RpcCode, type SendMode, type SendResult, type TaskView } from "../lib/protocol";
 
@@ -16,6 +17,7 @@ import { M, RpcCode, type SendMode, type SendResult, type TaskView } from "../li
 export function MessageComposer({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
   const live = useLive();
+  const tt = useT();
   const [mac] = useState(onMac);
   const [text, setText] = useState("");
   const [note, setNote] = useState<string | null>(null);
@@ -41,11 +43,11 @@ export function MessageComposer({ t }: { t: TaskView }) {
     try {
       const r = await rpc<SendResult>(M.messageSend, { task: t.id, text: msg, mode });
       setText((cur) => (cur === msg ? "" : cur));
-      setNote(r.delivered === "steer" ? "sent now" : `queued (#${r.queued}, delivered when the turn ends)`);
+      setNote(r.delivered === "steer" ? tt("composer.sentNow") : tt("composer.queued", { n: r.queued ?? "?" }));
     } catch (e) {
       const err = e instanceof DaemonError ? e : null;
       if (err?.unsupported) setFallback(true);
-      setNote(err?.code === RpcCode.NEEDS_YOU ? "answer the open request first" : String(err?.message ?? e));
+      setNote(err?.code === RpcCode.NEEDS_YOU ? tt("composer.answerFirst") : String(err?.message ?? e));
     }
   };
 
@@ -75,19 +77,19 @@ export function MessageComposer({ t }: { t: TaskView }) {
     });
   };
 
-  if (!t.live) return <p className="muted small composer-off">No live session: resume it to talk to the agent.</p>;
+  if (!t.live) return <p className="muted small composer-off">{tt("composer.noLive")}</p>;
   // Nothing can be sent while the daemon is away.
   const empty = !text.trim() || !live;
   return (
     <div className="composer">
       <label htmlFor={`msg-${t.id}`} className="sr-only">
-        Message to the agent
+        {tt("composer.label")}
       </label>
       <textarea
         id={`msg-${t.id}`}
         rows={2}
         value={text}
-        placeholder={`Message the agent (${mac ? "⌘↵" : "Ctrl+↵"} steer now, ${mac ? "⌥↵" : "Alt+↵"} queue)`}
+        placeholder={tt("composer.placeholder", { steer: mac ? "⌘↵" : "Ctrl+↵", queue: mac ? "⌥↵" : "Alt+↵" })}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
           // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.
@@ -103,14 +105,14 @@ export function MessageComposer({ t }: { t: TaskView }) {
       />
       <div className="composer-actions">
         <button className="btn btn-primary" onClick={() => send("steer")} disabled={empty || busy}>
-          Steer now
+          {tt("composer.steer")}
         </button>
         <button className="btn" onClick={() => send("queue")} disabled={empty || busy}>
-          Queue
+          {tt("composer.queue")}
         </button>
         {fallback && (
           <button className="btn btn-warn" onClick={interruptThenSend} disabled={empty || busy}>
-            Interrupt and send
+            {tt("composer.interruptSend")}
           </button>
         )}
       </div>
