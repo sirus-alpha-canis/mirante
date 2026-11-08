@@ -312,6 +312,8 @@ pub trait Driver: Send + Sync {
     fn input(&self, attachment: u64, bytes: &[u8]) -> Result<(), DriverError>;
     fn detach(&self, attachment: u64);
     /// The attached terminal changed size (Claude: resize the PTY; the agent redraws).
+    /// One size for all attached clients: the latest attach or resize wins, and every
+    /// client gets the agent's redraw at that size.
     fn resize(&self, _rows: u16, _cols: u16) -> Result<(), DriverError> {
         Err(DriverError::Unsupported("resize"))
     }

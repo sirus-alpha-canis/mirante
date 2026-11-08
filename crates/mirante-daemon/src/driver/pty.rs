@@ -419,10 +419,22 @@ impl PtyProcess {
         (id, initial, rx)
     }
 
-    /// Resizes the PTY (the agent gets SIGWINCH and redraws) and the mirror grid.
+    /// Resizes the mirror grid, then the PTY (the agent gets SIGWINCH and redraws), under
+    /// the fanout lock: the redraw is parsed at the new size, and an attach never sees a
+    /// screen of one size with a stream of the other. The PTY has one size for every
+    /// attached client: the latest attach or resize sets it.
     pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
-        lock(&self.master).resize(size(rows, cols)).map_err(other)?;
-        lock(&self.parser).set_size(nz(rows), nz(cols));
+        let _f = lock(&self.fanout);
+        let before = {
+            let mut parser = lock(&self.parser);
+            let before = parser.screen().size();
+            parser.set_size(nz(rows), nz(cols));
+            before
+        };
+        if let Err(e) = lock(&self.master).resize(size(rows, cols)) {
+            lock(&self.parser).set_size(before.0, before.1);
+            return Err(other(e));
+        }
         Ok(())
     }
 
@@ -528,6 +540,20 @@ mod tests {
         wait_for("echo", || p.grid().contains("got:hello"));
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Some(0));
         wait_for("exited flag", || p.exited());
+    }
+
+    /// What the agent draws in answer to the resize (SIGWINCH) is mirrored at the new size.
+    #[test]
+    fn the_redraw_after_a_resize_is_mirrored_at_the_new_size() {
+        let p = PtyProcess::spawn(
+            &sh("trap 'printf \"\\r%0119dX\" 0' WINCH; printf 'R'; while :; do sleep 0.05; done"),
+            |_| {},
+        )
+        .unwrap();
+        wait_for("ready", || p.grid().contains('R'));
+        p.resize(24, 120).unwrap();
+        // 119 zeros and an X: one row at 120 columns, two rows at 80.
+        wait_for("the redraw", || p.grid().lines().any(|l| l.ends_with("0X")));
     }
 
     /// A client attaching in the middle of a flood sees every line once, in order: its
