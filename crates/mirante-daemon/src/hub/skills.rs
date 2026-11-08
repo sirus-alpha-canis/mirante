@@ -228,7 +228,7 @@ impl Hub {
     fn tenant_view(&self, tenant: &str) -> Result<TenantView> {
         let st = self.lock();
         let rows = st.store.skill_tenants()?;
-        let skills = st.store.skill_list()?;
+        let skills = st.skill_rows()?;
         let row = rows.into_iter().find(|r| r.tenant == tenant);
         Ok(TenantView {
             tenant: tenant.to_string(),
@@ -242,7 +242,7 @@ impl Hub {
     pub fn skill_tenants(&self) -> Result<Vec<TenantView>> {
         let st = self.lock();
         let rows = st.store.skill_tenants()?;
-        let skills = st.store.skill_list()?;
+        let skills = st.skill_rows()?;
         let mut names: Vec<String> = rows.iter().map(|r| r.tenant.clone()).collect();
         names.extend(skills.iter().filter_map(|s| scope_tenant(&s.scope)));
         names.sort();
@@ -307,8 +307,7 @@ impl Hub {
         }
         let rows: Vec<SkillRow> = self
             .lock()
-            .store
-            .skill_list()?
+            .skill_rows()?
             .into_iter()
             .filter(|r| p.status.as_ref().is_none_or(|s| *s == r.status))
             .filter(|r| match (&p.tenant, scope_tenant(&r.scope)) {
@@ -1107,7 +1106,7 @@ impl Hub {
             if !st.store.skill_learning(tenant)? {
                 return Err(HubError::Conflict(format!("skill learning is not enabled for {tenant}")));
             }
-            let rows = st.store.skill_list()?;
+            let rows = st.skill_rows()?;
             let pending = st.store.skill_proposals(&SkillProposalQuery {
                 tenant: Some(tenant.to_string()),
                 status: Some("pending".into()),
@@ -1198,6 +1197,19 @@ impl Hub {
         if let Err(e) = self.mine_tenant(&tenant) {
             self.lock().log_error(Some(task_id), "skill mining after archive", &e);
         }
+    }
+}
+
+impl State {
+    /// Every skill row that parses, for lists and mining: a bad one is logged (stderr, not
+    /// an event: lists are polled) and left out instead of failing them. Injection reads
+    /// the strict list (fail closed).
+    pub(crate) fn skill_rows(&self) -> Result<Vec<SkillRow>> {
+        let (rows, bad) = self.store.skill_list_lenient()?;
+        for b in &bad {
+            eprintln!("mirante-daemon: skill index row skipped: {b}");
+        }
+        Ok(rows)
     }
 }
 

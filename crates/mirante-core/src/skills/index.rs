@@ -490,6 +490,22 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// [`Store::skill_list`] for lists and mining: a row that does not parse is left out
+    /// and named (`"<name>: <error>"`) instead of failing the whole list. Injection keeps
+    /// the strict one (fail closed).
+    pub fn skill_list_lenient(&self) -> Result<(Vec<SkillRow>, Vec<String>)> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {SKILL_COLUMNS} FROM skills ORDER BY name"))?;
+        let mut rows = stmt.query([])?;
+        let (mut good, mut bad) = (Vec::new(), Vec::new());
+        while let Some(r) = rows.next()? {
+            match skill_from_row(r) {
+                Ok(s) => good.push(s),
+                Err(e) => bad.push(format!("{}: {e}", r.get::<_, String>(0).unwrap_or_default())),
+            }
+        }
+        Ok((good, bad))
+    }
+
     /// Sets the skill's index row (its current version). No event: see
     /// [`Store::skill_accept`] and [`Store::skill_change`].
     pub fn skill_upsert_current(&mut self, s: &SkillRow) -> Result<()> {
@@ -1012,6 +1028,21 @@ mod tests {
         assert_eq!(s.skill_get("run-tests").unwrap().unwrap().manifest_hash, "h1");
         s.skill_accept(&p2.id, &fin("run-tests"), &row("run-tests", 2, "h2"), Some("h1"), "").unwrap();
         assert_eq!(s.skill_get("run-tests").unwrap().unwrap().manifest_hash, "h2");
+    }
+
+    /// A row that does not parse fails the strict list (injection stays fail-closed) but is
+    /// only skipped, by name, in the lenient one (lists and mining go on).
+    #[test]
+    fn a_bad_skill_row_is_skipped_by_name_in_the_lenient_list() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.skill_upsert_current(&row("good", 1, "h1")).unwrap();
+        s.skill_upsert_current(&row("bad", 1, "h2")).unwrap();
+        s.conn.execute("UPDATE skills SET agents = 'not json' WHERE name = 'bad'", []).unwrap();
+        assert!(s.skill_list().is_err());
+        let (rows, bad) = s.skill_list_lenient().unwrap();
+        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["good"]);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].starts_with("bad: "), "{bad:?}");
     }
 
     #[test]
