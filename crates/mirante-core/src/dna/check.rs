@@ -422,8 +422,29 @@ pub fn check_since(
         }
         states.push(state);
     }
-    // Per cited commit still to check: the paths changed between it and `head`.
-    let changed = changed_since(repo, &todo, &head)?;
+    // Per cited commit still to check: the paths changed between it and `head`. When git
+    // cannot diff one of them (a corrupt commit object), each is diffed alone and only the
+    // anchors citing one that fails are Unverifiable: one planted object must not fail the
+    // whole check (and never reads as unchanged, so never as fresh).
+    let changed = match changed_since(repo, &todo, &head) {
+        Ok(c) => c,
+        Err(_) => {
+            let mut ok = HashMap::new();
+            for c in &todo {
+                if let Ok(m) = changed_since(repo, &[c], &head) {
+                    ok.extend(m);
+                }
+            }
+            for (a, s) in anchors.iter().zip(states.iter_mut()) {
+                if s.is_none() && !ok.contains_key(a.commit.as_str()) {
+                    *s = Some(AnchorState::Unverifiable {
+                        reason: format!("the cited commit {} could not be read", short(&a.commit)),
+                    });
+                }
+            }
+            ok
+        }
+    };
     // Every blob to read, once.
     let mut names: Vec<(String, String)> = Vec::new();
     let mut slot: HashMap<(String, String), usize> = HashMap::new();
@@ -764,6 +785,25 @@ mod tests {
         let h = head(&r);
         let ok = changed_since(&r, &[&h, &c1], &h).unwrap();
         assert!(ok[&h].is_empty() && ok[&c1].contains("a.rs"), "{ok:?}");
+    }
+
+    /// A planted corrupt commit object costs only the anchors that cite it (Unverifiable,
+    /// never Fresh), not the whole check: one bad object must not take a repo's memory down.
+    #[test]
+    fn a_corrupt_cited_commit_makes_only_its_anchors_unverifiable() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let good = cite(&r, "HEAD", "a.rs", None, 1, 1).unwrap();
+        let bad = Anchor { commit: plant_corrupt_commit(&r), ..good.clone() };
+        for anchors in [vec![good.clone(), bad.clone()], vec![bad.clone(), good.clone()]] {
+            let rep = check_all(&r, "HEAD", &anchors).unwrap();
+            let state = |a: &Anchor| rep.iter().find(|c| c.anchor == *a).unwrap().state.clone();
+            assert_eq!(state(&good), AnchorState::Fresh);
+            assert!(
+                matches!(&state(&bad), AnchorState::Unverifiable { reason } if reason.contains("could not be read")),
+                "{:?}",
+                state(&bad)
+            );
+        }
     }
 
     #[test]
