@@ -32,6 +32,12 @@ pub enum DnaError {
     Git(String),
     #[error("the note changed on disk since it was read; reload and try again")]
     Changed,
+    /// Creating a file whose name is taken (a note, a symlink, anything).
+    #[error("{0} already exists")]
+    Exists(String),
+    /// The note's file is not there.
+    #[error("{0} does not exist")]
+    Missing(String),
     #[error("{0}")]
     Io(String),
 }

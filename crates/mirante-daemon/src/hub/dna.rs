@@ -43,12 +43,14 @@ const RELEVANT_MAX: usize = 10;
 const SEARCH_DEFAULT: usize = 10;
 const SEARCH_MAX: usize = 25;
 
-/// A DNA failure as the hub reports it: bad input is `Invalid`, everything else (unsafe
-/// directory, git, I/O, a file that changed meanwhile) is `Conflict`.
+/// A DNA failure as the hub reports it: bad input is `Invalid`, a missing note is
+/// `NotFound`, everything else (unsafe directory, git, I/O, a file that changed or appeared
+/// meanwhile) is `Conflict`.
 pub(crate) fn dna_err(e: DnaError) -> HubError {
     match e {
         DnaError::Anchor(..) | DnaError::Path(..) | DnaError::Note(_) => HubError::Invalid(e.to_string()),
-        DnaError::Unsafe(_) | DnaError::Git(_) | DnaError::Changed | DnaError::Io(_) => {
+        DnaError::Missing(_) => HubError::NotFound(e.to_string()),
+        DnaError::Unsafe(_) | DnaError::Git(_) | DnaError::Changed | DnaError::Exists(_) | DnaError::Io(_) => {
             HubError::Conflict(e.to_string())
         }
     }
@@ -163,7 +165,7 @@ fn create_unique(repo: &Path, base: &str, text: &str) -> std::result::Result<Str
         };
         match fsio::create_note(repo, &slug, text) {
             Ok(()) => return Ok(slug),
-            Err(DnaError::Io(m)) if m.ends_with("already exists") => continue,
+            Err(DnaError::Exists(_)) => continue,
             Err(e) => return Err(e),
         }
     }
@@ -1100,6 +1102,14 @@ pub(crate) mod tests {
             std::fs::read_to_string(k.repo.join(".mirante/memory/a.md")).map(|t| sha256_hex(t.as_bytes())).unwrap(),
             a.content_hash
         );
+    }
+
+    #[test]
+    fn an_action_on_a_missing_note_is_not_found() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        let r = k.hub.dna_note_action(&Caller::Person, action(&k, "nope", NoteAction::Retire, "h"));
+        assert!(matches!(r, Err(HubError::NotFound(_))), "{r:?}");
     }
 
     #[test]

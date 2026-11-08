@@ -281,6 +281,7 @@ impl MemoryDir {
         let f = match open_at(self.raw(), &c, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0) {
             Ok(fd) => File::from(fd),
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(unsafe_at(&shown, "is a symlink")),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(DnaError::Missing(shown)),
             Err(e) => return Err(e.into()),
         };
         let meta = f.metadata()?;
@@ -341,7 +342,7 @@ impl MemoryDir {
         let _ = self.unlink(&tmp);
         match linked {
             Ok(_) => self.sync(),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(DnaError::Io(format!("{name} already exists"))),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(DnaError::Exists(name.to_string())),
             Err(e) => Err(e.into()),
         }
     }
@@ -405,7 +406,7 @@ pub fn init(repo: &Path) -> Result<PathBuf, DnaError> {
     let dir = MemoryDir::open_in(repo, true)?.ok_or_else(|| DnaError::Io("could not create the memory dir".into()))?;
     match dir.create_file("README.md", README) {
         Ok(()) => {}
-        Err(DnaError::Io(_))
+        Err(DnaError::Exists(_))
             if stat_at(dir.raw(), c"README.md")
                 .is_ok_and(|st| file_type(st.st_mode as u32) == libc::S_IFREG as u32) => {}
         Err(e) => return Err(e),
@@ -517,7 +518,7 @@ mod tests {
         let d = repo_dir();
         init(d.path()).unwrap();
         create_note(d.path(), "a", "one").unwrap();
-        assert!(create_note(d.path(), "a", "two").is_err());
+        assert_eq!(create_note(d.path(), "a", "two"), Err(DnaError::Exists("a.md".into())));
         for bad in ["../a", "a/b", "A", "", ".hidden"] {
             assert!(create_note(d.path(), bad, "x").is_err(), "{bad}");
         }
@@ -540,7 +541,8 @@ mod tests {
         assert_eq!(update_note(d.path(), "a", &sha256_hex(b"stale"), "x"), Err(DnaError::Changed));
         update_note(d.path(), "a", &sha256_hex(b"one"), "two").unwrap();
         assert_eq!(read_note(d.path(), "a").unwrap(), "two");
-        assert!(update_note(d.path(), "missing", &sha256_hex(b""), "x").is_err());
+        assert!(matches!(update_note(d.path(), "missing", &sha256_hex(b""), "x"), Err(DnaError::Missing(_))));
+        assert!(matches!(read_note(d.path(), "missing"), Err(DnaError::Missing(_))));
     }
 
     #[test]
