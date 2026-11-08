@@ -131,6 +131,127 @@ export interface SendResult {
   queued: number;
 }
 
+// Repo memory (DNA), `mirante_ipc::types::Dna*`. Text fields come in the person view:
+// control and invisible characters stripped, `<` kept as written. Render them as text only.
+
+/** `DnaStatus`. */
+export interface DnaStatus {
+  repo: string;
+  enabled: boolean;
+  /** `.mirante/memory/` exists. */
+  dir: boolean;
+  notes: number;
+  stale: number;
+  unreviewed: number;
+  pending: number;
+  invalid: number;
+  head: string | null;
+}
+
+export type AnchorState = "unchecked" | "fresh" | "relocated" | "stale" | "unverifiable";
+
+export interface AnchorView {
+  path: string;
+  symbol: string | null;
+  start: number;
+  end: number;
+  commit: string;
+  state: AnchorState | string;
+  reason: string | null;
+  now_start: number | null;
+  now_end: number | null;
+}
+
+export interface NoteSummary {
+  slug: string;
+  title: string;
+  kind: string;
+  /** "active" or "retired". */
+  status: string;
+  /** The worst anchor's state ("relocated" counts as fresh). */
+  state: "fresh" | "stale" | "unverifiable" | "unchecked" | string;
+  /** A person accepted or confirmed this exact content. */
+  reviewed: boolean;
+  anchors: AnchorView[];
+}
+
+export interface NoteView extends NoteSummary {
+  body: string;
+  links: string[];
+  backlinks: string[];
+  /** Sent back as `expect_hash` by `dna.note_action`. */
+  content_hash: string;
+  source: string;
+  path: string;
+}
+
+export interface GraphLink {
+  src: string;
+  dst: string;
+  /** No note named `dst`. */
+  dangling: boolean;
+}
+
+export interface DnaGraph {
+  nodes: NoteSummary[];
+  links: GraphLink[];
+}
+
+/** `CheckReport` (`mirante_core::dna::index::RefreshReport`). */
+export interface CheckReport {
+  repo: string;
+  head: string | null;
+  notes: number;
+  invalid: { file: string; error: string }[];
+  stale: number;
+  relocated: number;
+  unverifiable: number;
+  unreviewed: number;
+}
+
+/** A proposal's citation (`mirante_core::dna::anchor::Anchor`). */
+export interface ProposalAnchor {
+  path: string;
+  symbol?: string | null;
+  start: number;
+  end: number;
+  commit: string;
+  fingerprint: string;
+}
+
+/** `ProposalView` (`mirante_core::dna::index::Proposal`). */
+export interface ProposalView {
+  id: string;
+  repo: string;
+  task_id: string | null;
+  /** "agent" or "cli". */
+  origin: string;
+  title: string;
+  kind: string;
+  body: string;
+  anchors: ProposalAnchor[];
+  /** Secrets masked before storage. */
+  redactions: number;
+  status: "pending" | "accepted" | "rejected" | string;
+  slug: string | null;
+  decision_note: string;
+  created_at: number;
+  decided_at: number | null;
+}
+
+export interface AtRisk extends NoteSummary {
+  /** What changed, per anchor (`path: reason`), joined with `; `. */
+  reason: string;
+}
+
+/** `DnaTaskContext`. */
+export interface TaskMemoryContext {
+  enabled: boolean;
+  relevant: NoteSummary[];
+  at_risk: AtRisk[];
+  proposals: ProposalView[];
+}
+
 export type StreamMsg =
   | { type: "connected"; snapshot: Snapshot }
   | { type: "event"; event: DaemonEvent }
@@ -184,4 +305,15 @@ export const M = {
   daemonStatus: "daemon.status",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
+  dnaStatus: "dna.status",
+  dnaEnable: "dna.enable",
+  dnaDisable: "dna.disable",
+  dnaGraph: "dna.graph",
+  dnaSearch: "dna.search",
+  dnaGet: "dna.get",
+  dnaCheck: "dna.check",
+  dnaTaskContext: "dna.task_context",
+  dnaProposals: "dna.proposals",
+  dnaReview: "dna.review",
+  dnaNoteAction: "dna.note_action",
 } as const;

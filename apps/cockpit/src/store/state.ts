@@ -62,6 +62,9 @@ export interface State {
   queues: Record<string, QueuedMessage[]>;
   /** Tasks whose history (`task.events`) could not be loaded, with why. */
   historyErrors: Record<string, string>;
+  /** Repo memory: bumped per repo on `dna.*` events, so memory views refetch (see
+   * [`dnaRev`]). `"*"`: an event whose repo is unknown (every repo refetches). */
+  dnaVersion: Record<string, number>;
 }
 
 export const FEED_CAP = 300;
@@ -77,7 +80,24 @@ export const initialState: State = {
   memory: [],
   queues: {},
   historyErrors: {},
+  dnaVersion: {},
 };
+
+/** Events that change what memory views show. */
+const DNA_REFETCH = new Set(["dna.indexed", "dna.changed", "dna.proposed", "dna.decided"]);
+
+/** When `repo`'s memory views last had to refetch (a counter; compare for change). */
+export function dnaRev(s: Pick<State, "dnaVersion">, repo: string): number {
+  return (s.dnaVersion[repo] ?? 0) + (s.dnaVersion["*"] ?? 0);
+}
+
+function dnaEffect(v: State["dnaVersion"], tasks: Record<string, TaskView>, e: DaemonEvent): State["dnaVersion"] {
+  if (!DNA_REFETCH.has(e.kind)) return v;
+  const p = e.payload ?? {};
+  const repo = typeof p.repo === "string" ? p.repo : e.task_id ? tasks[e.task_id]?.repo_path : undefined;
+  const key = repo ?? "*";
+  return { ...v, [key]: (v[key] ?? 0) + 1 };
+}
 
 export type Action =
   | { type: "connected"; snapshot: Snapshot }
@@ -162,6 +182,12 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       return { ...base, kind: "system", text: `agent exited (code ${str(p.code) || "none"})` };
     case "interrupt_sent":
       return { ...base, kind: "system", text: "interrupted" };
+    case "dna.proposed":
+      return { ...base, kind: "system", text: `proposed memory: ${str(p.title)} (awaiting review)` };
+    case "dna.decided":
+      return { ...base, kind: "system", text: p.accepted === true ? `memory proposal accepted as ${str(p.slug)}` : "memory proposal rejected" };
+    case "dna.unavailable":
+      return { ...base, kind: "system", text: str(p.reason) || "repo memory is off for this session" };
     default:
       return isMemoryEvent(e.kind) ? { ...base, kind: "system", text: describeMemoryEvent(e.kind, p) } : null;
   }
@@ -326,6 +352,7 @@ export function reduce(s: State, a: Action): State {
         feed: item && e.task_id ? addFeed(s.feed, e.task_id, [item]) : s.feed,
         memory,
         queues: queueEffect(s.queues, e),
+        dnaVersion: dnaEffect(s.dnaVersion, tasks, e),
       };
     }
     case "task":

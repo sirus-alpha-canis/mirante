@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ev, snapshot, task, taskRow } from "../test/fixtures";
-import { feedItem, initialState, reduce, type State } from "./state";
+import { isMemoryEvent } from "../lib/memguard";
+import { dnaRev, feedItem, initialState, reduce, type State } from "./state";
 
 const connected = (s: State = initialState, tasks = [task("t1")], seq = 5) =>
   reduce(s, { type: "connected", snapshot: snapshot(tasks, seq) });
@@ -256,5 +257,38 @@ describe("queue", () => {
     expect(s.queues.t1.map((m) => m.id)).toEqual(["b", "c"]);
     s = reduce(s, { type: "event", event: ev(2, "t1", "queue_dropped", { messages: ["b", "c"] }) });
     expect(s.queues.t1).toEqual([]);
+  });
+});
+
+describe("repo memory (dna.*) events", () => {
+  it("dna events land in the task feed and never in the memory guard", () => {
+    expect(feedItem(ev(1, "t", "dna.proposed", { id: "p", title: "Spool" }))?.text).toBe("proposed memory: Spool (awaiting review)");
+    expect(feedItem(ev(2, "t", "dna.decided", { id: "p", accepted: true, slug: "spool" }))?.text).toBe("memory proposal accepted as spool");
+    expect(feedItem(ev(3, "t", "dna.decided", { id: "p", accepted: false, slug: null }))?.text).toBe("memory proposal rejected");
+    expect(feedItem(ev(4, "t", "dna.unavailable", { reason: "repo memory is off for this session: no binary" }))?.text).toBe(
+      "repo memory is off for this session: no binary",
+    );
+    expect(isMemoryEvent("dna.proposed")).toBe(false);
+    let s = connected(initialState, [task("t1", { repo_path: "/r" })]);
+    s = reduce(s, { type: "event", event: ev(6, "t1", "dna.proposed", { id: "p", title: "Spool" }) });
+    expect(s.memory).toEqual([]);
+    expect(s.feed.t1.map((i) => i.text)).toEqual(["proposed memory: Spool (awaiting review)"]);
+  });
+
+  it("indexed, changed, proposed and decided bump the repo's dna version so views refetch", () => {
+    let s = connected(initialState, [task("t1", { repo_path: "/r" })]);
+    expect(dnaRev(s, "/r")).toBe(0);
+    s = reduce(s, { type: "event", event: ev(6, null, "dna.indexed", { repo: "/r", head: "h", notes: 1, stale: 0, unreviewed: 0, invalid: 0 }) });
+    s = reduce(s, { type: "event", event: ev(7, null, "dna.changed", { repo: "/r", slug: "a" }) });
+    s = reduce(s, { type: "event", event: ev(8, "t1", "dna.decided", { id: "p", accepted: true, slug: "a" }) });
+    s = reduce(s, { type: "event", event: ev(9, "t1", "dna.proposed", { id: "q", title: "Q" }) });
+    expect(dnaRev(s, "/r")).toBe(4);
+    expect(dnaRev(s, "/other")).toBe(0);
+    // A decision with no task (a CLI proposal) does not know its repo: every repo refetches.
+    s = reduce(s, { type: "event", event: ev(10, null, "dna.decided", { id: "c", accepted: false, slug: null }) });
+    expect([dnaRev(s, "/r"), dnaRev(s, "/other")]).toEqual([5, 1]);
+    // Unrelated events leave it alone.
+    const same = reduce(s, { type: "event", event: ev(11, "t1", "turn_started") });
+    expect(same.dnaVersion).toBe(s.dnaVersion);
   });
 });
