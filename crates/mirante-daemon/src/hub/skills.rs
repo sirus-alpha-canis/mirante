@@ -749,9 +749,21 @@ impl Hub {
         }
     }
 
+    /// Takes the hub lock: never called while holding it.
     pub(crate) fn proposal_view(&self, p: SkillProposal) -> SkillProposalView {
         let learned = Some(p.tenant.as_str()).filter(|t| *t != "personal");
-        let warnings = Scope::parse(&p.scope).map(|s| Hub::scope_warnings(&s, learned)).unwrap_or_default();
+        let mut warnings = Scope::parse(&p.scope).map(|s| Hub::scope_warnings(&s, learned)).unwrap_or_default();
+        // A pending edit that turns an on-demand skill always-on: its text would go into
+        // every session's system prompt (an agent may ask for that; the person decides).
+        if p.kind == "edit" && p.status == "pending" && p.activation == Activation::Always.as_str() {
+            let current = self.lock().store.skill_get(&p.name).ok().flatten();
+            if current.is_some_and(|r| r.activation == Activation::OnDemand) {
+                warnings.push(
+                    "raises activation from on_demand to always: its text goes into every session's system prompt"
+                        .into(),
+                );
+            }
+        }
         SkillProposalView { proposal: p, warnings, base: None }
     }
 
@@ -925,7 +937,8 @@ impl Hub {
     /// `skill.rereview`: a skill's own version folder (the path built here from the name
     /// and version, never given by the caller), as it is on disk now, queued as an edit of
     /// the skill with its current scope and activation. A folder whose `SKILL.md` names
-    /// another skill is refused: a re-review of one skill never proposes another.
+    /// another skill is refused: a re-review of one skill never proposes another. Only the
+    /// current version is re-reviewed (an older one would be a rollback: `Conflict`).
     pub fn skill_rereview(&self, caller: &Caller, p: SkillRereview) -> Result<SkillProposalView> {
         self.require_skill_person(caller)?;
         check_name(&p.name)?;
@@ -934,6 +947,13 @@ impl Hub {
         let versions = library::list_versions(&self.paths.skills(), &row.name).map_err(skill_err)?;
         if !versions.contains(&p.version) {
             return Err(HubError::NotFound(format!("no version {} of {} on disk", p.version, row.name)));
+        }
+        // An older version's text as an edit of the current one is a rollback: said so.
+        if p.version != row.version {
+            return Err(HubError::Conflict(format!(
+                "{} is at v{}: re-review the current version, or bring v{} back with `mirante skills rollback {} {}`",
+                row.name, row.version, p.version, row.name, p.version
+            )));
         }
         let dir = self.paths.skills().join(&row.name).join(library::version_dir(p.version));
         let (parsed, files) = read_skill_dir(&dir.to_string_lossy())?;
@@ -2085,6 +2105,39 @@ pub(crate) mod tests {
         assert_eq!(p.proposal.base_hash.as_deref(), Some("hash-of-theirs"));
     }
 
+    /// An edit that would put an on-demand skill into every session's system prompt says
+    /// so at review (an agent may ask for it; the person decides).
+    #[test]
+    fn an_edit_raising_activation_to_always_is_flagged() {
+        let k = Kit::new();
+        let mine = learning(&k, "mine");
+        k.hub
+            .lock()
+            .store
+            .skill_upsert_current(&SkillRow {
+                name: "ours".into(),
+                version: 1,
+                manifest_hash: "h".into(),
+                scope: Scope::Repo("github.com/acme/app".into()),
+                activation: Activation::OnDemand,
+                agents: vec!["claude".into()],
+                status: "active".into(),
+                description: "d".into(),
+                updated_at: 0,
+            })
+            .unwrap();
+        let agent = Peer::spawn(&[(AGENT_ENV, &mine.id)], k.dir.path());
+        let mut e = propose(&mine.id, None, Some("ours"), "b\n");
+        e.activation = Some("always".into());
+        let v = k.hub.skill_propose(&agent.caller(), e).unwrap();
+        assert!(v.warnings.iter().any(|w| w.contains("on_demand to always")), "{:?}", v.warnings);
+        let listed = k.hub.skill_proposals(SkillProposals { id: Some(v.proposal.id.clone()), ..Default::default() });
+        assert!(listed.unwrap()[0].warnings.iter().any(|w| w.contains("on_demand to always")));
+        // Same activation: nothing to say.
+        let same = k.hub.skill_propose(&agent.caller(), propose(&mine.id, None, Some("ours"), "c\n")).unwrap();
+        assert!(same.warnings.iter().all(|w| !w.contains("always")), "{:?}", same.warnings);
+    }
+
     /// A new skill named like another tenant's (or a personal) skill: the agent gets the
     /// answer it would get for a free name, and the proposal is filed under a fresh name a
     /// person sees. Its own tenant's names stay a conflict (it may edit those).
@@ -2582,6 +2635,22 @@ pub(crate) mod tests {
         std::fs::write(v1.join(SKILL_MD), render_skill_md("other", "About other", "Other.\n")).unwrap();
         let e = k.hub.skill_rereview(&Caller::Person, rr("lookup", 1));
         assert!(matches!(e, Err(HubError::Invalid(ref m)) if m.contains("other")), "{e:?}");
+    }
+
+    /// Re-reviewing an older version would bring its text back as an edit of the current
+    /// one: that is a rollback, done with `mirante skills rollback`, so it is refused here.
+    #[test]
+    fn rereview_of_a_version_that_is_not_current_is_refused_as_a_rollback() {
+        let k = Kit::new();
+        if keygen().is_none() {
+            return;
+        }
+        let scope = Scope::parse("org:github.com/acme").unwrap();
+        install(&k, "lookup", 1, scope.clone(), Activation::OnDemand, "Look it up.\n");
+        install(&k, "lookup", 2, scope, Activation::OnDemand, "Look it up better.\n");
+        let e = k.hub.skill_rereview(&Caller::Person, SkillRereview { name: "lookup".into(), version: 1 });
+        assert!(matches!(e, Err(HubError::Conflict(ref m)) if m.contains("rollback")), "{e:?}");
+        assert!(k.hub.skill_rereview(&Caller::Person, SkillRereview { name: "lookup".into(), version: 2 }).is_ok());
     }
 
     /// An edit in the queue carries the version it changes as a person may trust it: its
