@@ -12,17 +12,23 @@ Setup: `cargo install --path crates/mirante-daemon`, `crates/mirante-hook`,
 `crates/mirante-cli`; build and open the app (`apps/cockpit/README.md`). Keep
 `mirante watch` open in a terminal the first day to compare.
 
-- [ ] The app finds `mirante-daemon` in `~/.cargo/bin`, `/opt/homebrew/bin` or
-      `/usr/local/bin` only (not `~/.local/bin`, the Plan 2b symlink dir): `cargo install`
-      puts it in the first. The CLI and the daemon must be the same build.
-- [ ] Point the daemon at the real agents (PATH `claude` may be a cmux shim; Codex lives under
-      nvm): `export MIRANTE_CLAUDE_BIN=/opt/homebrew/bin/claude` and
+- [ ] The app finds `mirante-daemon` in `~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`
+      or `/usr/local/bin`, then on your login shell's PATH (or at `$MIRANTE_DAEMON_BIN`):
+      `cargo install` puts it in the first. The CLI and the daemon must be the same build.
+- [ ] Optionally point the daemon at the real agents explicitly (PATH `claude` may be a cmux
+      shim; Codex lives under nvm), in your shell profile so the app sees them too:
+      `export MIRANTE_CLAUDE_BIN=/opt/homebrew/bin/claude` and
       `export MIRANTE_CODEX_BIN=~/.nvm/versions/node/v22.14.0/bin/codex` (adjust the version).
-- [ ] Start the daemon **from that shell** (`mirante daemon start`), not with the app's
-      **Start daemon**: a daemon the app starts inherits the app's environment (macOS's
-      minimal `PATH`, none of the exports above), so it may not find `claude`, `codex` or
-      `node`. Use the app's button for check A1 only, then `mirante daemon restart` from the
-      shell.
+      Without them the daemon looks on PATH (skipping cmux shims), then in `~/.local/bin`,
+      `/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin` and nvm's newest Node that has
+      the agent.
+- [ ] Open the app from Finder or the Dock (not from a terminal) and use **Start daemon**:
+      the app takes PATH and `MIRANTE_*` from your login shell (`$SHELL -l -i`, 3 s limit;
+      nothing else from it) and the daemon finds `claude`, `codex` and `node`. Check with
+      `mirante doctor`: the `agents` lines name each binary and where it came from
+      (`MIRANTE_CLAUDE_BIN`, `PATH` or `well-known directory`). If your shell takes longer
+      than 3 s to start, the app falls back to its own PATH plus the usual install
+      directories; then `mirante daemon restart` from a shell.
 - [ ] Leave `MIRANTE_CLAUDE_INLINE_ANSWERS` **unset** (the default). Claude cards then offer
       **Answer in terminal** instead of Allow/Deny; see C.
 

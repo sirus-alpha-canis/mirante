@@ -10,7 +10,8 @@ Prerequisites: Rust (stable), Node 22.12+ and pnpm 10, Xcode command line tools 
 
 ```bash
 # The daemon, the hook and the CLI, once (the app finds the daemon in ~/.cargo/bin,
-# /opt/homebrew/bin or /usr/local/bin, or at $MIRANTE_DAEMON_BIN):
+# ~/.local/bin, /opt/homebrew/bin, /usr/local/bin or on your login shell's PATH, or at
+# $MIRANTE_DAEMON_BIN):
 cargo install --path crates/mirante-daemon
 cargo install --path crates/mirante-hook
 cargo install --path crates/mirante-cli
@@ -21,11 +22,21 @@ pnpm --dir apps/cockpit tauri dev
 
 If no daemon is running, the banner offers **Start daemon**.
 
-A daemon started by the app inherits the app's environment, not your shell's: an app opened
-from Finder or the Dock gets macOS's minimal `PATH` and none of your exports
-(`MIRANTE_CLAUDE_BIN`, `MIRANTE_CODEX_BIN`, `MIRANTE_CLAUDE_INLINE_ANSWERS`). For real
-agents, start the daemon from a shell that has them (`mirante daemon start`); the app
-connects to it.
+An app opened from Finder or the Dock gets macOS's minimal `PATH` and none of your
+exports, so before **Start daemon** starts a daemon the app asks your login shell once per
+run: `$SHELL` (only if listed in `/etc/shells`, else `/bin/zsh`) runs as `-l -i -c` with
+stdin closed and a 3 s limit, and prints its environment. The daemon gets only `PATH` and
+`MIRANTE_*` from it (`MIRANTE_CLAUDE_BIN`, `MIRANTE_CODEX_BIN`,
+`MIRANTE_CLAUDE_INLINE_ANSWERS`…; never `MIRANTE_HOME`, which the app's socket decides),
+plus `HOME`/`USER`/`LANG` if the app lacks them; nothing else (no tokens or keys) is passed
+on. If the shell fails or is too slow, the daemon gets the app's `PATH` with `~/.local/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` and `~/.cargo/bin` appended.
+
+The daemon also finds the agents on its own: `MIRANTE_CLAUDE_BIN` / `MIRANTE_CODEX_BIN`,
+then `PATH`, then those directories and nvm's (`~/.nvm/versions/node/*/bin`, newest Node
+that has the agent), never a cmux shim; an agent found off `PATH` runs with its directory
+first on `PATH`, so an npm-installed `codex` finds its `node`. `mirante doctor` prints which
+binaries the daemon resolved and from where.
 
 ### Without agents: the fake daemon
 
