@@ -4,7 +4,7 @@
 // Replies can arrive out of order: each one is dropped when a newer one for the same thing
 // was already applied.
 import { useSyncExternalStore } from "react";
-import type { DaemonEvent, PermissionView, StreamMsg, TaskView } from "../lib/protocol";
+import type { DaemonEvent, PermissionView, QueuedMessage, StreamMsg, TaskView } from "../lib/protocol";
 import { M, RpcCode } from "../lib/protocol";
 import { type Action, initialState, reduce, type State } from "./state";
 
@@ -44,11 +44,28 @@ async function pool(jobs: (() => Promise<void>)[], n: number): Promise<void> {
   await Promise.all(Array.from({ length: Math.min(n, jobs.length) }, worker));
 }
 
+/** Events after which a task's queue may differ from what was loaded. */
+function touchesQueue(e: DaemonEvent): boolean {
+  switch (e.kind) {
+    case "queue_changed":
+    case "message_queued":
+    case "message_requeued":
+    case "queue_dropped":
+      return true;
+    case "message_sent":
+      return e.payload?.mode === "queue";
+    default:
+      return false;
+  }
+}
+
 export interface Cockpit {
   getState(): State;
   subscribe(listener: () => void): () => void;
   dispatch(a: Action): void;
   connect(): Promise<void>;
+  /** Reloads a task's queued messages (`message.list_queued`), coalesced like refreshes. */
+  refreshQueue(taskId: string): void;
   /** Called after each state change with (previous, next). */
   onChange(fn: (prev: State, next: State) => void): () => void;
 }
@@ -102,6 +119,14 @@ export function createCockpit(t: Transport): Cockpit {
       for (const v of views) if (fresh(`task:${v.id}`, n)) applied.set(`task:${v.id}`, n);
       dispatch({ type: "tasks", views, keep });
     });
+  const refreshQueue = (id: string) =>
+    later(`queue:${id}`, async () => {
+      const n = ++sent;
+      const list = await t.rpc<QueuedMessage[]>(M.messageListQueued, { task_id: id });
+      if (!fresh(`queue:${id}`, n)) return;
+      applied.set(`queue:${id}`, n);
+      dispatch({ type: "queue", taskId: id, list: Array.isArray(list) ? list : [] });
+    });
   const loadPermissions = () =>
     later("perms", async () => {
       const rev = state.permRev;
@@ -143,6 +168,7 @@ export function createCockpit(t: Transport): Cockpit {
         dispatch({ type: "event", event: m.event });
         if (m.event.task_id) refreshTask(m.event.task_id);
         if (m.event.kind.startsWith("permission_")) loadPermissions();
+        if (m.event.task_id && touchesQueue(m.event)) refreshQueue(m.event.task_id);
         break;
       case "disconnected":
         dispatch({ type: "disconnected", error: m.error, retryMs: m.retry_ms });
@@ -161,6 +187,7 @@ export function createCockpit(t: Transport): Cockpit {
       return () => watchers.delete(fn);
     },
     dispatch,
+    refreshQueue,
     connect: () => t.subscribe(onMsg),
   };
 }

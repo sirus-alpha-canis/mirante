@@ -1,7 +1,7 @@
 // The client store: one reducer over (snapshot | event | refreshed view | history). The
 // daemon's event stream is a hint (seq-ordered, may replay); task views fetched with
 // `task.get` / `task.list` are the authority and overwrite what events guessed.
-import type { DaemonEvent, PermissionView, SendMode, Snapshot, TaskView } from "../lib/protocol";
+import type { DaemonEvent, PermissionView, QueuedMessage, SendMode, Snapshot, TaskView } from "../lib/protocol";
 import { describeMemoryEvent, isMemoryEvent } from "../lib/memguard";
 
 export type FeedKind = "tool" | "command" | "agent_message" | "message" | "turn" | "system" | "permission";
@@ -57,6 +57,9 @@ export interface State {
   /** Bumped on every permission change made by an event. */
   permRev: number;
   memory: MemoryNotice[];
+  /** Each live task's queued messages, next first, as `message.list_queued` last said
+   * (events adjust it meanwhile). Absent: not loaded. */
+  queues: Record<string, QueuedMessage[]>;
   /** Tasks whose history (`task.events`) could not be loaded, with why. */
   historyErrors: Record<string, string>;
 }
@@ -72,6 +75,7 @@ export const initialState: State = {
   perms: {},
   permRev: 0,
   memory: [],
+  queues: {},
   historyErrors: {},
 };
 
@@ -85,6 +89,7 @@ export type Action =
   /** `rev`: `State.permRev` when the list was asked for (cards changed since are kept). */
   | { type: "permissions"; list: PermissionView[]; rev?: number }
   | { type: "history"; taskId: string; events: DaemonEvent[] }
+  | { type: "queue"; taskId: string; list: QueuedMessage[] }
   | { type: "historyFailed"; taskId: string; error: string };
 
 /** Events that close a card. `permission_answered` always comes first from the daemon; the
@@ -95,6 +100,12 @@ const ANSWER_TEXT: Record<string, string> = {
   allowed_once: "allowed once",
   allowed_session: "allowed for this session",
   denied: "denied",
+};
+
+const QUEUE_CHANGE_TEXT: Record<string, string> = {
+  edited: "queued message edited",
+  removed: "queued message removed",
+  reordered: "queue reordered",
 };
 
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
@@ -128,6 +139,8 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       return { ...base, kind: "system", text: `message failed: ${str(p.error)}` };
     case "queue_dropped":
       return { ...base, kind: "system", text: "queued messages dropped (session ended)" };
+    case "queue_changed":
+      return { ...base, kind: "system", text: QUEUE_CHANGE_TEXT[str(p.op)] ?? "queue changed" };
     case "turn_started":
       return { ...base, kind: "turn", phase: "started", text: "turn started" };
     case "turn_ended":
@@ -204,6 +217,42 @@ function permEffect(perms: Record<string, Perm>, e: DaemonEvent, rev: number): R
   return { ...perms, [id]: { ...known, status, seq: e.seq, rev, closedBy } };
 }
 
+/** What an event says about a loaded queue (the `message.list_queued` refetch it triggers
+ * is the authority). */
+function queueEffect(queues: State["queues"], e: DaemonEvent): State["queues"] {
+  const id = e.task_id;
+  const cur = id ? queues[id] : undefined;
+  if (!id || !cur) return queues;
+  const p = e.payload ?? {};
+  const put = (list: QueuedMessage[]) => ({ ...queues, [id]: list });
+  switch (e.kind) {
+    case "message_queued":
+      return typeof p.id === "string" && !cur.some((m) => m.id === p.id) ? put([...cur, { id: p.id, text: str(p.text) }]) : queues;
+    case "message_sent":
+      return typeof p.id === "string" ? put(cur.filter((m) => m.id !== p.id)) : queues;
+    case "queue_dropped":
+    case "session_ended":
+    case "process_exited":
+      return put([]);
+    case "queue_changed":
+      switch (p.op) {
+        case "edited":
+          return put(cur.map((m) => (m.id === p.id ? { ...m, text: str(p.text) } : m)));
+        case "removed":
+          return put(cur.filter((m) => m.id !== p.id));
+        case "reordered": {
+          const ids = Array.isArray(p.ids) ? p.ids.map(str) : [];
+          const rank = (m: QueuedMessage) => (ids.includes(m.id) ? ids.indexOf(m.id) : ids.length);
+          return put([...cur].sort((a, b) => rank(a) - rank(b)));
+        }
+        default:
+          return queues;
+      }
+    default:
+      return queues;
+  }
+}
+
 /** What an event says about the task row itself (refined later by `task.get`). */
 function taskEffect(tasks: Record<string, TaskView>, e: DaemonEvent): Record<string, TaskView> {
   const id = e.task_id;
@@ -276,6 +325,7 @@ export function reduce(s: State, a: Action): State {
         permRev,
         feed: item && e.task_id ? addFeed(s.feed, e.task_id, [item]) : s.feed,
         memory,
+        queues: queueEffect(s.queues, e),
       };
     }
     case "task":
@@ -328,6 +378,8 @@ export function reduce(s: State, a: Action): State {
       const { [a.taskId]: _cleared, ...historyErrors } = s.historyErrors;
       return { ...s, feed: addFeed(s.feed, a.taskId, items), perms, permRev, historyErrors };
     }
+    case "queue":
+      return { ...s, queues: { ...s.queues, [a.taskId]: a.list } };
     case "historyFailed":
       return { ...s, historyErrors: { ...s.historyErrors, [a.taskId]: a.error } };
   }

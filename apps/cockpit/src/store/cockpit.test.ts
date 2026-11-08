@@ -212,3 +212,49 @@ describe("createCockpit", () => {
     expect(c.getState().perms.p1.status).toBe("denied");
   });
 });
+
+describe("queue refresh", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it.each(["queue_changed", "message_queued", "message_requeued", "message_sent", "queue_dropped"])(
+    "%s refetches that task's queue (once per burst)",
+    async (kind) => {
+      const t = fakeTransport({ "task.events": [], "permission.list": [], "task.get": task("t1"), "message.list_queued": [{ id: "x", text: "hi" }] });
+      const c = createCockpit(t);
+      await c.connect();
+      t.push({ type: "connected", snapshot: snapshot([task("t1")], 0) });
+      t.push({ type: "event", event: ev(1, "t1", kind, { op: "removed", id: "y", mode: "queue", text: "y" }) });
+      t.push({ type: "event", event: ev(2, "t1", kind, { op: "removed", id: "z", mode: "queue", text: "z" }) });
+      await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+      expect(t.calls.filter((x) => x[0] === "message.list_queued")).toEqual([["message.list_queued", { task_id: "t1" }]]);
+      expect(c.getState().queues.t1).toEqual([{ id: "x", text: "hi" }]);
+    },
+  );
+
+  it("a steer does not refetch the queue", async () => {
+    const t = fakeTransport({ "task.events": [], "permission.list": [], "task.get": task("t1") });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([task("t1")], 0) });
+    t.push({ type: "event", event: ev(1, "t1", "message_sent", { mode: "steer", text: "now" }) });
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    expect(t.calls.map((x) => x[0])).not.toContain("message.list_queued");
+  });
+
+  it("refreshQueue loads on demand; an older reply never overwrites a newer one", async () => {
+    const replies: ((v: unknown) => void)[] = [];
+    const t = fakeTransport({ "message.list_queued": () => new Promise((r) => replies.push(r)) });
+    const c = createCockpit(t);
+    c.refreshQueue("t1");
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    c.refreshQueue("t1");
+    await vi.advanceTimersByTimeAsync(REFRESH_MS + 1);
+    expect(replies).toHaveLength(2);
+    replies[1]([{ id: "new", text: "new" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    replies[0]([{ id: "old", text: "old" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.getState().queues.t1).toEqual([{ id: "new", text: "new" }]);
+  });
+});

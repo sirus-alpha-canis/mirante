@@ -76,6 +76,15 @@ describe("Detail (V1 classic)", () => {
     expect(screen.getByLabelText("Terminal of feat/a")).toBeInTheDocument();
   });
 
+  it("shows the task's queue above the composer", () => {
+    const h = makeEnv();
+    h.load([task("a", { status: "working", queued: 1 })]);
+    h.env.cockpit.dispatch({ type: "queue", taskId: "a", list: [{ id: "q1", text: "then update docs" }] });
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    const queue = screen.getByRole("region", { name: "Queued messages" });
+    expect(within(queue).getByText("then update docs")).toBeInTheDocument();
+  });
+
   it("opens on the requested tab", () => {
     const h = makeEnv();
     h.load([task("a", { status: "working" })]);

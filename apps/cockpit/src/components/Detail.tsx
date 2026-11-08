@@ -7,6 +7,7 @@ import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
 import { MessageComposer } from "./MessageComposer";
 import { PermissionCard } from "./PermissionCard";
+import { QueueList } from "./QueueList";
 import { TerminalTab } from "./TerminalTab";
 import { TrustCard } from "./TrustCard";
 
@@ -169,6 +170,7 @@ export function Detail({
               </p>
             )}
           </section>
+          {t.live && <QueueList t={t} />}
           <MessageComposer t={t} />
         </main>
       )}

@@ -120,6 +120,12 @@ export interface StartResult {
   screen: string;
 }
 
+/** `mirante_ipc::types::QueuedMessage`: a message held until the turn ends (next first). */
+export interface QueuedMessage {
+  id: string;
+  text: string;
+}
+
 export interface SendResult {
   delivered: SendMode;
   queued: number;
@@ -169,6 +175,10 @@ export const M = {
   sessionInterrupt: "session.interrupt",
   sessionResize: "session.resize",
   messageSend: "message.send",
+  messageListQueued: "message.list_queued",
+  messageEdit: "message.edit",
+  messageRemove: "message.remove",
+  messageReorder: "message.reorder",
   permissionList: "permission.list",
   permissionAnswer: "permission.answer",
   daemonStatus: "daemon.status",

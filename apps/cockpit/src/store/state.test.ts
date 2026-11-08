@@ -225,3 +225,36 @@ describe("history errors", () => {
     expect(s.historyErrors.t1).toBeUndefined();
   });
 });
+
+describe("queue", () => {
+  const q = (id: string, text = id) => ({ id, text });
+  const s0 = () => {
+    const s = reduce(initialState, { type: "connected", snapshot: snapshot([task("t1")], 0) });
+    return reduce(s, { type: "queue", taskId: "t1", list: [q("a"), q("b"), q("c")] });
+  };
+
+  it("a fetched list replaces the task's queue", () => {
+    const s = s0();
+    expect(s.queues.t1).toEqual([q("a"), q("b"), q("c")]);
+    expect(reduce(s, { type: "queue", taskId: "t1", list: [] }).queues.t1).toEqual([]);
+  });
+
+  it("queue_changed applies edits, removals and reorders right away (the refetch confirms)", () => {
+    let s = s0();
+    s = reduce(s, { type: "event", event: ev(1, "t1", "queue_changed", { op: "edited", id: "b", text: "B!" }) });
+    expect(s.queues.t1).toEqual([q("a"), q("b", "B!"), q("c")]);
+    s = reduce(s, { type: "event", event: ev(2, "t1", "queue_changed", { op: "removed", id: "a", text: "a" }) });
+    expect(s.queues.t1).toEqual([q("b", "B!"), q("c")]);
+    s = reduce(s, { type: "event", event: ev(3, "t1", "queue_changed", { op: "reordered", ids: ["c", "b"] }) });
+    expect(s.queues.t1).toEqual([q("c"), q("b", "B!")]);
+    expect(s.feed.t1.map((i) => i.text)).toEqual(["queued message edited", "queued message removed", "queue reordered"]);
+  });
+
+  it("a queued message is delivered off the front; a dropped queue empties", () => {
+    let s = s0();
+    s = reduce(s, { type: "event", event: ev(1, "t1", "message_sent", { mode: "queue", text: "a", id: "a" }) });
+    expect(s.queues.t1.map((m) => m.id)).toEqual(["b", "c"]);
+    s = reduce(s, { type: "event", event: ev(2, "t1", "queue_dropped", { messages: ["b", "c"] }) });
+    expect(s.queues.t1).toEqual([]);
+  });
+});

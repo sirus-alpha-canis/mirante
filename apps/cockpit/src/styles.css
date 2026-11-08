@@ -210,3 +210,13 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 @media (prefers-reduced-motion: no-preference) {
   .card, .chip, .tile { transition: border-color 150ms ease; }
 }
+
+/* The editable queue (Detail, above the composer). */
+.queue { border-top: 1px solid var(--line); padding: 8px 0 0; }
+.queue h2 { margin: 0 0 6px; font-weight: 600; }
+.queue ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.queue-item { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 4px 6px; border-radius: 6px; background: var(--panel-2); }
+.queue-item .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.queue-actions { display: inline-flex; gap: 2px; flex-shrink: 0; }
+.queue-edit { display: flex; gap: 6px; align-items: flex-start; width: 100%; }
+.queue-edit textarea { flex: 1; }
