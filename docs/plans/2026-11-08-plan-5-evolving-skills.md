@@ -613,13 +613,13 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
 
 **Files:** `claude_launch.rs`, `driver/real.rs`.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `plugin_dir_and_always_file_flags_come_before_mcp_config_and_are_pairs` (`--mcp-config` stays last among the variadic flags);
   - `no_skills_no_flags`;
   - `write_skill_bundle_creates_a_fresh_per_session_dir_with_rendered_skill_md_only` (no `hooks/`, `.mcp.json`, `agents/` or `commands/`; files 0600; the dir is create-new);
   - `plugin_json_names_mirante_skills`.
-- [ ] **Step 2: Run** `cargo test -p mirante-core claude_launch && cargo test -p mirante-daemon real`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p mirante-core claude_launch && cargo test -p mirante-daemon real`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - `LaunchInput.{plugin_dir, always_file}`.
   - `real::write_skill_bundle(session_dir, session_id, &InjectedSkills) -> (Option<PathBuf>, Option<PathBuf>)`.
   - The always file text: `<mirante-skills>\nStanding instructions from the operator, reviewed in Mirante.\n\n## <name>\n<body>…</mirante-skills>`.
@@ -628,19 +628,19 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
   - In a dispatched task, `/skills` (or `/help`) lists `mirante-skills:<name>`.
   - The always-on text is followed. If `--append-system-prompt-file` is rejected, switch to the inline fallback (Decision 8).
   - Capture one `PreToolUse` payload of the `Skill` tool.
-- [ ] **Step 5: Commit** `feat(daemon): inject skills into Claude per session (--plugin-dir, --append-system-prompt-file)`.
+- [x] **Step 5: Commit** `feat(daemon): inject skills into Claude per session (--plugin-dir, --append-system-prompt-file)`.
 
 ### Task 13: Codex (first-turn preamble)
 
 **Files:** `driver/codex.rs`, `driver/real.rs`.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `first_turn_of_a_new_thread_carries_the_skills_item_before_the_text`
   - `resume_and_later_turns_do_not`
   - `steer_never_carries_it`
   - `preamble_lists_on_demand_paths_and_always_text`
-- [ ] **Step 2: Run** `cargo test -p mirante-daemon codex`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p mirante-daemon codex`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - `ChildEnv.first_turn: Option<String>` is stored in `Shared` and taken on the first `turn/start` when not resuming.
   - `turn_start_params(.., prefix: Option<&str>)` puts `[{type:text,text:prefix},{type:text,text}]`.
   - Files are written to `<sess>/skills/<session_id>/<name>/`.
@@ -648,26 +648,26 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
   - Codex follows an always-on instruction.
   - Codex reads an on-demand `SKILL.md` path inside the workspace-write sandbox.
   - Record whether `-c 'skills.config=[{path="…/SKILL.md",enabled=true}]'` makes `skills/list` show it. This is for a later switch only.
-- [ ] **Step 5: Commit** `feat(daemon): give Codex its skills as the first turn's leading input item`.
+- [x] **Step 5: Commit** `feat(daemon): give Codex its skills as the first turn's leading input item`.
 
 ### Task 14: MCP `skill_propose` (the `mirante-skills` server)
 
 **Files:** `mirante-mcp/src/{lib.rs,main.rs}`, `claude_launch.rs` (`mcp_json` gains a second server), `driver/real.rs` (`codex_mcp_args` for both servers).
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `skills_surface_lists_only_skill_propose` (`readOnlyHint:false`)
   - `propose_forwards_own_task_and_says_it_awaits_review`
   - `task_key_in_arguments_is_ignored`
   - `args_are_capped` (name 64, description 1024, body 16 KiB)
   - `default_surface_is_still_memory`
   - `mcp_json_has_both_servers_when_both_are_on_and_one_when_one`
-- [ ] **Step 2: Run** `cargo test -p mirante-mcp`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p mirante-mcp`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - `main` reads `--surface skills|memory` (default memory). `Server::new(backend, task, Surface)`.
   - Instructions: "Propose a reusable skill with skill_propose when the operator gives an instruction that would apply to future tasks in this repository. A person reviews every proposal."
   - The `mirante-skills` server is injected when the task's tenant has learning on. `skill_propose` is not pre-allowed in Claude's settings.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(mcp): mirante-skills server with skill_propose; injected only for learning tenants`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(mcp): mirante-skills server with skill_propose; injected only for learning tenants`.
 
 ### Task 15: CLI `mirante skills …`
 
@@ -675,18 +675,43 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
 
 **Commands:** `tenant [<repo>]`, `learn on|off [<repo>]`, `ls`, `show <name> [--version n]`, `proposals [--all]`, `accept <id> [--scope s] [--activation a]`, `reject <id> [--note n]`, `retire|restore <name>`, `rescope <name> <scope>`, `rollback <name> <version>`, `mine [<repo>]`, `add <dir> --scope s [--activation a]`, `lint <SKILL.md>`.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `skills_subcommands_parse`
   - e2e: `skills_add_accept_ls_round_trip`
   - e2e: `skills_lint_exits_1_on_errors_and_prints_rule_and_line`
   - e2e: `tenant_prints_normalized_origin_without_token`
-- [ ] **Step 2: Run** `cargo build --workspace && cargo test -p mirante-cli skills`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo build --workspace && cargo test -p mirante-cli skills`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - `accept`, `reject`, `retire`, `restore`, `rescope`, `rollback` and `learn` follow memory's pattern: `skill.may_review` first, then the typed `/dev/tty` verb, which is an intent check only.
   - `lint` runs offline (exit 0 clean, 1 findings, 3 could not run).
   - Every agent-originated string goes through `untrusted::line`.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(cli): mirante skills (tenant, learn, review queue, add/import, offline lint)`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(cli): mirante skills (tenant, learn, review queue, add/import, offline lint)`.
+
+> **As built (2026-11-08), Batch C.** Tasks 12–15 landed one commit each, TDD (each new test seen failing first; the Task 15 e2e tests were red at build level, the binary not handling `skills` yet). Step 4 of Tasks 12 and 13 is left unchecked: its offline parts were run (below), the interactive ones wait for Task 21. Differences from the text above:
+> - **Task 12.**
+>   - `LaunchInput.always: Option<AlwaysOn>` (`File(path)` → `--append-system-prompt-file`, `Inline(text)` → `--append-system-prompt`) instead of `always_file`, plus `plugin_dir`; both go right after `--settings`, before the variadic `--mcp-config`. `claude_launch::{PLUGIN_NAME, plugin_json}` (name, version, description only).
+>   - The writer is `driver/skill_bundle.rs` (re-exported from `real`): `write_skill_bundle(paths, task, session, Option<&InjectedSkills>, agent) -> Result<Option<SkillBundle>, String>`. Everything for a session goes under `<session dir>/skills/<session id>/` (not `<sess>/claude-plugin` directly): `claude-plugin/` (`.claude-plugin/plugin.json`, `skills/<name>/SKILL.md` + its files) and `always.md`; an always-on skill's bundled files go to `<name>/` and the text says where. Made through `SafeDir` (0700/0600, create-new; a symlinked `skills/` is refused); a new session removes the earlier sessions' bundles first (no skills: they are just removed).
+>   - Every `SKILL.md` is **re-rendered** from the verified bytes: `parse_skill_md` for the body, then `render_skill_md(manifest.name, manifest.description, body)`, so no frontmatter key (`allowed-tools`, `hooks`) reaches Claude even if the signed bytes held one. A bundle that cannot be written is a `skills_failed` step (`{type, error}`) and the session starts without skills.
+>   - The hidden flag: `append_file_supported(claude, 10 s)` probes once per binary (path, size, mtime) with `claude --append-system-prompt-file /dev/null plugin validate --json <missing path>` (a root flag + a subcommand: no session, no model call); "unknown option", a failure or a timeout means inline. The inline text is not capped separately: the hub's budget already caps always-on `SKILL.md` bytes at 8 KiB (headings and wrapper add little).
+>   - Live (Claude 2.1.285, offline): `claude plugin validate --json` on a generated plugin: success, 0 errors, 1 warning (no `author`); repeatable with `MIRANTE_LIVE_CLAUDE=<claude> cargo test -p mirante-daemon live_claude -- --ignored`. `--append-system-prompt-file` is a known root option there (a bogus flag in the same position is "unknown option").
+>   - **Task 21:** `/skills` listing `mirante-skills:<name>`, the always-on text being followed, and one `PreToolUse` payload of the `Skill` tool (the hook still assumes `tool_input.skill`).
+> - **Task 13.**
+>   - `turn_start_params(thread, prefix, text, …)`; `Shared.first_turn` is set only when not resuming, taken by the first `turn/start`, and put back when that start was certainly refused (any error but a timeout or an after-write failure, which may have landed). `turn/steer` never carries it. `ChildEnv.first_turn: Option<&str>`; `CodexDriver::connect_with_first_turn` (`connect` passes none).
+>   - The item is `<mirante-skills>` labeled "operator-approved skills for this repository, reviewed in Mirante (not part of the task)", then `## Standing instructions` (`### <name>` + body) and `## On-demand skills` (`- <name> — <description> — read <abs>/<name>/SKILL.md when relevant`). Files are under `<session dir>/skills/<session id>/<name>/`.
+>   - **Resume:** a resumed Codex thread gets nothing again. The hub does not resolve or record skills for it (`start_session`: Codex + native id → `skills: None`), and the driver leaves the bundle the thread's first turn points at in place (`codex_skill_bundle`). Claude resumes still get their plugin and always-on text (the snapshot caveat stands).
+>   - Live (codex-cli 0.167.0, offline, `CODEX_HOME` a temp dir): `codex app-server generate-json-schema`: `TurnStartParams.input` is an array of `UserInput`, any number of text items. The schema also has `skills/extraRoots/set {extraRoots: [abs path]}` and a `SkillUserInput` input item: a candidate for native per-session skills later (app-server is per task), not used here (Decision 12).
+>   - **Task 21:** Codex following an always-on instruction, reading an on-demand `SKILL.md` inside workspace-write, and the `-c skills.config` / `skills/extraRoots/set` experiment.
+> - **Task 14.**
+>   - `Server::new(backend, task)` stays the memory surface; `Server::with_surface(backend, task, Surface)`; `main` takes `--surface memory|skills` (or `--surface=…`), anything else exits 2. The skills surface lists only `skill_propose` (`readOnlyHint:false`, `destructiveHint:false`) with `SKILLS_INSTRUCTIONS`; memory tools are unknown there and the reverse.
+>   - `skill_propose {name? | base?, description, body, activation?}`: name/base ≤64 bytes (not both), description ≤1024 chars, body ≤16 KiB, activation `always|on_demand`, all checked before the daemon; `task` is always the server's. The answer: `Skill proposal <id> (new skill <n> | edit of <n>) is waiting for a person's review in Mirante. It is not a skill yet.`, redactions, and each lint finding (`rule (severity, line n): message`); every echoed field through `untrusted::field`. The daemon's caps (20 per task, 50 per tenant for agents) and tenant checks apply unchanged.
+>   - `claude_launch::mcp_json(memory, skills, task, home)` (`SKILLS_SERVER = "mirante-skills"`, args `["--surface","skills"]`); `codex_mcp_args(memory, skills, task, home)` (`args` always set). `SpawnRequest.skills_mcp`, set by `Hub::skills_server_for`: confirmed origin + learning on + the `mirante-mcp` binary (missing: logged as `daemon_error`, the session starts). `skill_propose` is never pre-allowed in Claude's settings; memory's read tools only when memory is on.
+>   - e2e `an_agent_proposes_a_skill_through_the_skills_server`: the real `mirante-mcp --surface skills` with the agent marker proposes for its own task (repo scope, `agent` origin), a `task` argument ignored.
+> - **Task 15.**
+>   - `tenant`, `learn` and `mine` compute the checkout's origin in the CLI exactly as the daemon reads it (`origin::origin_of` with `~/.ssh/config` aliases), not the daemon's pinned origin (no wire method gives a checkout's pin; `skill.task_skills` gives a task's). `learn on|off` types `enable` / `disable`; `mine` and `add` need no typed word (the daemon still requires a person). `accept` also takes `--note`. Actions send the shown version's `manifest_hash`.
+>   - `lint` (module `mirante_cli::skilllint`) reads the `SKILL.md` (≤1 MiB) and the regular files beside it (no symlinks, no hidden names, the manifest and signature skipped, 3 levels, 64 files); a `SKILL.md` that does not parse is a `format` error; `SKILL.md` line numbers are the file's (frontmatter counted). Exit 0 clean or warnings only, 1 on an error finding, 3 when it could not run.
+>   - `confirm::no_tty` now says "a review (memory or skills)". Live: `mirante skills tenant` in this repo (origin `git@github.com-personal:…`, temp `MIRANTE_HOME`) prints `github.com/sirus-alpha-canis/mirante`.
+> - **For Batch D:** a `skills_failed` step can appear in the feed; `skill.task_skills` reports what a *new* session would get (a Codex resume gets nothing again). The bridge allowlist is unchanged (`skill.propose` stays out).
 
 ---
 
