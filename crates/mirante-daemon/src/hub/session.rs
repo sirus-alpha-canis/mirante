@@ -197,7 +197,8 @@ impl State {
             Ok(()) => {
                 l.delivery_in_flight = Some(Instant::now());
                 l.left_queue.insert(next.id.clone());
-                let payload = json!({ "mode": SendMode::Queue, "text": next.text, "id": next.id });
+                let payload =
+                    json!({ "mode": SendMode::Queue, "text": super::messages::logged(&next.text), "id": next.id });
                 l.last_sent = Some(next);
                 self.event(Some(task_id), "message_sent", payload)
             }
@@ -228,7 +229,7 @@ impl State {
         });
         for (text, delivery) in verdicts {
             // The person's words, not the label the agent saw.
-            let text = mirante_core::delivery::strip_operator_label(&text);
+            let text = super::messages::logged(mirante_core::delivery::strip_operator_label(&text));
             self.event(Some(task_id), "message_delivery", json!({ "text": text, "delivery": delivery }))?;
         }
         Ok(())
@@ -465,7 +466,7 @@ impl State {
                     l.requeue_at = at + 1;
                     l.delivery_in_flight = None;
                 }
-                let mut payload = json!({ "text": text, "reason": reason });
+                let mut payload = json!({ "text": super::messages::logged(&text), "reason": reason });
                 if let Some(id) = id {
                     payload["id"] = json!(id);
                 }
@@ -515,9 +516,10 @@ impl State {
             DriverEvent::Step(mut v) => {
                 // A message step (Codex `message_confirmed` / `send_unconfirmed`) carries what
                 // the agent was handed: the feed shows the person's words, not the label.
+                // Masked like every message text the log keeps.
                 if let Some(text) = v["text"].as_str() {
-                    let plain = mirante_core::delivery::strip_operator_label(text);
-                    if plain.len() != text.len() {
+                    let plain = super::messages::logged(mirante_core::delivery::strip_operator_label(text));
+                    if plain != text {
                         v["text"] = json!(plain);
                     }
                 }
@@ -556,6 +558,9 @@ impl Hub {
     /// Starts (or, with `resume`, resumes) the task's agent. Fails with a conflict while a
     /// session is live (the per-task lock). Waits until the agent leaves `Booting`.
     pub fn start_session(&self, req: StartSession, resume: bool) -> Result<StartResult> {
+        if let Some(p) = req.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+            super::messages::check_message(p)?;
+        }
         match self.launch(req, resume, false)? {
             Launch::Started(r) => Ok(r),
             Launch::Refused(why) => Err(HubError::Conflict(why.to_string())),

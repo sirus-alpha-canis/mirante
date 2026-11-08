@@ -61,6 +61,30 @@ impl State {
     }
 }
 
+/// Largest message Mirante relays (UTF-8 bytes): a person's paste fits, a runaway does not
+/// reach the agent or the event log.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// A message's text is not empty and at most [`MAX_MESSAGE_BYTES`].
+pub(crate) fn check_message(text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err(HubError::Invalid("empty message".into()));
+    }
+    if text.len() > MAX_MESSAGE_BYTES {
+        return Err(HubError::Invalid(format!(
+            "the message is {} bytes; at most {MAX_MESSAGE_BYTES} are sent (attach to paste more)",
+            text.len()
+        )));
+    }
+    Ok(())
+}
+
+/// A message's text as the event log keeps it: credentials masked. The agent gets the
+/// original.
+pub(crate) fn logged(text: &str) -> String {
+    mirante_core::redact::redact(text)
+}
+
 impl Hub {
     /// Steer: hand the message to the agent now (starts a turn if idle). Refused while a
     /// dialog is open, because typed text would answer it. Queue: hold it until the running
@@ -74,9 +98,7 @@ impl Hub {
     /// [`Hub::send`], stamping who sent it (`person` or `agent`) on its `message_sent` /
     /// `message_queued` event: mining reads only a person's words.
     pub fn send_by(&self, m: SendMessage, by: &str) -> Result<SendResult> {
-        if m.text.trim().is_empty() {
-            return Err(HubError::Invalid("empty message".into()));
-        }
+        check_message(&m.text)?;
         // Only Mirante labels a message as the person's (spec §5): an agent's message that
         // carries the label would pass itself off as theirs.
         let operator = by == "person";
@@ -117,7 +139,7 @@ impl Hub {
             st.event(
                 Some(&task.id),
                 "message_queued",
-                json!({ "text": m.text, "position": position, "id": id, "by": by }),
+                json!({ "text": logged(&m.text), "position": position, "id": id, "by": by }),
             )?;
             // An idle, ready agent with a backlog (an earlier delivery failed) takes the
             // next message now.
@@ -135,7 +157,7 @@ impl Hub {
             l.delivery_in_flight = Some(std::time::Instant::now());
         }
         let queued = l.queue.len();
-        st.event(Some(&task.id), "message_sent", json!({ "mode": m.mode, "text": m.text, "by": by }))?;
+        st.event(Some(&task.id), "message_sent", json!({ "mode": m.mode, "text": logged(&m.text), "by": by }))?;
         st.publish();
         Ok(SendResult { delivered: SendMode::Steer, queued })
     }
@@ -493,6 +515,42 @@ mod tests {
         }
         k.emit(DriverEvent::DialogClosed);
         assert_eq!(wire(&k), vec![label_operator("go"), label_operator("go")]);
+    }
+
+    #[test]
+    fn a_message_s_credentials_reach_the_agent_but_never_the_event_log() {
+        let token = format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        send(&k, &t.id, &format!("push with {token}"), SendMode::Steer).unwrap();
+        send(&k, &t.id, &format!("then {token}"), SendMode::Queue).unwrap();
+        let id = k.hub.list_queued(&t.id).unwrap()[0].id.clone();
+        k.hub.edit_queued(mirante_ipc::types::EditQueued { id, text: format!("then use {token}") }).unwrap();
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        let w = wire(&k);
+        assert!(w.len() == 2 && w.iter().all(|m| m.contains(&token)), "the agent gets the original: {w:?}");
+        let ev = k.hub.lock().store.task_events(&t.id).unwrap();
+        assert!(ev.iter().any(|e| e.kind == "message_sent"));
+        for e in &ev {
+            assert!(!e.payload.to_string().contains(&token), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_message_is_refused() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "c").task;
+        let big = "x".repeat(MAX_MESSAGE_BYTES + 1);
+        for mode in [SendMode::Steer, SendMode::Queue] {
+            assert!(matches!(send(&k, &t.id, &big, mode), Err(HubError::Invalid(_))));
+        }
+        assert!(send(&k, &t.id, &"x".repeat(MAX_MESSAGE_BYTES), SendMode::Steer).is_ok());
+        k.emit(DriverEvent::Status { to: Status::Working, cause: "t".into(), turn_open: true, detail: None });
+        send(&k, &t.id, "small", SendMode::Queue).unwrap();
+        let id = k.hub.list_queued(&t.id).unwrap()[0].id.clone();
+        let r = k.hub.edit_queued(mirante_ipc::types::EditQueued { id, text: big });
+        assert!(matches!(r, Err(HubError::Invalid(_))), "{r:?}");
     }
 
     #[test]

@@ -89,9 +89,7 @@ impl Hub {
 
     /// Rewrites a message that is still queued. Returns the queue.
     pub fn edit_queued(&self, e: EditQueued) -> Result<Vec<QueuedMessage>> {
-        if e.text.trim().is_empty() {
-            return Err(HubError::Invalid("empty message".into()));
-        }
+        super::messages::check_message(&e.text)?;
         let mut st = self.lock();
         let task_id = st.queue_of(&e.id)?;
         let l = st.live.get_mut(&task_id).expect("queue_of found it");
@@ -101,7 +99,11 @@ impl Hub {
         }
         let q = l.queue.iter_mut().find(|q| q.id == e.id).expect("queue_of found it");
         q.text = e.text.clone();
-        st.event(Some(&task_id), "queue_changed", json!({ "op": "edited", "id": e.id, "text": e.text }))?;
+        st.event(
+            Some(&task_id),
+            "queue_changed",
+            json!({ "op": "edited", "id": e.id, "text": super::messages::logged(&e.text) }),
+        )?;
         st.publish();
         Ok(st.queue_view(&task_id))
     }
@@ -116,7 +118,11 @@ impl Hub {
         if at < l.requeue_at {
             l.requeue_at -= 1;
         }
-        st.event(Some(&task_id), "queue_changed", json!({ "op": "removed", "id": gone.id, "text": gone.text }))?;
+        st.event(
+            Some(&task_id),
+            "queue_changed",
+            json!({ "op": "removed", "id": gone.id, "text": super::messages::logged(&gone.text) }),
+        )?;
         st.publish();
         Ok(st.queue_view(&task_id))
     }
