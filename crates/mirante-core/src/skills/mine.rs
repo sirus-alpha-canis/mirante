@@ -10,8 +10,9 @@
 //! two words of the command, kept to `[A-Za-z0-9._/-]`: the command is the agent's). A cluster qualifies with at least 3 distinct tasks; tenants
 //! never mix. [`draft`] turns one into a proposal: skipped when an active in-scope skill
 //! already says it, an edit of a repo or org skill of the same tenant that was active in
-//! ≥ 2/3 of its tasks (never a personal skill: that would carry one client's words to every
-//! other), else a new always-on skill. Deterministic: the same history gives the same drafts.
+//! ≥ 2/3 of its tasks and is about the same thing (≥ 1/3 of the line's words, stopwords
+//! aside, in its name, description or body: [`relevance`]); never a personal skill: that
+//! would carry one client's words to every other), else a new always-on skill. Deterministic: the same history gives the same drafts.
 use std::collections::{HashMap, HashSet};
 
 use super::format::{render_skill_md, Activation};
@@ -416,6 +417,27 @@ fn description_text(s: &str) -> String {
     untrusted::line(s, 120).replace(['<', '>'], " ")
 }
 
+/// Least share of the mined line's words an existing skill must also say (in its name,
+/// description or body) before the line is proposed as an edit of it: a third.
+pub const MIN_RELEVANCE: f64 = 1.0 / 3.0;
+
+/// Two words name the same thing: equal, or one starts the other and both have at least
+/// four letters (`commit` / `commitar`, `test` / `tests`): a crude stem across PT and EN.
+fn same_word(a: &str, b: &str) -> bool {
+    a == b || (a.len().min(b.len()) >= 4 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// The share of `line` (its tokens) that `skill` also says, in its name, description or
+/// body (stopwords never count: [`tokens`] drops them). Deterministic, no model.
+pub fn relevance(line: &[String], skill: &ActiveSkill) -> f64 {
+    if line.is_empty() {
+        return 0.0;
+    }
+    let said = tokens(&format!("{}\n{}\n{}", skill.name, skill.description, skill.body));
+    let shared = line.iter().filter(|w| said.iter().any(|s| same_word(w, s))).count();
+    shared as f64 / line.len() as f64
+}
+
 /// The proposal for cluster `c`, or `None` when it is covered: an active skill in scope of
 /// the cluster's repos has a body line with Jaccard ≥ 0.5 to the representative (the
 /// medoid). `active`: active skills; `active_in_tasks`: the skills active in each task;
@@ -466,19 +488,31 @@ pub fn draft(
         _ => Scope::Org(c.tenant.clone()),
     };
     // An edit when one in-scope skill of the cluster's own tenant (a repo or org scope
-    // inside it) was active in at least 2/3 of the cluster's tasks. A personal skill (or one
-    // of another tenant) may cover a line but is never edited: the tenant's words would
+    // inside it) was active in at least 2/3 of the cluster's tasks and is about the same
+    // thing (at least [`MIN_RELEVANCE`] of the line's words in its name, description or
+    // body): a skill that merely ran alongside (an API-lookup skill in tasks where the
+    // operator kept asking for clippy) is not where the line belongs. A personal skill (or
+    // one of another tenant) may cover a line but is never edited: the tenant's words would
     // reach every other client through it.
     let own_tenant = |s: &ActiveSkill| match &s.scope {
         Scope::Repo(k) | Scope::Org(k) => super::origin::tenant(k) == c.tenant,
         Scope::Personal => false,
+    };
+    // What the line is about: a denial's tool and command, else the line's own words.
+    let topic = match &c.denial {
+        Some((tool, head)) => {
+            let mut t = vec![tool.to_lowercase()];
+            t.extend(tokens(head));
+            t
+        }
+        None => tokens(&line),
     };
     let ran_with = |s: &ActiveSkill| {
         c.tasks.iter().filter(|t| active_in_tasks.get(*t).is_some_and(|names| names.contains(&s.name))).count()
     };
     let mut candidates: Vec<(&ActiveSkill, usize)> = in_scope
         .iter()
-        .filter(|s| own_tenant(s))
+        .filter(|s| own_tenant(s) && relevance(&topic, s) >= MIN_RELEVANCE)
         .map(|s| (*s, ran_with(s)))
         .filter(|(_, n)| n * 3 >= c.tasks.len() * 2)
         .collect();
@@ -634,7 +668,11 @@ mod tests {
         let elsewhere = active("lint-first", Scope::org(B), "rode cargo clippy antes de commitar\n");
         assert!(draft(&c[0], &[elsewhere], &HashMap::new(), &[]).is_some());
         // Not covered, but an in-scope skill was active in 2 of the 3 tasks: an edit of it.
-        let style = active("house-style", Scope::org(A), "Use tabs.\n");
+        // (Related: its description shares the line's words, see `relevance`.)
+        let style = ActiveSkill {
+            description: "House style for cargo projects: what to run before a commit".into(),
+            ..active("house-style", Scope::org(A), "Use tabs.\n")
+        };
         let ran: HashMap<String, Vec<String>> = [("t1", vec!["house-style"]), ("t3", vec!["house-style"])]
             .iter()
             .map(|(t, v)| (t.to_string(), v.iter().map(|s| s.to_string()).collect()))
@@ -651,6 +689,41 @@ mod tests {
         assert_eq!(draft(&c[0], &[style], &once, &[]).unwrap().kind, Kind::New);
     }
 
+    /// The dogfood case: the clippy rule was appended to an API-lookup skill only because
+    /// that skill ran in 2 of the 3 tasks. Unrelated: a new skill instead.
+    #[test]
+    fn an_unrelated_skill_that_ran_in_the_tasks_is_not_edited() {
+        let c = cluster(&units(&clippy_three()), &Params::default());
+        let api = ActiveSkill {
+            description: "Look up an HTTP endpoint in the OpenAPI spec before calling it".into(),
+            ..active("api-lookup", Scope::org(A), "Find the route in openapi.yaml and read its schema.\n")
+        };
+        let ran: HashMap<String, Vec<String>> = [("t1", vec!["api-lookup"]), ("t3", vec!["api-lookup"])]
+            .iter()
+            .map(|(t, v)| (t.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        let d = draft(&c[0], std::slice::from_ref(&api), &ran, &[]).unwrap();
+        assert_eq!(d.kind, Kind::New, "the clippy rule has nothing to do with API lookups");
+        assert!(d.body.contains("clippy") && !d.body.contains("openapi"), "{}", d.body);
+    }
+
+    /// A skill about the same thing (its name, description or body share the line's words)
+    /// that ran in the tasks is edited.
+    #[test]
+    fn a_related_skill_that_ran_in_the_tasks_is_edited() {
+        let c = cluster(&units(&clippy_three()), &Params::default());
+        let rust = ActiveSkill {
+            description: "Rust checks before a commit".into(),
+            ..active("rust-checks", Scope::org(A), "Run cargo fmt before every commit.\n")
+        };
+        let ran: HashMap<String, Vec<String>> = [("t1", vec!["rust-checks"]), ("t2", vec!["rust-checks"])]
+            .iter()
+            .map(|(t, v)| (t.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        let d = draft(&c[0], std::slice::from_ref(&rust), &ran, &[]).unwrap();
+        assert_eq!(d.kind, Kind::Edit { name: "rust-checks".into(), base_hash: "h".repeat(64) });
+    }
+
     #[test]
     fn a_personal_or_other_tenant_skill_is_never_edited_with_a_tenants_words() {
         // Three tasks of tenant A over two repos, an always-on personal skill active in all.
@@ -659,7 +732,7 @@ mod tests {
         let c = cluster(&units(&u), &Params::default());
         let all: HashMap<String, Vec<String>> =
             ["t1", "t2", "t3"].iter().map(|t| (t.to_string(), vec!["mine".to_string()])).collect();
-        let personal = active("mine", Scope::Personal, "Be terse.\n");
+        let personal = active("mine", Scope::Personal, "Be terse. Run cargo clippy checks before every commit.\n");
         let d = draft(&c[0], std::slice::from_ref(&personal), &all, &[]).unwrap();
         assert_eq!(d.kind, Kind::New, "A's line would leak into every client through a personal skill");
         assert_eq!(d.scope, Scope::org(A));
@@ -667,9 +740,13 @@ mod tests {
         let says = active("mine", Scope::Personal, "rode cargo clippy antes de commitar\n");
         assert!(draft(&c[0], &[says], &all, &[]).is_none());
         // A repo or org skill of the tenant itself is an edit candidate.
-        let org = active("mine", Scope::org(A), "Be terse.\n");
+        let org = active("mine", Scope::org(A), "Be terse. Run cargo clippy checks before every commit.\n");
         assert!(matches!(draft(&c[0], &[org], &all, &[]).unwrap().kind, Kind::Edit { .. }));
-        let repo = active("mine", Scope::repo(&format!("{A}/api")), "Be terse.\n");
+        let repo = active(
+            "mine",
+            Scope::repo(&format!("{A}/api")),
+            "Be terse. Run cargo clippy checks before every commit.\n",
+        );
         assert!(matches!(draft(&c[0], &[repo], &all, &[]).unwrap().kind, Kind::Edit { .. }));
     }
 
