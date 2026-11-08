@@ -1064,6 +1064,7 @@ impl State {
             tool_use_id: l.engine.tool_use_id_for(ev),
             tool_name: ev.tool_name.clone(),
             description,
+            detail: ev.permission_detail(),
             hook_lost: mirante_ipc::hookloss::fingerprint(&self.paths),
         };
         if key.tool_use_id.is_some() && l.dialogs.values().any(|k| k.same_dialog(&key)) {
@@ -1077,7 +1078,7 @@ impl State {
             .map(|p| p.id)
             .collect();
         let tool = ev.tool_name.clone().unwrap_or_else(|| "unknown".into());
-        let card = self.store.create_permission_request(session_id, &tool, &ev.permission_detail())?;
+        let card = self.store.create_permission_request(session_id, &tool, &key.detail)?;
         for id in older {
             self.store.answer_permission(&id, PermissionStatus::Denied)?;
             if let Some(l) = self.live.get_mut(task_id) {

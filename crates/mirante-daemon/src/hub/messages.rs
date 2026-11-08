@@ -243,7 +243,7 @@ impl Hub {
                         }
                         Ok(())
                     });
-                    (p.detail.clone(), k.description.clone(), Some(guard))
+                    (k.detail.clone(), k.description.clone(), Some(guard))
                 }
                 AgentKind::Codex => {
                     let key = l.perm_keys.get(&p.id).cloned().ok_or_else(|| {
@@ -591,6 +591,32 @@ mod tests {
         let ev = k.hub.lock().store.task_events(&t.id).unwrap();
         let answered = ev.iter().find(|e| e.kind == "permission_answered").unwrap();
         assert_eq!(answered.payload["by"], "person", "a person's answer is stamped as theirs");
+    }
+
+    #[test]
+    fn a_card_s_credentials_are_never_stored_but_the_typist_matches_the_real_command() {
+        let token = format!("{}{}", "sk-", "live0123456789abcdefghijklmnop");
+        let cmd = format!("curl -H \"Authorization: Bearer {token}\" https://api.example.com");
+        let k = Kit::new();
+        k.inline();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit"}));
+        k.tool_use("t1");
+        k.hook(&t.id, perm("t1", &cmd, None));
+        let p = k.hub.permissions().unwrap();
+        assert!(!p[0].request.detail.contains(&token) && p[0].request.detail.contains("«redacted»"));
+        k.hub.answer_permission(AnswerPermission { id: p[0].request.id.clone(), allow: true }).unwrap();
+        // The dialog on screen shows the real command: the typist matches that.
+        assert_eq!(k.calls(), vec![format!("answer:{cmd}:Bash:true")]);
+        // Codex cards too.
+        let c = k.started(AgentKind::Codex, "c").task;
+        k.emit(DriverEvent::PermissionRequested { key: "7".into(), tool: "command".into(), detail: cmd.clone() });
+        let ev = k.hub.lock().store.task_events(&t.id).unwrap();
+        let ev2 = k.hub.lock().store.task_events(&c.id).unwrap();
+        for e in ev.iter().chain(ev2.iter()) {
+            assert!(!e.payload.to_string().contains(&token), "{e:?}");
+        }
+        assert!(k.hub.permissions().unwrap().iter().all(|p| !p.request.detail.contains(&token)));
     }
 
     #[test]

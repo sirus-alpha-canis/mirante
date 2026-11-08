@@ -969,12 +969,16 @@ fn permission_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionRequ
 }
 
 impl Store {
+    /// A pending permission card. Its `detail` (a command, a path, a patch) is stored with
+    /// credentials masked ([`crate::redact::redact`]), in the row and in its event: the
+    /// live dialog's raw text stays in the daemon's memory only.
     pub fn create_permission_request(
         &mut self,
         session_id: &str,
         tool: &str,
         detail: &str,
     ) -> Result<PermissionRequest> {
+        let detail = &crate::redact::redact(detail);
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let s = load_session(&tx, session_id)?;
         if s.ended_at.is_some() {
@@ -1112,6 +1116,22 @@ mod permission_tests {
         assert!(s.pending_permissions(&t.id).unwrap().is_empty());
         let again = s.answer_permission(&p.id, PermissionStatus::AllowedOnce).unwrap_err();
         assert!(matches!(again, CoreError::InvalidTransition { kind: "permission", .. }), "{again}");
+    }
+
+    #[test]
+    fn a_permission_card_is_stored_without_its_credentials() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = s.create_task(sample_task("feat-a")).unwrap();
+        let c = s.create_conversation(&t.id).unwrap();
+        let sess = s.start_session(&t.id, &c.id).unwrap();
+        let token = format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let p = s
+            .create_permission_request(&sess.id, "Bash", &format!("git push https://x:{token}@github.com/a/b"))
+            .unwrap();
+        assert!(!p.detail.contains(&token), "{}", p.detail);
+        assert_eq!(s.pending_permissions(&t.id).unwrap()[0].detail, p.detail);
+        let ev = s.task_events(&t.id).unwrap();
+        assert!(ev.iter().all(|e| !e.payload.to_string().contains(&token)));
     }
 
     #[test]

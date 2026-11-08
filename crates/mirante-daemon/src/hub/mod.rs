@@ -230,6 +230,9 @@ pub(crate) struct DialogKey {
     /// The hook's `tool_input.description` (Bash shows it in the dialog box below the
     /// command); the driver matches it too.
     pub(crate) description: Option<String>,
+    /// The dialog's detail as the agent asked it (the stored card has its credentials
+    /// masked; the dialog on screen shows them): what the typist matches. Memory only.
+    pub(crate) detail: String,
     /// The hook-loss marker when the card was created ([`mirante_ipc::hookloss`]). Not part
     /// of the dialog's identity (see [`DialogKey::same_dialog`]).
     pub(crate) hook_lost: mirante_ipc::hookloss::Fingerprint,
