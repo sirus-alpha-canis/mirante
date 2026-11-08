@@ -359,6 +359,19 @@ fn resolve_agent(agent: Agent) -> Result<PathBuf, DriverError> {
     agent_bin::resolve(agent, &Lookup::from_env(agent)).map(|r| r.path).map_err(DriverError::Failed)
 }
 
+/// Where a binary came from, and the shims passed over on the way ("PATH; skipped cmux shim
+/// /Users/me/.cmuxterm/cmux-cli-shims/x/claude").
+fn source_note(r: &agent_bin::ResolvedBin) -> String {
+    let mut s = r.source.to_string();
+    if !r.skipped_shims.is_empty() {
+        let list: Vec<String> = r.skipped_shims.iter().map(|p| p.display().to_string()).collect();
+        let what =
+            if r.skipped_shims.iter().all(|p| p.to_string_lossy().contains("cmux")) { "cmux shim" } else { "shim" };
+        s.push_str(&format!("; skipped {what} {}", list.join(", ")));
+    }
+    s
+}
+
 /// Each agent binary as this daemon would resolve it (for `mirante doctor`).
 pub fn agents_report() -> Vec<AgentBinView> {
     agents_report_with(Lookup::from_env)
@@ -371,7 +384,7 @@ pub fn agents_report_with(lookup: impl Fn(Agent) -> Lookup) -> Vec<AgentBinView>
             Ok(r) => AgentBinView {
                 agent: agent.exe().to_string(),
                 path: Some(r.path.to_string_lossy().into_owned()),
-                source: Some(r.source.to_string()),
+                source: Some(source_note(&r)),
                 error: None,
             },
             Err(e) => AgentBinView { agent: agent.exe().to_string(), path: None, source: None, error: Some(e) },
@@ -433,6 +446,14 @@ impl RealFactory {
 }
 
 impl DriverFactory for RealFactory {
+    fn check_agent(&self, agent: AgentKind) -> Result<(), String> {
+        let agent = match agent {
+            AgentKind::Claude => Agent::Claude,
+            AgentKind::Codex => Agent::Codex,
+        };
+        agent_bin::resolve(agent, &Lookup::from_env(agent)).map(|_| ())
+    }
+
     fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
         match req.task.agent {
             AgentKind::Claude => self.claude(&req, sink),
@@ -686,6 +707,30 @@ mod tests {
         assert_eq!(r[0].source.as_deref(), Some("MIRANTE_CLAUDE_BIN"));
         assert_eq!(r[1].agent, "codex");
         assert!(r[1].path.is_none() && r[1].error.as_deref().is_some_and(|e| e.contains("no codex")), "{:?}", r[1]);
+    }
+
+    #[test]
+    fn the_agents_report_names_a_shim_it_passed_over() {
+        let d = TestDir::new();
+        let mk = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let p = dir.join("claude");
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let shim = mk(&d.path().join(".cmuxterm/cmux-cli-shims/x"));
+        let real = mk(&d.path().join("bin"));
+        let path = std::env::join_paths([shim.parent().unwrap(), real.parent().unwrap()]).unwrap();
+        let l = |_| mirante_core::agent_bin::Lookup {
+            override_bin: None,
+            path_var: Some(path.to_string_lossy().into_owned()),
+            home: None,
+            well_known: false,
+        };
+        let r = agents_report_with(l);
+        assert_eq!(r[0].path.as_deref(), Some(real.to_str().unwrap()));
+        assert_eq!(r[0].source.as_deref(), Some(format!("PATH; skipped cmux shim {}", shim.display()).as_str()));
     }
     #[test]
     fn claude_gets_its_session_bundle_before_mcp_config_with_the_inline_fallback() {

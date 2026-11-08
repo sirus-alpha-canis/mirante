@@ -592,6 +592,17 @@ impl Hub {
         }
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
         let by_person = self.identify(caller) == dna::Identity::Person;
+        // Before anything is made: a folder that cannot hold a worktree, or an agent that
+        // cannot be found, leaves no branch or checkout behind.
+        if let Some(why) = mirante_core::worktree::checkout_problem(&repo) {
+            return Err(HubError::Invalid(why));
+        }
+        if let Err(why) = self.factory.check_agent(p.agent) {
+            return Err(HubError::Invalid(format!(
+                "{why}\n(the daemon looks for the agent with its own environment: set the variable in \
+                 your shell profile, then run `mirante daemon restart`)"
+            )));
+        }
         let (checkout, origin, tenant) = self.origin_info(&repo);
         // Worktree first, then the task row (rolled back below if the row fails). A crash in
         // between leaves a checkout no task owns: recovery reports it as an orphan and never
@@ -891,6 +902,41 @@ mod tests {
     use super::*;
     use mirante_ipc::types::CreateTask;
     use std::process::Command;
+
+    fn create_in(k: &Kit, repo: &Path, branch: &str) -> Result<TaskView> {
+        k.hub.create_task(CreateTask {
+            repo: repo.to_string_lossy().into_owned(),
+            agent: AgentKind::Codex,
+            branch: branch.into(),
+            base: None,
+            goal: "go".into(),
+            title: None,
+        })
+    }
+
+    #[test]
+    fn a_missing_agent_is_refused_before_any_branch_or_worktree_exists() {
+        let k = Kit::new();
+        *k.factory.missing_agent.lock().unwrap() = Some("no codex in PATH=/usr/bin; set MIRANTE_CODEX_BIN".into());
+        let e = create_in(&k, &k.repo, "feat/x").unwrap_err();
+        assert!(matches!(e, HubError::Invalid(_)), "{e:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("MIRANTE_CODEX_BIN") && msg.contains("mirante daemon restart"), "{msg}");
+        let branches =
+            Command::new("git").arg("-C").arg(&k.repo).args(["branch", "--list", "feat/x"]).output().unwrap();
+        assert!(branches.stdout.is_empty(), "no branch was made");
+        assert!(k.hub.list_tasks(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_repository_is_named_plainly() {
+        let k = Kit::new();
+        let plain = k.dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let e = create_in(&k, &plain, "b").unwrap_err();
+        assert!(matches!(e, HubError::Invalid(_)), "{e:?}");
+        assert!(e.to_string().contains("is not a git repository"), "{e}");
+    }
 
     #[test]
     fn task_diff_reports_committed_uncommitted_and_untracked_changes() {

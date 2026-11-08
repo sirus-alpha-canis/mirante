@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use mirante_core::model::{Status, Task};
+use mirante_core::model::{AgentKind, Status, Task};
 use mirante_ipc::types::BootState;
 use mirante_ipc::Paths;
 use serde_json::Value;
@@ -380,6 +380,12 @@ pub struct SpawnRequest {
 
 pub trait DriverFactory: Send + Sync {
     fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError>;
+
+    /// Whether `agent`'s binary can be found, checked before a task's worktree is made so a
+    /// missing agent leaves nothing behind. `Err` says what was tried.
+    fn check_agent(&self, _agent: AgentKind) -> Result<(), String> {
+        Ok(())
+    }
 
     /// The memory MCP server binary, or why there is none (see [`real::mcp_bin`]).
     fn memory_server(&self) -> Result<std::path::PathBuf, String> {

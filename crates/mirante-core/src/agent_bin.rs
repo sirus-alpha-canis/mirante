@@ -68,6 +68,9 @@ impl fmt::Display for BinSource {
 pub struct ResolvedBin {
     pub path: PathBuf,
     pub source: BinSource,
+    /// Executables passed over because they are (or resolve into) a wrapper shim, in the
+    /// order they were met (`mirante doctor` names them).
+    pub skipped_shims: Vec<PathBuf>,
 }
 
 /// What resolution looks at; the process's own values in [`Lookup::from_env`].
@@ -158,22 +161,32 @@ pub fn resolve(agent: Agent, l: &Lookup) -> Result<ResolvedBin, String> {
     if let Some(bin) = l.override_bin.as_deref().filter(|b| !b.is_empty()) {
         let p = PathBuf::from(bin);
         return if is_executable(&p) {
-            Ok(ResolvedBin { path: p, source: BinSource::Override(var) })
+            Ok(ResolvedBin { path: p, source: BinSource::Override(var), skipped_shims: Vec::new() })
         } else {
             Err(format!("{var}={bin} is not an executable file"))
         };
     }
     let path_var = l.path_var.as_deref().unwrap_or_default();
+    let mut skipped_shims = Vec::new();
+    let mut pick = |p: &PathBuf| {
+        if usable(p) {
+            return true;
+        }
+        if is_executable(p) && !skipped_shims.contains(p) {
+            skipped_shims.push(p.clone());
+        }
+        false
+    };
     if let Some(p) = std::env::split_paths(path_var)
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(agent.exe()))
-        .find(|p| usable(p))
+        .find(&mut pick)
     {
-        return Ok(ResolvedBin { path: p, source: BinSource::Path });
+        return Ok(ResolvedBin { path: p, source: BinSource::Path, skipped_shims });
     }
     let well_known = if l.well_known { well_known_dirs(agent, l.home.as_deref()) } else { Vec::new() };
-    if let Some(p) = well_known.into_iter().map(|d| d.join(agent.exe())).find(|p| usable(p)) {
-        return Ok(ResolvedBin { path: p, source: BinSource::WellKnown });
+    if let Some(p) = well_known.into_iter().map(|d| d.join(agent.exe())).find(&mut pick) {
+        return Ok(ResolvedBin { path: p, source: BinSource::WellKnown, skipped_shims });
     }
     Err(format!(
         "no {exe} outside shim dirs in PATH={path_var} or the usual install directories (~/.local/bin, \
@@ -261,6 +274,7 @@ mod tests {
         let real = bin(&home.join(".local/bin"), "claude", 0o755);
         let r = resolve(Agent::Claude, &lookup(None, &[&shim, &linked], &home)).unwrap();
         assert_eq!((r.path, r.source), (real, BinSource::WellKnown));
+        assert_eq!(r.skipped_shims, vec![shim.join("claude"), linked.join("claude")]);
     }
 
     #[test]

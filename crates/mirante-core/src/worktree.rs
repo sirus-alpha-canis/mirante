@@ -134,6 +134,26 @@ pub fn repo_name(repo: &Path) -> Result<String> {
     })
 }
 
+/// Why `repo` cannot hold a task's worktree, in a person's words: not a git repository, or
+/// one without a commit yet (a new branch needs a base). `None` when it can.
+pub fn checkout_problem(repo: &Path) -> Option<String> {
+    let inside = Git::new(repo).args(["rev-parse", "--is-inside-work-tree"]).output();
+    if !inside.is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"true")) {
+        return Some(format!(
+            "{} is not a git repository: run `git init` there and commit once, or pass the path of a checkout",
+            repo.display()
+        ));
+    }
+    let head = Git::new(repo).args(["rev-parse", "--verify", "--quiet", "HEAD"]).output();
+    if !head.is_ok_and(|o| o.status.success()) {
+        return Some(format!(
+            "{} has no commit yet: commit once (git commit --allow-empty -m init) so a task branch has a base",
+            repo.display()
+        ));
+    }
+    None
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     let out = Git::new(repo)
         .args(["show-ref", "--verify", "--quiet", "--end-of-options", &format!("refs/heads/{branch}")])
@@ -412,6 +432,28 @@ mod tests {
             "init",
         ]);
         repo
+    }
+
+    #[test]
+    fn a_plain_folder_or_an_empty_repo_is_named_for_what_it_lacks() {
+        let d = TempDir::new("checkout-problem");
+        let plain = d.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let e = checkout_problem(&plain).unwrap();
+        assert!(e.contains("is not a git repository") && e.contains("git init"), "{e}");
+        let empty = d.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(Command::new("git").arg("-C").arg(&empty).args(["init", "-q"]).status().unwrap().success());
+        let e = checkout_problem(&empty).unwrap();
+        assert!(e.contains("has no commit yet"), "{e}");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&empty)
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "i"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(checkout_problem(&empty), None);
     }
 
     #[test]

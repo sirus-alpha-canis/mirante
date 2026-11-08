@@ -3,6 +3,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use mirante_core::model::AgentKind;
+
 use super::proctree::Proc;
 use super::{AnswerGuard, Attachment, Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
@@ -162,6 +164,8 @@ pub struct FakeFactory {
     pub skills: Mutex<Vec<Option<super::InjectedSkills>>>,
     /// Every spawn request's `withdrawn`, in order.
     pub withdrawn: Mutex<Vec<Vec<String>>>,
+    /// When set, `check_agent` fails with this message.
+    pub missing_agent: Mutex<Option<String>>,
 }
 
 impl FakeFactory {
@@ -175,6 +179,10 @@ impl FakeFactory {
 }
 
 impl DriverFactory for Arc<FakeFactory> {
+    fn check_agent(&self, _agent: AgentKind) -> Result<(), String> {
+        self.missing_agent.lock().unwrap().clone().map_or(Ok(()), Err)
+    }
+
     fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
         if let Some((entered, release)) = self.spawn_gate.lock().unwrap().take() {
             let _ = entered.send(());
