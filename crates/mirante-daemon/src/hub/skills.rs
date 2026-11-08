@@ -662,17 +662,24 @@ impl Hub {
         Ok(self.proposal_view(inserted.proposal))
     }
 
-    /// A name for a new skill from its description, `-2`, `-3`… past taken ones.
-    fn fresh_name(&self, description: &str) -> Result<String> {
+    /// A name for a new skill from its description (see [`Hub::fresh_from`]).
+    fn fresh_name(&self, description: &str, taken: impl Fn(&SkillRow) -> bool) -> Result<String> {
         let mut base: String = slugify(description).chars().take(40).collect();
         base = base.trim_end_matches('-').to_string();
         if !is_name(&base) {
             base = "skill".into();
         }
+        self.fresh_from(&base, taken)
+    }
+
+    /// `base`, else `base-2`, `base-3`… : the first name no skill holds for which `taken`
+    /// says yes (an agent counts only the skills it may see).
+    fn fresh_from(&self, base: &str, taken: impl Fn(&SkillRow) -> bool) -> Result<String> {
         let st = self.lock();
         for n in 1..=100 {
-            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
-            if st.store.skill_get(&name)?.is_none() {
+            let name =
+                if n == 1 { base.to_string() } else { format!("{}-{n}", base.chars().take(60).collect::<String>()) };
+            if !st.store.skill_get(&name)?.as_ref().is_some_and(&taken) {
                 return Ok(name);
             }
         }
@@ -717,6 +724,8 @@ impl Hub {
             return Err(HubError::Conflict(format!("skill learning is not enabled for {}", o.tenant)));
         }
         let (description, body, redactions) = clean_text(&p.description, &p.body)?;
+        // The name the agent is told, when it differs from the one filed.
+        let mut shown: Option<String> = None;
         let (kind, name, base_hash, scope, activation) = match &p.base {
             Some(base) => {
                 // An agent edits only its own tenant's skills (never a personal one), and a
@@ -731,16 +740,26 @@ impl Hub {
                 ("edit", row.name, Some(row.manifest_hash), row.scope, activation)
             }
             None => {
-                let name = match &p.name {
+                // An agent sees only its own tenant's skills: a name another tenant's (or a
+                // personal) skill holds is answered as a free one, and the proposal is filed
+                // under a fresh name the person sees at review (nothing reaches the agent).
+                let tenant = o.tenant.clone();
+                let visible =
+                    |r: &SkillRow| agent_task.is_none() || scope_tenant(&r.scope).as_deref() == Some(tenant.as_str());
+                let wanted = match &p.name {
                     Some(n) => {
                         check_name(n)?;
-                        if self.lock().store.skill_get(n)?.is_some() {
+                        if self.lock().store.skill_get(n)?.as_ref().is_some_and(visible) {
                             return Err(HubError::Conflict(format!("skill {n} exists: propose an edit with base {n}")));
                         }
                         n.clone()
                     }
-                    None => self.fresh_name(&description)?,
+                    None => self.fresh_name(&description, &visible)?,
                 };
+                let name = self.fresh_from(&wanted, |_| true)?;
+                if name != wanted {
+                    shown = Some(wanted);
+                }
                 let activation = parse_activation(p.activation.as_deref(), Activation::Always)?;
                 ("new", name, None, Scope::Repo(o.origin.clone()), activation)
             }
@@ -769,7 +788,11 @@ impl Hub {
             lint: lint(&draft),
             redactions,
         };
-        self.insert_proposal(&new)
+        let mut view = self.insert_proposal(&new)?;
+        if let Some(n) = shown {
+            view.proposal.name = n;
+        }
+        Ok(view)
     }
 
     /// A person adopts a skill from a folder (or inline text) as a proposal: an edit when
@@ -1823,6 +1846,64 @@ pub(crate) mod tests {
         // A person (the CLI) may still propose an edit of any skill.
         let p = k.hub.skill_propose(&Caller::Person, propose(&mine.id, None, Some("theirs"), "b\n")).unwrap();
         assert_eq!(p.proposal.base_hash.as_deref(), Some("hash-of-theirs"));
+    }
+
+    /// A new skill named like another tenant's (or a personal) skill: the agent gets the
+    /// answer it would get for a free name, and the proposal is filed under a fresh name a
+    /// person sees. Its own tenant's names stay a conflict (it may edit those).
+    #[test]
+    fn an_agent_new_name_taken_outside_its_tenant_answers_as_if_free() {
+        let k = Kit::new();
+        let mine = learning(&k, "mine");
+        let row = |name: &str, scope: Scope| SkillRow {
+            name: name.into(),
+            version: 1,
+            manifest_hash: format!("hash-of-{name}"),
+            scope,
+            activation: Activation::Always,
+            agents: vec!["claude".into()],
+            status: "active".into(),
+            description: "d".into(),
+            updated_at: 0,
+        };
+        for r in [
+            row("ours", Scope::Repo("github.com/acme/app".into())),
+            row("theirs", Scope::org("github.com/other")),
+            row("private", Scope::Personal),
+            // What a name derived from the description would be.
+            row("run-the-tests-before-committing", Scope::org("github.com/other")),
+        ] {
+            k.hub.lock().store.skill_upsert_current(&r).unwrap();
+        }
+        let agent = Peer::spawn(&[(AGENT_ENV, &mine.id)], k.dir.path());
+        let new = |name: Option<&str>| k.hub.skill_propose(&agent.caller(), propose(&mine.id, name, None, "b\n"));
+        let own = new(Some("ours")).unwrap_err();
+        assert!(matches!(own, HubError::Conflict(_)), "{own:?}");
+        let free = new(Some("nowhere")).unwrap();
+        let shape = |v: &SkillProposalView, n: &str| {
+            let mut j = serde_json::to_value(v).unwrap();
+            for k in ["id", "created_at"] {
+                j[k] = serde_json::Value::Null;
+            }
+            j.to_string().replace(n, "NAME")
+        };
+        for name in ["theirs", "private"] {
+            let v = new(Some(name)).unwrap();
+            assert_eq!(v.proposal.name, name, "the agent sees the name it asked for");
+            assert_eq!(shape(&v, name), shape(&free, "nowhere"), "{name} leaks something");
+            // Filed under a fresh name: accepting cannot collide with the other skill.
+            let stored = k.hub.lock().store.skill_proposal(&v.proposal.id).unwrap();
+            assert_ne!(stored.name, name);
+            assert!(stored.name.starts_with(name), "{}", stored.name);
+        }
+        // No name: derived from the description as if the other tenant's skill were not there.
+        let v = new(None).unwrap();
+        assert_eq!(v.proposal.name, "run-the-tests-before-committing");
+        let stored = k.hub.lock().store.skill_proposal(&v.proposal.id).unwrap();
+        assert_eq!(stored.name, "run-the-tests-before-committing-2");
+        // A person sees every name: the taken one is a conflict for them.
+        let p = k.hub.skill_propose(&Caller::Person, propose(&mine.id, Some("theirs"), None, "b\n"));
+        assert!(matches!(p, Err(HubError::Conflict(_))), "{p:?}");
     }
 
     #[test]
