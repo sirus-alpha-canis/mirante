@@ -48,6 +48,36 @@ pub enum Delivery {
     Inconclusive,
 }
 
+/// What Mirante puts in front of a person's mid-run message (spec §5, untrusted text): the
+/// agent reads it as coming from the human operator, not from the repo or another agent.
+/// One line, followed by one space and the message, so a one-line message stays one line
+/// (a paste the agent may collapse or a typist that counts lines is unaffected).
+pub const OPERATOR_LABEL: &str = "[Mirante · message from the human operator]";
+
+/// `text` as handed to the agent when a person sent it: [`OPERATOR_LABEL`], a space, the
+/// text. A slash command (`/…` once leading whitespace is skipped) is never labelled: the
+/// command must be the first thing the agent reads, or it is not run.
+pub fn label_operator(text: &str) -> String {
+    if text.trim_start().starts_with('/') {
+        return text.to_string();
+    }
+    format!("{OPERATOR_LABEL} {text}")
+}
+
+/// `text` without a leading [`OPERATOR_LABEL`] (and its space), else `text` unchanged.
+pub fn strip_operator_label(text: &str) -> &str {
+    match text.strip_prefix(OPERATOR_LABEL) {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+        None => text,
+    }
+}
+
+/// Whether `text` carries [`OPERATOR_LABEL`] anywhere (an agent's message that does would
+/// pass itself off as the person's).
+pub fn has_operator_label(text: &str) -> bool {
+    text.contains(OPERATOR_LABEL)
+}
+
 fn is_turn_end(v: &Value) -> bool {
     (v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")
         || (v["type"] == "system" && (v["subtype"] == "stop_hook_summary" || v["subtype"] == "turn_duration"))
@@ -133,12 +163,16 @@ pub fn classify_transcript(lines: &[Value]) -> Delivery {
 }
 
 /// "Was my message steered or queued?" — outcome of the most recent message whose enqueued
-/// text equals `text` (trimmed). `Inconclusive` when no such message was enqueued mid-turn.
+/// text equals `text` (trimmed, [`OPERATOR_LABEL`] ignored). `Inconclusive` when no such message was enqueued mid-turn.
 pub fn classify_message(lines: &[Value], text: &str) -> Delivery {
     let a = analyze(lines);
-    let want = text.trim();
+    // Matched without the operator label on either side: the transcript holds what was
+    // typed (labelled when a person sent it), the caller may hold either.
+    let want = strip_operator_label(text.trim()).trim();
     let found =
-        a.enqueues.iter().rev().find(|(i, _)| a.lines[*i]["content"].as_str().is_some_and(|c| c.trim() == want));
+        a.enqueues.iter().rev().find(|(i, _)| {
+            a.lines[*i]["content"].as_str().is_some_and(|c| strip_operator_label(c.trim()).trim() == want)
+        });
     match found {
         Some(&(i, true)) => classify_enqueue(&a, i),
         _ => Delivery::Inconclusive,
@@ -347,6 +381,33 @@ mod tests {
         assert_eq!(classify_transcript(&t), Delivery::Steered);
         let t = vec![prompt("one"), queue("enqueue"), queue("enqueue"), answer("x"), dequeue(), queued_user()];
         assert_eq!(classify_transcript(&t), Delivery::Queued);
+    }
+
+    #[test]
+    fn the_operator_label_prefixes_a_message_but_never_a_slash_command() {
+        let l = label_operator("use tabs");
+        assert_eq!(l, format!("{OPERATOR_LABEL} use tabs"));
+        assert_eq!(strip_operator_label(&l), "use tabs");
+        assert_eq!(strip_operator_label("use tabs"), "use tabs");
+        // A slash command must stay the first thing typed, or the agent never runs it.
+        assert_eq!(label_operator("  /compact keep it"), "  /compact keep it");
+        assert!(label_operator("fix a/b").starts_with(OPERATOR_LABEL));
+        assert!(has_operator_label(&format!("x\n{OPERATOR_LABEL} y")));
+        assert!(!has_operator_label("Mirante says hi"));
+    }
+
+    #[test]
+    fn classify_message_matches_a_labelled_message_by_its_text() {
+        let t = vec![
+            prompt("run five steps"),
+            tool_use(),
+            enqueue(&label_operator("A")),
+            json!({"type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn"}),
+            tool_result(),
+            answer("done"),
+        ];
+        assert_eq!(classify_message(&t, "A"), Delivery::Steered);
+        assert_eq!(classify_message(&t, &label_operator("A")), Delivery::Steered);
     }
 
     #[test]

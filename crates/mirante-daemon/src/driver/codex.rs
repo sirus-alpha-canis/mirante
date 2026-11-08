@@ -1454,6 +1454,26 @@ mod tests {
     }
 
     #[test]
+    fn a_labelled_steer_reaches_codex_whole_and_is_confirmed() {
+        use mirante_core::delivery::label_operator;
+        let (d, mut fake, rx, _) = setup(None);
+        d.send("five steps").unwrap();
+        let start = fake.expect("turn/start");
+        fake.reply(&start, json!({"turn": {"id": "tu-1", "items": [], "status": "inProgress"}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::Status { .. }));
+        let msg = label_operator("stop, say BANANA");
+        d.send(&msg).unwrap();
+        let steer = fake.expect("turn/steer");
+        assert_eq!(steer["params"]["input"][0]["text"].as_str(), Some(msg.as_str()));
+        let client_id = steer["params"]["clientUserMessageId"].as_str().unwrap().to_string();
+        fake.reply(&steer, json!({"turnId": "tu-1"}));
+        fake.notify("item/started", json!({"threadId": "th-1", "turnId": "tu-1",
+            "item": {"type": "userMessage", "id": "u2", "clientId": client_id, "content": [{"type": "text", "text": msg}]}}));
+        let ok = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "message_confirmed"));
+        assert_eq!(ok, DriverEvent::Step(json!({"type": "message_confirmed", "text": msg})));
+    }
+
+    #[test]
     fn send_starts_a_turn_with_the_policy_then_steers_the_running_one() {
         let (d, mut fake, rx, _) = setup(None);
         d.send("five steps").unwrap();

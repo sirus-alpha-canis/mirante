@@ -193,7 +193,7 @@ impl State {
         // delivered, and `message.edit` / `remove` / `reorder` refuse it (CONFLICT).
         let next = l.queue.pop_front().expect("not empty");
         l.requeue_at = 0;
-        match driver.send(&next.text) {
+        match driver.send(&next.wire()) {
             Ok(()) => {
                 l.delivery_in_flight = Some(Instant::now());
                 l.left_queue.insert(next.id.clone());
@@ -227,6 +227,8 @@ impl State {
             }
         });
         for (text, delivery) in verdicts {
+            // The person's words, not the label the agent saw.
+            let text = mirante_core::delivery::strip_operator_label(&text);
             self.event(Some(task_id), "message_delivery", json!({ "text": text, "delivery": delivery }))?;
         }
         Ok(())
@@ -434,10 +436,15 @@ impl State {
                 }
                 Ok(())
             }
-            DriverEvent::DeliveryAborted { text, reason } => {
+            DriverEvent::DeliveryAborted { text: wire, reason } => {
+                // The driver hands back what it was given (labelled when a person sent it):
+                // the queue holds the sender's own words and who sent them.
+                let text = mirante_core::delivery::strip_operator_label(&wire).to_string();
+                let operator = text != wire;
                 let mut id = None;
                 if let Some(l) = self.live.get_mut(task_id) {
-                    if let Some(i) = l.steers.iter().rposition(|s| *s == text) {
+                    let plain = |s: &String| mirante_core::delivery::strip_operator_label(s) == text;
+                    if let Some(i) = l.steers.iter().rposition(plain) {
                         l.steers.remove(i);
                     }
                     // A queued message comes back under its id (editable again); a steer
@@ -449,7 +456,7 @@ impl State {
                         }
                         other => {
                             l.last_sent = other;
-                            queue::Queued::new(text.clone())
+                            queue::Queued::from_operator(text.clone(), operator)
                         }
                     };
                     id = Some(back.id.clone());
@@ -505,7 +512,17 @@ impl State {
                 self.event(Some(task_id), "step", v)?;
                 Ok(self.store.skill_session_failed(session_id, task_id, &error)?)
             }
-            DriverEvent::Step(v) => self.event(Some(task_id), "step", v),
+            DriverEvent::Step(mut v) => {
+                // A message step (Codex `message_confirmed` / `send_unconfirmed`) carries what
+                // the agent was handed: the feed shows the person's words, not the label.
+                if let Some(text) = v["text"].as_str() {
+                    let plain = mirante_core::delivery::strip_operator_label(text);
+                    if plain.len() != text.len() {
+                        v["text"] = json!(plain);
+                    }
+                }
+                self.event(Some(task_id), "step", v)
+            }
             DriverEvent::Exited { code } => {
                 self.event(Some(task_id), "process_exited", json!({ "session_id": session_id, "code": code }))?;
                 let cause = self.live.get(task_id).and_then(|l| l.ending).unwrap_or("mirante:process_exited");

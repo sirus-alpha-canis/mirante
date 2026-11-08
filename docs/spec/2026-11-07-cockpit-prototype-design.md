@@ -82,7 +82,7 @@ CLI (cockpit …) ─────┘                              │
 - **Daemon socket.** Mode `0600` in `~/.cockpit/`. The daemon checks the peer uid.
 - **Agent permissions.** Never auto-approve and never use skip-permissions flags. Permission answers are scoped `once` by default.
 - **No secrets in the database.** Logs keep a bounded scrollback and redact token patterns.
-- **Untrusted text.** Agent output and repo text are treated as untrusted. Mid-run messages from the UI are labelled as coming from the human operator.
+- **Untrusted text.** Agent output and repo text are treated as untrusted. Mid-run messages from the UI are labelled as coming from the human operator: a person's message (steered or queued) reaches the agent as `[Mirante · message from the human operator] <text>` on one line. Slash commands, a task's first prompt and messages sent by another agent are not labelled, and an agent's message that carries the label is refused. Events, the queue and the feed keep the person's own words.
 
 ## 6. Success metrics (2 weeks of real use after the build)
 

@@ -9,6 +9,8 @@ use super::{AnswerGuard, Attachment, Driver, DriverError, DriverEvent, DriverFac
 #[derive(Default)]
 pub struct FakeDriver {
     pub calls: Mutex<Vec<String>>,
+    /// Every text `send` was handed, exactly (`calls` records it without the operator label).
+    pub wire: Mutex<Vec<String>>,
     pub dialog: AtomicBool,
     pub fail_answers: AtomicBool,
     /// The attached client's output channel, kept open until `detach` (like a live agent).
@@ -45,7 +47,8 @@ impl FakeDriver {
 
 impl Driver for FakeDriver {
     fn send(&self, text: &str) -> Result<(), DriverError> {
-        self.record(format!("send:{text}"));
+        self.wire.lock().unwrap().push(text.to_string());
+        self.record(format!("send:{}", mirante_core::delivery::strip_operator_label(text)));
         match self.send_error.lock().unwrap().clone() {
             Some(e) => Err(e),
             None => Ok(()),

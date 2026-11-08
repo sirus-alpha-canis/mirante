@@ -848,6 +848,27 @@ mod tests {
     }
 
     #[test]
+    fn a_labelled_message_is_typed_whole_as_one_paste() {
+        // The operator label is part of the paste: one line, the person's text after it.
+        let dir = TestDir::new();
+        let out = dir.path().join("typed");
+        let msg = mirante_core::delivery::label_operator("use tabs");
+        let want = [paste::bracketed(&msg), b"\r".to_vec()].concat();
+        assert_eq!(paste::line_count(&msg), 1);
+        let f = fake(&format!(
+            "{READY}; dd bs=1 count={} of={} 2>/dev/null; printf 'done'; sleep 5",
+            want.len(),
+            out.display()
+        ));
+        ready(&f);
+        f.d.send(&msg).unwrap();
+        wait_grid(&f.d, "done");
+        let got = std::fs::read(&out).unwrap();
+        assert_eq!(got, want);
+        assert!(String::from_utf8_lossy(&got).contains("[Mirante · message from the human operator] use tabs"));
+    }
+
+    #[test]
     fn two_concurrent_sends_never_interleave() {
         let dir = TestDir::new();
         let out = dir.path().join("typed");

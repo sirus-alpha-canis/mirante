@@ -22,16 +22,40 @@ use super::{Hub, HubError, Result, State};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {
     pub(crate) id: String,
+    /// The sender's own words (never labelled).
     pub(crate) text: String,
+    /// A person sent it: it reaches the agent behind the operator label ([`Queued::wire`]).
+    pub(crate) operator: bool,
 }
 
 impl Queued {
+    /// A message nobody vouches for as the person's (a task's first prompt, an agent's).
     pub(crate) fn new(text: impl Into<String>) -> Queued {
-        Queued { id: mirante_core::model::new_id(), text: text.into() }
+        Queued { id: mirante_core::model::new_id(), text: text.into(), operator: false }
+    }
+
+    /// A message from the person at the keyboard.
+    pub(crate) fn from_operator(text: impl Into<String>, operator: bool) -> Queued {
+        Queued { operator, ..Queued::new(text) }
+    }
+
+    /// What the agent is handed: the text, behind the operator label when a person sent it.
+    pub(crate) fn wire(&self) -> String {
+        wire(&self.text, self.operator)
     }
 
     fn view(&self) -> QueuedMessage {
         QueuedMessage { id: self.id.clone(), text: self.text.clone() }
+    }
+}
+
+/// `text` as handed to the agent: labelled as the human operator's when `operator`
+/// ([`mirante_core::delivery::label_operator`], never a slash command).
+pub(crate) fn wire(text: &str, operator: bool) -> String {
+    if operator {
+        mirante_core::delivery::label_operator(text)
+    } else {
+        text.to_string()
     }
 }
 
