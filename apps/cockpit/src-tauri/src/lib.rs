@@ -98,10 +98,19 @@ async fn attach_open(
     )
 }
 
+/// Typed bytes arrive as base64 (a JSON array of numbers is about four times larger).
+fn typed_bytes(b64: &str) -> Result<Vec<u8>, BridgeError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| BridgeError::Protocol { message: format!("typed input is not base64: {e}") })
+}
+
 /// Off the main thread: a daemon that stops reading must not freeze the window. The bridge
-/// bounds the write (`attach::WRITE_TIMEOUT`) and reports `BridgeError::Timeout`.
+/// bounds the write (`attach::WRITE_TIMEOUT`) and reports `BridgeError::Timeout`. The
+/// frontend keeps one write in flight per attachment, so keys cannot overtake each other here.
 #[tauri::command]
-async fn attach_write(app: AppHandle, id: u32, data: Vec<u8>) -> Result<(), BridgeError> {
+async fn attach_write(app: AppHandle, id: u32, b64: String) -> Result<(), BridgeError> {
+    let data = typed_bytes(&b64)?;
     joined(tauri::async_runtime::spawn_blocking(move || app.state::<Cockpit>().attachments.write(id, &data)).await)
 }
 
@@ -186,6 +195,12 @@ mod tests {
         ] {
             assert!(!is_app_url(&url(bad), false), "{bad}");
         }
+    }
+
+    #[test]
+    fn typed_input_is_decoded_from_base64_and_garbage_is_a_protocol_error() {
+        assert_eq!(typed_bytes("bHMN/w==").unwrap(), vec![0x6c, 0x73, 0x0d, 0xff]);
+        assert!(matches!(typed_bytes("not base64!"), Err(BridgeError::Protocol { .. })));
     }
 
     #[test]

@@ -93,11 +93,19 @@ export async function attachOpen(
   }
 }
 
-export async function attachWrite(id: number, text: string): Promise<void> {
-  const data = Array.from(new TextEncoder().encode(text));
-  await invoke("attach_write", { id, data }).catch((e) => {
+function toBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+/** Typed bytes, as base64 (a JSON array of numbers would be about four times larger). */
+export async function attachWrite(id: number, bytes: Uint8Array): Promise<void> {
+  try {
+    await invoke("attach_write", { id, b64: toBase64(bytes) });
+  } catch (e) {
     throw toDaemonError(e);
-  });
+  }
 }
 
 export async function attachClose(id: number): Promise<void> {

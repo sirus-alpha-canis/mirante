@@ -60,11 +60,17 @@ describe("daemon transport", () => {
     ]);
   });
 
+  it("typed bytes travel as base64, not a JSON array of numbers", async () => {
+    invoke.mockImplementation(async () => undefined);
+    await attachWrite(3, new Uint8Array([0x6c, 0x73, 0x0d, 0xff]));
+    expect(invoke).toHaveBeenCalledWith("attach_write", { id: 3, b64: "bHMN/w==" });
+  });
+
   it("a write timeout is a typed DaemonError", async () => {
     invoke.mockImplementation(async () => {
       throw { kind: "timeout", message: "the daemon did not take the input in 5s" };
     });
-    const e = (await attachWrite(1, "x").catch((x: unknown) => x)) as DaemonError;
+    const e = (await attachWrite(1, new Uint8Array([120])).catch((x: unknown) => x)) as DaemonError;
     expect([e instanceof DaemonError, e.info.kind, e.timedOut]).toEqual([true, "timeout", true]);
   });
 

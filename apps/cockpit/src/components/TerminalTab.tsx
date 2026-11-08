@@ -5,14 +5,20 @@ import { useEnv } from "../env";
 import { attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
 import { M, type TaskView } from "../lib/protocol";
 
+/** Window size changes settle for this long before one `session.resize` goes out. */
+const RESIZE_DEBOUNCE_MS = 100;
+/** Typed input waiting behind a write in flight; past this the daemon is not keeping up. */
+const MAX_PENDING_INPUT = 64 * 1024;
+
 /**
  * Terminal output is untrusted. Only the features below are on:
  * - OSC 8 hyperlinks leave through the injected opener (never `window.open`), only http(s),
- *   and only on a ⌘/Ctrl click so a stray click on spoofed link text does nothing.
+ *   and only on a ⌘/Ctrl click so a stray click on spoofed link text does nothing. Hovering
+ *   one shows the real target, whatever the link's text claims.
  * - No clipboard addon is loaded, so OSC 52 cannot write the clipboard.
  * - Title changes (OSC 0/2) are not subscribed, so nothing reaches the window title.
  */
-function linkHandler(openUrl: (url: string) => Promise<void>): ILinkHandler {
+function linkHandler(openUrl: (url: string) => Promise<void>, onHover: (uri: string | null) => void): ILinkHandler {
   return {
     allowNonHttpProtocols: false,
     activate(event, uri) {
@@ -26,7 +32,27 @@ function linkHandler(openUrl: (url: string) => Promise<void>): ILinkHandler {
       if (url.protocol !== "http:" && url.protocol !== "https:") return;
       openUrl(url.href).catch(() => {});
     },
+    hover: (_event, uri) => onHover(uri),
+    leave: () => onHover(null),
   };
+}
+
+/** xterm's binary strings (mouse reports) carry one byte per char. */
+function binaryBytes(s: string): Uint8Array {
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+  return out;
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  if (parts.length === 1) return parts[0];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
 }
 
 /** The task's live PTY over `attach`; keystrokes go back unless the stream is read-only. */
@@ -34,34 +60,98 @@ export function TerminalTab({ t }: { t: TaskView }) {
   const { rpc, openUrl } = useEnv();
   const host = useRef<HTMLDivElement>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
 
   useEffect(() => {
+    setNote(null);
+    setHovered(null);
     if (!t.live || !host.current) return;
+    let closed = false;
     const term = new Terminal({
       convertEol: false,
       cursorBlink: true,
       fontSize: 13,
       scrollback: 5000,
-      linkHandler: linkHandler(openUrl),
+      linkHandler: linkHandler(openUrl, (uri) => {
+        if (!closed) setHovered(uri);
+      }),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current);
     fit.fit();
     let id: number | null = null;
-    let closed = false;
-    const resize = () => {
-      fit.fit();
-      if (id !== null) rpc(M.sessionResize, { task: t.id, rows: term.rows, cols: term.cols }).catch(() => {});
+
+    // Size: the PTY learns the last size once resizing settles, and only when it changed.
+    let told = { rows: term.rows, cols: term.cols };
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const tellSize = () => {
+      resizeTimer = null;
+      if (closed || id === null) return;
+      if (term.rows === told.rows && term.cols === told.cols) return;
+      told = { rows: term.rows, cols: term.cols };
+      rpc(M.sessionResize, { task: t.id, rows: told.rows, cols: told.cols }).catch(() => {});
     };
-    const ro = new ResizeObserver(resize);
+    term.onResize(() => {
+      if (resizeTimer !== null) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(tellSize, RESIZE_DEBOUNCE_MS);
+    });
+    const ro = new ResizeObserver(() => fit.fit());
     ro.observe(host.current);
+
+    // Input: one write in flight at a time, so keys arrive in the order typed; whatever is
+    // typed meanwhile goes out as one write after it. A failed write drops what queued behind it.
+    let pending: Uint8Array[] = [];
+    let pendingBytes = 0;
+    let inFlight = false;
+    const pump = () => {
+      if (closed || inFlight || id === null || pending.length === 0) return;
+      const chunk = concat(pending);
+      pending = [];
+      pendingBytes = 0;
+      inFlight = true;
+      attachWrite(id, chunk).then(
+        () => {
+          inFlight = false;
+          pump();
+        },
+        (e) => {
+          inFlight = false;
+          pending = [];
+          pendingBytes = 0;
+          if (!closed)
+            setNote(e instanceof DaemonError && e.timedOut ? "input not delivered (the daemon timed out)" : "input not delivered");
+        },
+      );
+    };
+    const send = (bytes: Uint8Array) => {
+      if (closed) return;
+      if (pendingBytes + bytes.length > MAX_PENDING_INPUT) {
+        setNote("input dropped (the daemon is not keeping up)");
+        return;
+      }
+      pending.push(bytes);
+      pendingBytes += bytes.length;
+      pump();
+    };
+
     attachOpen(
       t.id,
-      term.rows,
-      term.cols,
-      (bytes) => term.write(bytes),
-      () => setNote("stream ended"),
+      told.rows,
+      told.cols,
+      // Output goes straight into xterm, which buffers and parses it; there is no backpressure
+      // toward the daemon (a flood is bounded by the PTY and the daemon's own buffers).
+      (bytes) => {
+        if (closed) return;
+        try {
+          term.write(bytes);
+        } catch {
+          // Disposed between the check and the write: nothing to show it on.
+        }
+      },
+      () => {
+        if (!closed) setNote("stream ended");
+      },
     )
       .then((a) => {
         if (closed) {
@@ -69,17 +159,23 @@ export function TerminalTab({ t }: { t: TaskView }) {
           return;
         }
         id = a.id;
-        if (!a.input) setNote("read-only stream (this agent takes messages from the composer)");
-        term.onData((data) => {
-          if (a.input)
-            attachWrite(a.id, data).catch((e) =>
-              setNote(e instanceof DaemonError && e.timedOut ? "input not delivered (the daemon timed out)" : "input not delivered"),
-            );
-        });
+        if (!a.input) {
+          setNote("read-only stream (this agent takes messages from the composer)");
+          return;
+        }
+        term.onData((data) => send(new TextEncoder().encode(data)));
+        term.onBinary((data) => send(binaryBytes(data)));
       })
-      .catch((e) => setNote(e instanceof Error ? e.message : String(e)));
+      .then(() => {
+        // The size may have changed while the attach was on its way.
+        tellSize();
+      })
+      .catch((e) => {
+        if (!closed) setNote(e instanceof Error ? e.message : String(e));
+      });
     return () => {
       closed = true;
+      if (resizeTimer !== null) clearTimeout(resizeTimer);
       ro.disconnect();
       if (id !== null) void attachClose(id).catch(() => {});
       term.dispose();
@@ -94,7 +190,12 @@ export function TerminalTab({ t }: { t: TaskView }) {
           {note}
         </p>
       )}
-      <div className="terminal" ref={host} aria-label={`Terminal of ${t.branch}`} />
+      <div className="terminal" ref={host} role="region" aria-label={`Terminal of ${t.branch}`} />
+      {hovered && (
+        <p className="small muted terminal-link">
+          Link to <code>{hovered}</code> (⌘/Ctrl-click to open)
+        </p>
+      )}
     </div>
   );
 }
