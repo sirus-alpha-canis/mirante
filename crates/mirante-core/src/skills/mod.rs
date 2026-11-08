@@ -1,6 +1,7 @@
 //! Skills: reusable instructions Mirante gives each new agent session whose scope matches
 //! the task repo's normalized origin. Pure library: origin normalization, the format,
 //! lint, signing, the versioned library and the miner. No daemon, no network.
+pub mod format;
 pub mod origin;
 
 /// The manifest's format tag.
