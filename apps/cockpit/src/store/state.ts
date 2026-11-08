@@ -14,6 +14,10 @@ export interface FeedItem {
   ok?: boolean;
   mode?: SendMode;
   phase?: "started" | "ended";
+  /** A tool step's tool name (`Read`, `Bash`…). */
+  tool?: string;
+  /** A line that warns (the agent left manual permission mode). */
+  warn?: boolean;
 }
 
 export type PermState = "pending" | "allowed_once" | "allowed_session" | "denied" | "expired";
@@ -198,6 +202,9 @@ const QUEUE_CHANGE_TEXT: Record<string, string> = {
   reordered: "queue reordered",
 };
 
+/** Claude permission modes that approve on their own (the daemon's `self_approves`). */
+export const SELF_APPROVING = new Set(["auto", "bypassPermissions", "acceptEdits"]);
+
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
 
 /** The feed line an event adds, if any. */
@@ -208,7 +215,7 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
     case "step": {
       switch (p.type) {
         case "tool":
-          return { ...base, kind: "tool", text: `${str(p.tool)} ${str(p.summary)}`.trim(), ok: p.ok !== false };
+          return { ...base, kind: "tool", tool: str(p.tool), text: `${str(p.tool)} ${str(p.summary)}`.trim(), ok: p.ok !== false };
         case "command":
           return { ...base, kind: "command", text: `$ ${str(p.command)}`, ok: p.exit_code === 0 };
         case "agent_message":
@@ -260,6 +267,18 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       return { ...base, kind: "system", text: p.accepted === true ? `memory proposal accepted as ${str(p.slug)}` : "memory proposal rejected" };
     case "dna.unavailable":
       return { ...base, kind: "system", text: str(p.reason) || "repo memory is off for this session" };
+    case "permission_mode": {
+      // Mirante starts Claude in manual mode: leaving it is worth a warning, going back a note.
+      if (p.self_approves === "commands") return { ...base, kind: "system", warn: true, text: "auto mode on — Claude approves its own commands" };
+      if (p.self_approves === "edits") return { ...base, kind: "system", warn: true, text: "accept-edits mode on — Claude edits files without asking" };
+      return SELF_APPROVING.has(str(p.from)) ? { ...base, kind: "system", text: "back to manual mode — Claude asks before acting" } : null;
+    }
+    case "session.auto_resumed":
+      return { ...base, kind: "system", text: "resumed after the daemon restarted" };
+    case "session.auto_resume_skipped":
+      return { ...base, kind: "system", text: `not resumed after the daemon restarted: ${str(p.reason)}` };
+    case "session.auto_resume_failed":
+      return { ...base, kind: "system", text: `could not resume after the daemon restarted: ${str(p.error)}` };
     case "skill.injected": {
       const names = Array.isArray(p.names) ? p.names.map(str) : [];
       return { ...base, kind: "system", text: `skills given to this session: ${names.join(", ")}` };

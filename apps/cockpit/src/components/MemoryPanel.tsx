@@ -98,7 +98,7 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
       ) : (
         <>
           <p className={`small level-${sys.level}`}>{pressureText(sys).main}</p>
-          <p className="small muted" title="On macOS free memory is always low (the file cache uses it); it is not what pauses sessions.">
+          <p className="small muted" title="Available is what the system can hand out now (macOS counts the file cache it gives back). It is not what pauses sessions: the system's pressure is.">
             {pressureText(sys).secondary}
           </p>
         </>

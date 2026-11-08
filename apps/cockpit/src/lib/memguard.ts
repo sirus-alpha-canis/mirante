@@ -19,6 +19,9 @@ export interface SystemMemory {
   paused: boolean;
   total: number;
   free: number;
+  /** What the OS calls available (macOS: its free percentage of the RAM); null from an
+   * older daemon (then `free` is all there is). */
+  available: number | null;
   swapUsed: number;
   swapTotal: number;
   /** The OS's own measure when it set the level ("normal" | "warn" | "critical"); null when
@@ -37,6 +40,7 @@ export function systemMemory(status: DaemonStatus | null): SystemMemory | null {
     paused: m.paused,
     total: m.total,
     free: m.free,
+    available: typeof m.available === "number" ? m.available : null,
     swapUsed: m.swap_used,
     swapTotal: m.swap_total,
     kernelLevel: m.kernel_level ?? null,
@@ -46,8 +50,9 @@ export function systemMemory(status: DaemonStatus | null): SystemMemory | null {
 
 const KERNEL_NAME: Record<string, string> = { macos: "macOS", "linux-psi": "Linux (PSI)" };
 
-/** Why new sessions wait (or that they do not), from the daemon's numbers only; free memory
- * is secondary (on macOS it is always low: the file cache uses it). */
+/** Why new sessions wait (or that they do not), from the daemon's numbers only; the room
+ * left is secondary: what the OS calls available (macOS counts the file cache it gives
+ * back), else the strict free pages from an older daemon. */
 export function pressureText(m: SystemMemory): { main: string; secondary: string } {
   const swap = m.swapTotal > 0 ? `swap ${Math.round((m.swapUsed * 100) / m.swapTotal)}%` : null;
   const who = m.kernelLevel ? (KERNEL_NAME[m.kernelSource ?? ""] ?? "The system") : null;
@@ -67,7 +72,8 @@ export function pressureText(m: SystemMemory): { main: string; secondary: string
     parts.push(swap ? `Memory tight (${swap} used, little free)` : "Memory tight (little free memory)");
     parts.push("new sessions paused until it eases");
   }
-  return { main: parts.join(" · "), secondary: `${size(m.free)} free of ${size(m.total)}` };
+  const room = m.available !== null ? `${size(m.available)} available` : `${size(m.free)} free`;
+  return { main: parts.join(" · "), secondary: `${room} of ${size(m.total)}` };
 }
 
 /** Bytes as MB, or GB with one decimal from 1 GB. */

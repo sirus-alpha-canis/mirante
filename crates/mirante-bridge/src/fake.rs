@@ -144,7 +144,12 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
         return r;
     }
     match m {
-        method::DAEMON_STATUS => Ok(json!({"pid": 1, "boot_id": s.boot_id, "version": "fake", "live_sessions": 0})),
+        method::DAEMON_STATUS => Ok(json!({
+            "pid": 1, "boot_id": s.boot_id, "version": "fake", "live_sessions": 0, "auto_resume": true,
+            "memory": {"level": "normal", "total": 17_179_869_184u64, "free": 476_053_504u64,
+                "available": 7_730_941_132u64, "swap_used": 0, "swap_total": 0, "paused": false,
+                "kernel_level": "normal", "kernel_source": "macos"},
+        })),
         method::TASK_LIST => Ok(Value::Array(s.tasks.clone())),
         method::TASK_GET => s
             .tasks

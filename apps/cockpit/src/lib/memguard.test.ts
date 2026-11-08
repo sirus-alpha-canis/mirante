@@ -44,6 +44,14 @@ describe("pressureText", () => {
     expect(pressureText(sys({})).main).toBe("Memory tight (swap 92% used, little free) · new sessions paused until it eases");
   });
 
+  it("what macOS says is available (its free percentage), not raw free pages, when the daemon sends it", () => {
+    // The founder's screenshot: "454 MB free" while macOS reported 45 % (about 8 GB) free.
+    const t = pressureText(sys({ level: "normal", paused: false, free: 454 * 2 ** 20, available: Math.round(0.45 * 18 * GB), total: 18 * GB }));
+    expect(t.secondary).toBe("8.1 GB available of 18.0 GB");
+    expect(systemMemory({ ...status, memory: { ...mem("normal"), available: 5 } })?.available).toBe(5);
+    expect(systemMemory({ ...status, memory: mem("normal") })?.available).toBeNull();
+  });
+
   it("not paused: the level, swap only when there is swap", () => {
     expect(pressureText(sys({ level: "normal", paused: false, kernel_level: "normal", kernel_source: "macos" })).main).toBe(
       "Memory pressure normal (macOS) · swap 92%",

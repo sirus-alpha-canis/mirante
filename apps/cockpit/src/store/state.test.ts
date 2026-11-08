@@ -108,6 +108,32 @@ describe("feedItem", () => {
     expect(feedItem(ev(4, "t", "hook_orphan"))).toBeNull();
   });
 
+  it("leaving manual mode is a warning line; going back says so; the first manual report says nothing", () => {
+    expect(feedItem(ev(1, "t", "permission_mode", { from: null, mode: "default", self_approves: null }))).toBeNull();
+    expect(feedItem(ev(2, "t", "permission_mode", { from: "default", mode: "auto", self_approves: "commands" }))).toMatchObject({
+      kind: "system",
+      warn: true,
+      text: "auto mode on — Claude approves its own commands",
+    });
+    expect(feedItem(ev(3, "t", "permission_mode", { from: "default", mode: "acceptEdits", self_approves: "edits" }))?.text).toBe(
+      "accept-edits mode on — Claude edits files without asking",
+    );
+    expect(feedItem(ev(4, "t", "permission_mode", { from: "auto", mode: "default", self_approves: null }))?.text).toBe(
+      "back to manual mode — Claude asks before acting",
+    );
+    expect(feedItem(ev(5, "t", "permission_mode", { from: "default", mode: "plan", self_approves: null }))).toBeNull();
+  });
+
+  it("auto-resume after a daemon restart has its lines", () => {
+    expect(feedItem(ev(1, "t", "session.auto_resumed", { resumed: true }))?.text).toBe("resumed after the daemon restarted");
+    expect(feedItem(ev(2, "t", "session.auto_resume_skipped", { reason: "hibernated" }))?.text).toBe("not resumed after the daemon restarted: hibernated");
+    expect(feedItem(ev(3, "t", "session.auto_resume_failed", { error: "boom" }))?.text).toBe("could not resume after the daemon restarted: boom");
+  });
+
+  it("a tool step keeps its tool name apart", () => {
+    expect(feedItem(ev(1, "t", "step", { type: "tool", tool: "Read", summary: "a.ts", ok: true }))).toMatchObject({ tool: "Read", text: "Read a.ts" });
+  });
+
   it("memory guard events become system lines", () => {
     expect(feedItem(ev(1, "t", "memory.warn", { state: "soft", bytes: 3 * 2 ** 30, budget: 4 * 2 ** 30 }))?.text).toBe("memory soft (3072 MB of 4096 MB)");
   });

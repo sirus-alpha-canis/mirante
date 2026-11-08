@@ -34,6 +34,8 @@ export interface TaskView {
   memory?: MemView | null;
   /** Hibernated to free memory; `session.wake` resumes it. */
   hibernated?: boolean;
+  /** Claude, while live: its permission mode (`default`, `plan`, `acceptEdits`, `auto`…). */
+  permission_mode?: string | null;
   /** `task.create`'s answer only: the origin fixed for the task's skills. */
   origin?: CreatedOrigin | null;
 }
@@ -63,6 +65,9 @@ export interface SystemView {
   level: string;
   total: number;
   free: number;
+  /** What the OS says is available (macOS `kern.memorystatus_level` × RAM, Linux
+   * MemAvailable); absent from older daemons. */
+  available?: number | null;
   swap_used: number;
   swap_total: number;
   paused: boolean;
@@ -129,6 +134,13 @@ export interface DaemonStatus {
   /** Mirante types Claude permission answers (`MIRANTE_CLAUDE_INLINE_ANSWERS=1`). Absent or
    * false: Claude cards are answered in the Terminal tab. */
   claude_inline_answers?: boolean;
+  /** Sessions the daemon ended come back when it starts again (absent from older daemons). */
+  auto_resume?: boolean | null;
+}
+
+/** `daemon.settings`. */
+export interface DaemonSettings {
+  auto_resume: boolean;
 }
 
 export interface StartResult {

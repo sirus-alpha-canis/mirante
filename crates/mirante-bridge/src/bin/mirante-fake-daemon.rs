@@ -18,9 +18,22 @@ fn main() {
     let mut done = task_json("t-claude-2", "/repos/shop", "feat/search", "claude", "idle");
     done["live"] = json!(false);
     done["boot"] = json!(null);
-    fake.set_tasks(vec![task_json("t-claude-1", "/repos/mirante", "feat/login", "claude", "working"), waiting, done]);
+    let mut working = task_json("t-claude-1", "/repos/mirante", "feat/login", "claude", "working");
+    // A session that left manual mode: the cockpit shows the red auto-mode badge.
+    working["permission_mode"] = json!("auto");
+    fake.set_tasks(vec![working, waiting, done]);
     fake.push_event(Some("t-claude-2"), "turn_started", json!({"idx": 1}));
+    fake.push_event(
+        Some("t-claude-2"),
+        "step",
+        json!({"type": "agent_message", "final": true, "text": "Search now ranks exact title matches first. I added tests for accents and empty queries; all 42 pass. One open question: should archived products be searchable?"}),
+    );
     fake.push_event(Some("t-claude-2"), "turn_ended", json!({"idx": 1}));
+    fake.push_event(
+        Some("t-claude-1"),
+        "permission_mode",
+        json!({"from": "default", "mode": "auto", "self_approves": "commands", "source": "hook"}),
+    );
     fake.push_event(
         Some("t-codex-1"),
         "permission_requested",

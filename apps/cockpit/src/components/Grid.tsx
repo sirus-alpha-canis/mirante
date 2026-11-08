@@ -1,6 +1,7 @@
 import { memo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
+import { collapseRepeats } from "../lib/feed";
 import { type DaemonStatus, M, RpcCode, type SendMode, type SendResult, type TaskView } from "../lib/protocol";
 import { hintsFor, onMac } from "../lib/shortcuts";
 import { columnOf, gridTasks, lastLines, pendingPerms } from "../store/select";
@@ -47,9 +48,11 @@ const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onO
       </header>
       <TaskBadges t={t} />
       <ol className="lines">
-        {lastLines(feed, 4).map((i) => (
-          <FeedLine key={i.seq} item={i} />
-        ))}
+        {collapseRepeats(lastLines(feed, 12))
+          .slice(-4)
+          .map((f) => (
+            <FeedLine key={f.item.seq} item={f.item} count={f.count} />
+          ))}
       </ol>
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
       {unexplained && (
