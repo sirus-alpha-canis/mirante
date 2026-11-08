@@ -1390,7 +1390,14 @@ pub(crate) mod tests {
     fn a_process_on_a_live_agents_terminal_counts_as_that_agent() {
         let k = Kit::new();
         let pty = on_a_pty(k.dir.path());
-        let caller = Caller::Peer(pty.root().unwrap());
+        let root = pty.root().unwrap();
+        let caller = Caller::Peer(root);
+        // macOS shows a process's environment only once it has run a little after exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proctree::environ(root.pid).is_none() {
+            assert!(std::time::Instant::now() < deadline, "the sleeper's environment never became readable");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // No live session has that terminal yet: a person.
         assert_eq!(k.hub.identify(&caller), Identity::Person);
         assert!(k.hub.require_person(&caller).is_ok());
