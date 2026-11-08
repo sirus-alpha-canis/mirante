@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn migration_7_and_decided_once() {
         let mut s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 7);
+        assert!(s.schema_version().unwrap() >= 7);
         let p = s.skill_insert_proposal(&proposal("github.com/acme", None, None), CAPS).unwrap();
         assert!(p.new);
         assert_eq!((p.proposal.status.as_str(), p.proposal.scope.as_str()), ("pending", "org:github.com/acme"));

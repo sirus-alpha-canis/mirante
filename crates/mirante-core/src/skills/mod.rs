@@ -7,6 +7,7 @@ pub mod library;
 pub mod lint;
 pub mod mine;
 pub mod origin;
+pub mod pin;
 pub mod sign;
 
 /// The manifest's format tag.

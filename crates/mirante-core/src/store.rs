@@ -23,6 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("migrations/0005_dna.sql")),
     (6, include_str!("migrations/0006_dna_ledger_and_queue.sql")),
     (7, include_str!("migrations/0007_skills.sql")),
+    (8, include_str!("migrations/0008_skill_signer.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -173,10 +174,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 7);
+        assert_eq!(s.schema_version().unwrap(), 8);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 7);
+        assert_eq!(s.schema_version().unwrap(), 8);
     }
 
     #[test]

@@ -46,8 +46,9 @@ pub trait Signer {
 }
 
 pub trait Verifier {
-    /// Ok when `sig` is a valid `mirante-skill` signature over exactly `msg` by `principal`.
-    fn verify(&self, msg: &[u8], sig: &str, principal: &str) -> Result<(), SkillError>;
+    /// Ok when `sig` is a valid `mirante-skill` signature over exactly `msg` by `principal`
+    /// made with the key whose fingerprint is `key` (`SHA256:…`).
+    fn verify(&self, msg: &[u8], sig: &str, principal: &str, key: &str) -> Result<(), SkillError>;
 }
 
 fn sign_err(msg: impl Into<String>) -> SkillError {
@@ -118,13 +119,18 @@ impl SshKeygen {
 
     /// The signer for `home`, generating the key on first use: `keys/` and `tmp/` 0700,
     /// `ssh-keygen -q -t ed25519 -N "" -C mirante-skills -f keys/skills_ed25519`, and
-    /// `allowed_signers` for [`PRINCIPAL`]; every file 0600. An existing key is reused.
+    /// `allowed_signers` for [`PRINCIPAL`]; every file 0600. An existing key is reused, and
+    /// its `allowed_signers` is never rewritten from whatever `.pub` is on disk: a missing
+    /// one is written, one that names another key is an error. (A key, `.pub` and
+    /// `allowed_signers` swapped together are consistent here: the caller compares
+    /// [`Signer::fingerprint`] with the fingerprint it pinned when the key was made.)
     pub fn ensure_key_with(home: &Path, bin: &Path) -> Result<SshKeygen, SkillError> {
         let k = SshKeygen::at(home, bin);
         private_dir(&home.join("keys"))?;
         private_dir(&k.tmp)?;
         let public = k.public_key_path();
-        if !exists_nofollow(&k.key) {
+        let generated = !exists_nofollow(&k.key);
+        if generated {
             if exists_nofollow(&public) {
                 return Err(sign_err(format!("{} exists without its private key", public.display())));
             }
@@ -146,8 +152,12 @@ impl SshKeygen {
             let mut s = String::new();
             f.take(8192).read_to_string(&mut s).ok().map(|_| s)
         });
-        if current.as_deref() != Some(line.as_str()) {
-            write_private(&k.signers, line.as_bytes())?;
+        match current {
+            Some(c) if c == line => {}
+            Some(_) if !generated => {
+                return Err(sign_err(format!("{} does not name the skill key", k.signers.display())));
+            }
+            _ => write_private(&k.signers, line.as_bytes())?,
         }
         Ok(k)
     }
@@ -295,8 +305,13 @@ impl Signer for SshKeygen {
 impl Verifier for SshKeygen {
     /// `ssh-keygen -Y verify -f <allowed_signers> -I <principal> -n mirante-skill -s <sig>`,
     /// `msg` on stdin; the signature is copied 0600 into `tmp/` for the call and removed.
-    fn verify(&self, msg: &[u8], sig: &str, principal: &str) -> Result<(), SkillError> {
+    /// Its `Good "…" signature for <principal> with <TYPE> key <fingerprint>` line must name
+    /// `key`.
+    fn verify(&self, msg: &[u8], sig: &str, principal: &str, key: &str) -> Result<(), SkillError> {
         check_principal(principal)?;
+        if !key.starts_with("SHA256:") || key.contains(char::is_whitespace) {
+            return Err(sign_err("bad key fingerprint"));
+        }
         if !sig.starts_with(ARMOR) || sig.len() > MAX_SIG {
             return Err(sign_err("not an SSH signature"));
         }
@@ -311,7 +326,13 @@ impl Verifier for SshKeygen {
             self.run(&["-Y", "verify", "-f", &signers, "-I", principal, "-n", NAMESPACE, "-s", &sig_path], msg)
         });
         let _ = std::fs::remove_file(&path);
-        result.map(drop)
+        let out = result?;
+        let text = String::from_utf8_lossy(&out);
+        let signed_by = text.lines().find(|l| l.starts_with("Good ")).and_then(|l| l.split_whitespace().last());
+        if signed_by != Some(key) {
+            return Err(sign_err("signed with another key"));
+        }
+        Ok(())
     }
 }
 
@@ -343,11 +364,12 @@ mod tests {
         let k = SshKeygen::ensure_key_with(d.path(), &bin).unwrap();
         let sig = k.sign(b"manifest\n").unwrap();
         assert!(sig.starts_with("-----BEGIN SSH SIGNATURE-----"));
-        k.verify(b"manifest\n", &sig, "mirante-local").unwrap();
-        assert!(k.verify(b"manifest!\n", &sig, "mirante-local").is_err());
-        assert!(k.verify(b"manifest\n", &sig, "someone-else").is_err());
-        assert!(k.verify(b"manifest\n", "not a signature", "mirante-local").is_err());
-        assert!(k.verify(b"manifest\n", &sig, "-oProxyCommand=x").is_err());
+        k.verify(b"manifest\n", &sig, "mirante-local", &k.fingerprint().unwrap()).unwrap();
+        let fp = k.fingerprint().unwrap();
+        assert!(k.verify(b"manifest!\n", &sig, "mirante-local", &fp).is_err());
+        assert!(k.verify(b"manifest\n", &sig, "someone-else", &fp).is_err());
+        assert!(k.verify(b"manifest\n", "not a signature", "mirante-local", &fp).is_err());
+        assert!(k.verify(b"manifest\n", &sig, "-oProxyCommand=x", &fp).is_err());
         assert!(k.fingerprint().unwrap().starts_with("SHA256:"));
         // The temporary signature files are removed.
         assert_eq!(std::fs::read_dir(d.path().join("tmp")).unwrap().count(), 0);
@@ -370,7 +392,32 @@ mod tests {
         let again = SshKeygen::ensure_key_with(d.path(), &bin).unwrap();
         assert_eq!(std::fs::read(d.path().join("keys/skills_ed25519")).unwrap(), key, "reused, not regenerated");
         // A signature made before still verifies with the reopened signer.
-        again.verify(b"m\n", &k.sign(b"m\n").unwrap(), PRINCIPAL).unwrap();
+        again.verify(b"m\n", &k.sign(b"m\n").unwrap(), PRINCIPAL, &k.fingerprint().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn allowed_signers_is_never_rewritten_from_whatever_key_is_on_disk() {
+        let Some(bin) = keygen() else { return };
+        let d = TempDir::new("sk-pin");
+        let k = SshKeygen::ensure_key_with(d.path(), &bin).unwrap();
+        let fp = k.fingerprint().unwrap();
+        let sig = k.sign(b"m\n").unwrap();
+        // The signature verifies only for the key that made it.
+        k.verify(b"m\n", &sig, PRINCIPAL, &fp).unwrap();
+        assert!(k.verify(b"m\n", &sig, PRINCIPAL, "SHA256:another").is_err());
+        // Another key planted in place of the skill key (private and public).
+        let other = TempDir::new("sk-other");
+        let o = SshKeygen::ensure_key_with(other.path(), &bin).unwrap();
+        for f in ["skills_ed25519", "skills_ed25519.pub"] {
+            std::fs::copy(other.path().join("keys").join(f), d.path().join("keys").join(f)).unwrap();
+        }
+        let signers = std::fs::read(d.path().join("keys/allowed_signers")).unwrap();
+        assert!(SshKeygen::ensure_key_with(d.path(), &bin).is_err(), "a swapped key is refused");
+        assert_eq!(std::fs::read(d.path().join("keys/allowed_signers")).unwrap(), signers, "not rewritten");
+        // An allowed_signers edited to trust the planted key is refused too.
+        std::fs::copy(other.path().join("keys/allowed_signers"), d.path().join("keys/allowed_signers")).unwrap();
+        let fresh = SshKeygen::ensure_key_with(d.path(), &bin).unwrap();
+        assert_eq!(fresh.fingerprint().unwrap(), o.fingerprint().unwrap(), "consistent on disk: the pin decides");
     }
 
     #[test]
@@ -400,7 +447,7 @@ mod tests {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         let git_sig = String::from_utf8(out.stdout).unwrap();
-        assert!(k.verify(b"manifest\n", &git_sig, PRINCIPAL).is_err());
+        assert!(k.verify(b"manifest\n", &git_sig, PRINCIPAL, &k.fingerprint().unwrap()).is_err());
     }
 
     fn fake(dir: &Path, script: &str) -> PathBuf {

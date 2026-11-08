@@ -11,7 +11,8 @@
 //! [`read_verified`] is the check before every injection: the manifest's bytes must hash to
 //! the hash a person accepted (the ledger's), the folder must hold exactly the manifest's
 //! files plus the manifest and the signature (no symlinks, no hard links), each file must
-//! match its pinned hash and size, and the signature must verify.
+//! match its pinned hash and size, the manifest must name the pinned signing key, and the
+//! signature must verify with that key.
 use std::path::{Path, PathBuf};
 
 use super::format::{check_file_path, is_name, FileEntry, Manifest, SignerRef};
@@ -193,13 +194,16 @@ fn walk(dir: &SafeDir, prefix: &str, depth: usize, out: &mut Vec<String>) -> Res
 }
 
 /// Reads version `version` of `name` and verifies it against `expect_hash` (the manifest
-/// hash a person accepted) and the signature (see the module docs). Any difference is
-/// [`SkillError::Modified`] naming what changed.
+/// hash a person accepted), `signer_key` (the fingerprint of the signing key Mirante
+/// pinned: the manifest must name it and the signature must be made with it) and the
+/// signature (see the module docs). Any difference is [`SkillError::Modified`] naming what
+/// changed.
 pub fn read_verified(
     lib: &Path,
     name: &str,
     version: u32,
     expect_hash: &str,
+    signer_key: &str,
     verifier: &dyn Verifier,
 ) -> Result<VerifiedSkill, SkillError> {
     check_name(name)?;
@@ -215,6 +219,9 @@ pub fn read_verified(
     let manifest = Manifest::parse(&bytes).map_err(|e| modified(format!("{MANIFEST}: {e}")))?;
     if manifest.name != name || manifest.version != version {
         return Err(modified(format!("{MANIFEST} names another skill or version")));
+    }
+    if manifest.signer.key != signer_key {
+        return Err(modified(format!("{MANIFEST} was signed by another key than Mirante's")));
     }
     let mut listed = Vec::new();
     walk(&dir, "", 0, &mut listed)?;
@@ -243,7 +250,7 @@ pub fn read_verified(
     }
     let sig = dir.read_file(SIGNATURE, MAX_META).map_err(|e| modified(format!("{SIGNATURE}: {e}")))?;
     verifier
-        .verify(&bytes, &sig, &manifest.signer.principal)
+        .verify(&bytes, &sig, &manifest.signer.principal, &manifest.signer.key)
         .map_err(|e| modified(format!("signature does not verify: {e}")))?;
     Ok(VerifiedSkill { manifest, manifest_hash: expect_hash.to_string(), files })
 }
@@ -329,14 +336,16 @@ mod tests {
     }
 
     impl Verifier for Fake {
-        fn verify(&self, msg: &[u8], sig: &str, principal: &str) -> Result<(), SkillError> {
-            if principal == PRINCIPAL && sig == self.sign(msg)? {
+        fn verify(&self, msg: &[u8], sig: &str, principal: &str, key: &str) -> Result<(), SkillError> {
+            if principal == PRINCIPAL && key == "SHA256:fake" && sig == self.sign(msg)? {
                 Ok(())
             } else {
                 Err(SkillError::Sign("bad signature".into()))
             }
         }
     }
+
+    const FAKE_KEY: &str = "SHA256:fake";
 
     fn signer() -> Fake {
         Fake
@@ -387,7 +396,10 @@ mod tests {
         assert_eq!(v.manifest.signer, SignerRef { principal: PRINCIPAL.into(), key: "SHA256:fake".into() });
         assert_eq!(v.manifest_hash, v.manifest.hash());
         assert!(write_version(&lib, &signer(), &bundle("a", 1)).is_err()); // v1 exists
-        let r = read_verified(&lib, "a", 1, &v.manifest_hash, &verifier()).unwrap();
+        let r = read_verified(&lib, "a", 1, &v.manifest_hash, FAKE_KEY, &verifier()).unwrap();
+        // A version signed by another key than the pinned one is refused.
+        let other = read_verified(&lib, "a", 1, &v.manifest_hash, "SHA256:other", &verifier());
+        assert!(matches!(&other, Err(SkillError::Modified(m)) if m.contains("another key")), "{other:?}");
         assert_eq!(r.files[0].0, "SKILL.md");
         assert_eq!(r.files[1], ("reference/guide.md".to_string(), b"Guide\n".to_vec()));
         assert_eq!(r.manifest, v.manifest);
@@ -425,7 +437,7 @@ mod tests {
     fn a_changed_extra_or_missing_file_fails_verification() {
         let (_home, lib) = lib_dir();
         let v = write_version(&lib, &signer(), &bundle("a", 1)).unwrap();
-        let read = || read_verified(&lib, "a", 1, &v.manifest_hash, &verifier());
+        let read = || read_verified(&lib, "a", 1, &v.manifest_hash, FAKE_KEY, &verifier());
         let skill = lib.join("a/v1/SKILL.md");
         let original = std::fs::read(&skill).unwrap();
         std::fs::write(&skill, b"---\nname: a\ndescription: x\n---\nrm -rf ~\n").unwrap();
@@ -444,7 +456,10 @@ mod tests {
         let (_home, lib) = lib_dir();
         let v = write_version(&lib, &signer(), &bundle("a", 1)).unwrap();
         // The ledger's hash is not this manifest's.
-        assert!(matches!(read_verified(&lib, "a", 1, &"0".repeat(64), &verifier()), Err(SkillError::Modified(_))));
+        assert!(matches!(
+            read_verified(&lib, "a", 1, &"0".repeat(64), FAKE_KEY, &verifier()),
+            Err(SkillError::Modified(_))
+        ));
         // A manifest rewritten (a wider scope, say) no longer hashes to the ledger's.
         let m = lib.join("a/v1/mirante-skill.json");
         let text = std::fs::read_to_string(&m).unwrap();
@@ -453,12 +468,12 @@ mod tests {
             text.replace(r#""kind":"org","value":"github.com/acme""#, r#""kind":"personal","value":"""#),
         )
         .unwrap();
-        assert!(read_verified(&lib, "a", 1, &v.manifest_hash, &verifier()).is_err());
+        assert!(read_verified(&lib, "a", 1, &v.manifest_hash, FAKE_KEY, &verifier()).is_err());
         std::fs::write(&m, &text).unwrap();
         // A signature over other bytes.
         std::fs::write(lib.join("a/v1/mirante-skill.sig"), signer().sign(b"other").unwrap()).unwrap();
         assert!(matches!(
-            read_verified(&lib, "a", 1, &v.manifest_hash, &verifier()),
+            read_verified(&lib, "a", 1, &v.manifest_hash, FAKE_KEY, &verifier()),
             Err(SkillError::Modified(m)) if m.contains("signature")
         ));
     }
@@ -471,7 +486,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), lib.join("a")).unwrap();
         assert!(matches!(write_version(&lib, &signer(), &bundle("a", 1)), Err(SkillError::Unsafe(_))));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-        assert!(read_verified(&lib, "a", 1, &"0".repeat(64), &verifier()).is_err());
+        assert!(read_verified(&lib, "a", 1, &"0".repeat(64), FAKE_KEY, &verifier()).is_err());
         // A version whose SKILL.md is a hard link to a file elsewhere.
         let v = write_version(&lib, &signer(), &bundle("b", 1)).unwrap();
         let skill = lib.join("b/v1/SKILL.md");
@@ -479,7 +494,7 @@ mod tests {
         std::fs::copy(&skill, &copy).unwrap();
         std::fs::remove_file(&skill).unwrap();
         std::fs::hard_link(&copy, &skill).unwrap();
-        assert!(read_verified(&lib, "b", 1, &v.manifest_hash, &verifier()).is_err());
+        assert!(read_verified(&lib, "b", 1, &v.manifest_hash, FAKE_KEY, &verifier()).is_err());
         // The library itself as a symlink is refused too.
         let (_h2, lib2) = lib_dir();
         std::os::unix::fs::symlink(outside.path(), &lib2).unwrap();
@@ -521,8 +536,8 @@ mod tests {
         let k = SshKeygen::ensure_key_with(home.path(), Path::new(DEFAULT_SSH_KEYGEN)).unwrap();
         let v = write_version(&lib, &k, &bundle("a", 1)).unwrap();
         assert!(v.manifest.signer.key.starts_with("SHA256:"));
-        read_verified(&lib, "a", 1, &v.manifest_hash, &k).unwrap();
+        read_verified(&lib, "a", 1, &v.manifest_hash, &v.manifest.signer.key, &k).unwrap();
         std::fs::write(lib.join("a/v1/mirante-skill.sig"), k.sign(b"other\n").unwrap()).unwrap();
-        assert!(read_verified(&lib, "a", 1, &v.manifest_hash, &k).is_err());
+        assert!(read_verified(&lib, "a", 1, &v.manifest_hash, &v.manifest.signer.key, &k).is_err());
     }
 }

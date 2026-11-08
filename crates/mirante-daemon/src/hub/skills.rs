@@ -30,7 +30,7 @@ use mirante_core::skills::library::{self, Bundle, VerifiedSkill};
 use mirante_core::skills::lint::{has_errors, lint, Draft, Finding, Severity};
 use mirante_core::skills::mine::{self, ActiveSkill, Kind, Params};
 use mirante_core::skills::origin::{self, Scope};
-use mirante_core::skills::sign::{SshKeygen, Verifier};
+use mirante_core::skills::sign::{Signer, SshKeygen, Verifier};
 use mirante_core::skills::{
     SkillError, FORMAT, KEEP_VERSIONS, MANIFEST, MAX_BODY, MAX_DESCRIPTION, MAX_FILE, MAX_FILES, MAX_TOTAL, SIGNATURE,
     SKILL_MD,
@@ -100,21 +100,25 @@ impl Default for SkillConf {
 }
 
 /// A [`Verifier`] that remembers what verified: the same manifest bytes, signature,
-/// principal and binary verify without running `ssh-keygen` again.
+/// principal, key and binary verify without running `ssh-keygen` again.
 struct Cached<'a> {
     inner: SshKeygen,
     seen: &'a Mutex<HashSet<String>>,
 }
 
 impl Verifier for Cached<'_> {
-    fn verify(&self, msg: &[u8], sig: &str, principal: &str) -> std::result::Result<(), SkillError> {
-        let key =
-            format!("{}:{}:{principal}:{}", sha256_hex(msg), sha256_hex(sig.as_bytes()), self.inner.bin.display());
-        if self.seen.lock().unwrap_or_else(|p| p.into_inner()).contains(&key) {
+    fn verify(&self, msg: &[u8], sig: &str, principal: &str, key: &str) -> std::result::Result<(), SkillError> {
+        let seen = format!(
+            "{}:{}:{principal}:{key}:{}",
+            sha256_hex(msg),
+            sha256_hex(sig.as_bytes()),
+            self.inner.bin.display()
+        );
+        if self.seen.lock().unwrap_or_else(|p| p.into_inner()).contains(&seen) {
             return Ok(());
         }
-        self.inner.verify(msg, sig, principal)?;
-        self.seen.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+        self.inner.verify(msg, sig, principal, key)?;
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).insert(seen);
         Ok(())
     }
 }
@@ -197,8 +201,23 @@ impl Hub {
         version: u32,
         expect_hash: &str,
     ) -> std::result::Result<VerifiedSkill, SkillError> {
-        let v = Cached { inner: SshKeygen::at(self.paths.home(), &self.skill_conf().keygen), seen: &self.skill_sigs };
-        library::read_verified(&self.paths.skills(), name, version, expect_hash, &v)
+        let inner = SshKeygen::at(self.paths.home(), &self.skill_conf().keygen);
+        let key = self.skill_signer_key(&inner)?;
+        let v = Cached { inner, seen: &self.skill_sigs };
+        library::read_verified(&self.paths.skills(), name, version, expect_hash, &key, &v)
+    }
+
+    /// The pinned fingerprint of the skill signing key (migration 8). Pinned the first time
+    /// the key is used (made, by [`Hub::signer`]); a store that predates the pin pins the
+    /// key on disk the first time a skill is verified (versions it did not sign then fail,
+    /// their manifests name another key).
+    fn skill_signer_key(&self, k: &SshKeygen) -> std::result::Result<String, SkillError> {
+        let io = |e: CoreError| SkillError::Io(e.to_string());
+        if let Some(pinned) = self.lock().store.skill_signer_key().map_err(io)? {
+            return Ok(pinned);
+        }
+        let on_disk = k.fingerprint()?;
+        self.lock().store.skill_pin_signer(&on_disk).map_err(io)
     }
 
     fn tenant_view(&self, tenant: &str) -> Result<TenantView> {
@@ -742,10 +761,20 @@ impl Hub {
         Ok(page.into_iter().map(|p| self.proposal_view(p)).collect())
     }
 
-    /// The signer (the key is generated on first use).
+    /// The signer (the key is generated on first use and its fingerprint pinned). A key on
+    /// disk that is not the pinned one is refused: it was swapped outside Mirante.
     fn signer(&self) -> Result<SshKeygen> {
-        SshKeygen::ensure_key_with(self.paths.home(), &self.skill_conf().keygen)
-            .map_err(|e| HubError::Conflict(format!("cannot sign skills: {e}")))
+        let cannot = |e: SkillError| HubError::Conflict(format!("cannot sign skills: {e}"));
+        let k = SshKeygen::ensure_key_with(self.paths.home(), &self.skill_conf().keygen).map_err(cannot)?;
+        let fp = k.fingerprint().map_err(cannot)?;
+        let pinned = self.lock().store.skill_pin_signer(&fp)?;
+        if pinned != fp {
+            return Err(HubError::Conflict(format!(
+                "cannot sign skills: the key in {} is {fp}, not the pinned {pinned} (replaced outside Mirante?)",
+                self.paths.home().join("keys").display()
+            )));
+        }
+        Ok(k)
     }
 
     /// The next version number of `name`: past the index's and every folder on disk.
@@ -1703,6 +1732,36 @@ pub(crate) mod tests {
         assert_eq!(changed, ["rescope", "rollback", "retire", "restore"]);
         let missing = k.hub.skill_action(&Caller::Person, act(SkillActionKind::Rescope, None, None, hash(&k)));
         assert!(matches!(missing, Err(HubError::Invalid(_))), "{missing:?}");
+    }
+
+    #[test]
+    fn a_signing_key_swapped_outside_mirante_signs_and_verifies_nothing() {
+        let Some(bin) = keygen() else { return };
+        let k = Kit::new();
+        let t = learning(&k, "t");
+        let p = k.hub.skill_propose(&Caller::Person, propose(&t.id, Some("s"), None, "One.\n")).unwrap();
+        k.hub.skill_review(&Caller::Person, accept(&p.proposal.id)).unwrap();
+        let pinned = k.hub.lock().store.skill_signer_key().unwrap().expect("pinned at first signing");
+        assert!(k.hub.skill_get(SkillGet { name: "s".into(), version: None }).unwrap().summary.verified);
+        // Key, .pub and allowed_signers replaced together: consistent on disk.
+        let other = k.dir.path().join("other-home");
+        std::fs::create_dir(&other).unwrap();
+        SshKeygen::ensure_key_with(&other, &bin).unwrap();
+        for f in ["skills_ed25519", "skills_ed25519.pub", "allowed_signers"] {
+            std::fs::copy(other.join("keys").join(f), k.hub.paths().home().join("keys").join(f)).unwrap();
+        }
+        // The planted key re-signs v1's exact manifest: it would verify against allowed_signers.
+        let planted = SshKeygen::at(k.hub.paths().home(), &bin);
+        let v1 = k.hub.paths().skills().join("s/v1");
+        let manifest = std::fs::read(v1.join("mirante-skill.json")).unwrap();
+        std::fs::write(v1.join("mirante-skill.sig"), planted.sign(&manifest).unwrap()).unwrap();
+        let v = k.hub.skill_get(SkillGet { name: "s".into(), version: None }).unwrap();
+        assert!(!v.summary.verified, "signed by a key that is not the pinned one: {v:?}");
+        // And nothing new is signed with it.
+        let e = k.hub.skill_propose(&Caller::Person, propose(&t.id, None, Some("s"), "Two.\n")).unwrap();
+        let r = k.hub.skill_review(&Caller::Person, accept(&e.proposal.id));
+        assert!(matches!(&r, Err(HubError::Conflict(m)) if m.contains("pinned")), "{r:?}");
+        assert_eq!(k.hub.lock().store.skill_signer_key().unwrap(), Some(pinned));
     }
 
     #[test]
