@@ -70,6 +70,13 @@ pub const TOOL_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "PostToolUseFai
 pub const TASK_ENV: &str = "MIRANTE_TASK_ID";
 /// Env var naming the Mirante session the agent runs in (forwarded by `mirante-hook`).
 pub const SESSION_ENV: &str = "MIRANTE_SESSION_ID";
+/// Env var every Mirante-launched agent (Claude and Codex) runs with, set to its task id.
+/// Children inherit it, so a process that left the agent's process tree (double fork,
+/// `setsid`, a tmux server, `cd /`) still carries it: the daemon reads it from a socket
+/// peer's environment to refuse memory review from Mirante-launched agents and to tie a
+/// proposal to its task. Defense in depth, not a boundary: a process that scrubs its
+/// environment before connecting loses it.
+pub const AGENT_ENV: &str = "MIRANTE_TASK";
 
 /// Credentials and config that no scrub list may remove.
 pub fn is_protected(key: &str) -> bool {
@@ -179,7 +186,7 @@ pub fn launch_spec(input: LaunchInput<'_>) -> LaunchSpec {
         args,
         cwd: input.worktree.to_path_buf(),
         env_remove: env_to_scrub(input.parent_env),
-        env_set: [(TASK_ENV, input.task_id), (SESSION_ENV, input.session_id)]
+        env_set: [(TASK_ENV, input.task_id), (SESSION_ENV, input.session_id), (AGENT_ENV, input.task_id)]
             .into_iter()
             .chain(AGENT_TERM_ENV)
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -339,6 +346,7 @@ mod tests {
             [
                 ("MIRANTE_TASK_ID", "t1"),
                 ("MIRANTE_SESSION_ID", "s1"),
+                ("MIRANTE_TASK", "t1"),
                 ("TERM", "xterm-256color"),
                 ("COLORTERM", "truecolor"),
                 ("TERM_PROGRAM", "mirante"),

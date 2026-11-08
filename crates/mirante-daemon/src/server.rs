@@ -195,6 +195,14 @@ pub fn handle(hub: &Hub, stream: UnixStream, on_shutdown: &(dyn Fn() + Send + Sy
     handle_with(hub, stream, on_shutdown, Limits::default())
 }
 
+/// The caller on the other end: its process (pid AND start time) as of now, when it
+/// connected. Each DNA guard re-checks that this exact process is still alive, so a peer
+/// that exits (or whose pid is reused) after connecting is refused, never taken for a
+/// person.
+pub fn caller_of(stream: &UnixStream) -> Caller {
+    peer_pid(stream).ok().and_then(crate::driver::proctree::proc_of).map_or(Caller::Unknown, Caller::Peer)
+}
+
 fn handle_with(
     hub: &Hub,
     stream: UnixStream,
@@ -206,7 +214,7 @@ fn handle_with(
         let e = RpcError::new(code::FORBIDDEN, "peer uid does not match the daemon's");
         return write_line(&mut writer, &Response::err(None, e));
     }
-    let caller = peer_pid(&stream).map_or(Caller::Unknown, Caller::Peer);
+    let caller = caller_of(&stream);
     // A connection that never sends its first request must not hold a slot forever. Later
     // requests may be far apart (a watch board's query connection), so only the first is timed.
     stream.set_read_timeout(Some(limits.first_line_timeout))?;
@@ -502,6 +510,13 @@ mod tests {
     }
 
     #[test]
+    fn the_caller_is_the_peer_process_with_its_start_time() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let me = crate::driver::proctree::proc_of(std::process::id() as i32).unwrap();
+        assert_eq!(caller_of(&a), Caller::Peer(me));
+    }
+
+    #[test]
     fn peer_pid_is_this_process_over_a_socketpair() {
         let (a, _b) = UnixStream::pair().unwrap();
         assert_eq!(peer_pid(&a).unwrap(), std::process::id() as i32);
@@ -517,9 +532,12 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let mut c = Client::connect(&sock).unwrap();
-        assert_eq!(code_of(c.call(method::DNA_REVIEW, review.clone())), code::NOT_FOUND);
-        *k.factory.driver.root.lock().unwrap() =
-            Some(crate::driver::proctree::Proc { pid: std::process::id() as i32, start: 1 });
+        // This test process is a person, unless the tests themselves run in a Mirante agent.
+        let in_agent = ["MIRANTE_TASK", "MIRANTE_TASK_ID"].iter().any(|k| std::env::var_os(k).is_some());
+        if !in_agent {
+            assert_eq!(code_of(c.call(method::DNA_REVIEW, review.clone())), code::NOT_FOUND);
+        }
+        *k.factory.driver.root.lock().unwrap() = crate::driver::proctree::proc_of(std::process::id() as i32);
         k.started(AgentKind::Claude, "agent");
         let mut c = Client::connect(&sock).unwrap();
         assert_eq!(code_of(c.call(method::DNA_REVIEW, review)), code::FORBIDDEN);

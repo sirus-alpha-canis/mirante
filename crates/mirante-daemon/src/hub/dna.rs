@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use mirante_core::claude_launch::{AGENT_ENV, TASK_ENV};
 use mirante_core::dna::anchor::check_path;
 use mirante_core::dna::anchor::Anchor;
 use mirante_core::dna::check::{check_all, cite, is_dirty, rev_parse, AnchorState};
@@ -24,14 +25,50 @@ use mirante_ipc::types::{
 use serde_json::json;
 
 use super::{Hub, HubError, Result};
+use crate::driver::proctree::{self, Proc};
 
-/// Who is calling: a person (in-process, tests), a socket peer by pid, or a peer whose pid
-/// could not be read.
+/// Who is calling: a person (in-process, tests), a socket peer (its process, pid AND start
+/// time, read once when it connected), or a peer whose process could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
     Person,
-    Peer(i32),
+    Peer(Proc),
     Unknown,
+}
+
+/// What [`Hub::identify`] makes of a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identity {
+    /// In-process, or a live peer that shows no sign of being a Mirante-launched agent.
+    Person,
+    /// A Mirante-launched agent or a process it started: inside a live session's process
+    /// tree, carrying the agent env marker, or working inside a task worktree. `task` when
+    /// every sign names the same task.
+    Agent { task: Option<String> },
+    /// The peer could not be checked: gone, its pid reused, or its environment or working
+    /// directory unreadable. Treated as an agent (fail closed).
+    Unverified(String),
+}
+
+/// The refusal for Mirante-launched agents.
+const AGENT_REFUSED: &str = "Mirante-launched agents are refused: reviewing memory is a person's decision. \
+Review it in the cockpit, or with the mirante CLI in a terminal you opened yourself";
+
+/// What a person whose call could not be checked can do instead.
+const HOW_TO_REVIEW: &str = "memory review is refused when the caller cannot be checked; review it in the \
+cockpit, or with the mirante CLI in a terminal you opened yourself";
+
+/// The task the agent env markers name: `None` without markers, `Some(None)` when they
+/// disagree or are empty.
+fn marker_task(env: &[String]) -> Option<Option<String>> {
+    let values: Vec<&str> = env
+        .iter()
+        .filter_map(|kv| kv.split_once('='))
+        .filter(|(k, _)| *k == AGENT_ENV || *k == TASK_ENV)
+        .map(|(_, v)| v)
+        .collect();
+    let first = *values.first()?;
+    Some((!first.is_empty() && values.iter().all(|v| *v == first)).then(|| first.to_string()))
 }
 
 /// Pending proposals one task, and one repo, may have at once.
@@ -331,15 +368,74 @@ impl Hub {
         self.dna_status_of(&repo)
     }
 
-    /// Ok for a person; `Forbidden` for a caller inside an agent's process tree (or one
-    /// whose pid could not be read). Defense in depth: agents run as the same uid.
+    /// Who `caller` is. A peer is a Mirante-launched agent when it is a live session's
+    /// process-tree root or below it, when its environment carries the agent marker
+    /// ([`AGENT_ENV`], or Claude's [`TASK_ENV`]; inherited by everything an agent starts, so
+    /// it survives a double fork, `setsid`, a tmux server or a daemon restart), or when it
+    /// works inside the worktree root. Fails closed: a peer that is gone, whose pid now
+    /// names another process, or whose environment or working directory cannot be read is
+    /// `Unverified`. The process is re-checked after the reads, so they were its own.
+    ///
+    /// Defense in depth, not a boundary: agents run as the same uid, and one that scrubs its
+    /// environment, leaves the tree and the worktree before connecting is not recognized.
+    pub fn identify(&self, caller: &Caller) -> Identity {
+        let p = match caller {
+            Caller::Person => return Identity::Person,
+            Caller::Unknown => return Identity::Unverified("could not read the calling process".into()),
+            Caller::Peer(p) => *p,
+        };
+        let gone = || Identity::Unverified("the calling process exited, or its pid now names another process".into());
+        if !proctree::alive(p) {
+            return gone();
+        }
+        let by_tree = self.task_of_tree(p);
+        let env = proctree::environ(p.pid);
+        let cwd = crate::memguard::orphans::process_cwd(p.pid);
+        if !proctree::alive(p) {
+            return gone();
+        }
+        let by_env = env.as_deref().and_then(marker_task);
+        if by_tree.is_some() || by_env.is_some() {
+            let signs: Vec<Option<String>> = by_tree.map(Some).into_iter().chain(by_env).collect();
+            let task = match signs.split_first() {
+                Some((first, rest)) if rest.iter().all(|t| t == first) => first.clone(),
+                _ => None,
+            };
+            return Identity::Agent { task };
+        }
+        if env.is_none() {
+            return Identity::Unverified("could not read the calling process's environment".into());
+        }
+        let Some(cwd) = cwd else {
+            return Identity::Unverified("could not read the calling process's working directory".into());
+        };
+        let root = self.paths.worktrees();
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if cwd.starts_with(&root) || cwd.starts_with(&canonical) {
+            return Identity::Agent { task: None };
+        }
+        Identity::Person
+    }
+
+    /// The task whose live session's process tree holds `p` (its root or a descendant).
+    fn task_of_tree(&self, p: Proc) -> Option<String> {
+        let roots: Vec<(String, Proc)> = {
+            let st = self.lock();
+            st.live.iter().filter_map(|(t, l)| Some((t.clone(), l.driver.as_ref()?.root()?))).collect()
+        };
+        if let Some((t, _)) = roots.iter().find(|(_, r)| *r == p) {
+            return Some(t.clone());
+        }
+        roots.into_iter().find(|(_, root)| proctree::descendants(*root).contains(&p)).map(|(t, _)| t)
+    }
+
+    /// Ok for a person; `Forbidden` for a Mirante-launched agent and for a caller that could
+    /// not be checked (see [`Hub::identify`]).
     pub(crate) fn require_person(&self, c: &Caller) -> Result<()> {
-        match c {
-            Caller::Unknown => Err(HubError::Forbidden("could not identify the caller".into())),
-            Caller::Peer(pid) if self.session_of_pid(*pid).is_some() => Err(HubError::Forbidden(
-                "memory review is a person's decision; it cannot be made from an agent session".into(),
-            )),
-            _ => Ok(()),
+        match self.identify(c) {
+            Identity::Person => Ok(()),
+            Identity::Agent { .. } => Err(HubError::Forbidden(AGENT_REFUSED.into())),
+            Identity::Unverified(why) => Err(HubError::Forbidden(format!("{why}: {HOW_TO_REVIEW}"))),
         }
     }
 
@@ -430,17 +526,21 @@ impl Hub {
 
 impl Hub {
     /// A proposed note, cited at the task worktree's HEAD, queued for a person's review.
-    /// An agent may only propose for its own task (found by its process tree, never by the
-    /// parameter); the CLI for any task.
+    /// A Mirante-launched agent may only propose for its own task (found by its process tree
+    /// and env marker, never by the parameter); a person (the CLI) for any task.
     pub fn dna_propose(&self, caller: &Caller, p: DnaPropose) -> Result<ProposalView> {
-        let agent_task = match caller {
-            Caller::Unknown => return Err(HubError::Forbidden("could not identify the caller".into())),
-            Caller::Peer(pid) => self.session_of_pid(*pid),
-            Caller::Person => None,
+        let own = |why: &str| {
+            HubError::Forbidden(format!("{why}: a Mirante-launched agent can only propose memory for its own task"))
+        };
+        let agent_task = match self.identify(caller) {
+            Identity::Person => None,
+            Identity::Agent { task: Some(t) } => Some(t),
+            Identity::Agent { task: None } => return Err(own("this agent's task is unknown")),
+            Identity::Unverified(why) => return Err(HubError::Forbidden(why)),
         };
         let task = self.lock().resolve(&p.task)?;
-        if agent_task.as_ref().is_some_and(|own| *own != task.id) {
-            return Err(HubError::Forbidden("an agent can only propose memory for its own task".into()));
+        if agent_task.as_ref().is_some_and(|t| *t != task.id) {
+            return Err(own("another task was named"));
         }
         if task.lifecycle == Lifecycle::Archived {
             return Err(HubError::Conflict(format!("task {} is archived", task.branch)));
@@ -763,8 +863,11 @@ pub(crate) mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::driver::proctree::tests::sleeper;
+    use crate::driver::proctree::{proc_of, Proc};
     use crate::hub::testkit::Kit;
     use crate::hub::HubError;
+    use mirante_core::claude_launch::{AGENT_ENV, TASK_ENV};
 
     impl Kit {
         pub fn repo_ref(&self) -> DnaRef {
@@ -855,14 +958,42 @@ pub(crate) mod tests {
         DnaReview { id: id.into(), accept: true, ..Default::default() }
     }
 
-    /// A started session whose fake driver reports `pid` as its process-tree root.
-    pub fn started(k: &Kit, branch: &str, pid: i32) -> mirante_core::model::Task {
-        *k.factory.driver.root.lock().unwrap() = Some(crate::driver::proctree::Proc { pid, start: 1 });
+    /// A started session whose fake driver reports `root` as its process-tree root.
+    pub fn started(k: &Kit, branch: &str, root: Proc) -> mirante_core::model::Task {
+        *k.factory.driver.root.lock().unwrap() = Some(root);
         k.started(AgentKind::Claude, branch).task
     }
 
-    fn me() -> i32 {
-        std::process::id() as i32
+    /// A live process that is nobody's agent: no agent env marker, outside every worktree.
+    /// Killed when dropped.
+    pub struct Peer(pub std::process::Child);
+
+    impl Peer {
+        pub fn spawn(set: &[(&str, &str)], cwd: &Path) -> Peer {
+            Peer(sleeper(set, &[AGENT_ENV, TASK_ENV], cwd))
+        }
+
+        pub fn proc(&self) -> Proc {
+            proc_of(self.0.id() as i32).expect("the peer is alive")
+        }
+
+        pub fn caller(&self) -> Caller {
+            Caller::Peer(self.proc())
+        }
+    }
+
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn forbidden_with(r: Result<impl std::fmt::Debug>, needle: &str) {
+        match r {
+            Err(HubError::Forbidden(m)) => assert!(m.contains(needle), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Enabled memory and a task whose worktree has `src/a.rs` committed.
@@ -1032,10 +1163,11 @@ pub(crate) mod tests {
     #[test]
     fn review_and_note_actions_are_refused_from_an_agent_tree() {
         let k = Kit::new();
-        let t = started(&k, "g", me());
-        let caller = Caller::Peer(me()); // this test process is the "agent root"
-        assert_eq!(k.hub.session_of_pid(me()), Some(t.id.clone()));
-        assert!(matches!(k.hub.dna_review(&caller, review_accept("x")), Err(HubError::Forbidden(_))));
+        let root = Peer::spawn(&[], k.dir.path());
+        let t = started(&k, "g", root.proc());
+        let caller = root.caller();
+        assert_eq!(k.hub.identify(&caller), Identity::Agent { task: Some(t.id.clone()) });
+        forbidden_with(k.hub.dna_review(&caller, review_accept("x")), "Mirante-launched agents are refused");
         assert!(matches!(k.hub.dna_enable(&k.repo_ref(), &caller), Err(HubError::Forbidden(_))));
         assert!(matches!(k.hub.dna_disable(&k.repo_ref(), &caller), Err(HubError::Forbidden(_))));
         assert!(matches!(k.hub.dna_review(&Caller::Unknown, review_accept("x")), Err(HubError::Forbidden(_))));
@@ -1046,32 +1178,92 @@ pub(crate) mod tests {
             expect_hash: "h".into(),
         };
         assert!(matches!(k.hub.dna_note_action(&caller, act), Err(HubError::Forbidden(_))));
-        // A pid outside every agent tree is a person (the review then fails on the id).
-        let other = Caller::Peer(1);
-        assert!(matches!(k.hub.dna_review(&other, review_accept("x")), Err(HubError::NotFound(_))));
+        // A process that is no Mirante-launched agent is a person (the review then fails on the id).
+        let person = Peer::spawn(&[], k.dir.path());
+        assert_eq!(k.hub.identify(&person.caller()), Identity::Person);
+        let r = k.hub.dna_review(&person.caller(), review_accept("x"));
+        assert!(matches!(r, Err(HubError::NotFound(_))), "{r:?}");
     }
 
     #[test]
     fn a_process_working_in_a_worktree_counts_as_an_agent() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "orphan").task;
-        let mut child = Command::new("/bin/sleep").arg("30").current_dir(&t.worktree_path).spawn().unwrap();
-        let pid = child.id() as i32;
-        assert_eq!(k.hub.session_of_pid(pid), Some(String::new()));
-        assert!(matches!(k.hub.dna_enable(&k.repo_ref(), &Caller::Peer(pid)), Err(HubError::Forbidden(_))));
-        let _ = child.kill();
-        let _ = child.wait();
+        let orphan = Peer::spawn(&[], Path::new(&t.worktree_path));
+        assert_eq!(k.hub.identify(&orphan.caller()), Identity::Agent { task: None });
+        assert!(matches!(k.hub.dna_enable(&k.repo_ref(), &orphan.caller()), Err(HubError::Forbidden(_))));
+    }
+
+    #[test]
+    fn an_agent_that_left_its_process_tree_is_known_by_its_env_marker() {
+        let k = Kit::new();
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        let mine = k.create(AgentKind::Claude, "mine").task;
+        commit_in(&mine.worktree_path, "src/a.rs", CODE);
+        let other = k.create(AgentKind::Claude, "other").task;
+        commit_in(&other.worktree_path, "src/a.rs", CODE);
+        // Double-forked, `cd /`, after a daemon restart: no live tree, no worktree cwd.
+        let escaped = Peer::spawn(&[(AGENT_ENV, &mine.id)], k.dir.path());
+        let caller = escaped.caller();
+        assert_eq!(k.hub.identify(&caller), Identity::Agent { task: Some(mine.id.clone()) });
+        forbidden_with(k.hub.dna_review(&caller, review_accept("x")), "Mirante-launched agents are refused");
+        forbidden_with(k.hub.dna_enable(&k.repo_ref(), &caller), "Mirante-launched agents are refused");
+        let claimed = k.hub.dna_propose(&caller, propose(&other.id, "T", "b", "src/a.rs", 1, 1));
+        forbidden_with(claimed, "its own task");
+        let p = k.hub.dna_propose(&caller, propose(&mine.id, "T", "b", "src/a.rs", 1, 1)).unwrap();
+        assert_eq!(p.origin, "agent");
+        // Claude's older marker counts too; markers naming different tasks name none.
+        let claude = Peer::spawn(&[(TASK_ENV, &mine.id)], k.dir.path());
+        assert_eq!(k.hub.identify(&claude.caller()), Identity::Agent { task: Some(mine.id.clone()) });
+        let mixed = Peer::spawn(&[(TASK_ENV, &mine.id), (AGENT_ENV, &other.id)], k.dir.path());
+        assert_eq!(k.hub.identify(&mixed.caller()), Identity::Agent { task: None });
+        forbidden_with(k.hub.dna_propose(&mixed.caller(), propose(&mine.id, "T", "b", "src/a.rs", 1, 1)), "task");
+    }
+
+    #[test]
+    fn a_caller_that_exited_or_whose_pid_was_reused_is_refused() {
+        let k = Kit::new();
+        let gone = {
+            let p = Peer::spawn(&[], k.dir.path());
+            p.proc()
+        }; // killed and reaped
+        forbidden_with(k.hub.dna_review(&Caller::Peer(gone), review_accept("x")), "exited");
+        let me = proc_of(std::process::id() as i32).unwrap();
+        let reused = Caller::Peer(Proc { pid: me.pid, start: me.start + 1 });
+        forbidden_with(k.hub.dna_review(&reused, review_accept("x")), "exited");
+        forbidden_with(k.hub.dna_review(&Caller::Unknown, review_accept("x")), "terminal you opened yourself");
+    }
+
+    #[test]
+    fn a_caller_whose_environment_cannot_be_read_is_refused_with_what_to_do() {
+        let k = Kit::new();
+        // Another user's process (init on Linux; macOS does not even show launchd's start
+        // time to us): its environment is not readable.
+        if let Some(init) = proc_of(1).filter(|_| unsafe { libc::getuid() } != 0) {
+            forbidden_with(k.hub.dna_review(&Caller::Peer(init), review_accept("x")), "terminal you opened yourself");
+        }
+        // macOS hides a platform binary's environment (`nc -U` on the socket).
+        #[cfg(target_os = "macos")]
+        {
+            let mut nc = Command::new("/bin/sleep").arg("30").current_dir(k.dir.path()).spawn().unwrap();
+            let caller = Caller::Peer(proc_of(nc.id() as i32).unwrap());
+            assert!(matches!(k.hub.identify(&caller), Identity::Unverified(_)));
+            forbidden_with(k.hub.dna_review(&caller, review_accept("x")), "environment");
+            let _ = nc.kill();
+            let _ = nc.wait();
+        }
     }
 
     #[test]
     fn propose_from_an_agent_tree_must_name_its_own_task() {
         let k = Kit::new();
         k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
-        let mine = started(&k, "mine", me());
+        let root = Peer::spawn(&[], k.dir.path());
+        let mine = started(&k, "mine", root.proc());
         commit_in(&mine.worktree_path, "src/a.rs", CODE);
         let other = k.create(AgentKind::Claude, "other").task;
         commit_in(&other.worktree_path, "src/a.rs", CODE);
-        let caller = Caller::Peer(me());
+        let caller = root.caller();
         let claimed = k.hub.dna_propose(&caller, propose(&other.id, "T", "b", "src/a.rs", 1, 1));
         assert!(matches!(claimed, Err(HubError::Forbidden(_))), "{claimed:?}");
         let p = k.hub.dna_propose(&caller, propose(&mine.id, "T", "b", "src/a.rs", 1, 1)).unwrap();

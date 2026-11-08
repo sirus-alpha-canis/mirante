@@ -48,7 +48,7 @@ pub mod method {
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
     pub const DNA_STATUS: &str = "dna.status";
-    /// Creates `.mirante/memory/README.md` and turns injection on (a person only).
+    /// Creates `.mirante/memory/README.md` and turns injection on (a person only; Mirante-launched agents are refused).
     pub const DNA_ENABLE: &str = "dna.enable";
     /// Turns injection off for new sessions; the files stay (a person only).
     pub const DNA_DISABLE: &str = "dna.disable";
@@ -67,13 +67,13 @@ pub mod method {
     /// The review queue ([`super::DnaProposals`] → `Vec<`[`super::ProposalView`]`>`).
     pub const DNA_PROPOSALS: &str = "dna.proposals";
     /// A person accepts (writes the note) or rejects a proposal ([`super::DnaReview`] →
-    /// [`super::ProposalView`]). Refused from inside an agent's process tree.
+    /// [`super::ProposalView`]). Mirante-launched agents are refused.
     pub const DNA_REVIEW: &str = "dna.review";
     /// A task's memory: notes relevant to it, notes its branch puts at risk, its proposals
     /// ([`super::TaskRef`] → [`super::DnaTaskContext`]).
     pub const DNA_TASK_CONTEXT: &str = "dna.task_context";
     /// A person confirms (re-anchors at HEAD) or retires a note ([`super::DnaNoteAction`] →
-    /// [`super::NoteView`]). Refused from inside an agent's process tree.
+    /// [`super::NoteView`]). Mirante-launched agents are refused.
     pub const DNA_NOTE_ACTION: &str = "dna.note_action";
 }
 

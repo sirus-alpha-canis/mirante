@@ -52,6 +52,34 @@ mod sys {
         })
     }
 
+    /// (argv, environment) from `KERN_PROCARGS2`.
+    pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<String>)> {
+        if pid <= 0 {
+            return None;
+        }
+        let mut max: libc::c_int = 0;
+        let mut len = size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `max` is a c_int and its size is passed.
+        let r = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 2, &mut max as *mut _ as *mut c_void, &mut len, std::ptr::null_mut(), 0)
+        };
+        if r != 0 || max <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; max as usize];
+        let mut len = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the buffer has `len` bytes.
+        let r = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0)
+        };
+        if r != 0 {
+            return None;
+        }
+        super::parse_procargs2(&buf[..len])
+    }
+
     pub fn group_members(pgid: i32) -> Vec<i32> {
         list(pgid, |pgid, buf, bytes| {
             // SAFETY: the buffer holds `bytes` bytes.
@@ -122,6 +150,49 @@ mod sys {
     pub fn group_members(pgid: i32) -> Vec<i32> {
         all_where(|s| s.2 == pgid)
     }
+
+    fn nul_list(path: String) -> Option<Vec<String>> {
+        let raw = std::fs::read(path).ok()?;
+        Some(
+            raw.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect(),
+        )
+    }
+
+    /// (argv, environment) from `/proc/<pid>/cmdline` and `/proc/<pid>/environ`.
+    pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<String>)> {
+        if pid <= 0 {
+            return None;
+        }
+        Some((nul_list(format!("/proc/{pid}/cmdline"))?, nul_list(format!("/proc/{pid}/environ"))?))
+    }
+}
+
+/// `KERN_PROCARGS2` (macOS): `argc` (native i32), the exec path, NUL padding, `argc` argv
+/// strings, then the environment strings up to the first empty one (the kernel's own
+/// `apple[]` strings follow it). `None` when too short.
+pub fn parse_procargs2(buf: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?).max(0) as usize;
+    let body = &buf[4..];
+    let body = body.strip_suffix(&[0]).unwrap_or(body);
+    let mut strings = body.split(|b| *b == 0).skip(1).skip_while(|s| s.is_empty());
+    let lossy = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
+    let argv: Vec<String> = strings.by_ref().take(argc).map(lossy).collect();
+    let env = strings.take_while(|s| !s.is_empty()).map(lossy).collect();
+    Some((argv, env))
+}
+
+/// The environment `pid` was started with (`KEY=value` strings): `KERN_PROCARGS2` on macOS,
+/// `/proc/<pid>/environ` on Linux. `None` when it cannot be read: gone, another user's, or
+/// hidden. macOS hides the environment of Apple platform binaries (`/bin/*`, `/usr/bin/*`:
+/// `nc`, `perl`, `python3`, `osascript`…) from other processes, returning argv only, so an
+/// empty environment counts as unreadable (every real process has at least `PATH`/`HOME`).
+pub fn environ(pid: i32) -> Option<Vec<String>> {
+    sys::procargs(pid).map(|(_, env)| env).filter(|env| !env.is_empty())
+}
+
+/// The command line `pid` was started with.
+pub fn argv(pid: i32) -> Option<Vec<String>> {
+    sys::procargs(pid).map(|(argv, _)| argv)
 }
 
 /// The process `pid` now (`None`: gone or a zombie).
@@ -324,10 +395,70 @@ pub fn kill_tree_with(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::{Child, Command};
     use std::sync::Mutex;
+
+    #[test]
+    fn procargs2_is_argc_exec_path_padding_argv_then_env() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/sleep\0\0\0\0sleep\0\x330\0A=1\0MIRANTE_TASK=t1\0\0ptr_munge=\0");
+        let (argv, env) = parse_procargs2(&buf).unwrap();
+        assert_eq!(argv, ["sleep", "30"]);
+        assert_eq!(env, ["A=1", "MIRANTE_TASK=t1"]);
+        assert_eq!(parse_procargs2(&[1, 0]), None);
+        // argc larger than what follows: argv is cut, env empty.
+        let mut short = 5i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/x\0x\0");
+        assert_eq!(parse_procargs2(&short), Some((vec!["x".to_string()], Vec::new())));
+    }
+
+    /// Not a test: the process [`sleeper`] runs (this test binary, which is not an Apple
+    /// platform binary, so its environment is readable on macOS).
+    #[test]
+    #[ignore = "helper process for the peer tests"]
+    fn sleeper_child() {
+        if std::env::var_os("MIRANTE_SLEEPER").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    /// A live process (this test binary, sleeping) with `set` added to and `remove` taken
+    /// from this process's environment, in `cwd`.
+    pub(crate) fn sleeper(set: &[(&str, &str)], remove: &[&str], cwd: &std::path::Path) -> Child {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "driver::proctree::tests::sleeper_child", "--ignored", "--test-threads=1", "-q"])
+            .env("MIRANTE_SLEEPER", "1")
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for k in remove {
+            cmd.env_remove(k);
+        }
+        cmd.envs(set.iter().copied());
+        cmd.spawn().expect("spawn the sleeper")
+    }
+
+    #[test]
+    fn environ_reads_a_child_process_environment() {
+        let mut child = sleeper(&[("MIRANTE_PROBE", "here")], &[], std::path::Path::new("/"));
+        let env = environ(child.id() as i32).expect("own child's environment is readable");
+        assert!(env.iter().any(|v| v == "MIRANTE_PROBE=here"), "{env:?}");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(environ(-1), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_platform_binary_hides_its_environment() {
+        let mut child = Command::new("/bin/sleep").arg("30").env("MIRANTE_PROBE", "here").spawn().unwrap();
+        assert_eq!(environ(child.id() as i32), None);
+        assert_eq!(argv(child.id() as i32).unwrap(), ["/bin/sleep", "30"]);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     /// Records every signal, then sends it.
     struct Recorder {

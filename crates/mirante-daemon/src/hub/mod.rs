@@ -42,7 +42,8 @@ pub enum HubError {
     /// Refused because a dialog waits for the user.
     NeedsYou(String),
     Invalid(String),
-    /// Refused because of who is asking (a DNA review from inside an agent's process tree).
+    /// Refused because of who is asking (a DNA review from a Mirante-launched agent, or from
+    /// a caller that could not be checked).
     Forbidden(String),
     /// Mirante did not type this Claude answer (inline answers are off, or the evidence
     /// that the dialog on screen is this card's is missing): the user answers it in the
@@ -678,29 +679,6 @@ impl Hub {
         };
         st.subscribers.push(tx);
         Ok(Subscription { snapshot, replay, events: rx })
-    }
-
-    /// The task whose agent process tree contains `pid`: a live session's root or one of
-    /// its descendants. A process whose working directory is inside the worktree root (an
-    /// agent's re-parented child, the memory guard's orphan rule) is `Some("")`: an agent,
-    /// task unknown. `None`: not an agent.
-    pub fn session_of_pid(&self, pid: i32) -> Option<String> {
-        let roots: Vec<(String, crate::driver::proctree::Proc)> = {
-            let st = self.lock();
-            st.live.iter().filter_map(|(t, l)| Some((t.clone(), l.driver.as_ref()?.root()?))).collect()
-        };
-        if let Some((t, _)) = roots.iter().find(|(_, r)| r.pid == pid) {
-            return Some(t.clone());
-        }
-        for (t, root) in roots {
-            if crate::driver::proctree::descendants(root).iter().any(|p| p.pid == pid) {
-                return Some(t);
-            }
-        }
-        let root = self.paths.worktrees();
-        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        let cwd = crate::memguard::orphans::process_cwd(pid)?;
-        (cwd.starts_with(&root) || cwd.starts_with(&canonical)).then(String::new)
     }
 
     pub fn status(&self) -> DaemonStatus {

@@ -67,32 +67,9 @@ mod sys {
         (!s.is_empty()).then(|| PathBuf::from(s))
     }
 
-    /// The command line (`KERN_PROCARGS2`: argc, exec path, padding, then argv).
+    /// The command line (`KERN_PROCARGS2`, see [`crate::driver::proctree::argv`]).
     pub fn argv(pid: i32) -> Option<String> {
-        let mut max: libc::c_int = 0;
-        let mut len = size_of::<libc::c_int>();
-        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-        // SAFETY: `max` is a c_int and its size is passed.
-        let r = unsafe {
-            libc::sysctl(mib.as_mut_ptr(), 2, &mut max as *mut _ as *mut c_void, &mut len, std::ptr::null_mut(), 0)
-        };
-        if r != 0 || max <= 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; max as usize];
-        let mut len = buf.len();
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        // SAFETY: the buffer has `len` bytes.
-        let r = unsafe {
-            libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0)
-        };
-        if r != 0 || len < 4 {
-            return None;
-        }
-        let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?).max(0) as usize;
-        let mut rest = buf[4..len].split(|b| *b == 0).skip(1).skip_while(|s| s.is_empty());
-        let args: Vec<String> = rest.by_ref().take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-        Some(args.join(" "))
+        crate::driver::proctree::argv(pid).map(|a| a.join(" "))
     }
 
     pub fn my_uid() -> u32 {

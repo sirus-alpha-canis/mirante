@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
-use mirante_core::claude_launch::{launch_spec, settings_json, LaunchInput};
+use mirante_core::claude_launch::{launch_spec, settings_json, LaunchInput, AGENT_ENV};
 use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
 use mirante_ipc::types::AgentBinView;
@@ -139,6 +139,14 @@ pub fn claude_spec(
     Ok((pty, pinned))
 }
 
+/// What the codex process gets set in its environment: the agent marker
+/// ([`AGENT_ENV`] = the task id) and, when needed, `PATH` with its directory first.
+pub fn codex_env_set(req: &SpawnRequest, bin: &Path, path_var: Option<&str>) -> Vec<(String, String)> {
+    let mut env = vec![(AGENT_ENV.to_string(), req.task.id.clone())];
+    env.extend(agent_path_env(bin, path_var));
+    env
+}
+
 /// `PATH` for an agent at `bin`: its directory first when PATH lacks it, else nothing to set.
 pub fn agent_path_env(bin: &Path, path_var: Option<&str>) -> Vec<(String, String)> {
     child_path(bin, path_var).map(|p| vec![("PATH".to_string(), p)]).unwrap_or_default()
@@ -187,7 +195,7 @@ impl RealFactory {
 
     fn codex(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
         let bin = resolve_agent(Agent::Codex)?;
-        let env_set = agent_path_env(&bin, std::env::var("PATH").ok().as_deref());
+        let env_set = codex_env_set(req, &bin, std::env::var("PATH").ok().as_deref());
         let log = req.paths.session_dir(&req.task.id).join("codex-stderr.log");
         // Appended, never truncated: the last session's stderr explains its crash.
         prepare_append_log(&log, STDERR_LOG_CAP)?;
@@ -300,11 +308,20 @@ mod tests {
         assert!(!args.contains("--resume") && !args.contains("dangerously"), "{args}");
         assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
         assert_eq!(env(&spec, "MIRANTE_TASK_ID"), Some("task-1"));
+        assert_eq!(env(&spec, "MIRANTE_TASK"), Some("task-1"));
         assert_eq!(env(&spec, "MIRANTE_HOME"), Some("/h"));
         assert_eq!(env(&spec, "TERM"), Some("xterm-256color"));
         assert!(spec.env_remove.contains(&"CLAUDECODE".to_string()));
         assert!(!spec.env_remove.iter().any(|k| k.starts_with("ANTHROPIC_")));
         assert_eq!((spec.cwd.as_path(), spec.rows, spec.cols), (Path::new("/w/tree"), 40, 120));
+    }
+
+    #[test]
+    fn codex_runs_with_the_agent_marker() {
+        let env = codex_env_set(&request(None), Path::new("/usr/bin/codex"), Some("/usr/bin:/bin"));
+        assert_eq!(env, [("MIRANTE_TASK".to_string(), "task-1".to_string())]);
+        let nvm = codex_env_set(&request(None), Path::new("/h/n/bin/codex"), Some("/usr/bin"));
+        assert!(nvm.iter().any(|(k, _)| k == "PATH") && nvm.iter().any(|(k, v)| k == "MIRANTE_TASK" && v == "task-1"));
     }
 
     #[test]
