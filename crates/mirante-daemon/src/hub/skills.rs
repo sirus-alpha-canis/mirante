@@ -691,7 +691,8 @@ impl Hub {
     /// env marker or terminal, never by the parameter); a person (the CLI) for any task. The
     /// tenant must have learning on and the task's origin must be confirmed. Text is
     /// redacted and linted (the findings are kept; errors block the accept, not the
-    /// proposal). A new skill is scoped to the task's repo.
+    /// proposal). A new skill is scoped to the task's repo, on demand by default when an
+    /// agent proposes it (always on when a person does).
     pub fn skill_propose(&self, caller: &Caller, p: SkillPropose) -> Result<SkillProposalView> {
         let own = |why: &str| {
             HubError::Forbidden(format!("{why}: a Mirante-launched agent can only propose skills for its own task"))
@@ -760,7 +761,10 @@ impl Hub {
                 if name != wanted {
                     shown = Some(wanted);
                 }
-                let activation = parse_activation(p.activation.as_deref(), Activation::Always)?;
+                // An agent's new skill is on demand unless it asks (a person decides at
+                // review whether it goes into every session's system prompt).
+                let default = if agent_task.is_some() { Activation::OnDemand } else { Activation::Always };
+                let activation = parse_activation(p.activation.as_deref(), default)?;
                 ("new", name, None, Scope::Repo(o.origin.clone()), activation)
             }
         };
@@ -1842,7 +1846,14 @@ pub(crate) mod tests {
         assert!(matches!(unknown, Err(HubError::Forbidden(_))), "{unknown:?}");
         // A person (the CLI) proposes for any task.
         let cli = k.hub.skill_propose(&Caller::Person, propose(&other.id, None, None, "Run cargo test first.\n"));
-        assert_eq!(cli.unwrap().proposal.origin, "cli");
+        let cli = cli.unwrap();
+        assert_eq!(cli.proposal.origin, "cli");
+        // An agent's new skill is on demand unless it asks; a person's is always on.
+        assert_eq!(p.proposal.activation, "on_demand");
+        assert_eq!(cli.proposal.activation, "always");
+        let mut asked = propose(&mine.id, Some("asked-always"), None, "x\n");
+        asked.activation = Some("always".into());
+        assert_eq!(k.hub.skill_propose(&caller, asked).unwrap().proposal.activation, "always");
     }
 
     /// An agent edits only its own tenant's skills, and cannot tell a skill of another

@@ -522,7 +522,7 @@ fn skill_tools() -> Value {
                                 "description": "One line: when the skill applies."},
                 "body": {"type": "string", "description": "The instructions (Markdown)."},
                 "activation": {"type": "string", "enum": ACTIVATIONS,
-                               "description": "always (every session) or on_demand (loaded when relevant)."}
+                               "description": "on_demand (loaded when relevant; the default) or always (every session)."}
             },
             "required": ["description", "body"],
             "additionalProperties": false
