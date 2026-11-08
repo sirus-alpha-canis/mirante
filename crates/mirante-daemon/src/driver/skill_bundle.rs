@@ -478,6 +478,14 @@ pub(crate) mod tests {
         let md = render_skill_md("x", "d", "b\n");
         for bad in [
             skill("x", Activation::OnDemand, &md, &[("../escape.md", "x")]),
+            // A nested SKILL.md would be a second skill with its raw frontmatter.
+            skill(
+                "x",
+                Activation::OnDemand,
+                &md,
+                &[("reference/SKILL.md", "---\nname: y\nallowed-tools: Bash\n---\n")],
+            ),
+            skill("x", Activation::OnDemand, &md, &[("a/skill.md", "x")]),
             skill("x", Activation::OnDemand, "no frontmatter", &[]),
             skill("Bad", Activation::OnDemand, &md, &[]),
         ] {

@@ -252,7 +252,7 @@ pub fn is_name(s: &str) -> bool {
 
 /// An extra file's path: relative, `/`-separated, at most 3 levels and 128 bytes, each
 /// segment `[A-Za-z0-9._-]` not starting with `.`, ending in `.md` or `.txt` (text only:
-/// scripts are deferred), and not one of the version's own names.
+/// scripts are deferred), and not one of the version's own names (at any depth).
 pub fn check_file_path(p: &str) -> Result<(), SkillError> {
     let refuse = |why: &str| Err(bad(format!("file path {p:?}: {why}")));
     if p.is_empty() || p.len() > 128 || p.starts_with('/') {
@@ -273,7 +273,10 @@ pub fn check_file_path(p: &str) -> Result<(), SkillError> {
     if !(p.ends_with(".md") || p.ends_with(".txt")) {
         return refuse("only .md and .txt files");
     }
-    if [SKILL_MD, MANIFEST, SIGNATURE].iter().any(|n| p.eq_ignore_ascii_case(n)) {
+    // At any depth: a nested `SKILL.md` would be discovered by Claude as a skill of its own,
+    // with its frontmatter as written (only the top one is re-rendered).
+    let last = segs.last().copied().unwrap_or_default();
+    if [SKILL_MD, MANIFEST, SIGNATURE].iter().any(|n| last.eq_ignore_ascii_case(n)) {
         return refuse("reserved name");
     }
     Ok(())
@@ -516,5 +519,16 @@ mod tests {
         for ok in ["reference/a.md", "notes.txt", "a/b/c.md"] {
             assert!(check_file_path(ok).is_ok(), "{ok}");
         }
+    }
+
+    /// A nested `SKILL.md` would be found by Claude as a skill of its own, with whatever
+    /// frontmatter it holds (`allowed-tools`, `hooks`): only the top one is re-rendered.
+    #[test]
+    fn a_skill_md_at_any_depth_is_reserved() {
+        for bad in ["reference/SKILL.md", "a/skill.md", "a/b/Skill.md", "x/SKILL.md"] {
+            let e = check_file_path(bad).unwrap_err().to_string();
+            assert!(e.contains("reserved"), "{bad}: {e}");
+        }
+        assert!(check_file_path("reference/skill-notes.md").is_ok());
     }
 }
