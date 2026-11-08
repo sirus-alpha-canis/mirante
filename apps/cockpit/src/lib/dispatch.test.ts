@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_OPTIONS,
+  CONTEXT_HEADER,
+  contextKey,
+  withContext,
   applySuggestion,
   branchFromGoal,
   branchProblem,
@@ -159,5 +163,34 @@ describe("suggest", () => {
     const text = "@claude sh/feat/x go";
     const r = suggest(text, 10, projs)!;
     expect(applySuggestion(text, r, r.items[0])).toEqual({ text: "@claude shop/feat/x go", caret: 13 });
+  });
+});
+
+describe("withContext", () => {
+  it("appends the attached references after the goal, labeled, one per line", () => {
+    const goal = "Fix the login\nkeep the API";
+    const out = withContext(goal, [
+      { kind: "file", path: "src/login.ts" },
+      { kind: "note", slug: "tokens", title: "Tokens are refreshed by the session layer" },
+      { kind: "skill", name: "cargo-tests-first", description: "run the tests first" },
+    ]);
+    expect(out).toBe(
+      [
+        "Fix the login",
+        "keep the API",
+        "",
+        CONTEXT_HEADER,
+        "- file: src/login.ts",
+        '- repo memory note "Tokens are refreshed by the session layer": .mirante/memory/tokens.md',
+        "- skill: cargo-tests-first (run the tests first)",
+      ].join("\n"),
+    );
+    expect(out.split("\n")[0]).toBe("Fix the login");
+    expect(withContext("just this", [])).toBe("just this");
+    expect(contextKey({ kind: "skill", name: "x", description: "" })).toBe("skill:x");
+  });
+
+  it("offers Claude and Codex, in that order", () => {
+    expect(AGENT_OPTIONS.map((a) => a.id)).toEqual(["claude", "codex"]);
   });
 });

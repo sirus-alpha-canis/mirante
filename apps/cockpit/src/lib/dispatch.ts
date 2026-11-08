@@ -155,3 +155,47 @@ export function applySuggestion(text: string, s: Suggestions, item: SuggestionIt
   const caret = s.from + item.insert.length + (out[s.from + item.insert.length] === "/" && !item.insert.endsWith("/") ? 1 : 0);
   return { text: out, caret };
 }
+
+/** Something attached to a goal with "+ context": a repo file, a repo memory note, a skill. */
+export type ContextRef =
+  | { kind: "file"; path: string }
+  | { kind: "note"; slug: string; title: string }
+  | { kind: "skill"; name: string; description: string };
+
+export const CONTEXT_HEADER = "Context attached in Mirante (read these before you start):";
+
+export function contextKey(r: ContextRef): string {
+  return r.kind === "file" ? `file:${r.path}` : r.kind === "note" ? `note:${r.slug}` : `skill:${r.name}`;
+}
+
+/** One reference line, as the agent reads it. */
+export function contextLine(r: ContextRef): string {
+  switch (r.kind) {
+    case "file":
+      return `- file: ${r.path}`;
+    case "note":
+      return `- repo memory note "${r.title}": .mirante/memory/${r.slug}.md`;
+    case "skill":
+      return `- skill: ${r.name}${r.description ? ` (${r.description})` : ""}`;
+  }
+}
+
+/** The goal with the attached references after it, clearly labeled (nothing when none). The
+ * first line stays the goal's, so the task's title is unchanged. */
+export function withContext(goal: string, refs: ContextRef[]): string {
+  if (refs.length === 0) return goal;
+  return `${goal.trimEnd()}\n\n${CONTEXT_HEADER}\n${refs.map(contextLine).join("\n")}`;
+}
+
+/** The agents the form offers. More (OpenCode, local models) join this list. */
+export interface AgentOption {
+  id: AgentKind;
+  label: string;
+  /** The model it runs, in a person's words (its own default for now). */
+  model: string;
+}
+
+export const AGENT_OPTIONS: AgentOption[] = [
+  { id: "claude", label: "Claude", model: "Claude Code's default model" },
+  { id: "codex", label: "Codex", model: "Codex's default model" },
+];
