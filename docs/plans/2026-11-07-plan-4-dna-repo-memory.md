@@ -1168,6 +1168,8 @@ cargo build -p mirante-mcp
 
 - [ ] **Step 6: Commit** `feat(daemon): per-task memory MCP for Claude (--mcp-config) and Codex (-c), only for enabled repos`.
 
+  > **As built (Batch C).** The MCP server's environment also carries the `MIRANTE_TASK` marker (in `mcp.json` and in Codex's `-c mcp_servers.mirante.env`), so the server process and anything it starts are recognized as a Mirante-launched agent (Decision 6) even though the agent's client launches it. `codex_mcp_args` returns `Result<Vec<String>, String>`: a path or value with a control character cannot be TOML-escaped safely and is refused rather than passed. The binary is resolved through `DriverFactory::memory_server()` (default `real::mcp_bin()`), so the fake factory can answer in tests without a real binary. The `-c` overrides reach `CodexDriver::spawn` through `ChildEnv.args` (next to `remove` and `set`), not a new positional parameter.
+
 ### Task 14: CLI `mirante memory …` (with an offline `check` for CI)
 
 **Files:** `crates/mirante-cli/src/{args.rs,main.rs,render.rs}`, `crates/mirante-cli/tests/e2e.rs`
@@ -1212,6 +1214,8 @@ cargo build -p mirante-mcp
 - [ ] **Step 4: Run and confirm.** Run `cargo build --workspace && cargo test -p mirante-cli`. Expected: PASS.
 
 - [ ] **Step 5: Commit** `feat(cli): mirante memory (enable, search, review queue, confirm/retire, offline check for CI)`.
+
+  > **As built (Batch C).** `check` choices: a note that does not parse fails the check (exit 1, printed as `invalid`); retired notes are skipped; `--rev` requires `--offline` (the daemon always checks at the checkout HEAD); `check` without `--offline` asks the daemon (`dna.check`, then `dna.graph`) and fails exactly like the offline check. `propose` requires `--task <id>`, because `dna.propose` cites the task worktree's HEAD.
 
 ---
 
