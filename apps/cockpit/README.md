@@ -86,17 +86,43 @@ picker's `open` and nothing else of the dialog plugin) or by pasting its path an
 (`~/…` is expanded with your home folder). A path that is missing or a file is refused there;
 whether it is a git checkout is checked when you dispatch a task to it.
 
+## Home: an inbox of every project
+
+Home lists what needs you first, across all projects: **Precisa de você** (each card with
+its one action: Allow / Deny for Codex, Answer in terminal for Claude, Trust, or Open
+terminal), **Pronto para revisar** (the agent's last answer in two lines, expandable, and
+Review diff), **Trabalhando** (one line each: title, agent, time on the turn, what it is
+doing in plain words; the raw steps stay in the task's detail), and the idle ones folded
+away, all grouped by project with a color per project. Past 10 minutes it says how many
+agents have waited on you. **Próximo** (⌘J) opens the next task that needs you (Claude's on
+its Terminal tab) and says where you are ("2 de 5"). The detail's task list groups by
+project then state, with filters (Precisa de você / Trabalhando / Pronto / Todos) and a
+search; its Steps tab sums runs of tool steps up ("leu 14 arquivos, rodou 3 comandos",
+click to see them) and folds repeated lines (×N). A Claude session that leaves manual
+permission mode gets a red **auto mode on** badge (from the `permission_mode` its hooks and
+transcript report); switch back with Shift+Tab in its terminal.
+
+The app remembers where you were (view, project, open task and tab, Home's scroll) on this
+machine. Closing it never ends a session: the daemon owns them. When the daemon itself
+restarts (an upgrade, a reboot, a crash), the sessions it ended are resumed on their
+conversations, one at a time while memory allows; turn that off under Sessions on the left
+(or `MIRANTE_AUTO_RESUME=off`). Stopped and hibernated tasks are never resumed by it.
+
 ## Dispatch
 
-Home's form: pick **Claude** or **Codex** (remembered on this machine), the repository (one
-of your Projects; it starts on the one selected on the left), and write the goal. The branch
-is named after the goal (`mirante/<words-of-the-goal>`, accents dropped, about 40 characters);
-a name another task of the repo uses, or one git already has, moves on to `-2`, `-3`… Use
-**edit** to type your own (an existing branch is then checked out as it is). Text starting
-with `@claude` or `@codex` is the one-line form, `@claude shop/feat/login add a login page`:
-typing `@` suggests the agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab
-picks, Esc closes); `shop/` with no branch gets one named from the goal. The Repository box
-filters the Projects the same way.
+Home's form is one box: write the goal, then use the chips below it. **Agent** (Claude or
+Codex, remembered on this machine; more agents will join the menu), **Repository** (one of
+your Projects; it starts on the one selected on the left; type to filter), the branch (it
+appears once there is a goal: `mirante/<words-of-the-goal>`, accents dropped, about 40
+characters; a name another task of the repo uses, or one git already has, moves on to `-2`,
+`-3`…; **edit** to type your own, and an existing branch is then checked out as it is), and
+**+ contexto**: attach repo files (searched by path), repo memory notes or skills; they are
+added after the goal as a labeled list of references for the agent ("Context attached in
+Mirante"), nothing else is read or sent. While the memory guard pauses new sessions the
+form says so. Text starting with `@claude` or `@codex` is the one-line form,
+`@claude shop/feat/login add a login page`: typing `@` suggests the agents, then the
+Projects (filtered as you type; ↑/↓, Enter or Tab picks, Esc closes); `shop/` with no
+branch gets one named from the goal.
 
 ## Keys
 
@@ -105,6 +131,7 @@ filters the Projects the same way.
 | ⌘K | Command bar (tasks, projects, `@claude repo/branch goal` into the dispatch form) |
 | ⌘G | Toggle the agent grid |
 | ⌘1 | Home |
+| ⌘J | Próximo: the next task that needs you |
 | Esc | Leave a task's detail |
 | ⇧⌘J | Theme: system → light → dark |
 | ⌘↵ | In Home's dispatch form: dispatch (Enter is a new line of the goal) |

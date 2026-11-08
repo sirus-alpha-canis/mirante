@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { dnaStatus } from "../lib/dna";
-import { RpcCode } from "../lib/protocol";
+import { type DaemonSettings, M, RpcCode } from "../lib/protocol";
 import { skillProposals } from "../lib/skills";
 import { useSkillsVersion } from "../lib/useSkills";
 import type { AgentKind, DaemonStatus, TaskView } from "../lib/protocol";
@@ -226,7 +226,52 @@ export function LeftRail(props: {
       </ul>
       {props.onSkills && <SkillsEntry onOpen={props.onSkills} />}
       <MemoryPanel status={props.status} onOpen={(id) => props.onOpen(id)} />
+      <SessionSettings status={props.status} />
     </nav>
+  );
+}
+
+/** Sessions outlive the app (the daemon owns them); the daemon's auto-resume setting
+ * (`daemon.settings`) says whether they come back after the daemon itself restarts. */
+export function SessionSettings({ status }: { status: DaemonStatus | null }) {
+  const { rpc } = useEnv();
+  // The answer of the last change, until the next status poll says the same.
+  const [mine, setMine] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const known = typeof status?.auto_resume === "boolean" ? status.auto_resume : null;
+  const on = mine ?? known;
+  useEffect(() => setMine(null), [known]);
+  const change = async (want: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await rpc<DaemonSettings>(M.daemonSettings, { auto_resume: want });
+      setMine(r?.auto_resume ?? want);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="settings" aria-label="Sessions">
+      <h2>Sessions</h2>
+      <p className="small muted">Closing Mirante leaves your agents running: the daemon owns them.</p>
+      {status && on === null ? (
+        <p className="small muted">This daemon does not bring sessions back after a restart.</p>
+      ) : (
+        <label className="small check">
+          <input type="checkbox" checked={on ?? false} disabled={!status || busy} onChange={(e) => void change(e.target.checked)} />{" "}
+          Resume sessions after a daemon restart
+        </label>
+      )}
+      {error && (
+        <p className="error small" role="alert">
+          {error}
+        </p>
+      )}
+    </section>
   );
 }
 

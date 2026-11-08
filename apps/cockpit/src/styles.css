@@ -100,7 +100,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .link { background: none; border: none; padding: 0; color: var(--text); font-weight: 600; cursor: pointer; text-align: left; }
 .link:hover { text-decoration: underline; }
 
-.home { display: grid; grid-template-columns: 240px 1fr 280px; flex: 1; min-height: 0; }
+.home { display: grid; grid-template-columns: 240px 1fr; flex: 1; min-height: 0; }
 .rail, .board, .tasklist { background: var(--panel); border-right: 1px solid var(--line); padding: 12px; overflow: auto; }
 .board { border-right: none; border-left: 1px solid var(--line); }
 .rail h2, .board h2, .tasklist h2, .memory h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 16px 0 6px; }
@@ -346,3 +346,72 @@ button.skill-chip { cursor: pointer; }
 .skills-pop { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; width: min(420px, 80vw); display: grid; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18); }
 .skills-pop p { margin: 0; overflow-wrap: anywhere; }
 .skill-confirm { border-left: 3px solid var(--needs); padding-left: 8px; }
+
+/* Project colors: one per project, stable (lib/inbox projectColor). Readable on both themes. */
+:root { --p0: #0f766e; --p1: #7c3aed; --p2: #b45309; --p3: #1d4ed8; --p4: #be185d; --p5: #15803d; --p6: #9333ea; --p7: #c2410c; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --p0: #2dd4bf; --p1: #c4b5fd; --p2: #fbbf24; --p3: #93b4ff; --p4: #f9a8d4; --p5: #4ade80; --p6: #d8b4fe; --p7: #fdba74; }
+}
+:root[data-theme="dark"] { --p0: #2dd4bf; --p1: #c4b5fd; --p2: #fbbf24; --p3: #93b4ff; --p4: #f9a8d4; --p5: #4ade80; --p6: #d8b4fe; --p7: #fdba74; }
+.proj { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600; border-radius: 999px; padding: 0 8px; border: 1px solid currentColor; white-space: nowrap; }
+.proj::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.proj-0 { color: var(--p0); } .proj-1 { color: var(--p1); } .proj-2 { color: var(--p2); } .proj-3 { color: var(--p3); }
+.proj-4 { color: var(--p4); } .proj-5 { color: var(--p5); } .proj-6 { color: var(--p6); } .proj-7 { color: var(--p7); }
+
+/* Home as an inbox: sections by what they need, groups by project. */
+.inbox .cards { gap: 18px; }
+.inbox-section h2, .inbox-section summary h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 8px; display: inline; }
+.inbox-section > h2 { display: block; }
+.inbox-needs_you > h2 { color: var(--needs); }
+.inbox-section summary { cursor: pointer; margin-bottom: 8px; }
+.inbox-group { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.inbox-project { margin: 2px 0 0; font-size: inherit; }
+.row { display: flex; align-items: center; gap: 10px; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--work); border-radius: 8px; padding: 6px 12px; min-width: 0; }
+.row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%; }
+.row .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.nudge { margin: 0; padding: 6px 10px; border-radius: 8px; background: var(--needs-bg); color: var(--needs); font-weight: 600; }
+.answer { margin-top: 6px; display: flex; gap: 6px; align-items: flex-start; }
+.answer-text { margin: 0; white-space: pre-wrap; word-break: break-word; flex: 1; }
+.answer-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.tag-danger { border-color: var(--danger); background: var(--danger); color: #fff; font-weight: 600; }
+.line-warn .text { color: var(--danger); font-weight: 600; }
+.repeat { margin-left: 6px; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 5px; }
+.line-run > .btn { padding: 0; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.run-lines { margin: 2px 0 4px 16px; }
+.btn.next { display: inline-flex; gap: 4px; align-items: center; }
+.settings { margin-top: 16px; border-top: 1px solid var(--line); }
+.settings h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 16px 0 6px; }
+.check { display: flex; gap: 6px; align-items: center; }
+
+/* The dispatch form, one rounded box: the goal, then a toolbar of chips. */
+.composer.dispatch { display: block; padding: 10px 20px 12px; }
+.composer-box { position: relative; border: 1px solid var(--line); border-radius: 14px; background: var(--bg); padding: 8px 10px 6px; }
+.composer-box:focus-within { border-color: var(--focus); }
+.composer-box textarea { width: 100%; border: none; background: transparent; resize: vertical; min-height: 44px; padding: 2px 0; outline: none; }
+.composer-box > .suggest { left: 10px; }
+.composer-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.toolbar-spacer { flex: 1; }
+.tchip { display: inline-flex; gap: 4px; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; background: var(--panel); font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+.tchip[aria-pressed="true"], .tchip[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+.tchip:disabled { opacity: 0.55; cursor: default; }
+.tchip-static { cursor: default; }
+.repo-box.tchip input { border: none; background: transparent; padding: 0; width: 140px; }
+.dispatch-branch { flex-basis: auto; }
+.dispatch-branch input { min-width: 180px; }
+.attached { list-style: none; display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 6px; padding: 0; }
+.attached-chip { display: inline-flex; gap: 4px; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 0 2px 0 9px; background: var(--panel-2); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.popover-wrap { position: relative; display: inline-flex; }
+.popover { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; width: 340px; max-height: 360px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18); padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.popover-search { border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; background: var(--bg); }
+.menu { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.menu-item { display: flex; justify-content: space-between; gap: 10px; width: 100%; text-align: left; background: none; border: none; border-radius: 6px; padding: 5px 8px; cursor: pointer; }
+.menu-item:hover, .menu-item[aria-pressed="true"] { background: var(--panel-2); }
+.menu-item:disabled { opacity: 0.6; cursor: default; }
+.menu-item .small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Detail's task list: search and filters, then projects and states. */
+.tasklist-tools { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.tasklist-tools input { border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; background: var(--bg); }
+.filters { display: flex; gap: 4px; flex-wrap: wrap; }
+.tasklist h3 { font-size: 11px; color: var(--muted); font-weight: 600; margin: 8px 0 2px; }
+.tasklist-project h2 { text-transform: none; letter-spacing: 0; }

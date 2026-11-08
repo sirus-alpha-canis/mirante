@@ -55,10 +55,12 @@ describe("App", () => {
     it("notifies when a task off screen starts needing you, not when it is on screen and focused", () => {
       const h = setup();
       vi.spyOn(document, "hasFocus").mockReturnValue(true);
-      // Home shows the first project (other): z is on screen, a is not.
+      // Home is an inbox of every project: z is on screen there.
       act(() => h.env.cockpit.dispatch({ type: "event", event: needs(1, "z") }));
       flushNotes();
       expect(h.env.notify).not.toHaveBeenCalled();
+      // In z's detail, a is off screen.
+      openViaPalette("goal of z");
       act(() => h.env.cockpit.dispatch({ type: "event", event: needs(2, "a") }));
       flushNotes();
       expect(h.env.notify).toHaveBeenCalledWith({ title: "feat/a needs you", body: "goal of a" });
@@ -291,11 +293,54 @@ describe("App", () => {
     expect(screen.getByRole("dialog", { name: "Command bar" })).toBeInTheDocument();
   });
 
+  it("⌘J opens the task that has waited longest, then the next (Claude on its Terminal tab); the button says i de n", async () => {
+    const h = setup({}, [
+      task("a", { status: "needs_you", updated_at: 5, agent: "codex" }),
+      task("b", { status: "needs_you", updated_at: 1 }),
+      task("w", { status: "working" }),
+    ]);
+    const next = screen.getByRole("button", { name: /^Próximo/ });
+    expect(next).toHaveTextContent("– de 2");
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ...mod });
+    expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: /^Próximo/ })).toHaveTextContent("1 de 2");
+    await userEvent.click(screen.getByRole("button", { name: /^Próximo/ }));
+    expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Próximo/ })).toHaveTextContent("2 de 2");
+    // Back to the first.
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ...mod });
+    expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
+    void h;
+  });
+
+  it("⌘J waits while a form field is being typed in; with nothing waiting, the button is off", () => {
+    setup({}, [task("w", { status: "working" })]);
+    expect(screen.getByRole("button", { name: /^Próximo/ })).toBeDisabled();
+    const goal = screen.getByLabelText("Goal");
+    goal.focus();
+    fireEvent.keyDown(goal, { key: "j", code: "KeyJ", ...mod });
+    expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
+  });
+
+  it("reopens where the person was: the view, the task and its tab", async () => {
+    const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [], "task.diff": { base: "main", merge_base: "x", files: [], untracked: [], patch: "", truncated: false, compare_url: null, pushed: false } });
+    h.load([task("a"), task("b")]);
+    const { unmount } = render(<App env={h.env} />);
+    await userEvent.click(screen.getByRole("button", { name: "goal of b" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Diff" }));
+    unmount();
+    render(<App env={h.env} />);
+    expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+  });
+
   it("visibleTasks follows the mode", () => {
     const h = makeEnv();
     h.load([task("a"), task("b", { repo_path: "/x" })]);
     const s = h.env.cockpit.getState();
-    expect([...visibleTasks(s, "home", "/x", null)]).toEqual(["b"]);
+    // Home is an inbox of every project.
+    expect([...visibleTasks(s, "home", "/x", null)].sort()).toEqual(["a", "b"]);
     expect([...visibleTasks(s, "detail", null, "a")]).toEqual(["a"]);
     expect([...visibleTasks(s, "brain", "/x", "a")]).toEqual([]);
     expect([...visibleTasks(s, "skills", "/x", "a")]).toEqual([]);

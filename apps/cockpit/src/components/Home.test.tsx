@@ -71,6 +71,15 @@ function setup(
   return { ...h, opened };
 }
 
+/** Picks an agent in the form's Agent menu. */
+async function chooseAgent(label: "Claude" | "Codex") {
+  await userEvent.click(screen.getByRole("button", { name: /^Agent:/ }));
+  await userEvent.click(within(screen.getByRole("group", { name: "Agents" })).getByRole("button", { name: new RegExp(`^${label}`) }));
+}
+
+/** The agent the form's Agent menu shows. */
+const agentShown = () => screen.getByRole("button", { name: /^Agent:/ }).textContent?.replace(/^Agent: /, "").replace(" ▾", "").trim();
+
 const daemonStatus = (claude_inline_answers: boolean): DaemonStatus => ({
   pid: 1,
   boot_id: "b1",
@@ -82,7 +91,7 @@ const daemonStatus = (claude_inline_answers: boolean): DaemonStatus => ({
 describe("Home (V3 group chat)", () => {
   it("the form dispatches: agent, repo, goal, and a branch named after the goal", async () => {
     const h = setup({ "task.create": task("new", { branch: "mirante/leia" }), "session.start": { boot: "booting" } });
-    await userEvent.click(screen.getByRole("button", { name: "Codex" }));
+    await chooseAgent("Codex");
     await userEvent.type(screen.getByLabelText("Goal"), "Leia este repositório e me explique");
     expect(screen.getByText("mirante/leia-este-repositorio-e-me-explique")).toBeInTheDocument();
     await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
@@ -109,10 +118,16 @@ describe("Home (V3 group chat)", () => {
 
   it("Claude is the default agent; the choice is remembered for next time", async () => {
     const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } });
-    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
-    await userEvent.click(screen.getByRole("button", { name: "Codex" }));
-    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    expect(agentShown()).toBe("Claude");
+    await chooseAgent("Codex");
+    expect(agentShown()).toBe("Codex");
     expect(h.env.storage.getItem(AGENT_KEY)).toBe("codex");
+    // The menu marks the chosen one.
+    await userEvent.click(screen.getByRole("button", { name: /^Agent:/ }));
+    expect(within(screen.getByRole("group", { name: "Agents" })).getByRole("button", { name: /^Codex/ })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("group", { name: "Agents" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^Agent:/ })).toHaveFocus();
   });
 
   it("starts on the remembered agent, and survives storage that throws", () => {
@@ -120,7 +135,7 @@ describe("Home (V3 group chat)", () => {
     h.load([]);
     h.env.storage.setItem(AGENT_KEY, "codex");
     renderWith(h.env, <Harness env={h.env} />);
-    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    expect(agentShown()).toBe("Codex");
     cleanup();
     const broken = makeEnv();
     broken.load([]);
@@ -133,7 +148,7 @@ describe("Home (V3 group chat)", () => {
       },
     };
     renderWith(broken.env, <Harness env={broken.env} registry={[]} />);
-    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
+    expect(agentShown()).toBe("Claude");
   });
 
   it("the repo box starts on the selected project; typing filters the projects, Enter picks", async () => {
@@ -304,19 +319,95 @@ describe("Home (V3 group chat)", () => {
     expect(sent(h)).toEqual([]);
   });
 
-  it("the board groups tasks into Needs you / Working / Ready for review", () => {
-    setup({ "task.diff": diff }, [task("n", { status: "needs_you" }), task("w", { status: "working" }), task("r")], [ev(1, "r", "turn_ended")]);
-    const board = screen.getByRole("complementary", { name: "Board" });
-    const col = (name: string) => within(within(board).getByRole("region", { name })).getAllByRole("button").map((b) => b.textContent);
-    expect(col("Needs you")).toEqual(["goal of n@claude · feat/n"]);
-    expect(col("Working")).toEqual(["goal of w@claude · feat/w"]);
-    expect(col("Ready for review")).toEqual(["goal of r@claude · feat/r"]);
+  it("Home is an inbox across projects: needs you, ready for review, working, grouped by project", async () => {
+    setup(
+      { "task.diff": diff },
+      [
+        task("n", { status: "needs_you" }),
+        task("n2", { status: "needs_you", repo_path: "/repos/api" }),
+        task("w", { status: "working" }),
+        task("r"),
+        task("i"),
+      ],
+      [ev(1, "r", "turn_ended"), ev(2, "w", "step", { type: "tool", tool: "Bash", summary: "rm -rf node_modules", ok: true })],
+    );
+    const inbox = screen.getByRole("main", { name: "Inbox" });
+    const section = (name: RegExp) => within(inbox).getByRole("region", { name });
+    const needs = section(/^Precisa de você \(2\)$/);
+    // Grouped by project, each with its chip.
+    expect(within(needs).getAllByRole("group").map((g) => g.getAttribute("aria-label"))).toEqual(["api", "shop"]);
+    expect(within(needs).getAllByRole("article")).toHaveLength(2);
+    expect(within(section(/^Pronto para revisar \(1\)$/)).getByRole("article", { name: "claude on feat/r" })).toBeInTheDocument();
+    const working = section(/^Trabalhando \(1\)$/);
+    const row = within(working).getByRole("article", { name: "claude on feat/w" });
+    // One line, in plain words: never the raw command.
+    expect(row).toHaveTextContent("@claude");
+    expect(row).toHaveTextContent("rodando um comando");
+    expect(row).not.toHaveTextContent("rm -rf");
+    // Idle tasks wait folded away.
+    expect(within(inbox).getByText(/^Parados \(1\)$/)).toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "Board" })).toBeNull();
+  });
+
+  it("says when agents have waited on you more than 10 minutes", () => {
+    const long = Date.now() - 11 * 60_000;
+    setup({}, [task("a", { status: "needs_you", updated_at: long }), task("b", { status: "needs_you", updated_at: long }), task("c", { status: "needs_you", updated_at: Date.now() })]);
+    expect(screen.getByText("2 agentes esperam você há mais de 10 min")).toBeInTheDocument();
+  });
+
+  it("the branch chip shows once there is a goal; attached context goes after the goal, labeled", async () => {
+    const h = setup({
+      "task.create": task("new"),
+      "session.start": { boot: "booting" },
+      "repo.files": (p: Record<string, unknown>) => (String(p.query).includes("log") ? ["src/login.ts", "docs/login.md"] : []),
+      "skill.list": [{ name: "cargo-tests-first", description: "run the tests first", version: 1, scope: "personal", activation: "on_demand", status: "active", manifest_hash: "h", verified: true, injected_30d: 0, used_30d: 0, updated_at: 0 }],
+    });
+    expect(screen.queryByRole("button", { name: "Edit branch" })).toBeNull();
+    await userEvent.type(screen.getByLabelText("Goal"), "Fix the login");
+    expect(screen.getByText("mirante/fix-the-login")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "+ contexto" }));
+    const dialog = screen.getByRole("dialog", { name: "Add context" });
+    await userEvent.type(within(dialog).getByLabelText("Search Files"), "log");
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Skills" }));
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^cargo-tests-first/ }));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Add context" })).toBeNull();
+    const attached = screen.getByRole("list", { name: "Attached context" });
+    expect(within(attached).getAllByRole("listitem")).toHaveLength(2);
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toContain("task.create"));
+    const goal = String(sent(h).find((c) => c[0] === "task.create")?.[1].goal);
+    expect(goal.split("\n")[0]).toBe("Fix the login");
+    expect(goal).toContain("- file: src/login.ts");
+    expect(goal).toContain("- skill: cargo-tests-first (run the tests first)");
+    await waitFor(() => expect(screen.queryByRole("list", { name: "Attached context" })).toBeNull());
+  });
+
+  it("while memory pauses new sessions, the form says so", () => {
+    const paused: DaemonStatus = {
+      ...daemonStatus(false),
+      memory: { level: "elevated", total: 1, free: 1, swap_used: 0, swap_total: 0, paused: true },
+    };
+    setup({}, [], [], paused);
+    expect(screen.getByText("Memory is tight: new sessions wait until it eases")).toBeInTheDocument();
+  });
+
+  it("the rail says closing the app keeps agents running, and switches auto-resume through the daemon", async () => {
+    const h = setup({ "daemon.settings": (p: Record<string, unknown>) => ({ auto_resume: p.auto_resume }) }, [], [], { ...daemonStatus(false), auto_resume: true });
+    const settings = screen.getByRole("region", { name: "Sessions" });
+    expect(settings).toHaveTextContent("Closing Mirante leaves your agents running");
+    const box = within(settings).getByRole("checkbox", { name: "Resume sessions after a daemon restart" });
+    expect(box).toBeChecked();
+    await userEvent.click(box);
+    expect(h.calls).toContainEqual(["daemon.settings", { auto_resume: false }]);
+    await waitFor(() => expect(box).not.toBeChecked());
   });
 
   it("an agent in the rail with no live session selects it in the form and focuses the goal", async () => {
     setup({}, []);
     await userEvent.click(screen.getByRole("button", { name: /@codex/ }));
-    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    expect(agentShown()).toBe("Codex");
     expect(screen.getByLabelText("Goal")).toHaveFocus();
   });
 
@@ -354,7 +445,7 @@ describe("Home (V3 group chat)", () => {
     const rail = screen.getByRole("navigation", { name: "Projects and agents" });
     await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));
     await userEvent.click(within(rail).getByRole("button", { name: "New @claude task" }));
-    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
+    expect(agentShown()).toBe("Claude");
     expect(screen.getByLabelText("Goal")).toHaveFocus();
   });
 
@@ -421,7 +512,7 @@ describe("Home (V3 group chat)", () => {
   it("Claude cards follow the daemon's inline-answer setting (off when unknown)", async () => {
     const asks = [ev(1, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "ls" })];
     const h = setup({}, [task("a", { status: "needs_you" })], asks);
-    const feed = screen.getByRole("main", { name: "Project feed" });
+    const feed = screen.getByRole("main", { name: "Inbox" });
     expect(within(feed).queryByRole("button", { name: "Allow once" })).toBeNull();
     await userEvent.click(within(feed).getByRole("button", { name: "Answer in terminal" }));
     expect(h.opened).toEqual([["a", "Terminal"]]);
@@ -430,7 +521,7 @@ describe("Home (V3 group chat)", () => {
   it("with inline answers on, a Claude card offers Allow once / Deny", () => {
     const asks = [ev(1, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "ls" })];
     setup({}, [task("a", { status: "needs_you" })], asks, daemonStatus(true));
-    const feed = screen.getByRole("main", { name: "Project feed" });
+    const feed = screen.getByRole("main", { name: "Inbox" });
     expect(within(feed).getByRole("button", { name: "Allow once" })).toBeInTheDocument();
     expect(within(feed).queryByRole("button", { name: "Answer in terminal" })).toBeNull();
   });

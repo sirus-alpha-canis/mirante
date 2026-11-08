@@ -9,17 +9,19 @@
 // Inside the terminal: off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K kills
 // a line, Ctrl+G…), so the caller leaves mod chords there to the terminal. On macOS ⌘ is not
 // a terminal key, so ⌘K opens the command bar even with the terminal focused.
-export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme";
+export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme" | "next";
 
 type KeyLike = Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey"> & Partial<Pick<KeyboardEvent, "code" | "repeat">>;
 
-const BY_CODE: Record<string, { action: Exclude<ShortcutAction, "escape">; shift: boolean }> = {
-  KeyK: { action: "palette", shift: false },
-  KeyG: { action: "grid", shift: false },
-  KeyB: { action: "brain", shift: false },
-  Digit1: { action: "home", shift: false },
-  KeyJ: { action: "theme", shift: true },
-};
+const CHORDS: { code: string; action: Exclude<ShortcutAction, "escape">; shift: boolean }[] = [
+  { code: "KeyK", action: "palette", shift: false },
+  { code: "KeyG", action: "grid", shift: false },
+  { code: "KeyB", action: "brain", shift: false },
+  { code: "Digit1", action: "home", shift: false },
+  { code: "KeyJ", action: "theme", shift: true },
+  // Focus mode: the next task that needs you.
+  { code: "KeyJ", action: "next", shift: false },
+];
 
 const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ" };
 
@@ -31,9 +33,7 @@ export function shortcutFor(e: KeyLike, mac: boolean): ShortcutAction | null {
   // The other modifier is not part of any chord (Ctrl+⌘K is not ⌘K).
   if (mac ? e.ctrlKey : e.metaKey) return null;
   const code = e.code || CODE_OF_KEY[e.key.toLowerCase()] || "";
-  const hit = BY_CODE[code];
-  if (!hit || hit.shift !== e.shiftKey) return null;
-  return hit.action;
+  return CHORDS.find((c) => c.code === code && c.shift === e.shiftKey)?.action ?? null;
 }
 
 /** Whether a key event's target is something the user types into (an input, a textarea,
@@ -65,6 +65,6 @@ export type ShortcutHints = Record<Exclude<ShortcutAction, "escape">, string>;
 
 export function hintsFor(mac: boolean): ShortcutHints {
   return mac
-    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J" }
-    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J" };
+    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J" }
+    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J" };
 }

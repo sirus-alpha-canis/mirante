@@ -42,17 +42,73 @@ function setup(answers = {}, tasks = [task("a", { status: "working" }), task("b"
 }
 
 describe("Detail (V1 classic)", () => {
-  it("lists tasks grouped by state and selects one", async () => {
+  it("lists tasks by project, then by state, and selects one", async () => {
     const h = setup();
     const nav = screen.getByRole("navigation", { name: "Tasks" });
-    expect(within(nav).getAllByRole("heading").map((x) => x.textContent)).toEqual(["Needs you", "Working"]);
+    expect(within(nav).getAllByRole("heading").map((x) => x.textContent)).toEqual(["shop", "Needs you", "Working"]);
     await userEvent.click(within(nav).getByRole("button", { name: /goal of b/ }));
     expect(h.onSelect).toHaveBeenCalledWith("b");
+  });
+
+  it("the list filters by state with chips and by text with a search", async () => {
+    setup({}, [
+      task("a", { status: "working" }),
+      task("b", { status: "needs_you", title: "fix the cart" }),
+      task("c", { status: "working", repo_path: "/repos/api", title: "api docs" }),
+    ]);
+    const nav = screen.getByRole("navigation", { name: "Tasks" });
+    const names = () => within(nav).queryAllByRole("button", { name: /@claude/ }).map((b) => b.querySelector(".chip-title")?.textContent);
+    const chips = within(nav).getByRole("group", { name: "Filter tasks" });
+    expect(within(chips).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Precisa de você (1)",
+      "Trabalhando (2)",
+      "Pronto (0)",
+      "Todos (3)",
+    ]);
+    expect(within(chips).getByRole("button", { name: "Todos (3)" })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(within(chips).getByRole("button", { name: "Trabalhando (2)" }));
+    expect(names()).toEqual(["api docs", "goal of a"]);
+    expect(within(nav).getAllByRole("region").map((r) => r.getAttribute("aria-label"))).toEqual(["api", "shop"]);
+    await userEvent.click(within(chips).getByRole("button", { name: "Todos (3)" }));
+    await userEvent.type(within(nav).getByRole("searchbox", { name: "Search tasks" }), "CART");
+    expect(names()).toEqual(["fix the cart"]);
+    await userEvent.type(within(nav).getByRole("searchbox", { name: "Search tasks" }), "zzz");
+    expect(within(nav).getByText("No task matches.")).toBeInTheDocument();
+  });
+
+  it("Steps sums up runs of tool steps in plain words, expandable; repeated lines fold with ×N", async () => {
+    const reads = Array.from({ length: 3 }, (_, i) => ev(10 + i, "a", "step", { type: "tool", tool: "Read", summary: `src/f${i}.ts`, ok: true }));
+    const hib = (seq: number) => ev(seq, "a", "memory.offer_hibernate", { reason: "memory pressure elevated" });
+    setup({}, [task("a", { status: "working" })], [
+      ...reads,
+      ev(20, "a", "step", { type: "command", command: "npm test", exit_code: 0 }),
+      hib(21),
+      hib(22),
+      hib(23),
+    ]);
+    const panel = screen.getByRole("tabpanel");
+    const run = within(panel).getByRole("button", { name: /leu 3 arquivos, rodou 1 comando/ });
+    expect(run).toHaveAttribute("aria-expanded", "false");
+    expect(within(panel).queryByText("$ npm test")).toBeNull();
+    await userEvent.click(run);
+    expect(within(panel).getByText("$ npm test")).toBeInTheDocument();
+    expect(within(panel).getByLabelText("3 times")).toHaveTextContent("×3");
+  });
+
+  it("tells the app which tab it shows; before the first snapshot it says loading, not gone", async () => {
+    const h = makeEnv();
+    const onTab = vi.fn();
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} onTab={onTab} initialTab="Diff" />);
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    expect(onTab).toHaveBeenLastCalledWith("Diff");
+    act(() => h.load([task("b")]));
+    expect(screen.getByText("This task is gone.")).toBeInTheDocument();
   });
 
   it("shows steps, switches tabs with arrows, and has a Memory tab", async () => {
     setup();
     expect(screen.getByText("$ npm test")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /rodou/ })).toBeNull();
     screen.getByRole("tab", { name: "Steps" }).focus();
     await userEvent.keyboard("{ArrowRight}");
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");

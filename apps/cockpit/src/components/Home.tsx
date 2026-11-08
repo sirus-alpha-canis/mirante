@@ -1,19 +1,82 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
+import { inboxSections, type ProjectGroup, type Section, sameSections, waitingLongerThan } from "../lib/inbox";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
-import { columnOf, COLUMN_LABEL, type Column, type Project, repoName } from "../store/select";
+import { useNow } from "../lib/useNow";
+import { columnOf, COLUMN_LABEL, type Column, type Project } from "../store/select";
+import type { State } from "../store/state";
 import { AgentCard } from "./AgentCard";
-import { Board } from "./Board";
 import { DispatchComposer, loadAgent, saveAgent } from "./DispatchComposer";
 import { LeftRail } from "./LeftRail";
+import { ProjectChip } from "./ProjectChip";
+import { WorkingRow } from "./WorkingRow";
 
-/** V3, the group chat: projects and agents | the project's feed | the board. */
+/** A nudge past this wait. */
+export const OVERDUE_MS = 10 * 60_000;
+
+export const SECTION_TITLE: Record<Section, string> = {
+  needs_you: "Precisa de você",
+  review: "Pronto para revisar",
+  working: "Trabalhando",
+  idle: "Parados",
+};
+
+const selectSections = (s: State) => inboxSections(s);
+
+/** "N agentes esperam você há mais de 10 min" (nothing when none do). */
+function Nudge() {
+  const now = useNow(30_000);
+  const n = useSelect((s) => waitingLongerThan(s, now, OVERDUE_MS));
+  if (n === 0) return null;
+  return (
+    <p className="nudge" role="status">
+      {n === 1 ? "1 agente espera você há mais de 10 min" : `${n} agentes esperam você há mais de 10 min`}
+    </p>
+  );
+}
+
+function Groups(props: {
+  groups: ProjectGroup[];
+  section: Section;
+  onOpen(taskId: string, tab?: "Terminal"): void;
+  inlineAnswers: boolean;
+}) {
+  const tasks = useSelect((s) => s.tasks);
+  return (
+    <>
+      {props.groups.map((g) => (
+        <div key={g.path} className="inbox-group" role="group" aria-label={g.name}>
+          <h3 className="inbox-project">
+            <ProjectChip path={g.path} />
+          </h3>
+          {g.ids.map((id) =>
+            tasks[id] ? (
+              props.section === "needs_you" || props.section === "review" ? (
+                <AgentCard key={id} t={tasks[id]} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} />
+              ) : (
+                <WorkingRow key={id} t={tasks[id]} onOpen={props.onOpen} />
+              )
+            ) : null,
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
+
+/**
+ * Home, an inbox across every project: "Precisa de você" (each with its one action),
+ * "Pronto para revisar" (the agent's last answer and its diff), "Trabalhando" (one line
+ * each), grouped by project; the dispatch form at the bottom. The rail keeps projects,
+ * agents, skills, memory and settings. `scroll` / `onScroll`: where the list was (restored
+ * once the tasks are there).
+ */
 export function Home(props: {
   projects: Project[];
   project: string | null;
   onProject(path: string): void;
   onReposChanged(repos: string[]): void;
-  /** `tab: "Terminal"` opens V1 on that task's Terminal tab (Claude answered there). */
+  /** `tab: "Terminal"` opens the task's detail on its Terminal tab (Claude answered there). */
   onOpen(taskId: string, tab?: "Terminal"): void;
   /** Opens the memory review queue of a project. */
   onReview?(path: string): void;
@@ -22,18 +85,17 @@ export function Home(props: {
   status: DaemonStatus | null;
   draft: string;
   onDraft(v: string): void;
+  scroll?: number;
+  onScroll?(top: number): void;
 }) {
   const env = useEnv();
-  const tasks = useSelect((s) => s.tasks);
-  const cards = useMemo(
-    () =>
-      Object.values(tasks)
-        .filter((t) => t.repo_path === props.project && t.lifecycle !== "archived")
-        .sort((a, b) => a.created_at - b.created_at),
-    [tasks, props.project],
-  );
-  // Each card's column (for the announcement below): renders when one changes, not per event.
-  const columns = useSelect((s) => Object.fromEntries(cards.map((t) => [t.id, columnOf(t, s.feed[t.id])])), shallow);
+  const sections = useSelect(selectSections, sameSections);
+  const inlineAnswers = props.status?.claude_inline_answers ?? false;
+  const count = (k: Section) => sections[k].reduce((n, g) => n + g.ids.length, 0);
+  const total = count("needs_you") + count("review") + count("working") + count("idle");
+  // Every task's column (for the announcement below): renders when one changes, not per event.
+  const columns = useSelect((s) => Object.fromEntries(Object.values(s.tasks).map((t) => [t.id, columnOf(t, s.feed[t.id])])), shallow);
+  const titles = useSelect((s) => s.tasks);
   const composer = useRef<HTMLTextAreaElement>(null);
   const [agent, setAgent] = useState<AgentKind>(() => loadAgent(env.storage));
   const pickAgent = (a: AgentKind) => {
@@ -44,16 +106,55 @@ export function Home(props: {
     pickAgent(a);
     composer.current?.focus();
   };
-  // One polite region says when a card changes state (not every new line on every card).
+  // One polite region says when a task changes state (not every new line of every task).
   const [announce, setAnnounce] = useState("");
   const seen = useRef<Record<string, Column> | null>(null);
   useEffect(() => {
     const before = seen.current;
     seen.current = columns;
     if (!before) return;
-    const changed = cards.filter((t) => t.id in before && before[t.id] !== columns[t.id]);
-    if (changed.length > 0) setAnnounce(changed.map((t) => `${t.title}: ${COLUMN_LABEL[columns[t.id]]}`).join(". "));
-  }, [cards, columns]);
+    const changed = Object.keys(columns).filter((id) => id in before && before[id] !== columns[id] && titles[id]);
+    if (changed.length > 0) setAnnounce(changed.map((id) => `${titles[id].title}: ${COLUMN_LABEL[columns[id]]}`).join(". "));
+  }, [columns, titles]);
+  // Back where the list was, once there is something to scroll.
+  const list = useRef<HTMLDivElement>(null);
+  const restored = useRef(false);
+  useLayoutEffect(() => {
+    if (restored.current || total === 0 || !list.current) return;
+    restored.current = true;
+    if (props.scroll) list.current.scrollTop = props.scroll;
+  }, [total, props.scroll]);
+  const onScroll = props.onScroll;
+  const scrolled = useMemo(() => {
+    let frame = 0;
+    return (top: number) => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => onScroll?.(top));
+    };
+  }, [onScroll]);
+  const section = (k: Section) => {
+    const n = count(k);
+    if (n === 0) return null;
+    const id = `inbox-${k}`;
+    const body = <Groups groups={sections[k]} section={k} onOpen={props.onOpen} inlineAnswers={inlineAnswers} />;
+    return k === "idle" ? (
+      <details key={k} className={`inbox-section inbox-${k}`}>
+        <summary>
+          <h2 id={id}>
+            {SECTION_TITLE[k]} ({n})
+          </h2>
+        </summary>
+        {body}
+      </details>
+    ) : (
+      <section key={k} className={`inbox-section inbox-${k}`} aria-labelledby={id}>
+        <h2 id={id}>
+          {SECTION_TITLE[k]} ({n})
+        </h2>
+        {body}
+      </section>
+    );
+  };
   return (
     <div className="home">
       <LeftRail
@@ -67,20 +168,18 @@ export function Home(props: {
         onSkills={props.onSkills}
         status={props.status}
       />
-      <main className="feed" aria-label="Project feed">
-        <header className="feed-head">
-          <h1>{props.project ? repoName(props.project) : "No project yet"}</h1>
-          {props.project && <span className="muted small">{props.project}</span>}
-        </header>
-        <div className="cards">
-          {cards.length === 0 && (
+      <main className="feed inbox" aria-label="Inbox">
+        <div className="cards" ref={list} onScroll={(e) => scrolled(e.currentTarget.scrollTop)}>
+          <Nudge />
+          {total === 0 && (
             <p className="muted empty">
-              {props.project ? "No agents here yet. Dispatch one below." : "Add a repository on the left to start."}
+              {props.projects.length > 0 ? "No agents yet. Dispatch one below." : "Add a repository on the left to start."}
             </p>
           )}
-          {cards.map((t) => (
-            <AgentCard key={t.id} t={t} onOpen={props.onOpen} inlineAnswers={props.status?.claude_inline_answers ?? false} />
-          ))}
+          {section("needs_you")}
+          {section("review")}
+          {section("working")}
+          {section("idle")}
         </div>
         <p className="sr-only" role="status" aria-label="Agent updates">
           {announce}
@@ -93,9 +192,9 @@ export function Home(props: {
           agent={agent}
           onAgent={pickAgent}
           inputRef={composer}
+          paused={props.status?.memory?.paused ?? false}
         />
       </main>
-      <Board onOpen={props.onOpen} />
     </div>
   );
 }

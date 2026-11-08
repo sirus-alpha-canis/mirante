@@ -1,10 +1,11 @@
-import { type KeyboardEvent, memo, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
+import { collapseRepeats, summarizeSteps } from "../lib/feed";
 import { M, type TaskView } from "../lib/protocol";
-import type { FeedItem } from "../store/state";
+import type { FeedItem, State } from "../store/state";
 import { useDnaKey, useDnaRev } from "../lib/useDna";
-import { columnOf, COLUMN_LABEL, type Column, pendingPerms, turnsEnded } from "../store/select";
+import { columnOf, COLUMN_LABEL, type Column, pendingPerms, repoName, turnsEnded } from "../store/select";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
@@ -12,6 +13,7 @@ import { HibernateButton } from "./MemoryPanel";
 import { atRiskCount, MemoryTab, useTaskMemory } from "./MemoryTab";
 import { MessageComposer } from "./MessageComposer";
 import { PermissionCard } from "./PermissionCard";
+import { ProjectChip } from "./ProjectChip";
 import { QueueList } from "./QueueList";
 import { SkillsChip } from "./SkillsChip";
 import { TerminalTab } from "./TerminalTab";
@@ -23,46 +25,131 @@ export type Tab = (typeof TABS)[number];
 
 const NO_FEED: FeedItem[] = [];
 
+/** The task list's filters: one column, or everything not archived. */
+type Filter = "needs_you" | "working" | "review" | "all";
+const FILTERS: { id: Filter; label: string }[] = [
+  { id: "needs_you", label: "Precisa de você" },
+  { id: "working", label: "Trabalhando" },
+  { id: "review", label: "Pronto" },
+  { id: "all", label: "Todos" },
+];
+
+/** Every task's column, as one map: renders when one changes, not on every event. */
+const selectColumns = (s: State) => Object.fromEntries(Object.values(s.tasks).map((t) => [t.id, columnOf(t, s.feed[t.id])]));
+
+const matches = (t: TaskView, q: string) =>
+  !q || [t.title, t.branch, t.agent, repoName(t.repo_path)].some((x) => x.toLowerCase().includes(q));
+
+/** The left list: by project, then by state; filter chips and a search. */
 const TaskList = memo(function TaskList({ selected, onSelect }: { selected: string; onSelect(id: string): void }) {
   const tasks = useSelect((s) => s.tasks);
-  // Each task's column: renders when one changes, not on every event.
-  const columns = useSelect((s) => Object.fromEntries(Object.values(s.tasks).map((t) => [t.id, columnOf(t, s.feed[t.id])])), shallow);
-  const groups = useMemo(
-    () =>
-      GROUPS.map((g) => ({
-        g,
-        tasks: Object.values(tasks)
-          .filter((t) => columns[t.id] === g)
-          .sort((a, b) => b.updated_at - a.updated_at),
-      })).filter((x) => x.tasks.length > 0),
-    [tasks, columns],
-  );
+  const columns = useSelect(selectColumns, shallow);
+  const [filter, setFilter] = useState<Filter>("all");
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const counts = useMemo(() => {
+    const c: Record<Filter, number> = { needs_you: 0, working: 0, review: 0, all: 0 };
+    for (const t of Object.values(tasks)) {
+      const col = columns[t.id];
+      if (!col || col === "archived") continue;
+      c.all++;
+      if (col === "needs_you" || col === "working" || col === "review") c[col]++;
+    }
+    return c;
+  }, [tasks, columns]);
+  const projects = useMemo(() => {
+    const by = new Map<string, Map<Column, TaskView[]>>();
+    for (const t of Object.values(tasks)) {
+      const col = columns[t.id];
+      if (!col || col === "archived" || (filter !== "all" && col !== filter) || !matches(t, q)) continue;
+      const p = by.get(t.repo_path) ?? new Map<Column, TaskView[]>();
+      p.set(col, [...(p.get(col) ?? []), t]);
+      by.set(t.repo_path, p);
+    }
+    return [...by.entries()]
+      .sort(([a], [b]) => repoName(a).localeCompare(repoName(b)) || a.localeCompare(b))
+      .map(([path, cols]) => ({
+        path,
+        groups: GROUPS.filter((g) => cols.has(g)).map((g) => ({ g, tasks: cols.get(g)!.sort((a, b) => b.updated_at - a.updated_at) })),
+      }));
+  }, [tasks, columns, filter, q]);
   return (
     <nav className="tasklist" aria-label="Tasks">
-      {groups.map(({ g, tasks }) => (
-        <section key={g}>
-          <h2>{COLUMN_LABEL[g]}</h2>
-          <ul>
-            {tasks.map((t) => (
-              <li key={t.id}>
-                <button
-                  className={`rail-item ${t.id === selected ? "selected" : ""}`}
-                  aria-current={t.id === selected ? "page" : undefined}
-                  onClick={() => onSelect(t.id)}
-                >
-                  <span className="chip-title">{t.title}</span>
-                  <span className="muted small">
-                    @{t.agent} · {t.branch}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
+      <div className="tasklist-tools">
+        <label htmlFor="task-search" className="sr-only">
+          Search tasks
+        </label>
+        <input id="task-search" type="search" placeholder="Search tasks" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="filters" role="group" aria-label="Filter tasks">
+          {FILTERS.map((f) => (
+            <button key={f.id} type="button" className="tchip" aria-pressed={filter === f.id} onClick={() => setFilter(f.id)}>
+              {f.label} ({counts[f.id]})
+            </button>
+          ))}
+        </div>
+      </div>
+      {projects.length === 0 && <p className="muted small">No task matches.</p>}
+      {projects.map(({ path, groups }) => (
+        <section key={path} aria-label={repoName(path)} className="tasklist-project">
+          <h2>
+            <ProjectChip path={path} />
+          </h2>
+          {groups.map(({ g, tasks }) => (
+            <div key={g}>
+              <h3>{COLUMN_LABEL[g]}</h3>
+              <ul>
+                {tasks.map((t) => (
+                  <li key={t.id}>
+                    <button
+                      className={`rail-item ${t.id === selected ? "selected" : ""}`}
+                      aria-current={t.id === selected ? "page" : undefined}
+                      onClick={() => onSelect(t.id)}
+                    >
+                      <span className="chip-title">{t.title}</span>
+                      <span className="muted small">
+                        @{t.agent} · {t.branch}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
         </section>
       ))}
     </nav>
   );
 });
+
+/** The Steps tab: runs of tool steps summed up ("leu 14 arquivos, rodou 3 comandos",
+ * expandable to their lines), identical lines folded with ×N. */
+const Steps = memo(function Steps({ feed }: { feed: FeedItem[] }) {
+  const entries = useMemo(() => summarizeSteps(feed), [feed]);
+  return (
+    <ol className="lines lines-full">
+      {entries.map((e) => (e.type === "line" ? <FeedLine key={e.item.seq} item={e.item} count={e.count} /> : <StepRun key={e.items[0].seq} items={e.items} text={e.text} />))}
+    </ol>
+  );
+});
+
+function StepRun({ items, text }: { items: FeedItem[]; text: string }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  return (
+    <li className="line line-run">
+      <button type="button" className="btn btn-small btn-ghost" aria-expanded={open} aria-controls={id} onClick={() => setOpen((o) => !o)}>
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span> {text}
+      </button>
+      {open && (
+        <ol id={id} className="lines run-lines">
+          {collapseRepeats(items).map((f) => (
+            <FeedLine key={f.item.seq} item={f.item} count={f.count} />
+          ))}
+        </ol>
+      )}
+    </li>
+  );
+}
 
 /** Interrupt / Stop / Resume: one at a time; Stop asks first; a new action clears the error. */
 function Actions({ t }: { t: TaskView }) {
@@ -141,14 +228,20 @@ export function Detail({
   initialTab,
   focusTerminalNonce,
   inlineAnswers = false,
+  onTab,
 }: {
   taskId: string;
   onSelect(id: string): void;
   initialTab?: Tab;
   focusTerminalNonce?: number;
   inlineAnswers?: boolean;
+  /** Told the selected tab (the app remembers it for its next start). */
+  onTab?(tab: Tab): void;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab ?? "Steps");
+  useEffect(() => onTab?.(tab), [tab, onTab]);
+  // Before the first snapshot nothing is known: "loading", not "gone".
+  const loaded = useSelect((s) => s.bootId !== null);
   // This task's slices only: another task's event does not render the detail.
   const t = useSelect((s) => s.tasks[taskId]);
   const feed = useSelect((s) => s.feed[taskId]) ?? NO_FEED;
@@ -208,7 +301,7 @@ export function Detail({
       <TaskList selected={taskId} onSelect={onSelect} />
       {!t ? (
         <main className="detail-main">
-          <p className="muted">This task is gone.</p>
+          <p className="muted">{loaded ? "This task is gone." : "Loading…"}</p>
         </main>
       ) : (
         <main className="detail-main" aria-label={`Task ${t.title}`}>
@@ -241,16 +334,7 @@ export function Detail({
           </div>
           <div className="panel-wrap">
             <section role="tabpanel" id="task-panel" aria-labelledby={`tab-${tab}`} className="panel">
-              {tab === "Steps" &&
-                (feed.length === 0 ? (
-                  <p className="muted">No steps yet.</p>
-                ) : (
-                  <ol className="lines lines-full">
-                    {feed.map((i) => (
-                      <FeedLine key={i.seq} item={i} />
-                    ))}
-                  </ol>
-                ))}
+              {tab === "Steps" && (feed.length === 0 ? <p className="muted">No steps yet.</p> : <Steps feed={feed} />)}
               {/* Mounted on every tab (hidden off its own): coming back to it is no new
                   terminal, attach or repaint. */}
               <div className="terminal-slot" hidden={!onTerminal}>

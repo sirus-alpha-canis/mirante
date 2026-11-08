@@ -1,4 +1,4 @@
-import { act, fireEvent, screen, within } from "@testing-library/react";
+import { act, cleanup as cleanupAll, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { GRANT_ROOT_TOOL } from "../lib/labels";
@@ -40,13 +40,14 @@ function setup(
 }
 
 describe("AgentCard", () => {
-  it("shows the dispatch, live steps, and answers a permission card once", async () => {
+  it("shows the project and the agent, never raw steps, and answers a permission card once", async () => {
     const h = setup({ "permission.answer": { status: "allowed_once" } }, task("a", { status: "working" }), [
       ev(1, "a", "step", { type: "tool", tool: "Bash", summary: "npm test", ok: true }),
       ev(2, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "rm -rf dist" }),
     ]);
     const card = screen.getByRole("article", { name: "claude on feat/a" });
-    expect(within(card).getByText("Bash npm test")).toBeInTheDocument();
+    expect(within(card).queryByText("Bash npm test")).toBeNull();
+    expect(within(card).getByText("shop")).toBeInTheDocument();
     const perm = within(card).getByRole("group", { name: "Permission request: Bash" });
     expect(within(perm).getByText("once")).toBeInTheDocument();
     await userEvent.click(within(perm).getByRole("button", { name: "Allow once" }));
@@ -141,7 +142,7 @@ describe("AgentCard", () => {
       ev(1, "c", "permission_requested", { permission_id: "p5", tool: GRANT_ROOT_TOOL, detail: "write under /wt/c" }),
       ev(2, "c", "permission_answered", { permission_id: "p5", answer: "allowed_session" }),
     ]);
-    expect(screen.getByText("allowed for this session")).toBeInTheDocument();
+    // Answered: the card has nothing left to ask (the answer is a line in the task's steps).
     expect(screen.queryByRole("group", { name: `Permission request: ${GRANT_ROOT_TOOL}` })).toBeNull();
   });
 
@@ -212,6 +213,33 @@ describe("AgentCard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Trust folder" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("pty gone");
     expect(screen.getByRole("button", { name: "Trust folder" })).toBeEnabled();
+  });
+
+  it("shows the agent's last answer in two lines, expandable", async () => {
+    const long = `Done. ${"I changed the login flow and the tests. ".repeat(8)}`;
+    setup({ "task.diff": diff }, task("b", { status: "idle" }), [
+      ev(1, "b", "turn_started"),
+      ev(2, "b", "step", { type: "agent_message", text: "Looking around first." }),
+      ev(3, "b", "step", { type: "agent_message", text: long, final: true }),
+      ev(4, "b", "turn_ended"),
+    ]);
+    const card = screen.getByRole("article", { name: "claude on feat/b" });
+    expect(within(card).getByText(long.trim(), { exact: false })).toBeInTheDocument();
+    expect(within(card).queryByText(/Looking around first/)).toBeNull();
+    const more = within(card).getByRole("button", { name: "more" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(more);
+    expect(within(card).getByRole("button", { name: "less" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("a Claude session out of manual mode shows a red auto-mode badge that says how to go back", () => {
+    setup({}, task("a", { status: "working", permission_mode: "auto" }));
+    const badge = screen.getByText("auto mode on");
+    expect(badge).toHaveClass("tag-danger");
+    expect(badge.getAttribute("title")).toMatch(/approves its own commands.*Shift\+Tab/);
+    cleanupAll();
+    setup({}, task("a", { status: "working", permission_mode: "default" }));
+    expect(screen.queryByText("auto mode on")).toBeNull();
   });
 
   it("shows how many skills the session was given, from its events", () => {

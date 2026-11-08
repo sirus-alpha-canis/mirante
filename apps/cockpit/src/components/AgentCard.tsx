@@ -1,26 +1,41 @@
 import { memo } from "react";
 import { shallow, useSelect } from "../env";
+import { lastAnswer } from "../lib/feed";
+import { agentModeLabel } from "../lib/labels";
 import type { TaskView } from "../lib/protocol";
-import { columnOf, lastLines, pendingPerms, turnsEnded } from "../store/select";
+import { columnOf, pendingPerms, turnsEnded } from "../store/select";
 import type { FeedItem } from "../store/state";
-import { StatusPill, TaskBadges } from "./Badges";
+import { AutoModeBadge, StatusPill } from "./Badges";
 import { DoneCard } from "./DoneCard";
+import { LastAnswer } from "./LastAnswer";
 import { PermissionCard } from "./PermissionCard";
+import { ProjectChip } from "./ProjectChip";
 import { SkillsCount } from "./SkillsChip";
 import { TrustCard } from "./TrustCard";
 
-export const FeedLine = memo(function FeedLine({ item }: { item: FeedItem }) {
+/** One feed line; `count` > 1 when identical lines in a row were folded into it. */
+export const FeedLine = memo(function FeedLine({ item, count = 1 }: { item: FeedItem; count?: number }) {
   const who = item.kind === "message" ? (item.mode === "queue" ? "you · queued" : "you · steer") : null;
   return (
-    <li className={`line line-${item.kind} ${item.ok === false ? "line-failed" : ""}`}>
+    <li className={`line line-${item.kind} ${item.ok === false ? "line-failed" : ""} ${item.warn ? "line-warn" : ""}`}>
       {who && <span className="who">{who}</span>}
       <span className="text">{item.text}</span>
+      {count > 1 && (
+        <span className="repeat" aria-label={`${count} times`}>
+          ×{count}
+        </span>
+      )}
     </li>
   );
 });
 
-/** One task in the project feed: the dispatch, live progress, and whatever needs the user.
- * `onOpen(id, "Terminal")` opens V1 on the task's Terminal tab (Claude cards answered there). */
+/**
+ * One task in Home's inbox (needs you, or ready for review): its project, title and agent,
+ * the agent's last answer (two lines, expandable), and the one thing to do: answer the
+ * request (Allow/Deny for Codex, Answer in terminal for Claude), trust the folder, open the
+ * terminal, or review the diff. Raw steps stay in the task's detail.
+ * `onOpen(id, "Terminal")` opens the task's Terminal tab (Claude answered there).
+ */
 export const AgentCard = memo(function AgentCard({
   t,
   onOpen,
@@ -38,27 +53,26 @@ export const AgentCard = memo(function AgentCard({
   // The task waits on the user but its request has not loaded (or is a dialog Mirante does
   // not model): the terminal is where it can be answered.
   const unexplained = t.status === "needs_you" && perms.length === 0 && t.boot !== "trust_prompt";
-  const lines = lastLines(feed, 5);
+  const answer = lastAnswer(feed);
+  const mode = agentModeLabel(t.agent);
   return (
     <article className={`card card-${col}`} aria-label={`${t.agent} on ${t.branch}`}>
-      <p className="dispatch">
-        <span className="who">you</span> @{t.agent} <code>{t.branch}</code> {t.goal}
-      </p>
       <header className="card-head">
+        <ProjectChip path={t.repo_path} />
         <button className="link" onClick={() => onOpen(t.id)}>
           {t.title}
         </button>
-        <TaskBadges t={t} />
+        <span className={`agent agent-${t.agent}`}>@{t.agent}</span>
+        {mode && (
+          <span className="tag" title={mode.title}>
+            {mode.text}
+          </span>
+        )}
+        <AutoModeBadge t={t} />
         <SkillsCount task={t.id} />
         <StatusPill column={col} />
       </header>
-      {lines.length > 0 && (
-        <ol className="lines">
-          {lines.map((i) => (
-            <FeedLine key={i.seq} item={i} />
-          ))}
-        </ol>
-      )}
+      {answer && <LastAnswer text={answer} />}
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
       {unexplained && (
         <p className="perm perm-compact">

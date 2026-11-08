@@ -22,6 +22,13 @@ describe("shortcutFor", () => {
     expect(shortcutFor(k("J", { metaKey: true, shiftKey: true }), true)).toBe("theme");
   });
 
+  it("mod+J is the next task that needs you; with Shift it stays the theme", () => {
+    expect(shortcutFor(k("j", { metaKey: true }), true)).toBe("next");
+    expect(shortcutFor(k("j", { ctrlKey: true }), false)).toBe("next");
+    expect(shortcutFor(k("J", { metaKey: true, shiftKey: true }), true)).toBe("theme");
+    expect(shortcutFor(k("j", { metaKey: true, repeat: true }), true)).toBeNull();
+  });
+
   it("mod+B is brain", () => {
     expect(shortcutFor(k("b", { metaKey: true }), true)).toBe("brain");
     expect(shortcutFor(k("b", { ctrlKey: true }), false)).toBe("brain");
@@ -44,7 +51,7 @@ describe("shortcutFor", () => {
   it("Shift is part of the chord, and auto-repeat never fires one", () => {
     expect(shortcutFor(k("K", { code: "KeyK", metaKey: true, shiftKey: true }), true)).toBeNull();
     expect(shortcutFor(k("g", { metaKey: true, shiftKey: true }), true)).toBeNull();
-    expect(shortcutFor(k("j", { metaKey: true }), true)).toBeNull();
+    expect(shortcutFor(k("1", { metaKey: true, shiftKey: true }), true)).toBeNull();
     expect(shortcutFor(k("k", { metaKey: true, repeat: true }), true)).toBeNull();
     expect(shortcutFor(k("Escape", { repeat: true }), true)).toBeNull();
   });
@@ -59,8 +66,8 @@ describe("platform", () => {
   });
 
   it("hints name the keys of the platform", () => {
-    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J" });
-    expect(hintsFor(false)).toEqual({ palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J" });
+    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J" });
+    expect(hintsFor(false)).toEqual({ palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J" });
   });
 });
 

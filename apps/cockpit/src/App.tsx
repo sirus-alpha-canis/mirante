@@ -7,12 +7,15 @@ import { Home } from "./components/Home";
 import { Skills } from "./components/Skills";
 import { type Env, EnvContext } from "./env";
 import { notificationsFor, shouldNotify } from "./lib/notify";
+import { needingOrder, nextNeeding } from "./lib/inbox";
 import { type DaemonStatus, M, type TaskView } from "./lib/protocol";
 import { loadRepos } from "./lib/repos";
 import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, THEME_KEY, type Theme } from "./lib/theme";
+import { type DetailTab, loadUi, saveUi } from "./lib/uistate";
 import { useCockpitSelect } from "./store/cockpit";
 import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
+import { shallow } from "./env";
 import { type Connection, same, type State } from "./store/state";
 
 export type Mode = "home" | "detail" | "grid" | "brain" | "skills";
@@ -35,10 +38,13 @@ export function visibleTasks(s: State, mode: Mode, project: string | null, taskI
   if (mode === "brain" || mode === "skills") return new Set();
   if (mode === "detail") return new Set(taskId ? [taskId] : []);
   if (mode === "grid") return new Set(gridTasks(s).map((t) => t.id));
-  return new Set(Object.values(s.tasks).filter((t) => t.repo_path === project && t.lifecycle !== "archived").map((t) => t.id));
+  // Home is an inbox of every project: a task that starts needing you shows there.
+  void project;
+  return new Set(Object.values(s.tasks).filter((t) => t.lifecycle !== "archived").map((t) => t.id));
 }
 
 const selectTasks = (s: State) => s.tasks;
+const selectNeeding = (s: State) => needingOrder(s);
 const selectConnection = (s: State) => s.connection;
 
 function ConnectionBanner({ connection, env }: { connection: Connection; env: Env }) {
@@ -76,19 +82,24 @@ export function App({ env }: { env: Env }) {
   // Only what App itself shows: the views below select their own slices.
   const tasks = useCockpitSelect(env.cockpit, selectTasks);
   const connection = useCockpitSelect(env.cockpit, selectConnection);
-  const [mode, setMode] = useState<Mode>("home");
+  const needing = useCockpitSelect(env.cockpit, selectNeeding, shallow);
+  // Where the person was when the app last closed (per viewer, this machine).
+  const [saved] = useState(() => loadUi(env.storage));
+  const [mode, setMode] = useState<Mode>(saved.mode);
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
   const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
   // Bumped by every "Review memory": the brain (open or not) switches to its review queue.
   const [reviewNonce, setReviewNonce] = useState(0);
   // Bumped by every "Review skills": the Skills view shows its review queue.
   const [skillsReviewNonce, setSkillsReviewNonce] = useState(0);
-  const [taskId, setTaskId] = useState<string | null>(null);
-  const [detailTab, setDetailTab] = useState<"Terminal" | undefined>(undefined);
+  const [taskId, setTaskId] = useState<string | null>(saved.taskId);
+  const [detailTab, setDetailTab] = useState<DetailTab | undefined>(saved.tab ?? undefined);
+  // The tab the detail shows now (remembered with the rest).
+  const [shownTab, setShownTab] = useState<DetailTab | null>(saved.tab);
   // Bumped by every "Answer in terminal": Detail re-selects its Terminal tab on each new value.
   const [terminalNonce, setTerminalNonce] = useState(0);
   const [repos, setRepos] = useState(() => loadRepos(env.storage));
-  const [project, setProject] = useState<string | null>(null);
+  const [project, setProject] = useState<string | null>(saved.project);
   const [draft, setDraft] = useState("");
   const [palette, setPalette] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => loadTheme(env.storage));
@@ -171,6 +182,20 @@ export function App({ env }: { env: Env }) {
     };
   }, [env, live]);
 
+  // Home's scroll goes to storage directly (it changes too often for state).
+  const ui = useRef({ ...saved });
+  useEffect(() => {
+    ui.current = { ...ui.current, mode, project, taskId, tab: shownTab };
+    saveUi(env.storage, ui.current);
+  }, [env, mode, project, taskId, shownTab]);
+  const onHomeScroll = useCallback(
+    (top: number) => {
+      ui.current = { ...ui.current, scroll: top };
+      saveUi(env.storage, ui.current);
+    },
+    [env],
+  );
+
   useEffect(() => {
     applyTheme(theme);
     env.storage.setItem(THEME_KEY, theme);
@@ -182,6 +207,15 @@ export function App({ env }: { env: Env }) {
     if (tab === "Terminal") setTerminalNonce((n) => n + 1);
     setMode("detail");
   }, []);
+  const inlineAnswersNow = status?.claude_inline_answers ?? false;
+  // Focus mode: the next task that needs the person, on the tab where it is answered.
+  const next = nextNeeding(needing, mode === "detail" ? taskId : null);
+  const goNext = useCallback(() => {
+    if (!next.id) return;
+    const t = tasks[next.id];
+    const terminal = t && t.agent === "claude" && t.boot !== "trust_prompt" && !inlineAnswersNow;
+    open(next.id, terminal ? "Terminal" : undefined);
+  }, [next.id, tasks, inlineAnswersNow, open]);
   const toggleGrid = useCallback(() => {
     if (mode === "grid") {
       setMode(beforeGrid);
@@ -227,8 +261,9 @@ export function App({ env }: { env: Env }) {
       // Off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K, Ctrl+G…). On macOS
       // ⌘ is no terminal key, so ⌘K opens the command bar even from the terminal.
       if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
-      if ((a === "brain" || a === "grid" || a === "home") && isFormField(e.target)) return;
+      if ((a === "brain" || a === "grid" || a === "home" || a === "next") && isFormField(e.target)) return;
       e.preventDefault();
+      if (a === "next") goNext();
       if (a === "palette") setPalette((p) => !p);
       if (a === "grid") toggleGrid();
       if (a === "brain") toggleBrain();
@@ -237,12 +272,13 @@ export function App({ env }: { env: Env }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, mode, toggleGrid, toggleBrain, mac]);
+  }, [palette, mode, toggleGrid, toggleBrain, mac, goNext]);
 
   const inlineAnswers = status?.claude_inline_answers ?? false;
   const commands: Command[] = useMemo(
     () => [
       { id: "home", label: "Go to Home", hint: hints.home, run: () => setMode("home") },
+      { id: "next", label: "Next task that needs you", hint: hints.next, run: goNext },
       { id: "grid", label: "Toggle agent grid", hint: hints.grid, run: toggleGrid },
       {
         id: "brain",
@@ -281,7 +317,7 @@ export function App({ env }: { env: Env }) {
             : { id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) },
         ),
     ],
-    [projs, tasks, theme, open, toggleGrid, toggleBrain, openReview, mode, hints, inlineAnswers],
+    [projs, tasks, theme, open, toggleGrid, toggleBrain, openReview, mode, hints, inlineAnswers, goNext],
   );
 
   return (
@@ -306,6 +342,21 @@ export function App({ env }: { env: Env }) {
               Skills
             </button>
           </nav>
+          <button
+            className="btn btn-small next"
+            disabled={needing.length === 0}
+            onClick={goNext}
+            title={needing.length === 0 ? "Nothing needs you" : "Open the next task that needs you"}
+            aria-label={needing.length === 0 ? "Próximo: nada precisa de você" : `Próximo, ${Math.max(next.at, 1)} de ${needing.length}`}
+          >
+            Próximo <kbd>{hints.next}</kbd>
+            {needing.length > 0 && (
+              <span className="muted small">
+                {" "}
+                · {next.at > 0 ? next.at : "–"} de {needing.length}
+              </span>
+            )}
+          </button>
           <button className="btn btn-small" onClick={() => setPalette(true)}>
             Commands <kbd>{hints.palette}</kbd>
           </button>
@@ -329,6 +380,8 @@ export function App({ env }: { env: Env }) {
             status={status}
             draft={draft}
             onDraft={setDraft}
+            scroll={saved.scroll}
+            onScroll={onHomeScroll}
           />
         )}
         {mode === "detail" && taskId && (
@@ -338,6 +391,7 @@ export function App({ env }: { env: Env }) {
             initialTab={detailTab}
             focusTerminalNonce={terminalNonce}
             inlineAnswers={inlineAnswers}
+            onTab={setShownTab}
           />
         )}
         {mode === "grid" && <Grid onOpen={open} status={status} />}
