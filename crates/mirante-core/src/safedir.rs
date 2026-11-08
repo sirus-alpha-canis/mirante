@@ -99,8 +99,14 @@ fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
     Ok(unsafe { st.assume_init() })
 }
 
+/// Widens a `stat` field losslessly. The field types differ between platforms (`mode_t` is
+/// u16 on macOS and u32 on Linux), so an `as` cast is a no-op on one and a lint on the other.
+fn widen<T: Into<U>, U>(v: T) -> U {
+    v.into()
+}
+
 fn file_type(mode: u32) -> u32 {
-    mode & libc::S_IFMT as u32
+    mode & widen::<_, u32>(libc::S_IFMT)
 }
 
 /// Opens the directory `name` inside `parent`, never through a symlink.
@@ -111,7 +117,7 @@ fn open_dir_at(parent: RawFd, name: &str, shown: &str) -> Result<Option<OwnedFd>
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
             let why = match stat_at(parent, &c) {
-                Ok(st) if file_type(st.st_mode as u32) == libc::S_IFLNK as u32 => "is a symlink",
+                Ok(st) if file_type(widen(st.st_mode)) == widen::<_, u32>(libc::S_IFLNK) => "is a symlink",
                 _ => "is not a directory",
             };
             Err(unsafe_at(shown, why))
@@ -143,22 +149,21 @@ pub struct Entry {
 
 impl Entry {
     pub fn is_file(&self) -> bool {
-        file_type(self.mode) == libc::S_IFREG as u32
+        file_type(self.mode) == widen::<_, u32>(libc::S_IFREG)
     }
 
     pub fn is_dir(&self) -> bool {
-        file_type(self.mode) == libc::S_IFDIR as u32
+        file_type(self.mode) == widen::<_, u32>(libc::S_IFDIR)
     }
 }
 
-#[allow(clippy::unnecessary_cast)] // the stat field types differ between platforms
 fn entry(name: String, st: &libc::stat) -> Entry {
     Entry {
         name,
-        mode: st.st_mode as u32,
-        size: st.st_size as u64,
-        mtime: st.st_mtime as i64,
-        mtime_nsec: st.st_mtime_nsec as i64,
+        mode: widen(st.st_mode),
+        size: u64::try_from(st.st_size).unwrap_or(0),
+        mtime: widen(st.st_mtime),
+        mtime_nsec: widen(st.st_mtime_nsec),
     }
 }
 
