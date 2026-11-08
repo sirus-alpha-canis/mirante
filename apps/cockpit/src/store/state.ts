@@ -313,6 +313,9 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       return sys("feed.autoResumeSkipped", { reason: str(p.reason) });
     case "session.auto_resume_failed":
       return sys("feed.autoResumeFailed", { error: str(p.error) });
+    case "session.auto_resume_pending":
+      // The daemon's own bookkeeping (it will resume this session); auto_resumed says the rest.
+      return null;
     case "skill.injected": {
       const versions = Array.isArray(p.versions) ? p.versions : [];
       const list = names(p).map((n, i) => (versions[i] == null ? n : `${n} v${str(versions[i])}`));

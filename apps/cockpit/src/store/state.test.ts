@@ -154,6 +154,7 @@ describe("feedItem", () => {
     expect(feedItem(ev(1, "t", "session.auto_resumed", { resumed: true }))?.text).toBe("resumed after the daemon restarted");
     expect(feedItem(ev(2, "t", "session.auto_resume_skipped", { reason: "hibernated" }))?.text).toBe("not resumed after the daemon restarted: hibernated");
     expect(feedItem(ev(3, "t", "session.auto_resume_failed", { error: "boom" }))?.text).toBe("could not resume after the daemon restarted: boom");
+    expect(feedItem(ev(4, "t", "session.auto_resume_pending", { session_id: "s" }))).toBeNull();
   });
 
   it("a tool step keeps its tool name apart", () => {
