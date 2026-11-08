@@ -398,6 +398,9 @@ impl Policy {
     ) -> Vec<Action> {
         let mut out = Vec::new();
         self.update_level(now, system, &mut out);
+        // Only live sessions are tracked: one that ended without a `forget` (an exit, a
+        // stop) leaves nothing behind for a later session of the same task to inherit.
+        self.sessions.retain(|task_id, _| sessions.iter().any(|(i, _)| i.task_id == *task_id));
         for (info, sample) in sessions {
             if let Some(sample) = sample {
                 self.update_session(now, info, *sample, &mut out);
@@ -544,6 +547,21 @@ mod tests {
         assert_eq!(kinds(&p.tick(t0, &normal(), &[s("a", false, false, 3 * GB + GB / 2)])), ["warn:a:soft"]);
         p.forget("a");
         assert_eq!(p.session("a"), None);
+    }
+
+    /// A session that ended without the hub telling the policy (no hibernation) is not
+    /// remembered: what is tracked is what the last tick saw live.
+    #[test]
+    fn a_session_missing_from_a_tick_is_forgotten() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        p.tick(t0, &normal(), &[s("a", false, false, 5 * GB), s("b", false, false, GB)]);
+        p.tick(t0, &normal(), &[s("b", false, false, GB)]);
+        assert_eq!(p.session("a"), None);
+        assert!(p.session("b").is_some());
+        // Back with a new session: it starts fresh (no stale peak or warning state).
+        p.tick(t0, &normal(), &[s("a", false, false, GB)]);
+        assert_eq!(p.session("a").unwrap().peak, GB);
     }
 
     /// Up `UP_SAMPLES` samples in a row before the level rises; down after `CALM_SAMPLES`.
