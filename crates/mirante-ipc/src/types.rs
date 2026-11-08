@@ -82,6 +82,10 @@ pub mod method {
     pub const SKILL_TASK_SKILLS: &str = "skill.task_skills";
     /// `{}` when the caller may review skills, else `FORBIDDEN`.
     pub const SKILL_MAY_REVIEW: &str = "skill.may_review";
+    /// A checkout's pinned origin and its live one, as the daemon reads them, for the CLI's
+    /// `skills tenant|learn|mine` ([`super::SkillRepoParams`] → [`super::RepoOrigin`]).
+    /// A person only.
+    pub const SKILL_REPO_ORIGIN: &str = "skill.repo_origin";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -920,6 +924,26 @@ pub struct SkillConfirmOrigin {
     pub task: String,
     /// The origin key the person confirms: the checkout's pinned one or its live one.
     pub origin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRepoParams {
+    /// A path in the checkout (canonicalized by the caller).
+    pub repo: String,
+}
+
+/// A checkout's origins: the one Mirante pinned (at its first person-created task, or a
+/// person's confirmation) and the live `remote.origin.url`, both normalized (no token, no
+/// ssh alias).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoOrigin {
+    pub live: String,
+    pub live_tenant: String,
+    /// `None` until a person creates a task in this checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

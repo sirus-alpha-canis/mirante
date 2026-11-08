@@ -95,6 +95,7 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::SKILL_MINE, Access::Person),
     (method::SKILL_TASK_SKILLS, Access::Person),
     (method::SKILL_MAY_REVIEW, Access::Person),
+    (method::SKILL_REPO_ORIGIN, Access::Person),
 ];
 
 /// Who may call `m`: its [`ACCESS`] entry, or a person only when it has none.

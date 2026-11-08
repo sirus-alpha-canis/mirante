@@ -950,3 +950,50 @@ fn skills_add_accept_ls_round_trip() {
     let out = env.on_tty(&repo, &["skills", "restore", "tests-first"], "restore");
     assert!(out.contains("restored tests-first"), "{out}");
 }
+
+/// `tenant`, `learn` and `mine` follow the origin the daemon pinned for the checkout, not
+/// the live `remote.origin.url` an agent could have changed: `tenant` shows both and the
+/// counts, `mine` refuses while they differ or when the checkout has no task yet.
+#[test]
+fn skills_tenant_and_mine_follow_the_pinned_origin() {
+    use mirante_core::model::AgentKind;
+    use mirante_ipc::types::{CreateTask, SkillLearn};
+    let env = Env::new();
+    let repo = env.repo.clone();
+    git(&repo, &["remote", "add", "origin", "git@github.com:acme/app.git"]);
+    env.ok(&["daemon", "start"]);
+    let run = |args: &[&str]| {
+        let out = env.mirante_in(&repo, args);
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+        )
+    };
+    // No task in this checkout yet: nothing is pinned, mining is refused.
+    let (ok, out) = run(&["skills", "mine"]);
+    assert!(!ok && out.contains("no task"), "{out}");
+    let create = CreateTask {
+        repo: repo.to_string_lossy().into_owned(),
+        agent: AgentKind::Codex,
+        branch: "b1".into(),
+        base: None,
+        goal: "g".into(),
+        title: None,
+    };
+    let _: TaskView = env.client().call(method::TASK_CREATE, create).unwrap();
+    let learn = SkillLearn { tenant: "github.com/acme".into(), enabled: true };
+    let _: Value = env.client().call(method::SKILL_LEARN, learn).unwrap();
+    let out = env.ok_in(&repo, &["skills", "tenant"]);
+    assert!(out.contains("origin  github.com/acme/app (pinned)"), "{out}");
+    assert!(out.contains("tenant  github.com/acme  (learning on; 1 tasks, 0 skills)"), "{out}");
+    let (ok, out) = run(&["skills", "mine"]);
+    assert!(ok && out.contains("github.com/acme:"), "{out}");
+    // The remote moved (an agent can run git remote set-url): shown, and mining refused.
+    git(&repo, &["remote", "set-url", "origin", "git@github.com:evil/x.git"]);
+    let out = env.ok_in(&repo, &["skills", "tenant"]);
+    assert!(out.contains("origin  github.com/acme/app (pinned)"), "{out}");
+    assert!(out.contains("github.com/evil/x") && out.contains("WARNING"), "{out}");
+    let (ok, out) = run(&["skills", "mine"]);
+    assert!(!ok && out.contains("github.com/evil/x") && out.contains("github.com/acme/app"), "{out}");
+    assert!(!out.contains("new proposal"), "{out}");
+}

@@ -2,8 +2,8 @@
 use mirante_core::dna::untrusted::line;
 use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
 use mirante_ipc::types::{
-    AnchorView, BootState, DoctorReport, MemView, NoteSummary, NoteView, PermissionView, ProposalView,
-    SkillProposalView, SkillSummary, SkillView, SystemView, TaskView,
+    AnchorView, BootState, DoctorReport, MemView, NoteSummary, NoteView, PermissionView, ProposalView, RepoOrigin,
+    SkillProposalView, SkillSummary, SkillView, SystemView, TaskView, TenantView,
 };
 
 /// A proposal as the review prompt shows it: status, title (or the person's new title),
@@ -383,6 +383,51 @@ fn body_lines(out: &mut String, body: &str) {
     for l in body.lines() {
         out.push_str(&format!("  | {}\n", line(l, usize::MAX)));
     }
+}
+
+/// The tenant `skills learn|mine` act on: the pinned one, else the live one.
+pub fn origin_tenant(o: &RepoOrigin) -> &str {
+    o.pinned_tenant.as_deref().unwrap_or(&o.live_tenant)
+}
+
+/// Why `skills learn|mine` must not act on this checkout's origin: its live
+/// `remote.origin.url` is not the origin Mirante pinned (an agent can run `git remote
+/// set-url`).
+pub fn origin_mismatch(o: &RepoOrigin) -> Option<String> {
+    let pinned = o.pinned.as_deref()?;
+    (pinned != o.live).then(|| {
+        format!(
+            "this checkout's remote.origin.url now reads {}, but Mirante pinned {pinned} for it: confirm the change \
+in the cockpit (a task's Skills chip) or set the remote back; nothing was changed",
+            line(&o.live, 200)
+        )
+    })
+}
+
+/// `mirante skills tenant` (and the head of `learn`'s prompt): the origin, whether it is
+/// pinned, a warning when the live remote differs, and the tenant's state and counts.
+pub fn origin_summary(o: &RepoOrigin, t: Option<&TenantView>) -> String {
+    let mut out = match &o.pinned {
+        Some(p) => format!("origin  {} (pinned)\n", line(p, 200)),
+        None => format!(
+            "origin  {} (not pinned yet: read from remote.origin.url as it is now; a person's first task here pins it)\n",
+            line(&o.live, 200)
+        ),
+    };
+    if o.pinned.as_deref().is_some_and(|p| p != o.live) {
+        out.push_str(&format!(
+            "        WARNING: remote.origin.url now reads {}; Mirante keeps the pinned origin until a person confirms \
+the change\n",
+            line(&o.live, 200)
+        ));
+    }
+    let learning = if t.is_some_and(|t| t.learning) { "learning on" } else { "learning off" };
+    let (tasks, skills) = t.map_or((0, 0), |t| (t.tasks, t.skills));
+    out.push_str(&format!("tenant  {}  ({learning}; {tasks} tasks, {skills} skills)\n", line(origin_tenant(o), 200)));
+    if tasks == 0 {
+        out.push_str("        WARNING: this client has no tasks in Mirante yet\n");
+    }
+    out
 }
 
 /// `mirante skills ls`: one skill per line, with its verification and 30-day usage.
@@ -771,6 +816,34 @@ mod tests {
         assert!(card.contains("  | line one\n"), "{card}");
         let table = skill_proposals_table(&[v]);
         assert!(table.contains("1 error(s)") && table.contains("agent"), "{table}");
+    }
+
+    #[test]
+    fn origin_summary_says_pinned_or_not_warns_on_a_moved_remote_and_counts() {
+        let o = |pinned: Option<&str>, live: &str| RepoOrigin {
+            live: live.into(),
+            live_tenant: live.rsplit_once('/').unwrap().0.into(),
+            pinned: pinned.map(str::to_string),
+            pinned_tenant: pinned.map(|p| p.rsplit_once('/').unwrap().0.to_string()),
+        };
+        let t = TenantView { tenant: "github.com/acme".into(), learning: true, tasks: 2, skills: 1 };
+        let same = o(Some("github.com/acme/app"), "github.com/acme/app");
+        assert_eq!(
+            origin_summary(&same, Some(&t)),
+            "origin  github.com/acme/app (pinned)\ntenant  github.com/acme  (learning on; 2 tasks, 1 skills)\n"
+        );
+        assert_eq!(origin_mismatch(&same), None);
+        let moved = o(Some("github.com/acme/app"), "github.com/evil/x");
+        let s = origin_summary(&moved, Some(&t));
+        assert!(s.contains("WARNING: remote.origin.url now reads github.com/evil/x"), "{s}");
+        assert_eq!(origin_tenant(&moved), "github.com/acme");
+        let why = origin_mismatch(&moved).unwrap();
+        assert!(why.contains("github.com/evil/x") && why.contains("pinned github.com/acme/app"), "{why}");
+        let fresh = o(None, "github.com/new/y");
+        let s = origin_summary(&fresh, None);
+        assert!(s.contains("not pinned yet") && s.contains("(learning off; 0 tasks, 0 skills)"), "{s}");
+        assert!(s.contains("WARNING: this client has no tasks"), "{s}");
+        assert_eq!((origin_tenant(&fresh), origin_mismatch(&fresh)), ("github.com/new", None));
     }
 
     /// Accept approves what the card shows: every line of the body, every char of a long

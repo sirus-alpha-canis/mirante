@@ -37,10 +37,10 @@ use mirante_core::skills::{
 };
 use mirante_core::CoreError;
 use mirante_ipc::types::{
-    OriginConfirmed, RefusedSkill, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits,
+    OriginConfirmed, RefusedSkill, RepoOrigin, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits,
     SkillFileView, SkillGet, SkillLearn, SkillLintParams, SkillListParams, SkillMine, SkillMined, SkillProposalView,
-    SkillProposals, SkillPropose, SkillReview, SkillSummary, SkillTaskParams, SkillView, TaskSkill, TaskSkills,
-    TenantView,
+    SkillProposals, SkillPropose, SkillRepoParams, SkillReview, SkillSummary, SkillTaskParams, SkillView, TaskSkill,
+    TaskSkills, TenantView,
 };
 
 use super::dna::{today, Caller, Identity};
@@ -429,6 +429,21 @@ impl Hub {
             )
         });
         Ok(OriginConfirmed { origin: p.origin, tenant, cleared, warning })
+    }
+}
+
+impl Hub {
+    /// `skill.repo_origin`: the checkout's pinned origin and its live one (a person only:
+    /// what the CLI learns and mines by).
+    pub fn skill_repo_origin(&self, caller: &Caller, p: SkillRepoParams) -> Result<RepoOrigin> {
+        self.require_skill_person(caller)?;
+        let (key, live, live_tenant) = self.origin_info(Path::new(&p.repo));
+        let pinned = match key {
+            Some(k) => self.lock().store.skill_repo_origin(&k)?,
+            None => None,
+        };
+        let (pinned, pinned_tenant) = pinned.unzip();
+        Ok(RepoOrigin { live, live_tenant, pinned, pinned_tenant })
     }
 }
 
@@ -1737,6 +1752,32 @@ pub(crate) mod tests {
         let d = create_in(&k, &Caller::Person, "d", "g");
         let o = k.hub.lock().store.skill_origin_of(&d.id).unwrap().unwrap();
         assert_eq!((o.tenant.as_str(), o.observed), ("github.com/other", None));
+    }
+
+    /// The CLI learns and mines by the checkout's pinned origin: this gives it both, to a
+    /// person only.
+    #[test]
+    fn repo_origin_gives_the_pinned_and_live_origins_to_a_person_only() {
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        let q = || SkillRepoParams { repo: k.repo.to_string_lossy().into_owned() };
+        let none = k.hub.skill_repo_origin(&Caller::Person, q()).unwrap();
+        assert_eq!((none.live.as_str(), none.pinned.as_deref()), ("github.com/acme/app", None));
+        let t = k.create(AgentKind::Claude, "a").task;
+        set_origin(&k.repo, "git@github.com:evil/x.git");
+        let r = k.hub.skill_repo_origin(&Caller::Person, q()).unwrap();
+        assert_eq!(
+            r,
+            RepoOrigin {
+                live: "github.com/evil/x".into(),
+                live_tenant: "github.com/evil".into(),
+                pinned: Some("github.com/acme/app".into()),
+                pinned_tenant: Some("github.com/acme".into()),
+            }
+        );
+        let agent = Peer::spawn(&[(AGENT_ENV, &t.id)], k.dir.path());
+        forbidden(k.hub.skill_repo_origin(&agent.caller(), q()));
+        forbidden(k.hub.skill_repo_origin(&Caller::Unknown, q()));
     }
 
     #[test]

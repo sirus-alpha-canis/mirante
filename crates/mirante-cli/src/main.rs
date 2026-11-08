@@ -14,10 +14,10 @@ use mirante_ipc::types::{
     method, AnswerPermission, AttachParams, AttachResult, BootState, CheckReport, CreateTask, DaemonStatus, DnaGet,
     DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus, DoctorReport,
     EditQueued, KillOrphan, ListParams, NoteAction, NoteSummary, NoteView, OrphanView, PermissionView, ProposalView,
-    ProposeAnchor, QueueRef, QueuedMessage, QueuedRef, ReorderQueue, ResizeParams, SendMessage, SendMode, SendResult,
-    SkillAction, SkillActionKind, SkillAdd, SkillEdits, SkillGet, SkillLearn, SkillListParams, SkillMine, SkillMined,
-    SkillProposalView, SkillProposals, SkillReview, SkillSummary, SkillView, Snapshot, StartResult, StartSession,
-    SubscribeParams, SystemView, TaskRef, TaskView, TenantView, TrustAnswer,
+    ProposeAnchor, QueueRef, QueuedMessage, QueuedRef, ReorderQueue, RepoOrigin, ResizeParams, SendMessage, SendMode,
+    SendResult, SkillAction, SkillActionKind, SkillAdd, SkillEdits, SkillGet, SkillLearn, SkillListParams, SkillMine,
+    SkillMined, SkillProposalView, SkillProposals, SkillRepoParams, SkillReview, SkillSummary, SkillView, Snapshot,
+    StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TenantView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd, USAGE};
 use mirante_cli::{confirm, daemon_ctl, memcheck, render, skilllint, term};
 use mirante_core::skills::lint::has_errors;
-use mirante_core::skills::origin;
 
 type Res = Result<(), Box<dyn Error>>;
 
@@ -533,15 +532,14 @@ fn may_review_skills(c: &mut Client) -> Res {
     Ok(())
 }
 
-/// The checkout's origin key and tenant, as Mirante reads them (raw `remote.origin.url`,
-/// normalized with this user's ssh aliases; no token or alias kept).
-fn origin_and_tenant(repo: Option<String>) -> Result<(String, String), Box<dyn Error>> {
+/// The checkout's origins as the daemon reads and pinned them (normalized: no token or
+/// alias), and the counts of the tenant `learn` and `mine` act on (the pinned one).
+fn repo_origin(c: &mut Client, repo: Option<String>) -> Result<(RepoOrigin, Option<TenantView>), Box<dyn Error>> {
     let repo = repo_or_cwd(repo)?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let aliases = home.map(|h| origin::read_aliases(&h)).unwrap_or_default();
-    let key = origin::origin_of(std::path::Path::new(&repo), &aliases);
-    let tenant = origin::tenant(&key);
-    Ok((key, tenant))
+    let o: RepoOrigin = c.call(method::SKILL_REPO_ORIGIN, SkillRepoParams { repo })?;
+    let tenants: Vec<TenantView> = c.call(method::SKILL_TENANTS, json!({}))?;
+    let t = tenants.into_iter().find(|t| t.tenant == render::origin_tenant(&o));
+    Ok((o, t))
 }
 
 /// `mirante skills lint` found an error: exit 1 (any other failure of lint exits 3).
@@ -639,33 +637,28 @@ fn skills(paths: &Paths, k: SkillsCmd) -> Res {
             Ok(())
         }
         SkillsCmd::Tenant { repo } => {
-            let (key, tenant) = origin_and_tenant(repo)?;
-            let tenants: Vec<TenantView> = client(paths)?.call(method::SKILL_TENANTS, json!({}))?;
-            let t = tenants.iter().find(|t| t.tenant == tenant);
-            let learning = if t.is_some_and(|t| t.learning) { "learning on" } else { "learning off" };
-            println!("origin  {key}");
-            println!(
-                "tenant  {tenant}  ({learning}; {} tasks, {} skills)",
-                t.map_or(0, |t| t.tasks),
-                t.map_or(0, |t| t.skills)
-            );
+            let (o, t) = repo_origin(&mut client(paths)?, repo)?;
+            print!("{}", render::origin_summary(&o, t.as_ref()));
             Ok(())
         }
         SkillsCmd::Learn { on, repo } => {
             let mut tty = confirm::DevTty::open()?;
-            let (key, tenant) = origin_and_tenant(repo)?;
             let mut c = client(paths)?;
             may_review_skills(&mut c)?;
+            let (o, t) = repo_origin(&mut c, repo)?;
+            if let Some(why) = render::origin_mismatch(&o) {
+                return Err(why.into());
+            }
+            let tenant = render::origin_tenant(&o).to_string();
+            let head = render::origin_summary(&o, t.as_ref());
             let summary = if on {
                 format!(
-                    "Turn skill learning on for {tenant} (this repo: {key}).\nMirante reads your goals, messages and \
-denied permissions in this client's tasks, on this machine only, to propose skills for your review. Agents may \
-propose skills for their own task (skill_propose)."
+                    "{head}\nTurn skill learning on for {tenant}.\nMirante reads your goals, messages and denied \
+permissions in this client's tasks, on this machine only, to propose skills for your review. Agents may propose \
+skills for their own task (skill_propose)."
                 )
             } else {
-                format!(
-                    "Turn skill learning off for {tenant} (this repo: {key}). Accepted skills stay and still apply."
-                )
+                format!("{head}\nTurn skill learning off for {tenant}. Accepted skills stay and still apply.")
             };
             let word = if on { "enable" } else { "disable" };
             confirm::typed(&mut tty, &summary, word)?;
@@ -716,8 +709,20 @@ propose skills for their own task (skill_propose)."
         }
         SkillsCmd::Action { name, op } => skill_action(paths, name, op),
         SkillsCmd::Mine { repo } => {
-            let (_, tenant) = origin_and_tenant(repo)?;
-            let m: SkillMined = client(paths)?.call(method::SKILL_MINE, SkillMine { tenant })?;
+            let mut c = client(paths)?;
+            let (o, _) = repo_origin(&mut c, repo)?;
+            if o.pinned.is_none() {
+                return Err(format!(
+                    "no task was created in this checkout yet: nothing to mine, and its origin ({}) is not pinned",
+                    o.live
+                )
+                .into());
+            }
+            if let Some(why) = render::origin_mismatch(&o) {
+                return Err(why.into());
+            }
+            let tenant = render::origin_tenant(&o).to_string();
+            let m: SkillMined = c.call(method::SKILL_MINE, SkillMine { tenant })?;
             println!(
                 "{}: {} new proposal(s), {} updated, {} skipped (mirante skills proposals)",
                 m.tenant, m.proposed, m.updated, m.skipped
