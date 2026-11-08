@@ -32,8 +32,8 @@ const titles = (h: ReturnType<typeof makeEnv>) => vi.mocked(h.env.notify).mock.c
 /** Opens a task's detail through the command bar, synchronously (fake-timer safe). */
 function openViaPalette(text: string) {
   fireEvent.keyDown(window, { key: "k", ...mod });
-  fireEvent.change(screen.getByRole("combobox"), { target: { value: text } });
-  fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" });
+  fireEvent.change(screen.getByRole("combobox", { name: "Command" }), { target: { value: text } });
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "Command" }), { key: "Enter" });
 }
 
 function setPlatform(platform: string) {
@@ -151,7 +151,7 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "g", ...mod });
     expect(screen.getByRole("button", { name: /Home/ })).toHaveAttribute("aria-pressed", "true");
     fireEvent.keyDown(window, { key: "k", ...mod });
-    const input = screen.getByRole("combobox");
+    const input = screen.getByRole("combobox", { name: "Command" });
     await userEvent.type(input, "goal of z{Enter}");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getByRole("button", { name: "Detail" })).toHaveAttribute("aria-pressed", "true");
@@ -162,7 +162,7 @@ describe("App", () => {
   it("Escape typed into the composer (or the terminal) stays there", async () => {
     setup();
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "goal of z{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "goal of z{Enter}");
     const box = screen.getByRole("textbox", { name: "Message to the agent" });
     fireEvent.keyDown(box, { key: "Escape" });
     expect(screen.getByRole("button", { name: "Detail" })).toHaveAttribute("aria-pressed", "true");
@@ -171,7 +171,7 @@ describe("App", () => {
   it("the grid toggles back to the view it came from", async () => {
     setup();
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "goal of z{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "goal of z{Enter}");
     fireEvent.keyDown(window, { key: "g", ...mod });
     expect(screen.getByRole("main", { name: "Agent grid" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "g", ...mod });
@@ -227,7 +227,7 @@ describe("App", () => {
     expect(labels).toContain("Answer in terminal: goal of a (@claude feat/a)");
     expect(labels).toContain("Open goal of x (@codex feat/x)");
     expect(labels).toContain("Open goal of w (@claude feat/w)");
-    await userEvent.type(screen.getByRole("combobox"), "Answer in terminal{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Answer in terminal{Enter}");
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
     expect(h.env.cockpit.getState().tasks.a).toBeDefined();
   });
@@ -282,7 +282,7 @@ describe("App", () => {
 
   it("view chords wait while a field is being typed in; ⌘K still opens the command bar", () => {
     setup();
-    const box = screen.getByRole("textbox", { name: "Dispatch an agent" });
+    const box = screen.getByRole("textbox", { name: "Goal" });
     for (const key of ["b", "g"]) {
       fireEvent.keyDown(box, { key, code: `Key${key.toUpperCase()}`, ...mod });
       expect(screen.getByRole("button", { name: /Home/ })).toHaveAttribute("aria-pressed", "true");
@@ -308,11 +308,11 @@ describe("App", () => {
     expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Home/ }));
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "Go to Skills{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Go to Skills{Enter}");
     expect(nav()).toHaveAttribute("aria-pressed", "true");
     expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "Review skills{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Review skills{Enter}");
     expect(await screen.findByRole("region", { name: "Skill review queue" })).toBeInTheDocument();
   });
 
@@ -324,10 +324,10 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "b", ...mod });
     expect(screen.getByRole("button", { name: /Home/ })).toHaveAttribute("aria-pressed", "true");
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "Review memory{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Review memory{Enter}");
     expect(await screen.findByRole("region", { name: "Memory review queue" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "Go to Brain{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Go to Brain{Enter}");
     expect(screen.getByRole("button", { name: /Brain/ })).toHaveAttribute("aria-pressed", "true");
   });
 
@@ -344,7 +344,7 @@ describe("App", () => {
     const graphs = () => h.calls.filter((c) => c[0] === "dna.graph").length;
     const n = graphs();
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "Review memory{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Review memory{Enter}");
     expect(await screen.findByRole("region", { name: "Memory review queue" })).toBeInTheDocument();
     expect(screen.getByRole("searchbox", { name: "Search memory" })).toHaveValue("kept");
     expect(graphs()).toBe(n);
@@ -354,7 +354,7 @@ describe("App", () => {
     setup(DNA);
     // Home starts on the first project (other); the task a lives in /repos/shop.
     fireEvent.keyDown(window, { key: "k", ...mod });
-    await userEvent.type(screen.getByRole("combobox"), "goal of a{Enter}");
+    await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "goal of a{Enter}");
     expect(screen.getByRole("button", { name: "Detail" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.keyDown(window, { key: "b", ...mod });
     expect(await screen.findByRole("heading", { name: "Memory of shop" })).toBeInTheDocument();

@@ -79,15 +79,25 @@ open apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app
 The bundle is not signed or notarized. Copied to another Mac it is quarantined; clear that
 with `xattr -dr com.apple.quarantine Mirante.app` (only for a build you made yourself).
 
+## Dispatch
+
+Home's form: pick **Claude** or **Codex** (remembered on this machine), the repository (one
+of your Projects; it starts on the one selected on the left), and write the goal. The branch
+is named after the goal (`mirante/<words-of-the-goal>`, accents dropped, about 40 characters);
+a name another task of the repo uses, or one git already has, moves on to `-2`, `-3`… Use
+**edit** to type your own (an existing branch is then checked out as it is). Text starting
+with `@claude` or `@codex` is the one-line form, `@claude shop/feat/login add a login page`.
+
 ## Keys
 
 | Keys | What |
 |---|---|
-| ⌘K | Command bar (tasks, projects, `@claude repo/branch goal` to dispatch) |
+| ⌘K | Command bar (tasks, projects, `@claude repo/branch goal` into the dispatch form) |
 | ⌘G | Toggle the agent grid |
 | ⌘1 | Home |
 | Esc | Leave a task's detail |
 | ⇧⌘J | Theme: system → light → dark |
+| ⌘↵ | In Home's dispatch form: dispatch (Enter is a new line of the goal) |
 | ⌘↵ / ⌥↵ | In a task's composer: steer now / queue |
 
 Off macOS, ⌘ is Ctrl (the hints in the app name your platform's keys). Keys match their

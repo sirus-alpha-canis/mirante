@@ -157,6 +157,16 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .composer .error, .composer [role="status"] { flex-basis: 100%; }
 .composer-actions { display: flex; flex-direction: column; gap: 6px; }
 .composer-off { padding: 10px 20px; }
+/* The dispatch form (Home): agent toggle and repo, the goal, the auto-named branch. */
+.dispatch-row { display: flex; gap: 8px; align-items: center; flex-basis: 100%; flex-wrap: wrap; }
+.dispatch-row select { border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; background: var(--bg); max-width: 260px; }
+.seg { display: inline-flex; gap: 0; }
+.seg .btn { border-radius: 0; }
+.seg .btn:first-child { border-radius: 6px 0 0 6px; }
+.seg .btn:last-child { border-radius: 0 6px 6px 0; margin-left: -1px; }
+.seg .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.dispatch-branch { flex-basis: 100%; margin: 0; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.dispatch-branch input { border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; background: var(--bg); font-family: var(--mono, ui-monospace, monospace); min-width: 220px; }
 
 .board section { margin-bottom: 12px; }
 .count { font-weight: 400; }

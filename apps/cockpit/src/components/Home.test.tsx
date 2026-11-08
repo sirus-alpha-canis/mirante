@@ -1,9 +1,10 @@
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it } from "vitest";
 import { type DaemonStatus, RpcCode, type TaskDiff } from "../lib/protocol";
 import { REPOS_KEY } from "../lib/repos";
+import { AGENT_KEY } from "./DispatchComposer";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 
@@ -79,17 +80,140 @@ const daemonStatus = (claude_inline_answers: boolean): DaemonStatus => ({
 });
 
 describe("Home (V3 group chat)", () => {
-  it("dispatches @agent repo/branch goal: task.create, then session.start with the goal", async () => {
+  it("the form dispatches: agent, repo, goal, and a branch named after the goal", async () => {
+    const h = setup({ "task.create": task("new", { branch: "mirante/leia" }), "session.start": { boot: "booting" } });
+    await userEvent.click(screen.getByRole("button", { name: "Codex" }));
+    await userEvent.type(screen.getByLabelText("Goal"), "Leia este repositório e me explique");
+    expect(screen.getByText("mirante/leia-este-repositorio-e-me-explique")).toBeInTheDocument();
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
+    expect(sent(h)[0][1]).toEqual({
+      repo: "/repos/shop",
+      agent: "codex",
+      branch: "mirante/leia-este-repositorio-e-me-explique",
+      goal: "Leia este repositório e me explique",
+      base: "HEAD",
+    });
+    expect(sent(h)[1][1]).toEqual({ task: "new", prompt: "Leia este repositório e me explique" });
+  });
+
+  it("Ctrl+Enter dispatches too; plain Enter is a new line", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } });
+    const box = screen.getByLabelText("Goal");
+    await userEvent.type(box, "first line{Enter}second");
+    expect(box).toHaveValue("first line\nsecond");
+    expect(sent(h)).toEqual([]);
+    await userEvent.keyboard("{Control>}{Enter}{/Control}");
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
+  });
+
+  it("Claude is the default agent; the choice is remembered for next time", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } });
+    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByRole("button", { name: "Codex" }));
+    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    expect(h.env.storage.getItem(AGENT_KEY)).toBe("codex");
+  });
+
+  it("starts on the remembered agent, and survives storage that throws", () => {
+    const h = makeEnv();
+    h.load([]);
+    h.env.storage.setItem(AGENT_KEY, "codex");
+    renderWith(h.env, <Harness env={h.env} />);
+    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    cleanup();
+    const broken = makeEnv();
+    broken.load([]);
+    broken.env.storage = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("blocked");
+      },
+    };
+    renderWith(broken.env, <Harness env={broken.env} registry={[]} />);
+    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("the repo select lists the projects, starts on the selected one, and is what is sent", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [], [], null, ["/repos/shop", "/repos/api"]);
+    const repo = screen.getByLabelText("Repository");
+    expect(repo).toHaveValue("/repos/shop");
+    await userEvent.selectOptions(repo, "/repos/api");
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h)[0]?.[1]).toMatchObject({ repo: "/repos/api", branch: "mirante/fix-it" }));
+  });
+
+  it("a branch another task of the repo has gets -2, -3…", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [
+      task("a", { branch: "mirante/fix-it" }),
+      task("b", { branch: "mirante/fix-it-2" }),
+      task("c", { branch: "mirante/other", repo_path: "/elsewhere" }),
+    ]);
+    await userEvent.type(screen.getByLabelText("Goal"), "Fix it");
+    expect(screen.getByText("mirante/fix-it-3")).toBeInTheDocument();
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h)[0]?.[1]).toMatchObject({ branch: "mirante/fix-it-3" }));
+  });
+
+  it("when git already has the branch, the next free name is tried", async () => {
+    const h = setup({
+      "task.create": (p: Record<string, unknown>) =>
+        p.branch === "mirante/fix-it" || p.branch === "mirante/fix-it-2"
+          ? rpcError(RpcCode.INVALID_PARAMS, `invalid branch name "${p.branch}": branch already exists; a base only applies to a new branch`)
+          : task("new", { branch: String(p.branch) }),
+      "session.start": { boot: "booting" },
+    });
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "task.create", "task.create", "session.start"]));
+    expect(sent(h).map((c) => c[1].branch).slice(0, 3)).toEqual(["mirante/fix-it", "mirante/fix-it-2", "mirante/fix-it-3"]);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("the branch can be edited; an edited branch is used as typed (an existing one is checked out)", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } });
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it");
+    await userEvent.click(screen.getByRole("button", { name: "Edit branch" }));
+    const branch = screen.getByLabelText("Branch");
+    expect(branch).toHaveValue("mirante/fix-it");
+    await userEvent.clear(branch);
+    await userEvent.type(branch, "feat/mine");
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    await waitFor(() => expect(sent(h)[0]?.[1]).toEqual({ repo: "/repos/shop", agent: "claude", branch: "feat/mine", goal: "fix it" }));
+  });
+
+  it("an edited branch git would refuse is explained without calling the daemon", async () => {
+    const h = setup();
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it");
+    await userEvent.click(screen.getByRole("button", { name: "Edit branch" }));
+    await userEvent.clear(screen.getByLabelText("Branch"));
+    await userEvent.type(screen.getByLabelText("Branch"), "a..b");
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("cannot contain '..'");
+    expect(sent(h)).toEqual([]);
+  });
+
+  it("with no project yet, the form says to add one", async () => {
+    const h = makeEnv();
+    h.load([]);
+    renderWith(h.env, <Harness env={h.env} registry={[]} />);
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it{Meta>}{Enter}{/Meta}");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Add a repository under Projects first");
+    expect(sent(h)).toEqual([]);
+  });
+
+  it("power users: @agent repo/branch goal in the goal box still works", async () => {
     const h = setup({ "task.create": task("new", { branch: "feat/login" }), "session.start": { boot: "booting" } });
-    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@codex shop/feat/login add a login page{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@codex shop/feat/login add a login page{Meta>}{Enter}{/Meta}");
     await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
     expect(sent(h)[0][1]).toEqual({ repo: "/repos/shop", agent: "codex", branch: "feat/login", goal: "add a login page" });
     expect(sent(h)[1][1]).toEqual({ task: "new", prompt: "add a login page" });
   });
 
-  it("explains a bad dispatch without calling the daemon", async () => {
+  it("explains a bad power-user dispatch without calling the daemon", async () => {
     const h = setup();
-    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude web/x do it{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@claude web/x do it{Meta>}{Enter}{/Meta}");
     expect(await screen.findByRole("alert")).toHaveTextContent('unknown repo "web"');
     expect(sent(h)).toEqual([]);
   });
@@ -103,10 +227,11 @@ describe("Home (V3 group chat)", () => {
     expect(col("Ready for review")).toEqual(["goal of r@claude · feat/r"]);
   });
 
-  it("an agent in the rail starts a message to it in the selected project", async () => {
-    setup();
+  it("an agent in the rail with no live session selects it in the form and focuses the goal", async () => {
+    setup({}, []);
     await userEvent.click(screen.getByRole("button", { name: /@codex/ }));
-    expect(screen.getByLabelText("Dispatch an agent")).toHaveValue("@codex shop/");
+    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("Goal")).toHaveFocus();
   });
 
   it("adding a repo takes an absolute path only", async () => {
@@ -134,24 +259,24 @@ describe("Home (V3 group chat)", () => {
 
   it("Enter pressed twice (or auto-repeat) dispatches once", async () => {
     const h = setup({ "task.create": () => new Promise(() => {}) });
-    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@codex shop/feat/x go{Enter}{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@codex shop/feat/x go{Meta>}{Enter}{Enter}{/Meta}");
     expect(h.calls.filter(([m]) => m === "task.create")).toHaveLength(1);
   });
 
   it("Enter while an IME is composing does not dispatch", () => {
     const h = setup();
-    const box = screen.getByLabelText("Dispatch an agent");
+    const box = screen.getByLabelText("Goal");
     fireEvent.change(box, { target: { value: "@codex shop/feat/x 日本" } });
-    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
-    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true, isComposing: true });
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true, keyCode: 229 });
     expect(sent(h)).toEqual([]);
   });
 
   it("text typed while a dispatch is in flight is kept", async () => {
     let finish: (v: unknown) => void = () => {};
     const h = setup({ "task.create": () => new Promise((r) => (finish = r)), "session.start": { boot: "booting" } });
-    const box = screen.getByLabelText("Dispatch an agent");
-    await userEvent.type(box, "@codex shop/feat/x go{Enter}");
+    const box = screen.getByLabelText("Goal");
+    await userEvent.type(box, "@codex shop/feat/x go{Meta>}{Enter}{/Meta}");
     await userEvent.type(box, " and more");
     await act(async () => finish(task("new", { branch: "feat/x" })));
     await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
@@ -160,29 +285,23 @@ describe("Home (V3 group chat)", () => {
 
   it("a dispatched draft is cleared once created", async () => {
     setup({ "task.create": task("new", { branch: "feat/x" }), "session.start": { boot: "booting" } });
-    const box = screen.getByLabelText("Dispatch an agent");
-    await userEvent.type(box, "@codex shop/feat/x go{Enter}");
+    const box = screen.getByLabelText("Goal");
+    await userEvent.type(box, "@codex shop/feat/x go{Meta>}{Enter}{/Meta}");
     await waitFor(() => expect(box).toHaveValue(""));
   });
 
   it("says so when the task was created but the agent did not start", async () => {
     setup({ "task.create": task("new", { branch: "feat/x" }), "session.start": rpcError(RpcCode.DRIVER, "codex not found") });
-    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@codex shop/feat/x go{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@codex shop/feat/x go{Meta>}{Enter}{/Meta}");
     expect(await screen.findByRole("alert")).toHaveTextContent("feat/x was created but the agent did not start");
     expect(screen.getByRole("alert")).toHaveTextContent("codex not found");
   });
 
   it("an ambiguous repo name is refused without calling the daemon", async () => {
     const h = setup({}, [task("a", { status: "working" })], [], null, ["/repos/shop", "/other/shop"]);
-    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude shop/feat/x go{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@claude shop/feat/x go{Meta>}{Enter}{/Meta}");
     expect(await screen.findByRole("alert")).toHaveTextContent('"shop" names several repos');
     expect(sent(h)).toEqual([]);
-  });
-
-  it("a mention puts the keyboard in the composer", async () => {
-    setup();
-    await userEvent.click(screen.getByRole("button", { name: /^@claude/ }));
-    expect(screen.getByLabelText("Dispatch an agent")).toHaveFocus();
   });
 
   it("an added repo can be removed from Projects", async () => {
@@ -240,7 +359,7 @@ describe("dispatch and the task's origin", () => {
   const created = (origin: unknown) => ({ ...task("n", { repo_path: "/repos/shop", branch: "feat/n" }), origin });
   const go = async (origin: unknown) => {
     const h = setup({ "task.create": created(origin), "session.start": { task: "n", boot: "ready", resumed: false, screen: "" } }, []);
-    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude shop/feat/n do it{Enter}");
+    await userEvent.type(screen.getByLabelText("Goal"), "@claude shop/feat/n do it{Meta>}{Enter}{/Meta}");
     return h;
   };
 

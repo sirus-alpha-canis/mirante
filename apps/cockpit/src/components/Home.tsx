@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useStore } from "../env";
+import { useEnv, useStore } from "../env";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { columnOf, COLUMN_LABEL, type Column, type Project, repoName } from "../store/select";
 import { AgentCard } from "./AgentCard";
 import { Board } from "./Board";
-import { DispatchComposer } from "./DispatchComposer";
+import { DispatchComposer, loadAgent, saveAgent } from "./DispatchComposer";
 import { LeftRail } from "./LeftRail";
 
 /** V3, the group chat: projects and agents | the project's feed | the board. */
@@ -24,6 +24,7 @@ export function Home(props: {
   onDraft(v: string): void;
 }) {
   const s = useStore();
+  const env = useEnv();
   const cards = useMemo(
     () =>
       Object.values(s.tasks)
@@ -32,9 +33,13 @@ export function Home(props: {
     [s.tasks, props.project],
   );
   const composer = useRef<HTMLTextAreaElement>(null);
-  const mention = (agent: AgentKind) => {
-    const repo = props.project ? `${repoName(props.project)}/` : "";
-    props.onDraft(`@${agent} ${repo}`);
+  const [agent, setAgent] = useState<AgentKind>(() => loadAgent(env.storage));
+  const pickAgent = (a: AgentKind) => {
+    setAgent(a);
+    saveAgent(env.storage, a);
+  };
+  const mention = (a: AgentKind) => {
+    pickAgent(a);
     composer.current?.focus();
   };
   // One polite region says when a card changes state (not every new line on every card).
@@ -78,7 +83,15 @@ export function Home(props: {
         <p className="sr-only" role="status" aria-label="Agent updates">
           {announce}
         </p>
-        <DispatchComposer projects={props.projects} value={props.draft} onChange={props.onDraft} inputRef={composer} />
+        <DispatchComposer
+          projects={props.projects}
+          project={props.project}
+          value={props.draft}
+          onChange={props.onDraft}
+          agent={agent}
+          onAgent={pickAgent}
+          inputRef={composer}
+        />
       </main>
       <Board onOpen={props.onOpen} />
     </div>

@@ -14,10 +14,13 @@ export type Parsed = { ok: true; value: Dispatch } | { ok: false; error: string 
 
 export const DISPATCH_HELP = "@claude <repo>/<branch> <goal>  or  @codex <repo>/<branch> <goal>";
 
+/** The goal box's hint: plain words, with the one-line syntax as a shortcut. */
+export const GOAL_HELP = "What should the agent do? (⌘↵ to dispatch; power users: @claude repo/branch goal)";
+
 const AGENTS: Record<string, AgentKind> = { "@claude": "claude", "@codex": "codex" };
 
 // git check-ref-format, as far as a typed branch name needs it.
-function branchProblem(b: string): string | null {
+export function branchProblem(b: string): string | null {
   if (b.startsWith("-")) return "a branch cannot start with '-'";
   if (b.startsWith("/")) return "a branch cannot start with '/'";
   if (b.includes("..")) return "a branch cannot contain '..'";
@@ -64,4 +67,36 @@ export function resolveRepo(name: string, known: { name: string; path: string }[
     return { ok: false, error: `"${name}" names several repos (${hits.map((h) => h.path).join(", ")}); rename one folder` };
   }
   return { ok: false, error: `unknown repo "${name}": add it under Projects first` };
+}
+
+/** Where auto-named branches live. */
+export const BRANCH_PREFIX = "mirante/";
+const SLUG_MAX = 40;
+
+/** "Leia este repositório e me explique" -> "mirante/leia-este-repositorio-e-me-explique":
+ * lowercase ASCII, accents stripped, words joined by "-", cut near 40 characters at a word
+ * boundary. Nothing ASCII left (e.g. Japanese) -> "mirante/task". */
+export function branchFromGoal(goal: string): string {
+  let slug = goal
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (slug.length > SLUG_MAX) {
+    const cut = slug.slice(0, SLUG_MAX + 1).lastIndexOf("-");
+    slug = cut > 0 ? slug.slice(0, cut) : slug.slice(0, SLUG_MAX);
+  }
+  return BRANCH_PREFIX + (slug || "task");
+}
+
+/** `base`, or `base-2`, `base-3`… the first not in `taken`. */
+export function nextFreeBranch(base: string, taken: ReadonlySet<string>): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+}
+
+/** Text that starts with "@claude" or "@codex" is the one-line dispatch syntax. */
+export function isPowerSyntax(text: string): boolean {
+  return /^\s*@(claude|codex)(\s|$)/i.test(text);
 }
