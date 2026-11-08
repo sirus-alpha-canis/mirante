@@ -3,6 +3,7 @@
 //! through [`crate::git::Git`].
 pub mod anchor;
 pub mod check;
+pub mod fsio;
 pub mod note;
 
 use sha2::{Digest, Sha256};
