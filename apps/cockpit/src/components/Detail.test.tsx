@@ -234,6 +234,8 @@ describe("Detail (V1 classic)", () => {
   it("a live task can be hibernated from the header; a hibernated one offers Wake, not Resume", async () => {
     const h = setup({ "session.hibernate": {}, "session.wake": {} }, [task("a", { status: "working" })], []);
     await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    expect(screen.getByRole("group", { name: "Confirm hibernate" })).toHaveTextContent("The agent is mid-turn; hibernating ends this turn.");
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate now" }));
     expect(h.calls).toContainEqual(["session.hibernate", { task: "a" }]);
     act(() => h.load([task("a", { live: false, boot: null, status: "ended", hibernated: true })]));
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();

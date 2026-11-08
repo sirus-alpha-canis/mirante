@@ -72,7 +72,10 @@ export function lastLines(feed: FeedItem[] | undefined, n: number): FeedItem[] {
   return (feed ?? []).filter((i) => i.kind !== "turn").slice(-n);
 }
 
-/** Tasks that just started needing the user (for notifications). */
+/** Tasks that just started needing the user (for notifications). Only the transition
+ * counts: a task that already needs the user and gets a second request (another permission
+ * while one is open) is not news again, so it does not notify twice; the open card and the
+ * needs-you badge already say so. */
 export function newlyNeedingYou(prev: State, next: State): TaskView[] {
   return Object.values(next.tasks).filter((t) => {
     const before = prev.tasks[t.id];

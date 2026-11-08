@@ -1,6 +1,6 @@
 // What components need from the outside world, injected so tests can fake it.
 import { createContext, useContext } from "react";
-import type { TaskView } from "./lib/protocol";
+import type { Note } from "./lib/notify";
 import type { Cockpit } from "./store/cockpit";
 import { useCockpitState } from "./store/cockpit";
 import type { State } from "./store/state";
@@ -12,8 +12,8 @@ export interface Env {
   storage: Pick<Storage, "getItem" | "setItem">;
   openUrl(url: string): Promise<void>;
   startDaemon(): Promise<void>;
-  /** Native notification (already decided: the task is not on screen). */
-  notify(t: TaskView): void;
+  /** Native notification (already decided: what it says, and that it is not on screen). */
+  notify(n: Note): void;
 }
 
 export const EnvContext = createContext<Env | null>(null);

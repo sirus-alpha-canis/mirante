@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { useEnv, useStore } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { type DaemonStatus, M, RpcCode, type SendMode, type SendResult, type TaskView } from "../lib/protocol";
+import { hintsFor, onMac } from "../lib/shortcuts";
 import { columnOf, gridTasks, lastLines, pendingPerms } from "../store/select";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
@@ -103,7 +104,7 @@ export function Grid({ onOpen, status }: { onOpen(id: string, tab?: "Terminal"):
   const s = useStore();
   const tiles = useMemo(() => gridTasks(s), [s]);
   const inlineAnswers = status?.claude_inline_answers ?? false;
-  if (tiles.length === 0) return <main className="grid-empty muted">No active agents. Dispatch one from Home (⌘1).</main>;
+  if (tiles.length === 0) return <main className="grid-empty muted">No active agents. Dispatch one from Home ({hintsFor(onMac()).home}).</main>;
   return (
     <main className={`grid grid-${Math.max(2, tiles.length)}`} aria-label="Agent grid">
       {tiles.map((t) => (

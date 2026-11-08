@@ -5,12 +5,14 @@ import { HIBERNATE, isHibernated, mb, systemMemory, taskMemory, WAKE } from "../
 import type { DaemonStatus, TaskView } from "../lib/protocol";
 
 /** Hibernate (end the process, keep the native session) or wake (resume it). One request at
- * a time; the state shown is the daemon's (the next event flips the button), never assumed. */
+ * a time; the state shown is the daemon's (the next event flips the button), never assumed.
+ * Hibernate asks first (like Stop), and says so when the agent is mid-turn. */
 export function HibernateButton({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const [busy, setBusy] = useState(false);
+  const [confirm, setConfirm] = useState(false);
   const asleep = isHibernated(t);
   if (!t.live && !asleep) return null;
   const run = async () => {
@@ -31,23 +33,43 @@ export function HibernateButton({ t }: { t: TaskView }) {
     } finally {
       inFlight.current = false;
       setBusy(false);
+      setConfirm(false);
     }
   };
+  const alert = error && (
+    <span className="error" role="alert">
+      {error}
+    </span>
+  );
+  if (confirm && !asleep) {
+    return (
+      <>
+        <span role="group" aria-label="Confirm hibernate">
+          <span className="small">
+            {t.status === "working" ? "The agent is mid-turn; hibernating ends this turn." : "Hibernate? Wake resumes the session later."}
+          </span>{" "}
+          <button className="btn btn-small btn-warn" disabled={busy} onClick={run}>
+            Hibernate now
+          </button>
+          <button className="btn btn-small" onClick={() => setConfirm(false)}>
+            Cancel
+          </button>
+        </span>
+        {alert}
+      </>
+    );
+  }
   return (
     <>
       <button
         className="btn btn-small"
         disabled={busy}
-        onClick={run}
+        onClick={asleep ? run : () => setConfirm(true)}
         title={asleep ? "Resume the agent's session" : "Stop the process, keep the session to resume later"}
       >
         {asleep ? "Wake" : "Hibernate"}
       </button>
-      {error && (
-        <span className="error" role="alert">
-          {error}
-        </span>
-      )}
+      {alert}
     </>
   );
 }
@@ -68,7 +90,9 @@ export function MemoryPanel({ status }: { status: DaemonStatus | null }) {
   return (
     <section className="memory" aria-label="Memory guard">
       <h2>Memory</h2>
-      {!sys ? (
+      {!status ? (
+        <p className="muted small">Memory status unknown.</p>
+      ) : !sys ? (
         <p className="muted small">Memory guard not available in this daemon.</p>
       ) : (
         <p className={`small level-${sys.level}`}>

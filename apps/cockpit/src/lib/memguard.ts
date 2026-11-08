@@ -1,7 +1,8 @@
 // The daemon's memory guard as the UI sees it (Plan 2b Tasks 18-19): per-session memory on
 // TaskView (`memory`, `hibernated`), the machine's view on `daemon.status.memory`, the
 // `session.hibernate` / `session.wake` calls and the `memory.*` events. An older daemon has
-// none of these: the panel then says "not available" and the actions answer
+// none of these: the panel then says "not available" (only once a status has loaded; with
+// no status at all it says "unknown") and the actions answer
 // METHOD_NOT_FOUND, which the UI reports instead of failing.
 import type { DaemonStatus, TaskView } from "./protocol";
 import { M } from "./protocol";
@@ -9,7 +10,8 @@ import { M } from "./protocol";
 export const HIBERNATE = M.sessionHibernate;
 export const WAKE = M.sessionWake;
 
-export type Pressure = "normal" | "elevated" | "critical";
+/** "unknown": a level this UI does not know (a newer daemon) — shown as such, never guessed. */
+export type Pressure = "normal" | "elevated" | "critical" | "unknown";
 
 export interface SystemMemory {
   level: Pressure;
@@ -23,7 +25,7 @@ export interface SystemMemory {
 export function systemMemory(status: DaemonStatus | null): SystemMemory | null {
   const m = status?.memory;
   if (!m) return null;
-  const level: Pressure = m.level === "elevated" || m.level === "critical" ? m.level : "normal";
+  const level: Pressure = m.level === "normal" || m.level === "elevated" || m.level === "critical" ? m.level : "unknown";
   return { level, paused: m.paused, total: m.total, free: m.free, swapUsed: m.swap_used };
 }
 

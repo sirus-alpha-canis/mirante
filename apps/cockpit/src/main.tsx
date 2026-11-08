@@ -16,7 +16,7 @@ const env: Env = {
   storage: window.localStorage,
   openUrl: (url) => openUrl(url),
   startDaemon: daemonStart,
-  notify: (t) => void notify(t).catch(() => {}),
+  notify: (n) => void notify(n).catch(() => {}),
 };
 
 createRoot(document.getElementById("root")!).render(

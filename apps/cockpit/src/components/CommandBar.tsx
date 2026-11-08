@@ -8,7 +8,8 @@ export interface Command {
 }
 
 /**
- * ⌘K: filter commands by text; "@agent repo/branch goal" becomes a dispatch. A modal dialog
+ * ⌘K: filter commands by text; "@agent repo/branch goal" goes to Home's dispatch box (it is
+ * not sent from here: the user reviews it there and presses Enter). A modal dialog
  * holding a combobox over a listbox: the input keeps focus, the arrows move the active
  * option, Enter runs it, Escape closes; focus returns to where it was on close.
  */
@@ -28,7 +29,7 @@ export function CommandBar(props: { commands: Command[]; onDispatch(text: string
     const needle = text.toLowerCase();
     const hits = props.commands.filter((c) => c.label.toLowerCase().includes(needle));
     if (text.startsWith("@")) {
-      return [{ id: "dispatch", label: `Dispatch: ${text}`, run: () => props.onDispatch(text) }, ...hits];
+      return [{ id: "dispatch", label: `Write in the dispatch box: ${text}`, run: () => props.onDispatch(text) }, ...hits];
     }
     return hits;
   }, [q, props]);
@@ -37,7 +38,9 @@ export function CommandBar(props: { commands: Command[]; onDispatch(text: string
     props.onClose();
     c.run();
   };
-  const active = items[i];
+  // The list can shrink under the active option (a task archived while the bar is open).
+  const idx = Math.max(0, Math.min(i, items.length - 1));
+  const active = items[idx];
   return (
     <div className="overlay" onMouseDown={props.onClose}>
       <div className="palette" role="dialog" aria-modal="true" aria-label="Command bar" onMouseDown={(e) => e.stopPropagation()}>
@@ -48,7 +51,7 @@ export function CommandBar(props: { commands: Command[]; onDispatch(text: string
           aria-expanded="true"
           aria-autocomplete="list"
           aria-controls="palette-list"
-          aria-activedescendant={active ? `cmd-${active.id}` : undefined}
+          aria-activedescendant={active ? `cmd-${idx}` : undefined}
           placeholder="Type a command, a task, or @claude repo/branch goal"
           value={q}
           onChange={(e) => {
@@ -61,10 +64,10 @@ export function CommandBar(props: { commands: Command[]; onDispatch(text: string
               props.onClose();
             } else if (e.key === "ArrowDown") {
               e.preventDefault();
-              setI((x) => Math.min(x + 1, items.length - 1));
+              setI(Math.min(idx + 1, items.length - 1));
             } else if (e.key === "ArrowUp") {
               e.preventDefault();
-              setI((x) => Math.max(x - 1, 0));
+              setI(Math.max(idx - 1, 0));
             } else if (e.key === "Enter") {
               if (e.nativeEvent.isComposing || e.keyCode === 229) return;
               e.preventDefault();
@@ -79,10 +82,11 @@ export function CommandBar(props: { commands: Command[]; onDispatch(text: string
           {items.map((c, n) => (
             <li
               key={c.id}
-              id={`cmd-${c.id}`}
+              // Positional: a command id can hold a path, which is no valid id token.
+              id={`cmd-${n}`}
               role="option"
-              aria-selected={n === i}
-              className={n === i ? "active" : ""}
+              aria-selected={n === idx}
+              className={n === idx ? "active" : ""}
               onMouseEnter={() => setI(n)}
               onClick={() => run(c)}
             >

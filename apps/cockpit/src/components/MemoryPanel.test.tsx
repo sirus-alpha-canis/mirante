@@ -17,6 +17,38 @@ describe("MemoryPanel", () => {
     expect(screen.getByText(/Memory guard not available/)).toBeInTheDocument();
   });
 
+  it("an unknown status (not loaded, or the daemon is away) says unknown, not unavailable", () => {
+    const h = makeEnv();
+    h.load([task("a")]);
+    renderWith(h.env, <MemoryPanel status={null} />);
+    expect(screen.getByText("Memory status unknown.")).toBeInTheDocument();
+    expect(screen.queryByText(/not available/)).toBeNull();
+  });
+
+  it("Hibernate asks first, and warns when the agent is mid-turn", async () => {
+    const h = makeEnv({ "session.hibernate": {} });
+    const memory = { bytes: 1, peak: 1, budget: 2, state: "ok" };
+    h.load([task("a", { memory, status: "working" })]);
+    renderWith(h.env, <MemoryPanel status={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    const confirm = screen.getByRole("group", { name: "Confirm hibernate" });
+    expect(confirm).toHaveTextContent("The agent is mid-turn; hibernating ends this turn.");
+    expect(h.calls.filter(([m]) => m === "session.hibernate")).toEqual([]);
+    await userEvent.click(within(confirm).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("group", { name: "Confirm hibernate" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate now" }));
+    expect(h.calls).toContainEqual(["session.hibernate", { task: "a" }]);
+  });
+
+  it("an idle session's confirm has no mid-turn warning", async () => {
+    const h = makeEnv();
+    h.load([task("a", { memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })]);
+    renderWith(h.env, <MemoryPanel status={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    expect(screen.getByRole("group", { name: "Confirm hibernate" })).not.toHaveTextContent(/mid-turn/);
+  });
+
   it("shows pressure, per-session memory, notices, and hibernates on request", async () => {
     const h = makeEnv({ "session.hibernate": {} });
     const memory = { bytes: 3 * GB, peak: 3 * GB, budget: 4 * GB, state: "soft" };
@@ -29,6 +61,7 @@ describe("MemoryPanel", () => {
     expect(screen.getByText("3072 MB / 4096 MB")).toBeInTheDocument();
     expect(screen.getByText("feat/a: hibernate suggested: memory pressure elevated")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate now" }));
     expect(h.calls).toContainEqual(["session.hibernate", { task: "a" }]);
   });
 
@@ -37,6 +70,7 @@ describe("MemoryPanel", () => {
     h.load([task("a", { memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })]);
     renderWith(h.env, <MemoryPanel status={status} />);
     await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate now" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("memory guard not available in this daemon");
   });
 

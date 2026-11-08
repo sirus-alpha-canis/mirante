@@ -4,19 +4,21 @@ import { Detail } from "./components/Detail";
 import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
 import { type Env, EnvContext } from "./env";
-import { shouldNotify } from "./lib/notify";
-import { type DaemonStatus, M } from "./lib/protocol";
+import { notificationsFor, shouldNotify } from "./lib/notify";
+import { type DaemonStatus, M, type TaskView } from "./lib/protocol";
 import { loadRepos } from "./lib/repos";
-import { isTypingTarget, SHORTCUT_HINTS, shortcutFor } from "./lib/shortcuts";
+import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, THEME_KEY, type Theme } from "./lib/theme";
 import { useCockpitState } from "./store/cockpit";
-import { gridTasks, newlyNeedingYou, projects } from "./store/select";
+import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
 import type { State } from "./store/state";
 
 export type Mode = "home" | "detail" | "grid";
 
-const MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
 export const STATUS_POLL_MS = 5000;
+/** Tasks that start needing the user within this window share one decision: past two, a
+ * single summary (a reconnect replays missed events one by one, a restart sends them all). */
+export const NOTIFY_BATCH_MS = 250;
 
 /** The task ids whose card, tile or detail is on screen in this mode. */
 export function visibleTasks(s: State, mode: Mode, project: string | null, taskId: string | null): Set<string> {
@@ -55,6 +57,8 @@ function ConnectionBanner({ s, env }: { s: State; env: Env }) {
 }
 
 export function App({ env }: { env: Env }) {
+  const mac = useMemo(onMac, []);
+  const hints = useMemo(() => hintsFor(mac), [mac]);
   const s = useCockpitState(env.cockpit);
   const [mode, setMode] = useState<Mode>("home");
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
@@ -80,33 +84,57 @@ export function App({ env }: { env: Env }) {
     env.cockpit.connect().catch(() => {});
   }, [env]);
 
-  useEffect(
-    () =>
-      env.cockpit.onChange((prev, next) => {
-        // The first snapshot is what the user left, not news.
-        if (prev.bootId === null) return;
-        for (const t of newlyNeedingYou(prev, next)) {
-          if (shouldNotify(t.id, visible.current, document.hasFocus())) env.notify(t);
-        }
-      }),
-    [env],
-  );
+  useEffect(() => {
+    // Tasks due a notification, collected for NOTIFY_BATCH_MS. Whether one is on screen is
+    // decided when it starts needing the user (what was shown then), not at the flush.
+    let due = new Map<string, TaskView>();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      timer = null;
+      const tasks = [...due.values()];
+      due = new Map();
+      for (const n of notificationsFor(tasks)) env.notify(n);
+    };
+    const off = env.cockpit.onChange((prev, next) => {
+      // The first snapshot is what the user left, not news.
+      if (prev.bootId === null) return;
+      for (const t of newlyNeedingYou(prev, next)) {
+        if (shouldNotify(t.id, visible.current, document.hasFocus())) due.set(t.id, t);
+      }
+      if (due.size > 0 && !timer) timer = setTimeout(flush, NOTIFY_BATCH_MS);
+    });
+    return () => {
+      off();
+      if (timer) clearTimeout(timer);
+    };
+  }, [env]);
 
   const live = s.connection.state === "live";
   useEffect(() => {
-    if (!live) return;
+    // Away from the daemon nothing is known: no stale memory numbers, no stale inline-answers flag.
+    if (!live) {
+      setStatus(null);
+      return;
+    }
     let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // One request at a time: the next poll is scheduled when this one settles.
     // An unknown status is null (never a guessed one): the memory panel then says so.
     const poll = () =>
-      env.rpc<DaemonStatus>(M.daemonStatus).then(
-        (v) => !stopped && setStatus(v ?? null),
-        () => !stopped && setStatus(null),
-      );
+      env
+        .rpc<DaemonStatus>(M.daemonStatus)
+        .then(
+          (v) => !stopped && setStatus(v ?? null),
+          () => !stopped && setStatus(null),
+        )
+        .finally(() => {
+          if (!stopped) timer = setTimeout(poll, STATUS_POLL_MS);
+        });
     void poll();
-    const h = setInterval(poll, STATUS_POLL_MS);
     return () => {
       stopped = true;
-      clearInterval(h);
+      clearTimeout(timer);
+      setStatus(null);
     };
   }, [env, live]);
 
@@ -132,15 +160,18 @@ export function App({ env }: { env: Env }) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const a = shortcutFor(e, MAC);
+      const a = shortcutFor(e, mac);
       if (!a || e.defaultPrevented) return;
+      // The command bar is modal: only its own toggle (and its Escape) act while it is open.
+      if (palette && a !== "palette" && a !== "escape") return;
       if (a === "escape") {
         // Escape belongs to whatever is being typed in (the terminal, a composer).
         if (!palette && mode === "detail" && !isTypingTarget(e.target)) setMode("home");
         return;
       }
-      // Off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K, Ctrl+G…).
-      if (!MAC && e.target instanceof Element && e.target.closest(".xterm")) return;
+      // Off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K, Ctrl+G…). On macOS
+      // ⌘ is no terminal key, so ⌘K opens the command bar even from the terminal.
+      if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
       e.preventDefault();
       if (a === "palette") setPalette((p) => !p);
       if (a === "grid") toggleGrid();
@@ -149,13 +180,14 @@ export function App({ env }: { env: Env }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, mode, toggleGrid]);
+  }, [palette, mode, toggleGrid, mac]);
 
+  const inlineAnswers = status?.claude_inline_answers ?? false;
   const commands: Command[] = useMemo(
     () => [
-      { id: "home", label: "Go to Home", hint: SHORTCUT_HINTS.home, run: () => setMode("home") },
-      { id: "grid", label: "Toggle agent grid", hint: SHORTCUT_HINTS.grid, run: toggleGrid },
-      { id: "theme", label: `Theme: ${nextTheme(theme)}`, hint: SHORTCUT_HINTS.theme, run: () => setTheme(nextTheme) },
+      { id: "home", label: "Go to Home", hint: hints.home, run: () => setMode("home") },
+      { id: "grid", label: "Toggle agent grid", hint: hints.grid, run: toggleGrid },
+      { id: "theme", label: `Theme: ${nextTheme(theme)}`, hint: hints.theme, run: () => setTheme(nextTheme) },
       ...projs.map((p) => ({
         id: `p-${p.path}`,
         label: `Project ${p.name}`,
@@ -166,9 +198,15 @@ export function App({ env }: { env: Env }) {
       })),
       ...Object.values(s.tasks)
         .filter((t) => t.lifecycle !== "archived")
-        .map((t) => ({ id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) })),
+        .map((t) =>
+          // A Claude request is answered in its own TUI unless the daemon types answers (a
+          // trust prompt is not: its card answers it here).
+          needsYou(t) && t.boot !== "trust_prompt" && t.agent === "claude" && !inlineAnswers
+            ? { id: `t-${t.id}`, label: `Answer in terminal: ${t.title} (@claude ${t.branch})`, run: () => open(t.id, "Terminal") }
+            : { id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) },
+        ),
     ],
-    [projs, s.tasks, theme, open, toggleGrid],
+    [projs, s.tasks, theme, open, toggleGrid, hints, inlineAnswers],
   );
 
   return (
@@ -178,19 +216,19 @@ export function App({ env }: { env: Env }) {
           <span className="brand">Mirante</span>
           <nav aria-label="Views" className="modes">
             <button aria-pressed={mode === "home"} onClick={() => setMode("home")}>
-              Home <kbd>{SHORTCUT_HINTS.home}</kbd>
+              Home <kbd>{hints.home}</kbd>
             </button>
             <button aria-pressed={mode === "detail"} disabled={!taskId} onClick={() => setMode("detail")}>
               Detail
             </button>
             <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
-              Grid <kbd>{SHORTCUT_HINTS.grid}</kbd>
+              Grid <kbd>{hints.grid}</kbd>
             </button>
           </nav>
           <button className="btn btn-small" onClick={() => setPalette(true)}>
-            Commands <kbd>{SHORTCUT_HINTS.palette}</kbd>
+            Commands <kbd>{hints.palette}</kbd>
           </button>
-          <button className="btn btn-small" onClick={() => setTheme(nextTheme)} aria-label={`Theme: ${theme}`} title={`Theme: ${theme} (${SHORTCUT_HINTS.theme})`}>
+          <button className="btn btn-small" onClick={() => setTheme(nextTheme)} aria-label={`Theme: ${theme}`} title={`Theme: ${theme} (${hints.theme})`}>
             <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
           </button>
         </header>
@@ -213,7 +251,7 @@ export function App({ env }: { env: Env }) {
             onSelect={setTaskId}
             initialTab={detailTab}
             focusTerminalNonce={terminalNonce}
-            inlineAnswers={status?.claude_inline_answers ?? false}
+            inlineAnswers={inlineAnswers}
           />
         )}
         {mode === "grid" && <Grid onOpen={open} status={status} />}

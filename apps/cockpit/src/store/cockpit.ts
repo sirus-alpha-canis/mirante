@@ -63,6 +63,7 @@ export interface Cockpit {
   getState(): State;
   subscribe(listener: () => void): () => void;
   dispatch(a: Action): void;
+  /** Subscribes to the daemon's stream; later calls share the first (idempotent). */
   connect(): Promise<void>;
   /** Reloads a task's queued messages (`message.list_queued`), coalesced like refreshes. */
   refreshQueue(taskId: string): void;
@@ -176,6 +177,20 @@ export function createCockpit(t: Transport): Cockpit {
     }
   };
 
+  // One subscription per store: React StrictMode runs the connecting effect twice, and each
+  // `subscribe` would open a stream (the shell replaces the old one, but not for free). A
+  // failed subscribe is forgotten so the next call can try again.
+  let subscribed: Promise<void> | null = null;
+  const connect = () => {
+    if (!subscribed) {
+      subscribed = t.subscribe(onMsg).catch((e) => {
+        subscribed = null;
+        throw e;
+      });
+    }
+    return subscribed;
+  };
+
   return {
     getState: () => state,
     subscribe(l) {
@@ -188,7 +203,7 @@ export function createCockpit(t: Transport): Cockpit {
     },
     dispatch,
     refreshQueue,
-    connect: () => t.subscribe(onMsg),
+    connect,
   };
 }
 

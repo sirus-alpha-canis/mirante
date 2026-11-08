@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { isTypingTarget, shortcutFor } from "./shortcuts";
+import { hintsFor, isMacPlatform, isTypingTarget, shortcutFor } from "./shortcuts";
 
-const k = (key: string, o: Partial<KeyboardEvent> = {}) => ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...o });
+const CODE: Record<string, string> = { k: "KeyK", g: "KeyG", "1": "Digit1", j: "KeyJ", J: "KeyJ", Escape: "Escape" };
+const k = (key: string, o: Partial<KeyboardEvent> = {}) => ({
+  key,
+  code: CODE[key] ?? "",
+  metaKey: false,
+  ctrlKey: false,
+  shiftKey: false,
+  altKey: false,
+  repeat: false,
+  ...o,
+});
 
 describe("shortcutFor", () => {
   it("uses ⌘ on macOS and Ctrl elsewhere", () => {
@@ -16,6 +26,35 @@ describe("shortcutFor", () => {
     expect(shortcutFor(k("g"), true)).toBeNull();
     expect(shortcutFor(k("k", { metaKey: true, altKey: true }), true)).toBeNull();
     expect(shortcutFor(k("Escape"), true)).toBe("escape");
+  });
+
+  it("matches the physical key, so other layouts and Shift-shifted keys still work", () => {
+    // AZERTY: the key at the "1" position types "&" without Shift.
+    expect(shortcutFor(k("&", { code: "Digit1", metaKey: true }), true)).toBe("home");
+    // A synthetic event without a code falls back to the key.
+    expect(shortcutFor(k("g", { code: "", metaKey: true }), true)).toBe("grid");
+  });
+
+  it("Shift is part of the chord, and auto-repeat never fires one", () => {
+    expect(shortcutFor(k("K", { code: "KeyK", metaKey: true, shiftKey: true }), true)).toBeNull();
+    expect(shortcutFor(k("g", { metaKey: true, shiftKey: true }), true)).toBeNull();
+    expect(shortcutFor(k("j", { metaKey: true }), true)).toBeNull();
+    expect(shortcutFor(k("k", { metaKey: true, repeat: true }), true)).toBeNull();
+    expect(shortcutFor(k("Escape", { repeat: true }), true)).toBeNull();
+  });
+});
+
+describe("platform", () => {
+  it("prefers userAgentData and falls back to navigator.platform", () => {
+    expect(isMacPlatform({ platform: "MacIntel" })).toBe(true);
+    expect(isMacPlatform({ platform: "Win32" })).toBe(false);
+    expect(isMacPlatform({ platform: "", userAgentData: { platform: "macOS" } })).toBe(true);
+    expect(isMacPlatform({ platform: "MacIntel", userAgentData: { platform: "Windows" } })).toBe(false);
+  });
+
+  it("hints name the keys of the platform", () => {
+    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", home: "⌘1", theme: "⇧⌘J" });
+    expect(hintsFor(false)).toEqual({ palette: "Ctrl+K", grid: "Ctrl+G", home: "Ctrl+1", theme: "Ctrl+Shift+J" });
   });
 });
 

@@ -54,6 +54,8 @@ describe("Grid (V2)", () => {
     h.load([task("idle", { live: false, boot: null })]);
     renderWith(h.env, <Grid onOpen={() => {}} status={null} />);
     expect(screen.getByText(/No active agents/)).toBeInTheDocument();
+    // The hint names this platform's keys (jsdom's navigator is not a Mac).
+    expect(screen.getByText(/No active agents/)).toHaveTextContent("Dispatch one from Home (Ctrl+1)");
   });
 
   it("a task waiting with no modelled request points at its terminal", async () => {
@@ -69,7 +71,10 @@ describe("Grid (V2)", () => {
     const h = makeEnv({ "session.hibernate": {} });
     h.load([task("a", { status: "working" })]);
     renderWith(h.env, <Grid onOpen={() => {}} status={null} />);
-    await userEvent.click(within(screen.getByRole("article")).getByRole("button", { name: "Hibernate" }));
+    const tile = screen.getByRole("article");
+    await userEvent.click(within(tile).getByRole("button", { name: "Hibernate" }));
+    expect(within(tile).getByRole("group", { name: "Confirm hibernate" })).toHaveTextContent("mid-turn");
+    await userEvent.click(within(tile).getByRole("button", { name: "Hibernate now" }));
     expect(h.calls).toContainEqual(["session.hibernate", { task: "a" }]);
   });
 });

@@ -24,6 +24,23 @@ describe("createCockpit", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  it("connect subscribes once, however often it is called (StrictMode runs effects twice)", async () => {
+    const t = fakeTransport({});
+    const c = createCockpit(t);
+    await Promise.all([c.connect(), c.connect()]);
+    await c.connect();
+    expect(t.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed subscribe can be retried", async () => {
+    const t = fakeTransport({});
+    t.subscribe.mockRejectedValueOnce(new Error("no shell"));
+    const c = createCockpit(t);
+    await expect(c.connect()).rejects.toThrow("no shell");
+    await c.connect();
+    expect(t.subscribe).toHaveBeenCalledTimes(2);
+  });
+
   it("loads history and permissions after a full snapshot", async () => {
     const t = fakeTransport({
       "permission.list": [],

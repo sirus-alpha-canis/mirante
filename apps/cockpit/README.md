@@ -76,3 +76,9 @@ with `xattr -dr com.apple.quarantine Mirante.app` (only for a build you made you
 | Esc | Leave a task's detail |
 | ⇧⌘J | Theme: system → light → dark |
 | ⌘↵ / ⌥↵ | In a task's composer: steer now / queue |
+
+Off macOS, ⌘ is Ctrl (the hints in the app name your platform's keys). Keys match their
+physical position, so they work on any keyboard layout; holding a key never repeats a
+shortcut, and while the command bar is open only ⌘K and Esc act. In a task's terminal,
+off macOS the Ctrl chords (Ctrl+K, Ctrl+G…) belong to the terminal; on macOS ⌘K still
+opens the command bar there (⌘ is not a terminal key).

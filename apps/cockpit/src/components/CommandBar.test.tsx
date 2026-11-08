@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import type { Command } from "./CommandBar";
 import { CommandBar } from "./CommandBar";
 
 function setup() {
@@ -22,7 +23,7 @@ describe("CommandBar", () => {
     expect(screen.getByRole("dialog", { name: "Command bar" })).toHaveAttribute("aria-modal", "true");
     const box = screen.getByRole("combobox", { name: "Command" });
     expect(box).toHaveFocus();
-    expect(box).toHaveAttribute("aria-activedescendant", "cmd-home");
+    expect(box).toHaveAttribute("aria-activedescendant", "cmd-0");
     expect(screen.getAllByRole("option").map((o) => o.getAttribute("aria-selected"))).toEqual(["true", "false"]);
   });
 
@@ -39,10 +40,29 @@ describe("CommandBar", () => {
   it("@ text becomes a dispatch; Escape closes", async () => {
     const h = setup();
     await userEvent.type(screen.getByRole("combobox"), "@claude shop/x fix it");
-    expect(screen.getAllByRole("option")[0]).toHaveTextContent("Dispatch: @claude shop/x fix it");
+    expect(screen.getAllByRole("option")[0]).toHaveTextContent("Write in the dispatch box: @claude shop/x fix it");
     await userEvent.keyboard("{Enter}");
     expect(h.onDispatch).toHaveBeenCalledWith("@claude shop/x fix it");
     await userEvent.keyboard("{Escape}");
     expect(h.onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("option ids are positional (task ids and paths are not valid id tokens)", () => {
+    const commands = [{ id: "p-/repos/my shop", label: "Project my shop", run: () => {} }];
+    render(<CommandBar commands={commands} onDispatch={() => {}} onClose={() => {}} />);
+    expect(screen.getByRole("option")).toHaveAttribute("id", "cmd-0");
+  });
+
+  it("the active option stays in range when the commands shrink", async () => {
+    const run = vi.fn();
+    const three: Command[] = ["a", "b", "c"].map((x) => ({ id: x, label: `item ${x}`, run }));
+    const { rerender } = render(<CommandBar commands={three} onDispatch={() => {}} onClose={() => {}} />);
+    await userEvent.keyboard("{ArrowDown}{ArrowDown}");
+    rerender(<CommandBar commands={three.slice(0, 1)} onDispatch={() => {}} onClose={() => {}} />);
+    const box = screen.getByRole("combobox");
+    expect(box).toHaveAttribute("aria-activedescendant", "cmd-0");
+    expect(screen.getByRole("option")).toHaveAttribute("aria-selected", "true");
+    await userEvent.keyboard("{Enter}");
+    expect(run).toHaveBeenCalledTimes(1);
   });
 });
