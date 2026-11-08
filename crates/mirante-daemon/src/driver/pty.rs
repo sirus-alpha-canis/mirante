@@ -497,6 +497,35 @@ mod tests {
         assert_eq!(p.parser.lock().unwrap().screen().scrollback(), 0, "the mirror is back on the live screen");
     }
 
+    /// The cockpit's bridge stops reading when its webview falls behind: the client's queue
+    /// stays bounded, it resumes with a repaint (not the backlog), and typing still works.
+    #[test]
+    fn a_flood_toward_a_stalled_client_stays_bounded_and_input_still_reaches_the_agent() {
+        let mark = std::env::temp_dir().join(format!("mirante-flood-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let script = format!(
+            "stty -echo; (while :; do echo 0123456789abcdef0123456789abcdef; done) & read line; \
+             echo \"got:$line\" > '{}'; kill $!; sleep 5",
+            mark.display()
+        );
+        let p = PtyProcess::spawn(&sh(&script), |_| {}).unwrap();
+        let (_, _initial, rx) = p.attach();
+        std::thread::sleep(Duration::from_millis(500));
+        let backlog: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert!(backlog.len() <= super::super::ATTACH_QUEUE + 1, "{} chunks queued", backlog.len());
+        // Once there is room again it gets the whole screen (the chunks in between are gone).
+        let mut after = backlog;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !after.iter().any(|c| c.starts_with(b"\x1b[2J")) {
+            assert!(Instant::now() < deadline, "resumed without a repaint");
+            after.extend(rx.recv_timeout(Duration::from_secs(5)));
+            after.extend(rx.try_iter());
+        }
+        p.write(b"q\r").unwrap();
+        wait_for("the typed line", || std::fs::read_to_string(&mark).is_ok_and(|s| s.contains("got:q")));
+        let _ = std::fs::remove_file(&mark);
+    }
+
     #[test]
     fn the_pty_is_the_controlling_tty_of_the_agent_and_its_children() {
         let p = PtyProcess::spawn(&sh("sleep 30 & sleep 30"), |_| {}).unwrap();
