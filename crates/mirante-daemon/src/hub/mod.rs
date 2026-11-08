@@ -340,6 +340,12 @@ pub struct Hub {
     /// The miner thread's queue of archived tasks (see [`Hub::spawn_miner`]); without one
     /// (tests), archiving mines inline.
     pub(crate) miner: Mutex<Option<mpsc::Sender<String>>>,
+    /// The daemon is going down ([`Hub::shutdown`]): set under the hub lock; launches are
+    /// refused, auto-resume stops, new connections are turned away.
+    pub(crate) shutting_down: AtomicBool,
+    /// Launches whose agent is being spawned (counted under the hub lock): shutdown waits
+    /// for them, so no agent is spawned after the sessions were stopped.
+    pub(crate) spawning: std::sync::atomic::AtomicUsize,
 }
 
 /// Highest event seq in the store (0 when empty).
@@ -509,6 +515,8 @@ impl Hub {
             claude_inline: AtomicBool::new(false),
             auto_resume: AtomicBool::new(true),
             auto_resume_env_off: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            spawning: std::sync::atomic::AtomicUsize::new(0),
             resume_gap: resume::RESUME_GAP,
             dna_gates: Mutex::default(),
             skill_conf: Mutex::default(),

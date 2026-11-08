@@ -57,6 +57,27 @@ impl SeenHooks {
     }
 }
 
+/// Why a launch is refused once [`Hub::shutdown`] began.
+pub(crate) const SHUTTING_DOWN: &str = "the daemon is shutting down";
+/// Longest wait of a shutdown for agents being spawned.
+const SPAWN_WAIT: Duration = Duration::from_secs(15);
+
+/// One launch whose agent is being spawned (see `Hub::spawning`), until dropped.
+struct Spawning<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Spawning<'a> {
+    fn new(n: &'a std::sync::atomic::AtomicUsize) -> Spawning<'a> {
+        n.fetch_add(1, Ordering::SeqCst);
+        Spawning(n)
+    }
+}
+
+impl Drop for Spawning<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// (task id, session id, driver) of a live session.
 type LiveRef = (String, String, Option<Arc<dyn Driver>>);
 
@@ -572,8 +593,17 @@ impl Hub {
     /// `resume::resume_refusal`) and memory must not be tight (`Refused(MEMORY_TIGHT)`: the
     /// caller waits and retries). Its `session_launch` says `auto_resume`.
     pub(crate) fn launch(&self, req: StartSession, resume: bool, auto: bool) -> Result<Launch> {
-        let (task, session_id, native, sink, conversation_id) = {
+        let (task, session_id, native, sink, conversation_id, spawning) = {
             let mut st = self.lock();
+            // Read under the lock `shutdown` sets it under: a launch either is refused here
+            // or is counted before shutdown looks.
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return if auto {
+                    Ok(Launch::Refused(SHUTTING_DOWN))
+                } else {
+                    Err(HubError::Conflict(format!("{SHUTTING_DOWN}: start it again once it is back")))
+                };
+            }
             let task = st.resolve(&req.task)?;
             if auto {
                 if st.mem.paused {
@@ -637,7 +667,7 @@ impl Hub {
                 }
             }
             st.publish();
-            (task, session.id, native, sink, conversation.id)
+            (task, session.id, native, sink, conversation.id, Spawning::new(&self.spawning))
         };
         let mcp = self.memory_server_for(&task);
         let skills_mcp = self.skills_server_for(&task);
@@ -696,6 +726,8 @@ impl Hub {
                 return Err(e.into());
             }
         }
+        // Owned by the live session now (or stopped): shutdown need not wait for its boot.
+        drop(spawning);
         self.wait_boot(&task.id, &session_id, native.is_some()).map(Launch::Started)
     }
 
@@ -815,8 +847,23 @@ impl Hub {
         Ok((task.id.clone(), l.session_id.clone(), l.driver.clone()))
     }
 
-    /// Stops every live session (daemon shutdown).
+    /// The daemon is going down ([`Hub::shutdown`] began).
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Stops every live session (daemon shutdown). From the moment it begins, launches are
+    /// refused; an agent being spawned is waited for (at most [`SPAWN_WAIT`]) so it is
+    /// stopped with the rest instead of outliving the daemon.
     pub fn shutdown(&self) {
+        {
+            let _st = self.lock();
+            self.shutting_down.store(true, Ordering::SeqCst);
+        }
+        let deadline = Instant::now() + SPAWN_WAIT;
+        while self.spawning.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let live: Vec<LiveRef> = {
             let mut st = self.lock();
             for l in st.live.values_mut() {
@@ -1426,15 +1473,14 @@ mod tests {
         k.hub.hibernate(&b).unwrap();
         assert_eq!(end_cause(&k, &b), "mirante:hibernated");
         assert!(k.hub.get_task(&b).unwrap().hibernated);
+        // An exit nobody asked for is still the process's.
+        let d = k.started(AgentKind::Claude, "d").task.id;
+        k.emit(DriverEvent::Exited { code: Some(1) });
+        assert_eq!(end_cause(&k, &d), "mirante:process_exited");
         let c = k.started(AgentKind::Claude, "c").task.id;
         exit_during_stop(&k, &c);
         k.hub.shutdown();
         assert_eq!(end_cause(&k, &c), "mirante:daemon_shutdown");
-        // An exit nobody asked for is still the process's.
-        *k.factory.driver.on_stop.lock().unwrap() = None;
-        let d = k.started(AgentKind::Claude, "d").task.id;
-        k.emit(DriverEvent::Exited { code: Some(1) });
-        assert_eq!(end_cause(&k, &d), "mirante:process_exited");
     }
 
     #[test]
@@ -1615,6 +1661,35 @@ mod tests {
         assert_eq!(status(&k, &b.id), Status::Ended);
         assert_eq!(k.calls().iter().filter(|c| *c == "stop").count(), 2);
         assert_eq!(k.hub.status().live_sessions, 0);
+    }
+
+    #[test]
+    fn shutdown_waits_for_an_in_flight_launch_then_stops_it_and_refuses_new_ones() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Codex, "c").task;
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *k.factory.spawn_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let hub = k.hub.clone();
+        let id = t.id.clone();
+        let launch = std::thread::spawn(move || hub.start_session(StartSession { task: id, prompt: None }, false));
+        entered.recv().unwrap();
+        // The agent is being spawned: shutdown waits for it instead of exiting under it.
+        let hub = k.hub.clone();
+        let down = std::thread::spawn(move || hub.shutdown());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!down.is_finished(), "shutdown returned while an agent was being spawned");
+        // No new session starts while the daemon goes down.
+        let other = k.create(AgentKind::Codex, "d").task;
+        let r = k.hub.start_session(StartSession { task: other.id.clone(), prompt: None }, false);
+        assert!(matches!(&r, Err(HubError::Conflict(m)) if m.contains("shutting down")), "{r:?}");
+        release.send(()).unwrap();
+        down.join().unwrap();
+        let _ = launch.join().unwrap();
+        // The agent that was spawning is stopped, not left running without a daemon.
+        assert_eq!(k.calls().iter().filter(|c| *c == "stop").count(), 1, "{:?}", k.calls());
+        assert_eq!(k.hub.status().live_sessions, 0);
+        assert_eq!(status(&k, &t.id), Status::Ended);
     }
 
     #[test]

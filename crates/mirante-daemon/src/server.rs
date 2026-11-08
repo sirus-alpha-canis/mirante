@@ -166,8 +166,12 @@ pub fn serve_with(hub: Arc<Hub>, listener: UnixListener, on_shutdown: OnShutdown
                 continue;
             }
         };
-        if open.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
-            open.fetch_sub(1, Ordering::SeqCst);
+        // Going down: nothing new is served (a launch would race the sessions' stop).
+        let down = hub.is_shutting_down();
+        if down || open.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
+            if !down {
+                open.fetch_sub(1, Ordering::SeqCst);
+            }
             // Read the request first (briefly), so the client is not mid-write when the
             // connection closes and sees the BUSY answer instead of a broken pipe.
             std::thread::spawn(move || {
@@ -176,7 +180,11 @@ pub fn serve_with(hub: Arc<Hub>, listener: UnixListener, on_shutdown: OnShutdown
                 if let Ok(r) = stream.try_clone() {
                     let _ = read_line(&mut BufReader::new(r));
                 }
-                let e = RpcError::new(code::BUSY, "the daemon is at its connection limit; retry");
+                let e = if down {
+                    RpcError::new(code::BUSY, "the daemon is shutting down; retry once it is back")
+                } else {
+                    RpcError::new(code::BUSY, "the daemon is at its connection limit; retry")
+                };
                 let _ = write_line(&mut stream, &Response::err(None, e));
             });
             continue;
@@ -762,6 +770,19 @@ mod tests {
         let status: Result<Value, ClientError> = c.call(method::DAEMON_STATUS, Value::Null);
         assert!(status.is_ok(), "{status:?}");
         assert_eq!(code_of(c.call(method::DNA_STATUS, json!({"repo": k.repo}))), code::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_daemon_going_down_turns_new_connections_away() {
+        let k = Kit::new();
+        let (sock, _) = serve_kit(&k);
+        k.hub.shutdown();
+        let mut c = Client::connect(&sock).unwrap();
+        let r: Result<Value, ClientError> = c.call(method::DAEMON_STATUS, Value::Null);
+        match r {
+            Err(ClientError::Rpc(e)) => assert!(e.code == code::BUSY && e.message.contains("shutting down"), "{e:?}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
