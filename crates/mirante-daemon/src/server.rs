@@ -314,6 +314,8 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
             out(hub.dna_proposals(q))
         }
         method::DNA_REVIEW => out(hub.dna_review(caller, params(p)?)),
+        method::DNA_TASK_CONTEXT => out(hub.dna_task_context(&params::<TaskRef>(p)?.task)),
+        method::DNA_NOTE_ACTION => out(hub.dna_note_action(caller, params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
@@ -489,6 +491,13 @@ mod tests {
         assert_eq!(e.code, code::NOT_FOUND);
         let e = dispatch(&k.hub, method::DNA_SEARCH, json!({"repo": k.repo})).unwrap_err();
         assert_eq!(e.code, code::INVALID_PARAMS);
+        let t = k.create(AgentKind::Codex, "ctx").task;
+        let c = dispatch(&k.hub, method::DNA_TASK_CONTEXT, json!({"task": t.id})).unwrap();
+        assert_eq!((c["enabled"].as_bool(), c["relevant"].as_array().map(Vec::len)), (Some(true), Some(0)));
+        let bad = json!({"repo": k.repo, "slug": "a", "action": "delete", "expect_hash": "h"});
+        assert_eq!(dispatch(&k.hub, method::DNA_NOTE_ACTION, bad).unwrap_err().code, code::INVALID_PARAMS);
+        let q = dispatch(&k.hub, method::DNA_PROPOSALS, Value::Null).unwrap();
+        assert_eq!(q, json!([]));
         assert_eq!(dispatch(&k.hub, method::DNA_DISABLE, repo).unwrap()["enabled"], false);
     }
 

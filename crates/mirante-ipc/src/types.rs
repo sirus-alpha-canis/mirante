@@ -69,6 +69,12 @@ pub mod method {
     /// A person accepts (writes the note) or rejects a proposal ([`super::DnaReview`] →
     /// [`super::ProposalView`]). Refused from inside an agent's process tree.
     pub const DNA_REVIEW: &str = "dna.review";
+    /// A task's memory: notes relevant to it, notes its branch puts at risk, its proposals
+    /// ([`super::TaskRef`] → [`super::DnaTaskContext`]).
+    pub const DNA_TASK_CONTEXT: &str = "dna.task_context";
+    /// A person confirms (re-anchors at HEAD) or retires a note ([`super::DnaNoteAction`] →
+    /// [`super::NoteView`]). Refused from inside an agent's process tree.
+    pub const DNA_NOTE_ACTION: &str = "dna.note_action";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,6 +671,46 @@ pub struct DnaReview {
     /// Why (kept with the decision).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// A note whose cited lines the task branch changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtRisk {
+    #[serde(flatten)]
+    pub note: NoteSummary,
+    /// What changed, per anchor (`path: reason`), joined with `; `.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaTaskContext {
+    /// The task's repo has memory enabled; everything else is empty when not.
+    pub enabled: bool,
+    /// Notes citing the files the task changed first, then full-text hits on its title
+    /// and goal; at most 10.
+    pub relevant: Vec<NoteSummary>,
+    /// Notes whose cited lines the task branch changed (stale at the branch tip).
+    pub at_risk: Vec<AtRisk>,
+    /// This task's proposals, oldest first.
+    pub proposals: Vec<ProposalView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteAction {
+    /// Re-anchor every anchor at the checkout's HEAD and mark this content reviewed.
+    Confirm,
+    /// Set `status: retired`; the file stays.
+    Retire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaNoteAction {
+    pub repo: String,
+    pub slug: String,
+    pub action: NoteAction,
+    /// The `content_hash` the person saw: the action is refused if the file changed since.
+    pub expect_hash: String,
 }
 
 #[cfg(test)]

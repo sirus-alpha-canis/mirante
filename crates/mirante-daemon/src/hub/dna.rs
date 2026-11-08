@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use mirante_core::dna::anchor::check_path;
-use mirante_core::dna::check::{cite, is_dirty, rev_parse, AnchorState};
+use mirante_core::dna::check::{check_all, cite, is_dirty, rev_parse, AnchorState};
 use mirante_core::dna::index::{self, IndexedAnchor, NewProposal, NoteRow, RefreshReport};
 use mirante_core::dna::note::{Kind, Note, Status};
 use mirante_core::dna::{fsio, note, sha256_hex, DnaError, MAX_ANCHORS, MAX_BODY_BYTES, MAX_TITLE_CHARS};
@@ -15,8 +15,8 @@ use mirante_core::model::{new_id, now_ms, Lifecycle};
 use mirante_core::redact::redact_counted;
 use mirante_core::CoreError;
 use mirante_ipc::types::{
-    AnchorView, CheckReport, DnaGet, DnaGraph, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus,
-    GraphLink, NoteSummary, NoteView, ProposalView,
+    AnchorView, AtRisk, CheckReport, DnaGet, DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview,
+    DnaSearch, DnaStatus, DnaTaskContext, GraphLink, NoteAction, NoteSummary, NoteView, ProposalView,
 };
 use serde_json::json;
 
@@ -34,6 +34,9 @@ pub enum Caller {
 /// Pending proposals one task, and one repo, may have at once.
 const MAX_PENDING_PER_TASK: usize = 20;
 const MAX_PENDING_PER_REPO: usize = 200;
+
+/// Most notes `dna.task_context` lists as relevant.
+const RELEVANT_MAX: usize = 10;
 
 /// Search results by default and at most.
 const SEARCH_DEFAULT: usize = 10;
@@ -525,6 +528,134 @@ impl Hub {
     }
 }
 
+impl Hub {
+    /// The task's memory: notes citing the files its branch changed (most cited first),
+    /// then full-text hits on its title and goal (deduped, at most 10); the notes whose
+    /// cited lines the branch changed (checked at the branch tip: the per-task "Memory
+    /// CI"); and its proposals. git runs without the hub lock.
+    pub fn dna_task_context(&self, task_ref: &str) -> Result<DnaTaskContext> {
+        let task = self.lock().resolve(task_ref)?;
+        let repo = PathBuf::from(&task.repo_path);
+        let key = key_of(&repo);
+        let enabled = self.lock().store.dna_repo(&key)?.is_some_and(|r| r.enabled);
+        if !enabled {
+            return Ok(DnaTaskContext { enabled, relevant: Vec::new(), at_risk: Vec::new(), proposals: Vec::new() });
+        }
+        self.dna_ensure_fresh(&repo)?;
+        let live = task.lifecycle != Lifecycle::Archived;
+        let worktree = Path::new(&task.worktree_path);
+        let files: Vec<String> = if live {
+            let d = crate::diff::task_diff(&repo, worktree, &task.branch).map_err(HubError::Conflict)?;
+            d.files.into_iter().map(|f| f.path).chain(d.untracked).collect()
+        } else {
+            Vec::new()
+        };
+        let (citing, hits, proposals) = {
+            let st = self.lock();
+            let slugs = st.store.dna_notes_citing(&key, &files)?;
+            let mut citing = Vec::with_capacity(slugs.len());
+            for slug in &slugs {
+                citing.extend(st.store.dna_note(&key, slug)?);
+            }
+            let hits = match index::fts_query(&format!("{} {}", task.title, task.goal)) {
+                Some(q) => st.store.dna_search(&key, &q, RELEVANT_MAX)?,
+                None => Vec::new(),
+            };
+            let proposals: Vec<ProposalView> = st
+                .store
+                .dna_proposals(Some(&key), None)?
+                .into_iter()
+                .filter(|p| p.task_id.as_deref() == Some(task.id.as_str()))
+                .collect();
+            (citing, hits, proposals)
+        };
+        let mut relevant: Vec<NoteRow> = Vec::new();
+        for n in citing.iter().chain(&hits) {
+            if relevant.len() < RELEVANT_MAX && !relevant.iter().any(|r| r.slug == n.slug) {
+                relevant.push(n.clone());
+            }
+        }
+        // At risk: the anchors in changed files, checked at the branch tip.
+        let mut at_risk = Vec::new();
+        let cited: Vec<(&NoteRow, &IndexedAnchor)> = citing
+            .iter()
+            .flat_map(|n| n.anchors.iter().filter(|a| files.contains(&a.anchor.path)).map(move |a| (n, a)))
+            .collect();
+        if live && !cited.is_empty() {
+            let tip = rev_parse(worktree, "HEAD").map_err(dna_err)?;
+            let anchors: Vec<_> = cited.iter().map(|(_, a)| a.anchor.clone()).collect();
+            let checked = check_all(&repo, &tip, &anchors).map_err(dna_err)?;
+            let mut reasons: Vec<(&NoteRow, Vec<String>)> = Vec::new();
+            for ((n, a), c) in cited.iter().zip(checked) {
+                if let AnchorState::Stale { reason } = c.state {
+                    let line = format!("{}: {reason}", a.anchor.path);
+                    match reasons.iter_mut().find(|(r, _)| r.slug == n.slug) {
+                        Some((_, v)) => v.push(line),
+                        None => reasons.push((n, vec![line])),
+                    }
+                }
+            }
+            let rows: Vec<NoteRow> = reasons.iter().map(|(n, _)| (*n).clone()).collect();
+            let summaries = self.dna_summaries(&key, &rows)?;
+            at_risk = summaries
+                .into_iter()
+                .zip(reasons)
+                .map(|(note, (_, why))| AtRisk { note, reason: why.join("; ") })
+                .collect();
+        }
+        Ok(DnaTaskContext { enabled, relevant: self.dna_summaries(&key, &relevant)?, at_risk, proposals })
+    }
+
+    /// A person's action on a note in the checkout. Confirm re-cites every anchor at the
+    /// checkout's HEAD (each must be fresh or relocated); retire sets `status: retired`.
+    /// Both rewrite only the frontmatter lines they own, need the hash the person saw, never
+    /// delete, and record the new content as reviewed.
+    pub fn dna_note_action(&self, caller: &Caller, a: DnaNoteAction) -> Result<NoteView> {
+        self.require_person(caller)?;
+        let repo = self.dna_repo_of(&DnaRef { repo: Some(a.repo.clone()), task: None })?;
+        let text = fsio::read_note(&repo, &a.slug).map_err(dna_err)?;
+        if sha256_hex(text.as_bytes()) != a.expect_hash {
+            return Err(dna_err(DnaError::Changed));
+        }
+        let n = note::parse(&text).map_err(|e| HubError::Conflict(format!("note {} does not parse: {e}", a.slug)))?;
+        let updated = match a.action {
+            NoteAction::Confirm => {
+                let head = rev_parse(&repo, "HEAD").map_err(dna_err)?;
+                let checked = check_all(&repo, &head, &n.anchors).map_err(dna_err)?;
+                let mut anchors = Vec::with_capacity(checked.len());
+                for (i, c) in checked.iter().enumerate() {
+                    let (start, end) = match &c.state {
+                        AnchorState::Fresh => (c.anchor.start, c.anchor.end),
+                        AnchorState::Relocated { start, end } => (*start, *end),
+                        other => {
+                            return Err(HubError::Conflict(format!(
+                                "anchor {} is {}: re-cite it or retire the note",
+                                i + 1,
+                                state_name(other)
+                            )))
+                        }
+                    };
+                    let symbol = c.anchor.symbol.as_deref();
+                    anchors.push(cite(&repo, &head, &c.anchor.path, symbol, start, end).map_err(dna_err)?);
+                }
+                note::update(&text, None, Some(&anchors))
+            }
+            NoteAction::Retire => note::update(&text, Some(Status::Retired), None),
+        }
+        .map_err(dna_err)?;
+        fsio::update_note(&repo, &a.slug, &a.expect_hash, &updated).map_err(dna_err)?;
+        let key = key_of(&repo);
+        {
+            let mut st = self.lock();
+            st.store.dna_record_review(&key, &a.slug, &sha256_hex(updated.as_bytes()), "confirmed")?;
+            st.event(None, "dna.changed", json!({ "repo": key, "slug": a.slug }))?;
+            st.publish();
+        }
+        self.dna_refresh(&repo)?;
+        self.dna_view(&repo, &a.slug)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::Path;
@@ -535,7 +666,9 @@ pub(crate) mod tests {
     use mirante_core::dna::sha256_hex;
     use mirante_core::model::AgentKind;
     use mirante_core::store::Store;
-    use mirante_ipc::types::{DnaGet, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, ProposeAnchor};
+    use mirante_ipc::types::{
+        DnaGet, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, NoteAction, ProposeAnchor,
+    };
     use serde_json::Value;
 
     use super::*;
@@ -777,6 +910,13 @@ pub(crate) mod tests {
         assert!(matches!(k.hub.dna_enable(&k.repo_ref(), &caller), Err(HubError::Forbidden(_))));
         assert!(matches!(k.hub.dna_disable(&k.repo_ref(), &caller), Err(HubError::Forbidden(_))));
         assert!(matches!(k.hub.dna_review(&Caller::Unknown, review_accept("x")), Err(HubError::Forbidden(_))));
+        let act = DnaNoteAction {
+            repo: k.repo.to_string_lossy().into(),
+            slug: "a".into(),
+            action: NoteAction::Retire,
+            expect_hash: "h".into(),
+        };
+        assert!(matches!(k.hub.dna_note_action(&caller, act), Err(HubError::Forbidden(_))));
         // A pid outside every agent tree is a person (the review then fails on the id).
         let other = Caller::Peer(1);
         assert!(matches!(k.hub.dna_review(&other, review_accept("x")), Err(HubError::NotFound(_))));
@@ -821,6 +961,129 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(k.repo.join(".mirante/elsewhere"), &mem).unwrap();
         assert!(k.hub.dna_review(&Caller::Person, review_accept(&p.id)).is_err());
         assert_eq!(k.hub.lock().store.dna_proposal(&p.id).unwrap().status, "pending");
+    }
+
+    fn key(k: &Kit) -> String {
+        k.repo.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn action(k: &Kit, slug: &str, action: NoteAction, expect_hash: &str) -> DnaNoteAction {
+        DnaNoteAction {
+            repo: k.repo.to_string_lossy().into(),
+            slug: slug.into(),
+            action,
+            expect_hash: expect_hash.into(),
+        }
+    }
+
+    fn view(k: &Kit, slug: &str) -> mirante_ipc::types::NoteView {
+        k.hub.dna_get(DnaGet { at: k.repo_ref(), slug: slug.into() }).unwrap()
+    }
+
+    /// Enabled memory with `src/a.rs` and `src/b.rs` committed, note `a` citing a.rs L2-4
+    /// and note `b` citing b.rs L2-4, both committed.
+    fn with_a_and_b(k: &Kit) {
+        commit_in(&k.repo, "src/a.rs", CODE);
+        commit_in(&k.repo, "src/b.rs", CODE);
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        write_note(&k.repo, "a", &note_text(&k.repo, "Alpha", "About a.", "src/a.rs", 2, 4));
+        write_note(&k.repo, "b", &note_text(&k.repo, "Beta", "About b.", "src/b.rs", 2, 4));
+        git(&k.repo, &["add", "-A"]);
+        git(&k.repo, &["commit", "-q", "-m", "memory"]);
+    }
+
+    #[test]
+    fn task_context_ranks_notes_citing_the_task_diff_first() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        let t = k.create(AgentKind::Claude, "ctx").task;
+        commit_in(&t.worktree_path, "src/b.rs", &format!("{CODE}// more\n"));
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.relevant[0].slug, "b");
+        assert!(c.at_risk.is_empty(), "appending below the cited lines changes nothing: {:?}", c.at_risk);
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "T", "x", "src/b.rs", 1, 1)).unwrap();
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        assert_eq!(c.proposals.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), [p.id.as_str()]);
+    }
+
+    #[test]
+    fn at_risk_lists_notes_whose_cited_lines_the_task_branch_changed() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        let t = k.create(AgentKind::Claude, "risk").task;
+        commit_in(&t.worktree_path, "src/b.rs", &CODE.replace("write()", "flush()"));
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        assert_eq!(c.at_risk.iter().map(|r| r.note.slug.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert!(c.at_risk[0].reason.starts_with("src/b.rs: "), "{}", c.at_risk[0].reason);
+        // The checkout's HEAD is unaffected.
+        assert_eq!(view(&k, "b").summary.state, "fresh");
+    }
+
+    #[test]
+    fn context_of_a_repo_without_memory_says_disabled() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "off").task;
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        assert!(!c.enabled && c.relevant.is_empty() && c.at_risk.is_empty() && c.proposals.is_empty());
+    }
+
+    #[test]
+    fn confirm_reanchors_to_head_and_records_review() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        let path = k.repo.join(".mirante/memory/a.md");
+        let text = std::fs::read_to_string(&path).unwrap().replace("source: manual\n", "source: manual\ntags: [x]\n");
+        std::fs::write(&path, &text).unwrap();
+        commit_in(&k.repo, "src/a.rs", &format!("// moved\n{CODE}"));
+        let before = view(&k, "a");
+        assert_eq!((before.summary.anchors[0].state.as_str(), before.summary.reviewed), ("relocated", false));
+        let after =
+            k.hub.dna_note_action(&Caller::Person, action(&k, "a", NoteAction::Confirm, &before.content_hash)).unwrap();
+        let text2 = std::fs::read_to_string(&path).unwrap();
+        let n = mirante_core::dna::note::parse(&text2).unwrap();
+        assert_eq!((n.anchors[0].start, n.anchors[0].end, n.anchors[0].commit.clone()), (3, 5, head_of(&k.repo)));
+        assert_eq!(n.anchors[0].fingerprint, mirante_core::dna::note::parse(&text).unwrap().anchors[0].fingerprint);
+        assert!(text2.contains("tags: [x]\n") && text2.contains("id: 0193b7c2-5f1e-7c3a-9a10-3f2b8d1e4c55\n"));
+        assert_eq!((after.summary.state.as_str(), after.summary.reviewed), ("fresh", true));
+        assert!(k.hub.lock().store.dna_is_reviewed(&key(&k), "a", &sha256_hex(text2.as_bytes())).unwrap());
+        assert!(!k.payloads("dna.changed").is_empty());
+    }
+
+    #[test]
+    fn confirm_refuses_a_stale_anchor_and_a_changed_file() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        commit_in(&k.repo, "src/b.rs", &CODE.replace("write()", "flush()"));
+        let b = view(&k, "b");
+        let stale = k.hub.dna_note_action(&Caller::Person, action(&k, "b", NoteAction::Confirm, &b.content_hash));
+        assert!(
+            matches!(&stale, Err(HubError::Conflict(m)) if m == "anchor 1 is stale: re-cite it or retire the note"),
+            "{stale:?}"
+        );
+        let a = view(&k, "a");
+        let changed = k.hub.dna_note_action(&Caller::Person, action(&k, "a", NoteAction::Confirm, "0000"));
+        assert!(
+            matches!(&changed, Err(HubError::Conflict(m)) if *m == mirante_core::dna::DnaError::Changed.to_string()),
+            "{changed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(k.repo.join(".mirante/memory/a.md")).map(|t| sha256_hex(t.as_bytes())).unwrap(),
+            a.content_hash
+        );
+    }
+
+    #[test]
+    fn retire_keeps_the_file_with_status_retired() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        let b = view(&k, "b");
+        let v = k.hub.dna_note_action(&Caller::Person, action(&k, "b", NoteAction::Retire, &b.content_hash)).unwrap();
+        assert_eq!((v.summary.status.as_str(), v.summary.reviewed), ("retired", true));
+        let text = std::fs::read_to_string(k.repo.join(".mirante/memory/b.md")).unwrap();
+        assert!(text.contains("status: retired\n") && text.contains("About b."));
+        let hits = k.hub.dna_search(DnaSearch { at: k.repo_ref(), query: "beta".into(), limit: None }).unwrap();
+        assert!(hits.is_empty(), "retired notes are not handed to agents");
     }
 
     #[test]
