@@ -206,7 +206,10 @@ pub struct ClaudeExtras<'a> {
 }
 
 /// How the bundle's always-on text reaches Claude: the file when `file_flag` (the binary
-/// accepts `--append-system-prompt-file`), else the text inline.
+/// accepts `--append-system-prompt-file`), else the text inline. The file is preferred:
+/// inline, the text sits in Claude's argv, which any local user can read with `ps` for as
+/// long as the session runs (skills are lint-checked for secrets, but they are still the
+/// operator's instructions).
 pub fn claude_always(b: &SkillBundle, file_flag: bool) -> Option<AlwaysOn<'_>> {
     match (&b.always_file, &b.always_text) {
         (Some(f), _) if file_flag => Some(AlwaysOn::File(f)),
