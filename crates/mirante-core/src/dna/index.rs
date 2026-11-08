@@ -4,8 +4,13 @@
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+
 use super::anchor::Anchor;
-use super::check::AnchorState;
+use super::check::{check_all, rev_parse, AnchorState};
+use super::{fsio, note, sha256_hex, DnaError, MAX_NOTES, MEMORY_DIR};
 use crate::error::{CoreError, Result};
 use crate::model::{new_id, now_ms};
 use crate::store::Store;
@@ -508,6 +513,238 @@ impl Store {
     }
 }
 
+/// A file in `.mirante/memory` that is not in the index, or is indexed without content
+/// because it does not parse. Never deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvalidNote {
+    pub file: String,
+    pub error: String,
+}
+
+/// What reading `.mirante/memory` found (no git, no store).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scan {
+    pub notes: Vec<IndexedNote>,
+    pub invalid: Vec<InvalidNote>,
+    /// The directory listing's stat signature when the scan started ([`signature`]).
+    pub signature: String,
+}
+
+/// What a refresh indexed and found at `head`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshReport {
+    pub repo: String,
+    pub head: Option<String>,
+    /// Valid notes indexed.
+    pub notes: usize,
+    pub invalid: Vec<InvalidNote>,
+    /// Notes with at least one anchor in that state.
+    pub stale: usize,
+    pub relocated: usize,
+    pub unverifiable: usize,
+    pub unreviewed: usize,
+    #[serde(skip)]
+    pub signature: String,
+}
+
+/// The cheap facts that tell whether the index is behind ([`needs_refresh`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub head: Option<String>,
+    pub signature: String,
+}
+
+/// The index key of a repo: its canonical path.
+pub fn repo_key(repo: &Path) -> std::result::Result<String, DnaError> {
+    Ok(repo.canonicalize()?.to_string_lossy().into_owned())
+}
+
+/// `Ok(None)` when `.mirante/memory` does not exist at all; the checked directory when it
+/// does; `Err(Unsafe)` when either level is a symlink or not a directory.
+fn existing_memory_dir(repo: &Path) -> std::result::Result<Option<std::path::PathBuf>, DnaError> {
+    let mut p = repo.to_path_buf();
+    for seg in MEMORY_DIR.split('/') {
+        p.push(seg);
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+                return Err(DnaError::Unsafe(format!("{}: is a symlink or not a directory", p.display())))
+            }
+            Ok(_) => {}
+        }
+    }
+    fsio::memory_dir(repo).map(Some)
+}
+
+/// A stat signature of `.mirante/memory`: every entry's name, type, size and mtime,
+/// hashed. `"absent"` when the directory does not exist.
+pub fn signature(repo: &Path) -> std::result::Result<String, DnaError> {
+    let Some(dir) = existing_memory_dir(repo)? else {
+        return Ok("absent".into());
+    };
+    let mut lines = Vec::new();
+    for (i, entry) in std::fs::read_dir(&dir)?.enumerate() {
+        if i > MAX_NOTES {
+            break;
+        }
+        let entry = entry?;
+        let m = entry.metadata()?; // does not follow a symlink
+        lines.push(format!(
+            "{}\0{:o}\0{}\0{}.{}",
+            entry.file_name().to_string_lossy(),
+            m.mode(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec()
+        ));
+    }
+    lines.sort();
+    Ok(sha256_hex(lines.join("\n").as_bytes()))
+}
+
+/// Reads `.mirante/memory`: at most [`MAX_NOTES`] entries; regular `*.md` files only
+/// (symlinks, directories, dotfiles, other extensions and `README.md` are skipped); each
+/// read without following symlinks and size-capped. A file whose name is not a slug is
+/// listed as invalid; one that does not parse is indexed with its `parse_error`.
+pub fn scan(repo: &Path) -> std::result::Result<Scan, DnaError> {
+    let signature = signature(repo)?;
+    let Some(dir) = existing_memory_dir(repo)? else {
+        return Ok(Scan { notes: Vec::new(), invalid: Vec::new(), signature });
+    };
+    let (mut notes, mut invalid) = (Vec::new(), Vec::new());
+    for (i, entry) in std::fs::read_dir(&dir)?.enumerate() {
+        if i >= MAX_NOTES {
+            invalid.push(InvalidNote {
+                file: String::new(),
+                error: format!("more than {MAX_NOTES} entries; rest skipped"),
+            });
+            break;
+        }
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".md").map(str::to_string) else { continue };
+        if name.starts_with('.') || name.eq_ignore_ascii_case("README.md") || !entry.file_type()?.is_file() {
+            continue;
+        }
+        if !note::is_slug(&stem) {
+            invalid.push(InvalidNote { file: name, error: "the file name is not a note name (a-z, 0-9 and -)".into() });
+            continue;
+        }
+        let text = match fsio::read_note(repo, &stem) {
+            Ok(t) => t,
+            Err(e) => {
+                invalid.push(InvalidNote { file: name, error: e.to_string() });
+                continue;
+            }
+        };
+        let content_hash = sha256_hex(text.as_bytes());
+        match note::parse(&text) {
+            Ok(n) => notes.push(IndexedNote {
+                slug: stem.clone(),
+                id: n.id,
+                title: n.title,
+                kind: n.kind.as_str().to_string(),
+                status: n.status.as_str().to_string(),
+                links: note::links(&n.body),
+                body: n.body,
+                content_hash,
+                source: n.source,
+                parse_error: None,
+                anchors: n.anchors,
+            }),
+            Err(e) => {
+                invalid.push(InvalidNote { file: name, error: e.to_string() });
+                notes.push(IndexedNote {
+                    slug: stem.clone(),
+                    id: String::new(),
+                    title: stem.clone(),
+                    kind: String::new(),
+                    status: "active".into(),
+                    body: String::new(),
+                    content_hash,
+                    source: String::new(),
+                    parse_error: Some(e.to_string()),
+                    anchors: Vec::new(),
+                    links: Vec::new(),
+                });
+            }
+        }
+    }
+    notes.sort_by(|a, b| a.slug.cmp(&b.slug));
+    invalid.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(Scan { notes, invalid, signature })
+}
+
+/// The HEAD a scan was checked at and each anchor's state (slug, idx, state).
+pub type Checks = (Option<String>, Vec<(String, u32, AnchorState)>);
+
+/// Anchor states of a scan's notes at the repo's HEAD. git only; no store. Without a HEAD
+/// commit every anchor stays `Unchecked`.
+pub fn check_scan(repo: &Path, scan: &Scan) -> std::result::Result<Checks, DnaError> {
+    let keys: Vec<(String, u32, Anchor)> = scan
+        .notes
+        .iter()
+        .flat_map(|n| n.anchors.iter().enumerate().map(|(i, a)| (n.slug.clone(), i as u32, a.clone())))
+        .collect();
+    let Ok(head) = rev_parse(repo, "HEAD") else {
+        return Ok((None, keys.into_iter().map(|(s, i, _)| (s, i, AnchorState::Unchecked)).collect()));
+    };
+    let anchors: Vec<Anchor> = keys.iter().map(|(_, _, a)| a.clone()).collect();
+    let checked = check_all(repo, &head, &anchors)?;
+    Ok((Some(head), keys.into_iter().zip(checked).map(|((s, i, _), c)| (s, i, c.state)).collect()))
+}
+
+/// Writes a scan and its checks to the index and reports the counts.
+pub fn apply(store: &mut Store, key: &str, scan: &Scan, checks: &Checks) -> Result<RefreshReport> {
+    let (head, states) = checks;
+    store.dna_replace_index(key, &scan.notes)?;
+    store.dna_set_anchor_states(key, head.as_deref(), states)?;
+    let notes_with = |want: fn(&AnchorState) -> bool| {
+        let mut slugs: Vec<&str> = states.iter().filter(|(_, _, s)| want(s)).map(|(s, _, _)| s.as_str()).collect();
+        slugs.dedup();
+        slugs.len()
+    };
+    Ok(RefreshReport {
+        repo: key.to_string(),
+        head: head.clone(),
+        notes: scan.notes.iter().filter(|n| n.parse_error.is_none()).count(),
+        invalid: scan.invalid.clone(),
+        stale: notes_with(|s| matches!(s, AnchorState::Stale { .. })),
+        relocated: notes_with(|s| matches!(s, AnchorState::Relocated { .. })),
+        unverifiable: notes_with(|s| matches!(s, AnchorState::Unverifiable { .. })),
+        unreviewed: store.dna_status(key)?.unreviewed,
+        signature: scan.signature.clone(),
+    })
+}
+
+fn dna(e: DnaError) -> CoreError {
+    CoreError::Io(std::io::Error::other(e.to_string()))
+}
+
+/// Re-reads `.mirante/memory` into the index and checks every anchor at HEAD. Notes that
+/// do not parse are listed, never deleted.
+pub fn refresh(store: &mut Store, repo: &Path) -> Result<RefreshReport> {
+    let key = repo_key(repo).map_err(dna)?;
+    let scan = scan(repo).map_err(dna)?;
+    let checks = check_scan(repo, &scan).map_err(dna)?;
+    apply(store, &key, &scan, &checks)
+}
+
+/// The repo's HEAD and memory-directory signature, for [`needs_refresh`].
+pub fn probe(repo: &Path) -> std::result::Result<Probe, DnaError> {
+    Ok(Probe { head: rev_parse(repo, "HEAD").ok(), signature: signature(repo)? })
+}
+
+/// True when the index is behind: never indexed, HEAD moved since the last check, or the
+/// directory listing changed since `known_signature` (kept in memory by the caller).
+pub fn needs_refresh(store: &Store, key: &str, probe: &Probe, known_signature: Option<&str>) -> Result<bool> {
+    let Some(row) = store.dna_repo(key)? else {
+        return Ok(true);
+    };
+    Ok(row.indexed_at.is_none() || row.checked_head != probe.head || known_signature != Some(probe.signature.as_str()))
+}
+
 #[cfg(test)]
 mod fts_tests {
     use super::*;
@@ -661,5 +898,162 @@ mod store_tests {
         assert_eq!(nodes.iter().map(|n| n.slug.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(links, [("a".to_string(), "b".to_string()), ("a".to_string(), "gone".to_string())]);
         assert_eq!(s.dna_backlinks("r", "b").unwrap(), ["a"]);
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use crate::dna::check::{cite, rev_parse};
+    use crate::dna::note::{render, Kind, Note, Status};
+    use crate::dna::{fsio, sha256_hex};
+    use crate::test_support::TempDir;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn plain(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn commit_file(r: &Path, path: &str, text: &str) {
+        let full = r.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+        plain(r, &["add", "-A", "--", path]);
+        plain(r, &["commit", "-q", "-m", path]);
+    }
+
+    const CODE: &str = "fn keep() {}\nfn spool() {\n  write();\n}\nfn other() {}\n";
+
+    /// A note citing `path` lines `start..=end` at HEAD.
+    fn note_text(r: &Path, title: &str, path: &str, start: u32, end: u32) -> String {
+        let a = cite(r, &rev_parse(r, "HEAD").unwrap(), path, None, start, end).unwrap();
+        render(&Note {
+            id: "0193b7c2-5f1e-7c3a-9a10-3f2b8d1e4c55".into(),
+            title: title.into(),
+            kind: Kind::Fact,
+            status: Status::Active,
+            created: "2026-11-07".into(),
+            source: "manual".into(),
+            anchors: vec![a],
+            body: format!("{title} body, see [[other]].\n"),
+        })
+    }
+
+    fn repo_with_memory(notes: &[(&str, &str)]) -> TempDir {
+        let r = TempDir::new("dna-index");
+        plain(r.path(), &["init", "-q", "-b", "main"]);
+        commit_file(r.path(), "src/a.rs", CODE);
+        fsio::init(r.path()).unwrap();
+        for (slug, text) in notes {
+            let text = if *text == "GOOD" { note_text(r.path(), slug, "src/a.rs", 2, 4) } else { text.to_string() };
+            std::fs::write(r.path().join(format!(".mirante/memory/{slug}.md")), text).unwrap();
+        }
+        r
+    }
+
+    #[test]
+    fn refresh_indexes_valid_notes_and_reports_bad_ones() {
+        let r = repo_with_memory(&[("good", "GOOD"), ("bad", "no frontmatter")]);
+        let mut s = Store::open_in_memory().unwrap();
+        let rep = refresh(&mut s, r.path()).unwrap();
+        assert_eq!((rep.notes, rep.invalid.len()), (1, 1));
+        assert_eq!(rep.invalid[0].file, "bad.md");
+        assert!(r.path().join(".mirante/memory/bad.md").exists());
+        let key = repo_key(r.path()).unwrap();
+        let good = s.dna_note(&key, "good").unwrap().unwrap();
+        assert_eq!((good.anchors.len(), good.anchors[0].state.clone()), (1, AnchorState::Fresh));
+        assert!(s.dna_note(&key, "bad").unwrap().unwrap().parse_error.is_some());
+        assert_eq!(s.dna_search(&key, "\"spool\"* OR \"good\"*", 10).unwrap().len(), 1);
+        assert_eq!(s.dna_status(&key).unwrap().invalid, 1);
+        assert_eq!(rep.head, Some(rev_parse(r.path(), "HEAD").unwrap()));
+    }
+
+    #[test]
+    fn refresh_skips_symlinks_dirs_and_non_md() {
+        let r = repo_with_memory(&[("good", "GOOD")]);
+        let dir = r.path().join(".mirante/memory");
+        std::os::unix::fs::symlink("/etc/hosts", dir.join("x.md")).unwrap();
+        std::fs::create_dir(dir.join("y.md")).unwrap();
+        std::fs::write(dir.join("z.txt"), "text").unwrap();
+        std::fs::write(dir.join("Not A Slug.md"), "x").unwrap();
+        let mut s = Store::open_in_memory().unwrap();
+        let rep = refresh(&mut s, r.path()).unwrap();
+        assert_eq!(rep.notes, 1);
+        assert_eq!(rep.invalid.iter().map(|i| i.file.as_str()).collect::<Vec<_>>(), ["Not A Slug.md"]);
+        let key = repo_key(r.path()).unwrap();
+        assert!(s.dna_note(&key, "x").unwrap().is_none() && s.dna_note(&key, "readme").unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_of_a_repo_without_memory_is_empty_but_a_symlinked_dir_is_refused() {
+        let r = TempDir::new("dna-none");
+        plain(r.path(), &["init", "-q", "-b", "main"]);
+        commit_file(r.path(), "src/a.rs", CODE);
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(refresh(&mut s, r.path()).unwrap().notes, 0);
+        let elsewhere = TempDir::new("dna-elsewhere");
+        std::os::unix::fs::symlink(elsewhere.path(), r.path().join(".mirante")).unwrap();
+        assert!(refresh(&mut s, r.path()).is_err());
+    }
+
+    #[test]
+    fn refresh_then_check_marks_stale_and_relocated() {
+        let r = TempDir::new("dna-stale");
+        plain(r.path(), &["init", "-q", "-b", "main"]);
+        commit_file(r.path(), "src/a.rs", CODE);
+        commit_file(r.path(), "src/b.rs", CODE);
+        fsio::init(r.path()).unwrap();
+        let dir = r.path().join(".mirante/memory");
+        std::fs::write(dir.join("a.md"), note_text(r.path(), "a", "src/a.rs", 2, 4)).unwrap();
+        std::fs::write(dir.join("b.md"), note_text(r.path(), "b", "src/b.rs", 2, 4)).unwrap();
+        commit_file(r.path(), "src/a.rs", &format!("// moved\n{CODE}"));
+        commit_file(r.path(), "src/b.rs", &CODE.replace("write()", "flush()"));
+        let mut s = Store::open_in_memory().unwrap();
+        let rep = refresh(&mut s, r.path()).unwrap();
+        assert_eq!((rep.stale, rep.relocated, rep.unverifiable), (1, 1, 0));
+        let key = repo_key(r.path()).unwrap();
+        assert_eq!(s.dna_status(&key).unwrap().stale, 1);
+        assert_eq!(
+            s.dna_note(&key, "a").unwrap().unwrap().anchors[0].state,
+            AnchorState::Relocated { start: 3, end: 5 }
+        );
+    }
+
+    #[test]
+    fn unreviewed_unless_hash_in_ledger() {
+        let r = repo_with_memory(&[("good", "GOOD")]);
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(refresh(&mut s, r.path()).unwrap().unreviewed, 1);
+        let key = repo_key(r.path()).unwrap();
+        let text = std::fs::read_to_string(r.path().join(".mirante/memory/good.md")).unwrap();
+        s.dna_record_review(&key, "good", &sha256_hex(text.as_bytes()), "accepted").unwrap();
+        assert_eq!(refresh(&mut s, r.path()).unwrap().unreviewed, 0);
+        // A hand edit is new content: unreviewed again.
+        std::fs::write(r.path().join(".mirante/memory/good.md"), text.replace("body", "edited")).unwrap();
+        assert_eq!(refresh(&mut s, r.path()).unwrap().unreviewed, 1);
+    }
+
+    #[test]
+    fn needs_refresh_when_head_or_the_listing_changes() {
+        let r = repo_with_memory(&[("good", "GOOD")]);
+        let mut s = Store::open_in_memory().unwrap();
+        let key = repo_key(r.path()).unwrap();
+        assert!(needs_refresh(&s, &key, &probe(r.path()).unwrap(), None).unwrap());
+        let rep = refresh(&mut s, r.path()).unwrap();
+        let sig = rep.signature.clone();
+        assert!(!needs_refresh(&s, &key, &probe(r.path()).unwrap(), Some(&sig)).unwrap());
+        std::fs::write(r.path().join(".mirante/memory/new.md"), "x").unwrap();
+        assert!(needs_refresh(&s, &key, &probe(r.path()).unwrap(), Some(&sig)).unwrap());
+        let sig = refresh(&mut s, r.path()).unwrap().signature;
+        commit_file(r.path(), "src/c.rs", "c\n");
+        assert!(needs_refresh(&s, &key, &probe(r.path()).unwrap(), Some(&sig)).unwrap());
     }
 }
