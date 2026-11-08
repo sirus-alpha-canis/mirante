@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
+pub mod dna;
 pub(crate) mod evidence;
 pub mod memory;
 pub mod messages;
@@ -289,6 +290,8 @@ pub(crate) struct State {
     pub(crate) mem: memory::MemShared,
     /// The daemon's home (the hook-loss marker lives there).
     pub(crate) paths: Paths,
+    /// DNA: each indexed repo's `.mirante/memory` stat signature at its last refresh.
+    pub(crate) dna_sigs: HashMap<String, String>,
 }
 
 pub struct Hub {
@@ -457,6 +460,7 @@ impl Hub {
                 seen_hooks: session::SeenHooks::default(),
                 mem: memory::MemShared::default(),
                 paths: paths.clone(),
+                dna_sigs: HashMap::new(),
             }),
             worktrees: WorktreeManager::new(&paths.worktrees()),
             paths,

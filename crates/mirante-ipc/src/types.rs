@@ -46,6 +46,21 @@ pub mod method {
     pub const DAEMON_KILL_ORPHAN: &str = "daemon.kill_orphan";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
+    /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
+    pub const DNA_STATUS: &str = "dna.status";
+    /// Creates `.mirante/memory/README.md` and turns injection on (a person only).
+    pub const DNA_ENABLE: &str = "dna.enable";
+    /// Turns injection off for new sessions; the files stay (a person only).
+    pub const DNA_DISABLE: &str = "dna.disable";
+    /// Notes and `[[links]]` ([`super::DnaRef`] → [`super::DnaGraph`]).
+    pub const DNA_GRAPH: &str = "dna.graph";
+    /// Full-text search ([`super::DnaSearch`] → `Vec<`[`super::NoteSummary`]`>`).
+    pub const DNA_SEARCH: &str = "dna.search";
+    /// One note ([`super::DnaGet`] → [`super::NoteView`]).
+    pub const DNA_GET: &str = "dna.get";
+    /// Reindex and recheck every anchor at the checkout's HEAD ([`super::DnaRef`] →
+    /// [`super::CheckReport`]).
+    pub const DNA_CHECK: &str = "dna.check";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,5 +508,122 @@ mod tests {
         assert_eq!(q, serde_json::from_value(json!({"task": "t"})).unwrap());
         let r: ReorderQueue = serde_json::from_value(json!({"task_id": "t", "ids": ["b", "a"]})).unwrap();
         assert_eq!(r.ids, vec!["b".to_string(), "a".to_string()]);
+    }
+}
+
+/// A repo's memory, named by the repo checkout or by a task (its repo). Agent worktrees are
+/// never indexed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaStatus {
+    /// The canonical checkout path.
+    pub repo: String,
+    /// New sessions of this repo's tasks get the memory tools.
+    pub enabled: bool,
+    /// `.mirante/memory/` exists.
+    pub dir: bool,
+    pub notes: usize,
+    pub stale: usize,
+    pub unreviewed: usize,
+    pub pending: usize,
+    pub invalid: usize,
+    pub head: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorView {
+    pub path: String,
+    pub symbol: Option<String>,
+    pub start: u32,
+    pub end: u32,
+    pub commit: String,
+    /// `unchecked`, `fresh`, `relocated`, `stale` or `unverifiable`.
+    pub state: String,
+    pub reason: Option<String>,
+    /// Where a relocated anchor's lines are now.
+    pub now_start: Option<u32>,
+    pub now_end: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteSummary {
+    pub slug: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    /// "fresh" | "stale" | "unverifiable" | "unchecked": the worst anchor's state
+    /// ("relocated" counts as fresh).
+    pub state: String,
+    /// A person accepted or confirmed this exact content.
+    pub reviewed: bool,
+    pub anchors: Vec<AnchorView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteView {
+    #[serde(flatten)]
+    pub summary: NoteSummary,
+    pub body: String,
+    pub links: Vec<String>,
+    pub backlinks: Vec<String>,
+    /// SHA-256 of the file (`dna.note_action` needs it back as `expect_hash`).
+    pub content_hash: String,
+    pub source: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaSearch {
+    #[serde(flatten)]
+    pub at: DnaRef,
+    pub query: String,
+    /// Default 10, at most 25.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaGet {
+    #[serde(flatten)]
+    pub at: DnaRef,
+    pub slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphLink {
+    pub src: String,
+    pub dst: String,
+    /// No note named `dst`.
+    pub dangling: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaGraph {
+    pub nodes: Vec<NoteSummary>,
+    pub links: Vec<GraphLink>,
+}
+
+/// `dna.check`: what the reindex found.
+pub use mirante_core::dna::index::RefreshReport as CheckReport;
+
+#[cfg(test)]
+mod dna_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dna_params_flatten_the_ref() {
+        let s: DnaSearch = serde_json::from_value(json!({"task": "t", "query": "spool"})).unwrap();
+        assert_eq!((s.at.task.as_deref(), s.at.repo, s.limit), (Some("t"), None, None));
+        let g: DnaGet = serde_json::from_value(json!({"repo": "/r", "slug": "a"})).unwrap();
+        assert_eq!(g.at.repo.as_deref(), Some("/r"));
+        assert_eq!(serde_json::to_value(DnaRef::default()).unwrap(), json!({}));
     }
 }

@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::hub::dna::Caller;
 use crate::hub::{self, Hub};
 
 pub type OnShutdown = Arc<dyn Fn() + Send + Sync>;
@@ -261,6 +262,13 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         method::SESSION_WAKE => out(hub.wake(&params::<TaskRef>(p)?.task)),
         method::DAEMON_DOCTOR => out(hub.doctor()),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
+        method::DNA_STATUS => out(hub.dna_status(&params(p)?)),
+        method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, &Caller::Person)),
+        method::DNA_DISABLE => out(hub.dna_disable(&params(p)?, &Caller::Person)),
+        method::DNA_GRAPH => out(hub.dna_graph(&params(p)?)),
+        method::DNA_SEARCH => out(hub.dna_search(params(p)?)),
+        method::DNA_GET => out(hub.dna_get(params(p)?)),
+        method::DNA_CHECK => out(hub.dna_check(&params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
@@ -411,6 +419,32 @@ mod tests {
         assert_eq!(e.code, code::INVALID_PARAMS);
         let d = dispatch(&k.hub, method::TASK_DIFF, json!({"task": "te"})).unwrap();
         assert_eq!((d["base"].as_str(), d["files"].as_array().map(Vec::len)), (Some("trunk"), Some(0)));
+    }
+
+    #[test]
+    fn dna_methods_are_served_and_validate_params() {
+        let k = Kit::new();
+        let e = dispatch(&k.hub, method::DNA_STATUS, json!({})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        let e = dispatch(&k.hub, method::DNA_STATUS, json!({"repo": "/definitely/not/here"})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        let plain = k.dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let e = dispatch(&k.hub, method::DNA_STATUS, json!({"repo": plain})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        let repo = json!({"repo": k.repo});
+        let st = dispatch(&k.hub, method::DNA_STATUS, repo.clone()).unwrap();
+        assert_eq!(st["enabled"], false);
+        assert_eq!(dispatch(&k.hub, method::DNA_ENABLE, repo.clone()).unwrap()["enabled"], true);
+        assert_eq!(dispatch(&k.hub, method::DNA_CHECK, repo.clone()).unwrap()["notes"], 0);
+        assert_eq!(dispatch(&k.hub, method::DNA_GRAPH, repo.clone()).unwrap()["nodes"], json!([]));
+        let hits = dispatch(&k.hub, method::DNA_SEARCH, json!({"repo": k.repo, "query": "x"})).unwrap();
+        assert_eq!(hits, json!([]));
+        let e = dispatch(&k.hub, method::DNA_GET, json!({"repo": k.repo, "slug": "nope"})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        let e = dispatch(&k.hub, method::DNA_SEARCH, json!({"repo": k.repo})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        assert_eq!(dispatch(&k.hub, method::DNA_DISABLE, repo).unwrap()["enabled"], false);
     }
 
     #[test]
