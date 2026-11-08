@@ -13,6 +13,7 @@
 use std::io::{self, BufRead};
 
 use mirante_core::dna::untrusted::{self, PREAMBLE};
+use mirante_core::dna::{MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use mirante_ipc::rpc::code;
 use mirante_ipc::types::{method, AnchorView, NoteSummary, NoteView};
 use mirante_ipc::RpcError;
@@ -27,6 +28,10 @@ pub const SEARCH_DEFAULT: u64 = 8;
 pub const SEARCH_MAX: u64 = 25;
 const MAX_SLUG: usize = 200;
 const MAX_ANCHORS: usize = 8;
+/// Longest search query, anchor path and anchor symbol (bytes) sent to the daemon.
+pub const MAX_ARG_BYTES: usize = 1024;
+/// Most `[[links]]` and backlinks `memory_get` lists, each.
+const MAX_LINKS: usize = 50;
 /// One-line fields (titles, paths, reasons, error messages) are cut to this many chars.
 const MAX_FIELD: usize = 300;
 
@@ -140,6 +145,7 @@ impl<B: Backend> Server<B> {
         if query.trim().is_empty() {
             return Err(bad("query must not be empty"));
         }
+        at_most_bytes("query", query, MAX_ARG_BYTES)?;
         let limit = match args.get("limit") {
             None | Some(Value::Null) => SEARCH_DEFAULT,
             Some(v) => v.as_u64().ok_or_else(|| bad("limit must be a positive integer"))?.clamp(1, SEARCH_MAX),
@@ -183,13 +189,19 @@ impl<B: Backend> Server<B> {
         for a in &s.anchors {
             inner.push_str(&format!("- {}\n", anchor_text(a, true)));
         }
-        let links =
-            |l: &[String]| l.iter().map(|x| format!("[[{}]]", untrusted::field(x, MAX_SLUG))).collect::<Vec<_>>();
+        let links = |l: &[String]| {
+            let mut shown: Vec<String> =
+                l.iter().take(MAX_LINKS).map(|x| format!("[[{}]]", untrusted::field(x, MAX_SLUG))).collect();
+            if l.len() > MAX_LINKS {
+                shown.push(format!("and {} more", l.len() - MAX_LINKS));
+            }
+            shown.join(", ")
+        };
         if !n.links.is_empty() {
-            inner.push_str(&format!("links: {}\n", links(&n.links).join(", ")));
+            inner.push_str(&format!("links: {}\n", links(&n.links)));
         }
         if !n.backlinks.is_empty() {
-            inner.push_str(&format!("backlinks: {}\n", links(&n.backlinks).join(", ")));
+            inner.push_str(&format!("backlinks: {}\n", links(&n.backlinks)));
         }
         inner.push('\n');
         inner.push_str(&n.body);
@@ -198,11 +210,15 @@ impl<B: Backend> Server<B> {
 
     fn propose(&self, args: &Map<String, Value>) -> ToolResult {
         let title = string_arg(args, "title")?;
+        if title.chars().count() > MAX_TITLE_CHARS {
+            return Err(bad(format!("title is too long: at most {MAX_TITLE_CHARS} characters")));
+        }
         let kind = string_arg(args, "kind")?;
         if !KINDS.contains(&kind) {
             return Err(bad(format!("kind must be one of {}", KINDS.join(", "))));
         }
         let body = string_arg(args, "body")?;
+        at_most_bytes("body", body, MAX_BODY_BYTES)?;
         let list = args.get("anchors").and_then(Value::as_array).ok_or_else(|| bad("anchors must be an array"))?;
         if list.is_empty() || list.len() > MAX_ANCHORS {
             return Err(bad("cite 1 to 8 anchors: committed code this note is about"));
@@ -211,6 +227,7 @@ impl<B: Backend> Server<B> {
         for (i, a) in list.iter().enumerate() {
             let a = a.as_object().ok_or_else(|| bad(format!("anchor {} must be an object", i + 1)))?;
             let path = string_arg(a, "path")?;
+            at_most_bytes(&format!("anchor {}: path", i + 1), path, MAX_ARG_BYTES)?;
             let line = |k: &str| {
                 a.get(k)
                     .and_then(Value::as_u64)
@@ -224,7 +241,10 @@ impl<B: Backend> Server<B> {
             let mut o = json!({"path": path, "start": start, "end": end});
             match a.get("symbol") {
                 None | Some(Value::Null) => {}
-                Some(Value::String(sym)) => o["symbol"] = json!(sym),
+                Some(Value::String(sym)) => {
+                    at_most_bytes(&format!("anchor {}: symbol", i + 1), sym, MAX_ARG_BYTES)?;
+                    o["symbol"] = json!(sym)
+                }
                 Some(_) => return Err(bad(format!("anchor {}: symbol must be a string", i + 1))),
             }
             anchors.push(o);
@@ -266,6 +286,20 @@ fn anchor_text(a: &AnchorView, full: bool) -> String {
         }
     }
     s
+}
+
+/// `Err` when `value` is longer than `max` bytes: refused before it reaches the daemon.
+fn at_most_bytes(what: &str, value: &str, max: usize) -> Result<(), ToolError> {
+    if value.len() > max {
+        return Err(bad(format!("{what} is too long: at most {max} bytes")));
+    }
+    Ok(())
+}
+
+/// The error an agent sees when the daemon cannot be reached: no socket path or other
+/// local detail (the caller logs `e` to stderr).
+pub fn unreachable(_e: &io::Error) -> RpcError {
+    RpcError::new(code::INTERNAL, "the Mirante daemon is not reachable; Mirante must be running for repo memory")
 }
 
 fn string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, ToolError> {
@@ -664,6 +698,99 @@ mod tests {
         // An unknown tool is a protocol error (MCP: invalid params).
         let v = reply(&s, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rm_rf"}}));
         assert_eq!(v["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn oversized_arguments_are_refused_before_the_daemon() {
+        let f = Fake::default();
+        let s = Server::new(&f, "t1");
+        let long = "a".repeat(MAX_ARG_BYTES + 1);
+        let anchor =
+            |path: &str, symbol: &str| json!([{"path": path, "symbol": symbol, "start_line": 1, "end_line": 1}]);
+        for (tool, args) in [
+            ("memory_search", json!({"query": long})),
+            ("memory_propose", json!({"title": "t", "kind": "fact", "body": "b", "anchors": anchor(&long, "s")})),
+            ("memory_propose", json!({"title": "t", "kind": "fact", "body": "b", "anchors": anchor("a.rs", &long)})),
+            (
+                "memory_propose",
+                json!({"title": "é".repeat(121), "kind": "fact", "body": "b", "anchors": anchor("a.rs", "s")}),
+            ),
+            (
+                "memory_propose",
+                json!({"title": "t", "kind": "fact", "body": "b".repeat(16 * 1024 + 1), "anchors": anchor("a.rs", "s")}),
+            ),
+        ] {
+            let r = call_tool(&s, tool, args);
+            assert_eq!(r["isError"], true, "{tool}");
+            assert!(text_of(&r).contains("too long"), "{}", text_of(&r));
+        }
+        assert!(f.calls.borrow().is_empty(), "oversized arguments never reach the daemon");
+        // At the limits: forwarded.
+        let f = Fake::default().answering("dna.search", Ok(json!([])));
+        let s = Server::new(&f, "t1");
+        call_tool(&s, "memory_search", json!({"query": "a".repeat(MAX_ARG_BYTES)}));
+        assert_eq!(f.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn get_lists_at_most_50_links_and_backlinks() {
+        let mut note = summary("hub", "Hub", "fresh", true);
+        let many: Vec<String> = (0..80).map(|i| format!("n-{i}")).collect();
+        let extra = json!({"body": "b", "links": many, "backlinks": many, "content_hash": "ab", "source": "cli",
+            "path": "/r/.mirante/memory/hub.md"});
+        note.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let f = Fake::default().answering("dna.get", Ok(note));
+        let s = Server::new(&f, "t1");
+        let t = text_of(&call_tool(&s, "memory_get", json!({"slug": "hub"})));
+        assert_eq!(t.matches("[[n-").count(), 100, "50 links and 50 backlinks: {t}");
+        assert!(t.contains("[[n-49]]") && !t.contains("[[n-50]]"), "{t}");
+        assert_eq!(t.matches("and 30 more").count(), 2, "{t}");
+    }
+
+    #[test]
+    fn the_task_is_this_servers_whatever_the_arguments_say() {
+        let f = Fake::default()
+            .answering("dna.search", Ok(json!([])))
+            .answering("dna.get", Err(RpcError::new(code::NOT_FOUND, "no note x")))
+            .answering("dna.propose", Ok(json!({"id": "p-1", "redactions": 0})));
+        let s = Server::new(&f, "t1");
+        call_tool(&s, "memory_search", json!({"query": "q", "task": "other"}));
+        call_tool(&s, "memory_get", json!({"slug": "x", "task": "other"}));
+        let a = json!([{"path": "a.rs", "start_line": 1, "end_line": 1}]);
+        call_tool(
+            &s,
+            "memory_propose",
+            json!({"title": "t", "kind": "fact", "body": "b", "anchors": a, "task": "other"}),
+        );
+        let calls = f.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        for (m, p) in calls.iter() {
+            assert_eq!(p["task"], "t1", "{m}: {p}");
+        }
+    }
+
+    #[test]
+    fn the_last_line_needs_no_newline_and_crlf_is_one_line_end() {
+        let mut r = io::BufReader::new("{\"a\":1}\r\n{\"b\":2}".as_bytes());
+        assert_eq!(read_line_capped(&mut r, MAX_LINE).unwrap(), Some(Line::Text("{\"a\":1}".into())));
+        assert_eq!(read_line_capped(&mut r, MAX_LINE).unwrap(), Some(Line::Text("{\"b\":2}".into())));
+        assert_eq!(read_line_capped(&mut r, MAX_LINE).unwrap(), None);
+        // A lone \r inside a line stays; only a \r right before the \n goes.
+        let mut r = io::BufReader::new("a\rb\r\r\n".as_bytes());
+        assert_eq!(read_line_capped(&mut r, MAX_LINE).unwrap(), Some(Line::Text("a\rb\r".into())));
+        // Through the server: a final request without a newline is answered.
+        let f = Fake::default();
+        let s = Server::new(&f, "t1");
+        let mut r = io::BufReader::new(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.as_bytes());
+        let Some(Line::Text(l)) = read_line_capped(&mut r, MAX_LINE).unwrap() else { panic!("a line") };
+        assert!(s.handle(&l).unwrap().contains("\"result\":{}"));
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_reported_without_its_socket_path() {
+        let e = io::Error::new(io::ErrorKind::NotFound, "/Users/me/.mirante/daemon.sock: No such file");
+        let r = unreachable(&e);
+        assert!(r.message.contains("not reachable") && !r.message.contains("daemon.sock"), "{}", r.message);
     }
 
     #[test]

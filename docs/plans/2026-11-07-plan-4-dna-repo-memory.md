@@ -1095,6 +1095,7 @@ pub struct GraphLink { pub src: String, pub dst: String, pub dangling: bool }
     - Requires `MIRANTE_TASK_ID`. Without it, print to stderr and exit 0 (nothing on stdout).
     - `Paths::from_env()`. `DaemonBackend` opens one connection per call, `Client::connect(&paths.socket())` with a 30 s timeout.
     - Read stdin lines and write replies to stdout with a flush. Logs go to stderr only.
+  - **As built (Batch C review).** Arguments are capped before they reach the daemon: `query`, an anchor's `path` and `symbol` at 1 KiB each, `title` at 120 chars, `body` at 16 KiB (a tool error says which is too long). `memory_get` lists at most 50 links and 50 backlinks (then "and N more"). The `task` always comes from the server's own `MIRANTE_TASK_ID`; a `task` key in the arguments is ignored (pinned by a test). An unreachable daemon is reported to the agent without the socket path (the detail goes to stderr). The last stdin line needs no newline; `\r\n` ends a line like `\n`.
 
 - [ ] **Step 4: Run and confirm.** Run `cargo test -p mirante-mcp && cargo build -p mirante-mcp`. Expected: PASS.
 

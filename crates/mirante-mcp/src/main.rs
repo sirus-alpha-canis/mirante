@@ -19,8 +19,10 @@ struct DaemonBackend {
 
 impl Backend for DaemonBackend {
     fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        let unreachable =
-            |e: io::Error| RpcError::new(code::INTERNAL, format!("the Mirante daemon is not reachable ({e})"));
+        let unreachable = |e: io::Error| {
+            eprintln!("mirante-mcp: the daemon is not reachable: {e}");
+            mirante_mcp::unreachable(&e)
+        };
         let mut c = Client::connect(&self.paths.socket()).map_err(unreachable)?;
         c.set_timeout(Some(CALL_TIMEOUT)).map_err(unreachable)?;
         c.call(method, params).map_err(|e| match e {
