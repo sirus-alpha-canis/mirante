@@ -15,6 +15,9 @@ usage: mirante <command>
   attach <task>          live terminal (Claude) or event stream (Codex); detach with Ctrl-]
   say <task> [--queue] <message...>
                          steer now (default) or queue for the end of the running turn
+  queue ls <task>        the messages queued for the turn end, numbered (1 = next)
+  queue edit <task> <n> <message...> | queue rm <task> <n> | queue mv <task> <n> <to>
+                         change, drop or move queued message <n> (not once it is delivered)
   perms                  pending permission requests
   allow <perm> | deny <perm>
                          answer one request, once (never \"always\"); a Claude dialog is
@@ -34,6 +37,14 @@ usage: mirante <command>
 
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
 <perm> is a permission id or a unique suffix.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueCmd {
+    Ls { task: String },
+    Edit { task: String, n: usize, text: String },
+    Rm { task: String, n: usize },
+    Mv { task: String, n: usize, to: usize },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonCmd {
@@ -69,6 +80,7 @@ pub enum Cmd {
         text: String,
         queue: bool,
     },
+    Queue(QueueCmd),
     Perms,
     Answer {
         id: String,
@@ -157,6 +169,48 @@ fn task_and_text(p: &Parsed, what: &str) -> Result<(String, String), String> {
     Ok((task.clone(), text))
 }
 
+/// A 1-based queue position.
+fn position(v: &str) -> Result<usize, String> {
+    v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{v} is not a queue position (1 = next)"))
+}
+
+fn queue(args: &[String]) -> Result<QueueCmd, String> {
+    let none: &[&str] = &[];
+    let (op, rest) = args.split_first().ok_or("queue ls|edit|rm|mv <task> ...")?;
+    let p = split(rest, none, none)?;
+    let at = |i: usize, what: &str| p.positional.get(i).cloned().ok_or(format!("missing <{what}>"));
+    let exactly = |n: usize| {
+        if p.positional.len() > n {
+            Err(format!("queue {op} takes {n} arguments"))
+        } else {
+            Ok(())
+        }
+    };
+    match op.as_str() {
+        "ls" => {
+            exactly(1)?;
+            Ok(QueueCmd::Ls { task: at(0, "task")? })
+        }
+        "edit" => {
+            let (task, n) = (at(0, "task")?, position(&at(1, "n")?)?);
+            let text = p.positional[2..].join(" ");
+            if text.trim().is_empty() {
+                return Err("missing <message>".into());
+            }
+            Ok(QueueCmd::Edit { task, n, text })
+        }
+        "rm" => {
+            exactly(2)?;
+            Ok(QueueCmd::Rm { task: at(0, "task")?, n: position(&at(1, "n")?)? })
+        }
+        "mv" => {
+            exactly(3)?;
+            Ok(QueueCmd::Mv { task: at(0, "task")?, n: position(&at(1, "n")?)?, to: position(&at(2, "to")?)? })
+        }
+        other => Err(format!("unknown queue command {other} (ls, edit, rm, mv)")),
+    }
+}
+
 pub fn parse(args: &[String]) -> Result<Cmd, String> {
     let Some((sub, rest)) = args.split_first() else {
         return Ok(Cmd::Help);
@@ -202,6 +256,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             let (task, text) = task_and_text(&p, "message")?;
             Ok(Cmd::Say { task, text, queue: !p.bools.is_empty() })
         }
+        "queue" => queue(rest).map(Cmd::Queue),
         "perms" => Ok(Cmd::Perms),
         "allow" | "deny" => Ok(Cmd::Answer { id: one(&split(rest, none, none)?, "perm")?, allow: sub == "allow" }),
         "interrupt" => Ok(Cmd::Interrupt { task: one(&split(rest, none, none)?, "task")? }),
@@ -285,6 +340,22 @@ mod tests {
             Cmd::Say { task: "feat".into(), text: "--not-a-flag".into(), queue: true }
         );
         assert_eq!(p("say feat").unwrap_err(), "missing <message>");
+    }
+
+    #[test]
+    fn queue_commands_take_one_based_positions() {
+        assert_eq!(p("queue ls feat").unwrap(), Cmd::Queue(QueueCmd::Ls { task: "feat".into() }));
+        assert_eq!(
+            p("queue edit feat 2 run all the tests").unwrap(),
+            Cmd::Queue(QueueCmd::Edit { task: "feat".into(), n: 2, text: "run all the tests".into() })
+        );
+        assert_eq!(p("queue rm feat 1").unwrap(), Cmd::Queue(QueueCmd::Rm { task: "feat".into(), n: 1 }));
+        assert_eq!(p("queue mv feat 3 1").unwrap(), Cmd::Queue(QueueCmd::Mv { task: "feat".into(), n: 3, to: 1 }));
+        assert_eq!(p("queue rm feat 0").unwrap_err(), "0 is not a queue position (1 = next)");
+        assert_eq!(p("queue edit feat 1").unwrap_err(), "missing <message>");
+        assert_eq!(p("queue mv feat 1").unwrap_err(), "missing <to>");
+        assert_eq!(p("queue rm feat 1 2").unwrap_err(), "queue rm takes 2 arguments");
+        assert_eq!(p("queue pop feat").unwrap_err(), "unknown queue command pop (ls, edit, rm, mv)");
     }
 
     #[test]

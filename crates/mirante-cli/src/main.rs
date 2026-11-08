@@ -12,13 +12,14 @@ use mirante_core::model::{PermissionRequest, Status};
 use mirante_ipc::rpc::code;
 use mirante_ipc::types::{
     method, AnswerPermission, AttachParams, AttachResult, BootState, CreateTask, DaemonStatus, DoctorReport,
-    KillOrphan, ListParams, OrphanView, PermissionView, ResizeParams, SendMessage, SendMode, SendResult, Snapshot,
-    StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TrustAnswer,
+    EditQueued, KillOrphan, ListParams, OrphanView, PermissionView, QueueRef, QueuedMessage, QueuedRef, ReorderQueue,
+    ResizeParams, SendMessage, SendMode, SendResult, Snapshot, StartResult, StartSession, SubscribeParams, SystemView,
+    TaskRef, TaskView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
-use mirante_cli::args::{self, Cmd, DaemonCmd, USAGE};
+use mirante_cli::args::{self, Cmd, DaemonCmd, QueueCmd, USAGE};
 use mirante_cli::{daemon_ctl, render, term};
 
 type Res = Result<(), Box<dyn Error>>;
@@ -72,6 +73,39 @@ fn answer_in_terminal(paths: &Paths, c: &mut Client, id: &str, why: &str) -> Res
 
 /// Walks the start result: asks the user about Claude's trust dialog (unless `--trust`
 /// said yes up front), reports how the boot ended.
+/// `mirante queue ...`: positions are 1-based, resolved to message ids from a fresh list
+/// (the daemon refuses a message that left the queue meanwhile).
+fn queue(paths: &Paths, q: QueueCmd) -> Res {
+    let mut c = client(paths)?;
+    let task = match &q {
+        QueueCmd::Ls { task } | QueueCmd::Edit { task, .. } | QueueCmd::Rm { task, .. } | QueueCmd::Mv { task, .. } => {
+            task.clone()
+        }
+    };
+    let list: Vec<QueuedMessage> = c.call(method::MESSAGE_LIST_QUEUED, QueueRef { task_id: task.clone() })?;
+    let id_at = |n: usize| {
+        list.get(n - 1).map(|m| m.id.clone()).ok_or_else(|| format!("no queued message #{n} ({} queued)", list.len()))
+    };
+    let after: Vec<QueuedMessage> = match q {
+        QueueCmd::Ls { .. } => list.clone(),
+        QueueCmd::Edit { n, text, .. } => c.call(method::MESSAGE_EDIT, EditQueued { id: id_at(n)?, text })?,
+        QueueCmd::Rm { n, .. } => c.call(method::MESSAGE_REMOVE, QueuedRef { id: id_at(n)? })?,
+        QueueCmd::Mv { n, to, .. } => {
+            let id = id_at(n)?;
+            let mut ids: Vec<String> = list.iter().map(|m| m.id.clone()).filter(|i| *i != id).collect();
+            ids.insert((to - 1).min(ids.len()), id);
+            c.call(method::MESSAGE_REORDER, ReorderQueue { task_id: task, ids })?
+        }
+    };
+    if after.is_empty() {
+        println!("nothing queued");
+    }
+    for (i, m) in after.iter().enumerate() {
+        println!("{:>3}  {}", i + 1, m.text);
+    }
+    Ok(())
+}
+
 fn boot_flow(c: &mut Client, mut r: StartResult, trust: bool) -> Res {
     let id = render::short(&r.task).to_string();
     loop {
@@ -342,6 +376,7 @@ fn run(cmd: Cmd) -> Res {
                 SendMode::Queue => println!("queued (#{} in line, delivered when the turn ends)", r.queued),
             }
         }
+        Cmd::Queue(q) => queue(&paths, q)?,
         Cmd::Perms => {
             let perms: Vec<PermissionView> = client(&paths)?.call(method::PERMISSION_LIST, json!({}))?;
             print!("{}", render::perms_table(&perms));
