@@ -175,6 +175,7 @@ describe("ReviewQueue", () => {
         onSelect={() => {}}
         onReposChanged={() => {}}
         onMention={() => {}}
+        onOpen={() => {}}
         onReview={onReview}
         status={null}
       />,

@@ -5,9 +5,9 @@ import { dnaStatus } from "../lib/dna";
 import { RpcCode } from "../lib/protocol";
 import { skillProposals } from "../lib/skills";
 import { useSkillsVersion } from "../lib/useSkills";
-import type { AgentKind, DaemonStatus } from "../lib/protocol";
+import type { AgentKind, DaemonStatus, TaskView } from "../lib/protocol";
 import { addRepo, expandHome, loadRepos, normaliseRepoPath, removeRepo } from "../lib/repos";
-import type { Project } from "../store/select";
+import { needsYou, type Project, repoName } from "../store/select";
 import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
 
@@ -16,7 +16,10 @@ export function LeftRail(props: {
   selected: string | null;
   onSelect(path: string): void;
   onReposChanged(repos: string[]): void;
+  /** Selects the agent in the dispatch form and focuses its goal. */
   onMention(agent: AgentKind): void;
+  /** Opens a task's detail (`"Terminal"` when it needs the person). */
+  onOpen(taskId: string, tab?: "Terminal"): void;
   /** Opens the memory review queue of a project. */
   onReview?(path: string): void;
   /** Opens the Skills view. */
@@ -46,12 +49,28 @@ export function LeftRail(props: {
   const [path, setPath] = useState("");
   const [error, setError] = useState<string | null>(null);
   const agents = useMemo(() => {
-    const count = (a: AgentKind) => Object.values(s.tasks).filter((t) => t.agent === a && t.live).length;
+    const live = (a: AgentKind) =>
+      Object.values(s.tasks)
+        .filter((t) => t.agent === a && t.live)
+        .sort((x, y) => x.created_at - y.created_at);
     return [
-      { agent: "claude" as const, live: count("claude") },
-      { agent: "codex" as const, live: count("codex") },
+      { agent: "claude" as const, live: live("claude") },
+      { agent: "codex" as const, live: live("codex") },
     ];
   }, [s.tasks]);
+  // The agent whose live sessions are listed to pick from (it has several).
+  const [picking, setPicking] = useState<AgentKind | null>(null);
+  const openTask = (t: TaskView) => {
+    setPicking(null);
+    props.onOpen(t.id, needsYou(t) ? "Terminal" : undefined);
+  };
+  /** One live session: open it. Several: list them. None: write it a new task. */
+  const agentClick = (a: { agent: AgentKind; live: TaskView[] }) => {
+    if (a.live.length === 1) return openTask(a.live[0]);
+    if (a.live.length > 1) return setPicking((p) => (p === a.agent ? null : a.agent));
+    setPicking(null);
+    props.onMention(a.agent);
+  };
 
   /** Adds a typed or picked folder: "~/…" expanded with the app's home, then it must be a
    * folder (whether it is a git checkout the daemon checks when a task is created there). */
@@ -156,16 +175,57 @@ export function LeftRail(props: {
       <h2>Agents</h2>
       <ul>
         {agents.map((a) => (
-          <li key={a.agent}>
-            <button className="rail-item" onClick={() => props.onMention(a.agent)} title={`Start a message to @${a.agent}`}>
+          <li
+            key={a.agent}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && picking === a.agent) setPicking(null);
+            }}
+          >
+            <button
+              className="rail-item"
+              onClick={() => agentClick(a)}
+              aria-expanded={a.live.length > 1 ? picking === a.agent : undefined}
+              title={
+                a.live.length === 0
+                  ? `Write a task for @${a.agent}`
+                  : a.live.length === 1
+                    ? `Open ${a.live[0].branch}`
+                    : `Pick one of the ${a.live.length} live @${a.agent} sessions`
+              }
+            >
               <span>@{a.agent}</span>
-              <span className="muted small">{a.live} live</span>
+              <span className="muted small">{a.live.length} live</span>
             </button>
+            {picking === a.agent && a.live.length > 1 && (
+              <ul className="rail-pick" aria-label={`Live @${a.agent} sessions`}>
+                {a.live.map((t) => (
+                  <li key={t.id}>
+                    <button className="rail-item" onClick={() => openTask(t)} title={t.title}>
+                      <span>
+                        {t.branch} · {repoName(t.repo_path)}
+                      </span>
+                      <span className={`small ${needsYou(t) ? "warn" : "muted"}`}>{needsYou(t) ? "needs you" : t.status}</span>
+                    </button>
+                  </li>
+                ))}
+                <li>
+                  <button
+                    className="btn btn-small btn-ghost"
+                    onClick={() => {
+                      setPicking(null);
+                      props.onMention(a.agent);
+                    }}
+                  >
+                    New @{a.agent} task
+                  </button>
+                </li>
+              </ul>
+            )}
           </li>
         ))}
       </ul>
       {props.onSkills && <SkillsEntry onOpen={props.onSkills} />}
-      <MemoryPanel status={props.status} />
+      <MemoryPanel status={props.status} onOpen={(id) => props.onOpen(id)} />
     </nav>
   );
 }

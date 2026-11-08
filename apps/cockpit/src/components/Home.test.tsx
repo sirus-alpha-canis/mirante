@@ -234,6 +234,51 @@ describe("Home (V3 group chat)", () => {
     expect(screen.getByLabelText("Goal")).toHaveFocus();
   });
 
+  it("an agent in the rail with one live session opens it (Terminal when it needs you)", async () => {
+    const h = setup({}, [task("a", { status: "needs_you" }), task("x", { agent: "codex", status: "working" }), task("z", { agent: "codex", live: false })]);
+    const rail = screen.getByRole("navigation", { name: "Projects and agents" });
+    await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));
+    await userEvent.click(within(rail).getByRole("button", { name: /^@codex/ }));
+    expect(h.opened).toEqual([
+      ["a", "Terminal"],
+      ["x", undefined],
+    ]);
+  });
+
+  it("an agent with several live sessions lists them to pick from; Escape closes the list", async () => {
+    const h = setup({}, [
+      task("a", { status: "working" }),
+      task("b", { status: "needs_you", repo_path: "/repos/api" }),
+      task("x", { agent: "codex" }),
+    ]);
+    const rail = screen.getByRole("navigation", { name: "Projects and agents" });
+    await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));
+    const list = within(rail).getByRole("list", { name: "Live @claude sessions" });
+    expect(within(list).getAllByRole("button").map((b) => b.textContent)).toEqual(["feat/a · shopworking", "feat/b · apineeds you", "New @claude task"]);
+    await userEvent.keyboard("{Escape}");
+    expect(within(rail).queryByRole("list", { name: "Live @claude sessions" })).toBeNull();
+    await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));
+    await userEvent.click(within(rail).getByRole("button", { name: /^feat\/b/ }));
+    expect(h.opened).toEqual([["b", "Terminal"]]);
+    expect(within(rail).queryByRole("list", { name: "Live @claude sessions" })).toBeNull();
+  });
+
+  it("the list of live sessions also offers a new task", async () => {
+    setup({}, [task("a"), task("b")]);
+    const rail = screen.getByRole("navigation", { name: "Projects and agents" });
+    await userEvent.click(within(rail).getByRole("button", { name: /^@claude/ }));
+    await userEvent.click(within(rail).getByRole("button", { name: "New @claude task" }));
+    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("Goal")).toHaveFocus();
+  });
+
+  it("a session named in the memory panel opens its detail", async () => {
+    const h = setup({}, [task("a", { status: "working", memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })]);
+    const panel = screen.getByRole("region", { name: "Memory guard" });
+    await userEvent.click(within(panel).getByRole("button", { name: "feat/a" }));
+    expect(h.opened).toEqual([["a", undefined]]);
+  });
+
   it("adding a repo takes an absolute path only", async () => {
     setup();
     await userEvent.type(screen.getByLabelText("Repository path"), "shop{Enter}");

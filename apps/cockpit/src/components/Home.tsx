@@ -61,6 +61,7 @@ export function Home(props: {
         onSelect={props.onProject}
         onReposChanged={props.onReposChanged}
         onMention={mention}
+        onOpen={props.onOpen}
         onReview={props.onReview}
         onSkills={props.onSkills}
         status={props.status}

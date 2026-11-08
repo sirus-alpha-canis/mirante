@@ -108,6 +108,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .rail-item { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 6px; background: none; border: none; border-radius: 6px; padding: 6px 8px; cursor: pointer; text-align: left; flex-wrap: wrap; }
 .rail-item:hover, .rail-item.selected { background: var(--panel-2); }
 .rail-row { display: flex; align-items: center; gap: 2px; }
+.rail-pick { margin: 2px 0 6px 10px !important; border-left: 1px solid var(--line); padding-left: 4px !important; }
 .btn-ghost { border-color: transparent; background: none; color: var(--muted); }
 .badge { background: var(--needs); color: var(--panel); border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: 700; }
 .add-repo { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }

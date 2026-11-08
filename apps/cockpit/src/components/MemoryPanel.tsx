@@ -75,7 +75,7 @@ export function HibernateButton({ t }: { t: TaskView }) {
 }
 
 /** The daemon's memory guard: machine pressure, the heaviest sessions, the latest notices. */
-export function MemoryPanel({ status }: { status: DaemonStatus | null }) {
+export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; onOpen?(taskId: string): void }) {
   const s = useStore();
   const sys = systemMemory(status);
   const heavy = useMemo(
@@ -108,7 +108,13 @@ export function MemoryPanel({ status }: { status: DaemonStatus | null }) {
             const m = taskMemory(t);
             return (
               <li key={t.id} className={m ? `mem-${m.state}` : ""}>
-                <span className="mem-name">{t.branch}</span>
+                {onOpen ? (
+                  <button className="mem-name link" title={`Open ${t.title}`} onClick={() => onOpen(t.id)}>
+                    {t.branch}
+                  </button>
+                ) : (
+                  <span className="mem-name">{t.branch}</span>
+                )}
                 <span className="muted small">{m ? `${mb(m.bytes)} / ${mb(m.budget)}` : "hibernated"}</span>
                 <HibernateButton t={t} />
               </li>
