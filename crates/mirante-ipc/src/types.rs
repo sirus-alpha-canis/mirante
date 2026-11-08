@@ -1046,6 +1046,10 @@ pub struct SkillLintParams {
     pub body: String,
     /// `personal`, `org:<prefix>` or `repo:<key>`.
     pub scope: String,
+    /// The proposal being reviewed: its bundled files are linted and their secrets counted
+    /// with the draft (default: none, a draft without files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
