@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useEnv } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { M, RpcCode, type SendMode, type SendResult, type TaskView } from "../lib/protocol";
@@ -6,40 +6,74 @@ import { M, RpcCode, type SendMode, type SendResult, type TaskView } from "../li
 /**
  * Mid-run messages. "Steer now" reaches the agent at its next step (Claude: next tool
  * boundary; Codex: turn/steer); "Queue" is held by the daemon until the turn ends. When the
- * agent cannot be steered the daemon says so (UNSUPPORTED) and the fallback is offered:
- * interrupt, then send as a new prompt.
+ * agent cannot be steered the daemon says so (UNSUPPORTED, or an older daemon without the
+ * method) and the fallback is offered: interrupt, then send as a new prompt.
+ *
+ * One send at a time: a double click, key auto-repeat or a second shortcut while a send is
+ * in flight does nothing. Mount with `key={t.id}` so a draft never follows another task.
  */
 export function MessageComposer({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
   const [text, setText] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [fallback, setFallback] = useState(false);
+  // A ref, not only `busy`: a second click arrives before React re-renders.
+  const inFlight = useRef(false);
+  const [busy, setBusy] = useState(false);
 
-  const send = async (mode: SendMode) => {
-    if (!text.trim()) return;
-    setNote(null);
-    setFallback(false);
+  const guarded = async (work: () => Promise<void>) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setBusy(true);
     try {
-      const r = await rpc<SendResult>(M.messageSend, { task: t.id, text, mode });
-      setText("");
+      await work();
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  };
+
+  /** Sends `msg` (captured when the user acted); clears the box only if it still holds it. */
+  const deliver = async (msg: string, mode: SendMode) => {
+    try {
+      const r = await rpc<SendResult>(M.messageSend, { task: t.id, text: msg, mode });
+      setText((cur) => (cur === msg ? "" : cur));
       setNote(r.delivered === "steer" ? "sent now" : `queued (#${r.queued}, delivered when the turn ends)`);
     } catch (e) {
       const err = e instanceof DaemonError ? e : null;
-      if (err?.code === RpcCode.UNSUPPORTED) setFallback(true);
+      if (err?.unsupported) setFallback(true);
       setNote(err?.code === RpcCode.NEEDS_YOU ? "answer the open request first" : String(err?.message ?? e));
     }
   };
 
-  const interruptThenSend = async () => {
-    try {
-      await rpc(M.sessionInterrupt, { task: t.id });
-      await send("queue");
-    } catch (e) {
-      setNote(e instanceof Error ? e.message : String(e));
-    }
+  const send = (mode: SendMode) => {
+    const msg = text;
+    if (!msg.trim()) return;
+    return guarded(async () => {
+      setNote(null);
+      setFallback(false);
+      await deliver(msg, mode);
+    });
+  };
+
+  const interruptThenSend = () => {
+    const msg = text;
+    if (!msg.trim()) return;
+    return guarded(async () => {
+      setFallback(false);
+      setNote(null);
+      try {
+        await rpc(M.sessionInterrupt, { task: t.id });
+      } catch (e) {
+        setNote(e instanceof Error ? e.message : String(e));
+        return;
+      }
+      await deliver(msg, "queue");
+    });
   };
 
   if (!t.live) return <p className="muted small composer-off">No live session: resume it to talk to the agent.</p>;
+  const empty = !text.trim();
   return (
     <div className="composer">
       <label htmlFor={`msg-${t.id}`} className="sr-only">
@@ -52,6 +86,8 @@ export function MessageComposer({ t }: { t: TaskView }) {
         placeholder="Message the agent (⌘↵ steer now, ⌥↵ queue)"
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
+          // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
             e.preventDefault();
             void send("steer");
@@ -62,14 +98,14 @@ export function MessageComposer({ t }: { t: TaskView }) {
         }}
       />
       <div className="composer-actions">
-        <button className="btn btn-primary" onClick={() => send("steer")} disabled={!text.trim()}>
+        <button className="btn btn-primary" onClick={() => send("steer")} disabled={empty || busy}>
           Steer now
         </button>
-        <button className="btn" onClick={() => send("queue")} disabled={!text.trim()}>
+        <button className="btn" onClick={() => send("queue")} disabled={empty || busy}>
           Queue
         </button>
         {fallback && (
-          <button className="btn btn-warn" onClick={interruptThenSend}>
+          <button className="btn btn-warn" onClick={interruptThenSend} disabled={empty || busy}>
             Interrupt and send
           </button>
         )}

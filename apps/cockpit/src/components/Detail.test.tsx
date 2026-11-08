@@ -1,5 +1,6 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { TaskView } from "../lib/protocol";
 
@@ -7,10 +8,14 @@ vi.mock("./TerminalTab", () => ({
   TerminalTab: ({ t }: { t: TaskView }) => <div aria-label={`Terminal of ${t.branch}`}>terminal here</div>,
 }));
 
-import { RpcCode } from "../lib/protocol";
+import { RpcCode, type TaskDiff } from "../lib/protocol";
 import { ev, task } from "../test/fixtures";
+import { EnvContext, type Env } from "../env";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { Detail } from "./Detail";
+
+// The same element type `renderWith` renders, so a rerender updates instead of remounting.
+const wrap = (env: Env, ui: ReactElement) => <EnvContext.Provider value={env}>{ui}</EnvContext.Provider>;
 
 function setup(answers = {}, tasks = [task("a", { status: "working" }), task("b", { status: "needs_you" })], events = [ev(1, "a", "step", { type: "command", command: "npm test", exit_code: 1 })]) {
   const h = makeEnv(answers);
@@ -91,5 +96,138 @@ describe("Detail (V1 classic)", () => {
     renderWith(h.env, <Detail taskId="a" onSelect={() => {}} initialTab="Terminal" />);
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Terminal of feat/a")).toBeInTheDocument();
+  });
+
+  it("Home and End jump between tabs, arrows move focus with the selection, all tabs control one panel", async () => {
+    setup();
+    screen.getByRole("tab", { name: "Steps" }).focus();
+    await userEvent.keyboard("{ArrowRight}");
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveFocus();
+    await userEvent.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: "Memory" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Memory" })).toHaveFocus();
+    await userEvent.keyboard("{Home}");
+    expect(screen.getByRole("tab", { name: "Steps" })).toHaveFocus();
+    const panel = screen.getByRole("tabpanel");
+    for (const tab of screen.getAllByRole("tab")) expect(tab).toHaveAttribute("aria-controls", panel.id);
+  });
+
+  it("a new focusTerminalNonce selects the Terminal tab again", async () => {
+    const h = makeEnv();
+    h.load([task("a", { status: "needs_you" })]);
+    const r = renderWith(h.env, <Detail taskId="a" onSelect={() => {}} focusTerminalNonce={1} />);
+    // Mounting with a nonce is not a request: initialTab says where to open.
+    expect(screen.getByRole("tab", { name: "Steps" })).toHaveAttribute("aria-selected", "true");
+    r.rerender(wrap(h.env, <Detail taskId="a" onSelect={() => {}} focusTerminalNonce={2} />));
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    await userEvent.click(screen.getByRole("tab", { name: "Steps" }));
+    r.rerender(wrap(h.env, <Detail taskId="a" onSelect={() => {}} focusTerminalNonce={3} />));
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("Stop asks first; Cancel stops nothing", async () => {
+    const h = setup({ "session.stop": {} });
+    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(h.calls.map((c) => c[0])).not.toContain("session.stop");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("button", { name: "Stop the session" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await userEvent.click(screen.getByRole("button", { name: "Stop the session" }));
+    expect(h.calls).toContainEqual(["session.stop", { task: "a" }]);
+  });
+
+  it("a session action runs once while in flight, and a later success clears the error", async () => {
+    let n = 0;
+    let release!: () => void;
+    const h = setup({
+      "session.interrupt": () => {
+        n++;
+        if (n === 1) return rpcError(RpcCode.DRIVER, "agent busy");
+        return new Promise<object>((res) => (release = () => res({})));
+      },
+    });
+    const btn = screen.getByRole("button", { name: "Interrupt" });
+    await userEvent.click(btn);
+    expect(await screen.findByRole("alert")).toHaveTextContent("agent busy");
+    await userEvent.dblClick(btn);
+    expect(h.calls.filter((c) => c[0] === "session.interrupt")).toHaveLength(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+    await act(async () => release());
+  });
+
+  it("Steer now sends once on a double click", async () => {
+    const h = setup({ "message.send": () => new Promise(() => {}) });
+    await userEvent.type(screen.getByLabelText("Message to the agent"), "hi");
+    await userEvent.dblClick(screen.getByRole("button", { name: "Steer now" }));
+    fireEvent.keyDown(screen.getByLabelText("Message to the agent"), { key: "Enter", metaKey: true });
+    expect(h.calls.filter((c) => c[0] === "message.send")).toHaveLength(1);
+  });
+
+  it("Enter that ends an IME composition sends nothing", () => {
+    const h = setup({ "message.send": { delivered: "steer", queued: 0 } });
+    const box = screen.getByLabelText("Message to the agent");
+    fireEvent.change(box, { target: { value: "日本" } });
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true, isComposing: true });
+    expect(h.calls.filter((c) => c[0] === "message.send")).toHaveLength(0);
+  });
+
+  it("an unknown method (older daemon) also offers interrupt-and-send", async () => {
+    setup({ "message.send": rpcError(RpcCode.METHOD_NOT_FOUND, "no such method") });
+    await userEvent.type(screen.getByLabelText("Message to the agent"), "stop");
+    await userEvent.click(screen.getByRole("button", { name: "Steer now" }));
+    expect(await screen.findByRole("button", { name: "Interrupt and send" })).toBeInTheDocument();
+  });
+
+  it("Interrupt and send runs once, and not at all once the text is emptied", async () => {
+    let release!: () => void;
+    const h = setup({
+      "message.send": (p: Record<string, unknown>) => (p.mode === "steer" ? rpcError(RpcCode.UNSUPPORTED, "cannot steer") : { delivered: "queue", queued: 1 }),
+      "session.interrupt": () => new Promise<object>((res) => (release = () => res({}))),
+    });
+    const box = screen.getByLabelText("Message to the agent");
+    await userEvent.type(box, "stop");
+    await userEvent.click(screen.getByRole("button", { name: "Steer now" }));
+    const fallback = await screen.findByRole("button", { name: "Interrupt and send" });
+    await userEvent.dblClick(fallback);
+    expect(h.calls.filter((c) => c[0] === "session.interrupt")).toHaveLength(1);
+    await act(async () => release());
+    await waitFor(() => expect(h.calls.at(-1)).toEqual(["message.send", { task: "a", text: "stop", mode: "queue" }]));
+
+    // Again, but the box is emptied before choosing the fallback: nothing is interrupted.
+    await userEvent.type(box, "again");
+    await userEvent.click(screen.getByRole("button", { name: "Steer now" }));
+    const again = await screen.findByRole("button", { name: "Interrupt and send" });
+    await userEvent.clear(box);
+    await userEvent.click(again);
+    expect(h.calls.filter((c) => c[0] === "session.interrupt")).toHaveLength(1);
+  });
+
+  it("switching task clears the draft", async () => {
+    const h = makeEnv();
+    h.load([task("a", { status: "working" }), task("b", { status: "working" })]);
+    const r = renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    await userEvent.type(screen.getByLabelText("Message to the agent"), "for a only");
+    r.rerender(wrap(h.env, <Detail taskId="b" onSelect={() => {}} />));
+    expect(screen.getByLabelText("Message to the agent")).toHaveValue("");
+  });
+
+  it("switching task shows the new task's diff loading, never the old one's", async () => {
+    const diff = (base: string): TaskDiff => ({ base, merge_base: "abcdef123456", files: [{ path: `${base}.ts`, added: 1, removed: 0 }], untracked: [], patch: "+x", truncated: false, compare_url: null, pushed: false });
+    const h = makeEnv({ "task.diff": (p: Record<string, unknown>) => (p.task === "a" ? diff("main-a") : new Promise(() => {})) });
+    h.load([task("a", { status: "working" }), task("b", { status: "working" })]);
+    const r = renderWith(h.env, <Detail taskId="a" onSelect={() => {}} initialTab="Diff" />);
+    expect(await screen.findByText("main-a.ts")).toBeInTheDocument();
+    r.rerender(wrap(h.env, <Detail taskId="b" onSelect={() => {}} initialTab="Diff" />));
+    expect(screen.queryByText("main-a.ts")).toBeNull();
+    expect(screen.getByText("Reading the diff…")).toBeInTheDocument();
+  });
+
+  it("Open PR that fails to open the browser says so", async () => {
+    const h = makeEnv({ "task.diff": { base: "main", merge_base: "abcdef123456", files: [], untracked: [], patch: "", truncated: false, compare_url: "https://github.com/acme/shop/compare/main...feat/a", pushed: true } });
+    h.load([task("a", { status: "working" })]);
+    (h.env.openUrl as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("denied"));
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} initialTab="Diff" />);
+    await userEvent.click(await screen.findByRole("button", { name: "Open PR" }));
+    expect(await screen.findByText(/could not open the browser/)).toBeInTheDocument();
   });
 });
