@@ -8,7 +8,7 @@ use super::DnaError;
 /// Deserializing validates exactly like [`Anchor::parse`]: an anchor from JSON (a stored
 /// proposal, a wire message) can never carry a commit or path that git would read as an
 /// option.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "RawAnchor")]
 pub struct Anchor {
     pub path: String,

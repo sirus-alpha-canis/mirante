@@ -8,7 +8,7 @@ use serde_json::json;
 use std::path::Path;
 
 use super::anchor::Anchor;
-use super::check::{check_all, memory_files_at, rev_parse, AnchorState};
+use super::check::{check_since, memory_files_at, rev_parse, AnchorState, Previous};
 use super::fsio::MemoryDir;
 use super::{note, sha256_hex, DnaError, MAX_NOTES};
 use crate::error::{CoreError, Result};
@@ -378,6 +378,32 @@ impl Store {
         set_anchor_states(&tx, repo, head, states)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The anchor states of the last check and the HEAD they were found at, for
+    /// [`check_scan`] to reuse; `None` before any check at a commit.
+    pub fn dna_previous(&self, repo: &str) -> Result<Option<Previous>> {
+        let Some(head) = self.dna_repo(repo)?.and_then(|r| r.checked_head) else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT path, symbol, line_start, line_end, commit_sha, fingerprint, state, reason, now_start, now_end
+             FROM dna_anchors WHERE repo = ?1",
+        )?;
+        let rows = stmt.query_map([repo], |r| {
+            let state: String = r.get(6)?;
+            let anchor = Anchor {
+                path: r.get(0)?,
+                symbol: r.get(1)?,
+                start: r.get(2)?,
+                end: r.get(3)?,
+                commit: r.get(4)?,
+                fingerprint: r.get(5)?,
+            };
+            Ok((anchor, state_from(&state, r.get(7)?, (r.get(8)?, r.get(9)?))))
+        })?;
+        let states = rows.collect::<rusqlite::Result<_>>()?;
+        Ok(Some(Previous { head, states }))
     }
 
     fn dna_anchors_of(&self, repo: &str, slug: &str) -> Result<Vec<IndexedAnchor>> {
@@ -813,8 +839,10 @@ fn add_file(
 pub type Checks = (Option<String>, Vec<(String, u32, AnchorState)>);
 
 /// Anchor states of a scan's notes at the repo's HEAD. git only; no store. Without a HEAD
-/// commit every anchor stays `Unchecked`.
-pub fn check_scan(repo: &Path, scan: &Scan) -> std::result::Result<Checks, DnaError> {
+/// commit every anchor stays `Unchecked`. `prev`: the states of the last check
+/// ([`Store::dna_previous`]), reused for anchors whose path did not change since
+/// ([`check_since`]); `None` checks every anchor.
+pub fn check_scan(repo: &Path, scan: &Scan, prev: Option<&Previous>) -> std::result::Result<Checks, DnaError> {
     let keys: Vec<(String, u32, Anchor)> = scan
         .notes
         .iter()
@@ -824,7 +852,7 @@ pub fn check_scan(repo: &Path, scan: &Scan) -> std::result::Result<Checks, DnaEr
         return Ok((None, keys.into_iter().map(|(s, i, _)| (s, i, AnchorState::Unchecked)).collect()));
     };
     let anchors: Vec<Anchor> = keys.iter().map(|(_, _, a)| a.clone()).collect();
-    let checked = check_all(repo, &head, &anchors)?;
+    let checked = check_since(repo, &head, &anchors, prev)?;
     Ok((Some(head), keys.into_iter().zip(checked).map(|((s, i, _), c)| (s, i, c.state)).collect()))
 }
 
@@ -854,12 +882,14 @@ fn dna(e: DnaError) -> CoreError {
     CoreError::Io(std::io::Error::other(e.to_string()))
 }
 
-/// Re-reads `.mirante/memory` into the index and checks every anchor at HEAD. Notes that
-/// do not parse are listed, never deleted.
+/// Re-reads `.mirante/memory` into the index and checks every anchor at HEAD (reusing the
+/// last check's states where the cited path did not change). Notes that do not parse are
+/// listed, never deleted.
 pub fn refresh(store: &mut Store, repo: &Path) -> Result<RefreshReport> {
     let key = repo_key(repo).map_err(dna)?;
     let scan = scan(repo).map_err(dna)?;
-    let checks = check_scan(repo, &scan).map_err(dna)?;
+    let prev = store.dna_previous(&key)?;
+    let checks = check_scan(repo, &scan, prev.as_ref()).map_err(dna)?;
     apply(store, &key, &scan, &checks)
 }
 
@@ -1310,6 +1340,32 @@ mod refresh_tests {
         // A hand edit is new content: unreviewed again.
         std::fs::write(r.path().join(".mirante/memory/good.md"), text.replace("body", "edited")).unwrap();
         assert_eq!(refresh(&mut s, r.path()).unwrap().unreviewed, 1);
+    }
+
+    #[test]
+    fn a_refresh_after_head_moves_starts_from_the_stored_states() {
+        let r = TempDir::new("dna-since");
+        plain(r.path(), &["init", "-q", "-b", "main"]);
+        commit_file(r.path(), "src/a.rs", CODE);
+        commit_file(r.path(), "src/b.rs", CODE);
+        fsio::init(r.path()).unwrap();
+        let dir = r.path().join(".mirante/memory");
+        std::fs::write(dir.join("a.md"), note_text(r.path(), "a", "src/a.rs", 2, 4)).unwrap();
+        std::fs::write(dir.join("b.md"), note_text(r.path(), "b", "src/b.rs", 2, 4)).unwrap();
+        let mut s = Store::open_in_memory().unwrap();
+        let key = repo_key(r.path()).unwrap();
+        assert!(s.dna_previous(&key).unwrap().is_none(), "nothing checked yet");
+        refresh(&mut s, r.path()).unwrap();
+        let prev = s.dna_previous(&key).unwrap().expect("states at the checked head");
+        assert_eq!(prev.head, rev_parse(r.path(), "HEAD").unwrap());
+        assert_eq!(prev.states.len(), 2);
+        assert!(prev.states.values().all(|st| *st == AnchorState::Fresh));
+        // b's cited lines change between the stored HEAD and the new one: stale, not reused.
+        commit_file(r.path(), "src/b.rs", &CODE.replace("write()", "flush()"));
+        let rep = refresh(&mut s, r.path()).unwrap();
+        assert_eq!((rep.stale, rep.relocated), (1, 0));
+        assert_eq!(s.dna_note(&key, "a").unwrap().unwrap().anchors[0].state, AnchorState::Fresh);
+        assert!(matches!(s.dna_note(&key, "b").unwrap().unwrap().anchors[0].state, AnchorState::Stale { .. }));
     }
 
     #[test]

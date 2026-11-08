@@ -327,19 +327,22 @@ impl Hub {
         gates.entry(key_of(repo)).or_default().clone()
     }
 
-    /// Reindexes `repo` (git and file reads without the hub lock), one refresh at a time.
+    /// Reindexes `repo` (git and file reads without the hub lock), one refresh at a time,
+    /// reusing the last check's anchor states where their path did not change.
     pub(crate) fn dna_refresh(&self, repo: &Path) -> Result<RefreshReport> {
         let gate = self.dna_gate(repo);
         let _one = gate.lock().unwrap_or_else(|p| p.into_inner());
-        self.dna_refresh_gated(repo)
+        self.dna_refresh_gated(repo, true)
     }
 
-    /// The refresh itself (the caller holds the repo's gate). Emits `dna.indexed` only when
-    /// the head or a count changed since the last one.
-    fn dna_refresh_gated(&self, repo: &Path) -> Result<RefreshReport> {
-        let scan = index::scan(repo).map_err(dna_err)?;
-        let checks = index::check_scan(repo, &scan).map_err(dna_err)?;
+    /// The refresh itself (the caller holds the repo's gate). `reuse`: start from the
+    /// stored states ([`index::check_scan`]); false rechecks every anchor. Emits
+    /// `dna.indexed` only when the head or a count changed since the last one.
+    fn dna_refresh_gated(&self, repo: &Path, reuse: bool) -> Result<RefreshReport> {
         let key = key_of(repo);
+        let prev = if reuse { self.lock().store.dna_previous(&key)? } else { None };
+        let scan = index::scan(repo).map_err(dna_err)?;
+        let checks = index::check_scan(repo, &scan, prev.as_ref()).map_err(dna_err)?;
         let mut st = self.lock();
         let rep = index::apply(&mut st.store, &key, &scan, &checks)?;
         st.dna_sigs.insert(key.clone(), scan.signature);
@@ -368,7 +371,7 @@ impl Hub {
             index::needs_refresh(&st.store, &key, &probe, st.dna_sigs.get(&key).map(String::as_str))?
         };
         if stale {
-            self.dna_refresh_gated(repo)?;
+            self.dna_refresh_gated(repo, true)?;
         }
         Ok(())
     }
@@ -542,10 +545,12 @@ impl Hub {
         self.dna_status_of(&repo)
     }
 
-    /// Reindexes and rechecks every anchor at the checkout's HEAD.
+    /// Reindexes and rechecks every anchor at the checkout's HEAD (nothing reused).
     pub fn dna_check(&self, at: &DnaRef) -> Result<CheckReport> {
         let repo = self.dna_repo_of(at)?;
-        self.dna_refresh(&repo)
+        let gate = self.dna_gate(&repo);
+        let _one = gate.lock().unwrap_or_else(|p| p.into_inner());
+        self.dna_refresh_gated(&repo, false)
     }
 
     pub(crate) fn dna_summaries(&self, key: &str, rows: &[NoteRow], view: View) -> Result<Vec<NoteSummary>> {

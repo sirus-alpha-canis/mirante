@@ -4,9 +4,11 @@
 //! agents can write, outside their sandbox. Anchors are validated before any of their
 //! fields reaches git; revisions follow `--end-of-options`; paths are passed as
 //! `<commit>:<path>` object names on `cat-file`'s stdin, or with `--literal-pathspecs`,
-//! never as globs. One [`check_all`] runs a fixed number of git processes: `rev-parse` per
-//! distinct cited commit, one `diff` per distinct commit, then one `cat-file --batch-check`
-//! and one `cat-file --batch` for every blob it reads.
+//! never as globs. One [`check_all`] runs a fixed number of git processes whatever the
+//! anchors cite: `rev-parse`, one `cat-file --batch-check` (which cited commits exist), one
+//! `diff-tree --stdin` (the paths changed since each), then one `cat-file --batch-check`
+//! and one `cat-file --batch` for every blob it reads. [`check_since`] also reuses the
+//! states found at an earlier HEAD for anchors whose path did not change since.
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
@@ -210,7 +212,7 @@ pub fn rev_parse(repo: &Path, rev: &str) -> Result<String, DnaError> {
 }
 
 fn commit_exists(repo: &Path, commit: &str) -> bool {
-    rev_parse(repo, commit).is_ok()
+    is_full_sha(commit) && existing_commits(repo, &[commit]).is_ok_and(|e| e.contains(commit))
 }
 
 /// The text of `path` at `commit` (a full sha), `None` when the commit has no such path.
@@ -263,48 +265,143 @@ pub fn cite(
     Anchor::parse(&a.render())
 }
 
+/// The cited commits, among `commits` (full shas), that exist as commit objects: one
+/// `cat-file --batch-check` for all of them.
+fn existing_commits(repo: &Path, commits: &[&str]) -> Result<HashSet<String>, DnaError> {
+    if commits.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut input = Vec::new();
+    for c in commits {
+        if !is_full_sha(c) {
+            return Err(DnaError::Git(format!("{c:?} is not a full sha")));
+        }
+        input.extend_from_slice(format!("{c}\n").as_bytes());
+    }
+    let out = git_with_input(repo, &["cat-file", "--batch-check"], input)?;
+    let lines: Vec<&[u8]> = out.split(|b| *b == b'\n').take(commits.len()).collect();
+    if lines.len() != commits.len() {
+        return Err(DnaError::Git("unexpected cat-file --batch-check output".into()));
+    }
+    Ok(commits
+        .iter()
+        .zip(lines)
+        .filter(|(c, line)| line.starts_with(format!("{c} commit ").as_bytes()))
+        .map(|(c, _)| c.to_string())
+        .collect())
+}
+
+/// The paths changed between each of `commits` (full shas of existing commits) and `head`:
+/// one `diff-tree --stdin` for all of them. With `--name-status -z` every path follows a
+/// one-letter status, so a header (the commit, echoed before a non-empty diff) cannot be
+/// confused with a path, even one named like a commit.
+fn changed_since(repo: &Path, commits: &[&str], head: &str) -> Result<HashMap<String, HashSet<String>>, DnaError> {
+    let mut changed: HashMap<String, HashSet<String>> =
+        commits.iter().map(|c| (c.to_string(), HashSet::new())).collect();
+    if commits.is_empty() {
+        return Ok(changed);
+    }
+    if !is_full_sha(head) {
+        return Err(DnaError::Git(format!("{head:?} is not a full sha")));
+    }
+    let mut input = Vec::new();
+    for c in commits {
+        if !is_full_sha(c) {
+            return Err(DnaError::Git(format!("{c:?} is not a full sha")));
+        }
+        input.extend_from_slice(format!("{c} {head}\n").as_bytes());
+    }
+    let args = ["diff-tree", "--stdin", "-r", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z"];
+    let out = git_with_input(repo, &args, input)?;
+    let bad = || DnaError::Git("unexpected diff-tree output".into());
+    let mut tokens = out.split(|b| *b == 0).filter(|t| !t.is_empty());
+    // Headers come in input order (a commit with no change prints none).
+    let mut expected = commits.iter();
+    let mut current_key: Option<&str> = None;
+    while let Some(tok) = tokens.next() {
+        if tok.len() == 1 && tok[0].is_ascii_uppercase() {
+            let path = tokens.next().ok_or_else(bad)?;
+            let key = current_key.ok_or_else(bad)?;
+            changed.get_mut(key).ok_or_else(bad)?.insert(String::from_utf8_lossy(path).into_owned());
+        } else {
+            let header = std::str::from_utf8(tok).map_err(|_| bad())?;
+            let next = expected.by_ref().find(|c| **c == header).ok_or_else(bad)?;
+            current_key = Some(next);
+        }
+    }
+    Ok(changed)
+}
+
 /// States of `anchors` against `rev`. An anchor that fails [`Anchor::validate`] is
-/// Unverifiable and never reaches git. One `diff --name-only -z <commit> <rev>` per
-/// distinct commit, then every blob read in one batch: each anchor's cited lines at its own
-/// commit (re-verified against the fingerprint, so a hand-edited anchor is Unverifiable:
-/// "anchor does not match its commit"), plus the file at `rev` for changed paths. A commit
-/// that no longer exists → Unverifiable.
+/// Unverifiable and never reaches git. A fixed number of git processes whatever the
+/// anchors cite: `rev-parse`, one `cat-file --batch-check` for whether each distinct cited
+/// commit exists, one `diff-tree --stdin` for the paths changed between each and `rev`,
+/// then every blob read in one batch: each anchor's cited lines at its own commit
+/// (re-verified against the fingerprint, so a hand-edited anchor is Unverifiable: "anchor
+/// does not match its commit"), plus the file at `rev` for changed paths. A commit that no
+/// longer exists → Unverifiable.
 pub fn check_all(repo: &Path, rev: &str, anchors: &[Anchor]) -> Result<Vec<Checked>, DnaError> {
+    check_since(repo, rev, anchors, None)
+}
+
+/// What a check found at an earlier HEAD (the index keeps it): reused by [`check_since`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Previous {
+    pub head: String,
+    pub states: HashMap<Anchor, AnchorState>,
+}
+
+/// [`check_all`], reusing what was found at `prev.head`: an anchor found fresh, relocated
+/// or stale there has the same state at `rev` when its path did not change between the
+/// two (same blob, same lines, same answer), and its commit still exists. So a HEAD move
+/// costs one `diff-tree` (old HEAD → new HEAD) plus the checks of anchors on changed paths.
+/// Everything else (unchecked or unverifiable before, a path that changed, an old HEAD that
+/// no longer exists, as after a switch to an unrelated history and a gc) is checked anew.
+pub fn check_since(
+    repo: &Path,
+    rev: &str,
+    anchors: &[Anchor],
+    prev: Option<&Previous>,
+) -> Result<Vec<Checked>, DnaError> {
     let head = rev_parse(repo, rev)?;
     let invalid: Vec<Option<String>> = anchors.iter().map(|a| a.validate().err().map(|e| e.to_string())).collect();
-    let valid = || anchors.iter().zip(&invalid).filter(|(_, e)| e.is_none()).map(|(a, _)| a);
-    // Per cited commit: the paths changed between it and `head`, or None if it is gone.
-    let mut changed: HashMap<&str, Option<HashSet<String>>> = HashMap::new();
-    for a in valid() {
-        if changed.contains_key(a.commit.as_str()) {
-            continue;
+    let mut commits: Vec<&str> = Vec::new();
+    for (a, e) in anchors.iter().zip(&invalid) {
+        if e.is_none() && !commits.contains(&a.commit.as_str()) {
+            commits.push(&a.commit);
         }
-        let paths = if commit_exists(repo, &a.commit) {
-            let out = git(
-                repo,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-renames",
-                    "--name-only",
-                    "-z",
-                    "--end-of-options",
-                    &a.commit,
-                    &head,
-                ],
-            )?;
-            Some(
-                out.split(|b| *b == 0)
-                    .filter(|p| !p.is_empty())
-                    .map(|p| String::from_utf8_lossy(p).into_owned())
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        changed.insert(&a.commit, paths);
     }
+    let prev_head = prev.map(|p| p.head.as_str()).filter(|h| is_full_sha(h) && *h != head);
+    let exists = existing_commits(repo, &[&commits[..], prev_head.as_slice()].concat())?;
+    // Paths changed since the previous HEAD; None: nothing can be reused.
+    let moved: Option<HashSet<String>> = match prev {
+        Some(p) if p.head == head => Some(HashSet::new()),
+        Some(p) if exists.contains(&p.head) => changed_since(repo, &[&p.head], &head)?.remove(&p.head),
+        _ => None,
+    };
+    let reused = |a: &Anchor| -> Option<AnchorState> {
+        let (prev, moved) = (prev?, moved.as_ref()?);
+        let state = prev.states.get(a)?;
+        let reusable = matches!(state, AnchorState::Fresh | AnchorState::Relocated { .. } | AnchorState::Stale { .. });
+        (reusable && exists.contains(&a.commit) && !moved.contains(&a.path)).then(|| state.clone())
+    };
+    let mut states: Vec<Option<AnchorState>> = Vec::with_capacity(anchors.len());
+    let mut todo: Vec<&str> = Vec::new();
+    for (a, e) in anchors.iter().zip(&invalid) {
+        let state = match e {
+            Some(e) => Some(AnchorState::Unverifiable { reason: format!("invalid anchor: {e}") }),
+            None if !exists.contains(&a.commit) => Some(AnchorState::Unverifiable {
+                reason: format!("the cited commit {} no longer exists", short(&a.commit)),
+            }),
+            None => reused(a),
+        };
+        if state.is_none() && !todo.contains(&a.commit.as_str()) {
+            todo.push(&a.commit);
+        }
+        states.push(state);
+    }
+    // Per cited commit still to check: the paths changed between it and `head`.
+    let changed = changed_since(repo, &todo, &head)?;
     // Every blob to read, once.
     let mut names: Vec<(String, String)> = Vec::new();
     let mut slot: HashMap<(String, String), usize> = HashMap::new();
@@ -315,30 +412,27 @@ pub fn check_all(repo: &Path, rev: &str, anchors: &[Anchor]) -> Result<Vec<Check
             names.push(key);
         }
     };
-    for a in valid() {
-        if let Some(Some(paths)) = changed.get(a.commit.as_str()) {
+    for (a, s) in anchors.iter().zip(&states) {
+        if s.is_none() {
             want(&a.commit, &a.path);
-            if paths.contains(&a.path) {
+            if changed[a.commit.as_str()].contains(&a.path) {
                 want(&head, &a.path);
             }
         }
     }
     let blobs = read_blobs(repo, &names)?;
     let read = |commit: &str, path: &str| blobs[slot[&(commit.to_string(), path.to_string())]].clone();
-    let mut out = Vec::with_capacity(anchors.len());
-    for (a, invalid) in anchors.iter().zip(invalid) {
-        let state = match (invalid, changed.get(a.commit.as_str())) {
-            (Some(e), _) => AnchorState::Unverifiable { reason: format!("invalid anchor: {e}") },
-            (None, Some(Some(paths))) => {
-                check_one(a, paths.contains(&a.path), read(&a.commit, &a.path), || read(&head, &a.path))
-            }
-            (None, _) => {
-                AnchorState::Unverifiable { reason: format!("the cited commit {} no longer exists", short(&a.commit)) }
-            }
-        };
-        out.push(Checked { anchor: a.clone(), state });
-    }
-    Ok(out)
+    Ok(anchors
+        .iter()
+        .zip(states)
+        .map(|(a, s)| {
+            let state = s.unwrap_or_else(|| {
+                let path_changed = changed[a.commit.as_str()].contains(&a.path);
+                check_one(a, path_changed, read(&a.commit, &a.path), || read(&head, &a.path))
+            });
+            Checked { anchor: a.clone(), state }
+        })
+        .collect())
 }
 
 /// One anchor's state from its blob at its own commit and, when the path changed, at HEAD.
@@ -521,6 +615,111 @@ mod tests {
         assert!(rep[1..].iter().all(|c| c.state == AnchorState::Fresh));
         // rev-parse HEAD, rev-parse the cited commit, one diff, then one batch-check and one batch.
         assert!(SPAWNS.with(|n| n.get()) <= 5, "{} git calls", SPAWNS.with(|n| n.get()));
+    }
+
+    #[test]
+    fn check_all_runs_a_fixed_number_of_git_processes_whatever_the_cited_commits() {
+        let r = repo_with(&[]);
+        let mut anchors = Vec::new();
+        for i in 0..8 {
+            let p = format!("f{i}.rs");
+            commit_file(&r, &p, &format!("line {i}\n"));
+            anchors.push(cite(&r, "HEAD", &p, None, 1, 1).unwrap());
+        }
+        commit_file(&r, "f0.rs", "changed\n");
+        SPAWNS.with(|n| n.set(0));
+        let rep = check_all(&r, "HEAD", &anchors).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0]);
+        assert!(rep[1..].iter().all(|c| c.state == AnchorState::Fresh), "{rep:?}");
+        // rev-parse HEAD, one commit-existence batch, one diff-tree batch, then the blobs.
+        assert!(SPAWNS.with(|n| n.get()) <= 5, "{} git calls", SPAWNS.with(|n| n.get()));
+    }
+
+    #[test]
+    fn a_changed_path_named_like_a_commit_is_still_a_changed_path() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let c1 = head(&r);
+        let a = cite(&r, &c1, "a.rs", None, 1, 1).unwrap();
+        commit_file(&r, "b.rs", "b\n");
+        let c2 = head(&r);
+        let b = cite(&r, &c2, "b.rs", None, 1, 1).unwrap();
+        // A file named exactly like the second cited commit, changed along with a.rs.
+        std::fs::write(r.join(&c2), "x\n").unwrap();
+        commit_file(&r, "a.rs", "two\n");
+        let rep = check_all(&r, "HEAD", &[a, b]).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0]);
+        assert_eq!(rep[1].state, AnchorState::Fresh);
+    }
+
+    fn previous(r: &Path, anchors: &[Anchor]) -> Previous {
+        let head = head(r);
+        let states = check_all(r, &head, anchors).unwrap().into_iter().map(|c| (c.anchor, c.state)).collect();
+        Previous { head, states }
+    }
+
+    #[test]
+    fn since_reuses_states_whose_path_did_not_change() {
+        let files: Vec<(String, String)> = (0..6).map(|i| (format!("f{i}.rs"), format!("line {i}\n"))).collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        let r = repo_with(&refs);
+        let anchors: Vec<Anchor> = files.iter().map(|(p, _)| cite(&r, "HEAD", p, None, 1, 1).unwrap()).collect();
+        let prev = previous(&r, &anchors);
+        commit_file(&r, "other.rs", "unrelated\n");
+        commit_file(&r, "f0.rs", "changed\n");
+        SPAWNS.with(|n| n.set(0));
+        let rep = check_since(&r, "HEAD", &anchors, Some(&prev)).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "path changed between HEAD and HEAD': {:?}", rep[0]);
+        assert!(rep[1..].iter().all(|c| c.state == AnchorState::Fresh), "{rep:?}");
+        // rev-parse, one existence batch, two diff-trees (HEAD → HEAD', f0's commit → HEAD'),
+        // then the blobs.
+        assert!(SPAWNS.with(|n| n.get()) <= 6, "{} git calls", SPAWNS.with(|n| n.get()));
+        assert_eq!(rep, check_all(&r, "HEAD", &anchors).unwrap());
+    }
+
+    #[test]
+    fn since_rechecks_everything_after_a_switch_to_an_unrelated_history() {
+        let r = repo_with(&[("a.rs", "one\n"), ("b.rs", "keep\n")]);
+        let a = cite(&r, "HEAD", "a.rs", None, 1, 1).unwrap();
+        let b = cite(&r, "HEAD", "b.rs", None, 1, 1).unwrap();
+        let prev = previous(&r, &[a.clone(), b.clone()]);
+        plain(&r, &["checkout", "-q", "--orphan", "other"]);
+        plain(&r, &["rm", "-rq", "--cached", "."]);
+        std::fs::write(r.join("a.rs"), "something else\n").unwrap();
+        std::fs::remove_file(r.join("b.rs")).unwrap();
+        plain(&r, &["add", "a.rs"]);
+        plain(&r, &["commit", "-q", "-m", "orphan"]);
+        let rep = check_since(&r, "HEAD", &[a.clone(), b.clone()], Some(&prev)).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0]);
+        assert!(matches!(&rep[1].state, AnchorState::Stale { reason } if reason.contains("deleted")), "{:?}", rep[1]);
+        assert_eq!(rep, check_all(&r, "HEAD", &[a, b]).unwrap());
+    }
+
+    #[test]
+    fn since_never_trusts_a_previous_head_or_commit_that_is_gone() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let a = cite(&r, "HEAD", "a.rs", None, 1, 1).unwrap();
+        commit_file(&r, "a.rs", "two\n");
+        // A previous HEAD that does not exist: everything is rechecked.
+        let bogus = Previous { head: "3".repeat(40), states: [(a.clone(), AnchorState::Fresh)].into() };
+        let rep = check_since(&r, "HEAD", std::slice::from_ref(&a), Some(&bogus)).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0]);
+        // A cited commit that no longer exists is unverifiable, whatever was found before.
+        let ghost = Anchor { commit: "4".repeat(40), ..a };
+        let prev = Previous { head: head(&r), states: [(ghost.clone(), AnchorState::Fresh)].into() };
+        let rep = check_since(&r, "HEAD", &[ghost], Some(&prev)).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Unverifiable { .. }), "{:?}", rep[0]);
+    }
+
+    #[test]
+    fn since_ignores_a_planted_replace_ref_between_heads() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let a = cite(&r, "HEAD", "a.rs", None, 1, 1).unwrap();
+        let prev = previous(&r, std::slice::from_ref(&a));
+        commit_file(&r, "a.rs", "two\n");
+        // With replace refs honored, HEAD' would read as HEAD: an empty diff, a false fresh.
+        plain(&r, &["replace", &head(&r), &prev.head]);
+        let rep = check_since(&r, "HEAD", &[a], Some(&prev)).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "{:?}", rep[0]);
     }
 
     #[test]
