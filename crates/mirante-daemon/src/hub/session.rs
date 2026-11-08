@@ -696,6 +696,30 @@ impl Hub {
     /// permission requests, and feeds the status engine. A payload for a task without a
     /// live Claude session, stamped with another Mirante session (`hook_stale`), or (once
     /// the native session id is known) from another native session, is only logged.
+    /// `hook.event` from a socket caller (see [`Hub::apply_hook_as`]).
+    pub fn apply_hook_from(&self, caller: &super::dna::Caller, e: HookEnvelope) -> Result<()> {
+        self.apply_hook_as(&self.identify(caller), e)
+    }
+
+    /// `hook.event` for `who`: a person may deliver any task's hook; a Mirante-launched
+    /// agent (its `mirante-hook`) only its own task's, so a forged `Stop` or permission
+    /// request never reaches another task. An agent whose task is unknown, and a caller that
+    /// could not be checked, are refused.
+    pub fn apply_hook_as(&self, who: &super::dna::Identity, e: HookEnvelope) -> Result<()> {
+        use super::dna::Identity;
+        let own = |why: &str| {
+            HubError::Forbidden(format!("{why}: a Mirante-launched agent delivers its own task's hooks only"))
+        };
+        match who {
+            Identity::Person => {}
+            Identity::Agent { task: Some(t) } if *t == e.params.task => {}
+            Identity::Agent { task: Some(_) } => return Err(own("another task was named")),
+            Identity::Agent { task: None } => return Err(own("this agent's task is unknown")),
+            Identity::Unverified(why) => return Err(HubError::Forbidden(why.clone())),
+        }
+        self.apply_hook_envelope(e)
+    }
+
     pub fn apply_hook_envelope(&self, e: HookEnvelope) -> Result<()> {
         let mut st = self.lock();
         let r = st.apply_hook_locked(e);

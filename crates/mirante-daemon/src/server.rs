@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::hub::dna::Caller;
+use crate::hub::dna::{Caller, Identity};
 use crate::hub::{self, Hub};
 
 pub type OnShutdown = Arc<dyn Fn() + Send + Sync>;
@@ -242,6 +242,12 @@ fn handle_with(
                 continue;
             }
         };
+        // Who may call what (see [`crate::access`]), before the params are even read.
+        let who = hub.identify(&caller);
+        if let Err(e) = crate::access::check(&req.method, &who) {
+            write_line(&mut writer, &Response::err(Some(req.id), e))?;
+            continue;
+        }
         match req.method.as_str() {
             method::EVENTS_SUBSCRIBE => return subscribe(hub, req, writer, limits),
             method::ATTACH => return attach(hub, req, reader, writer, limits),
@@ -252,7 +258,7 @@ fn handle_with(
                 return Ok(());
             }
             _ => {
-                let resp = match dispatch_from(hub, &caller, &req.method, req.params) {
+                let resp = match dispatch_as(hub, &caller, &who, &req.method, req.params) {
                     Ok(v) => Response::ok(req.id, v),
                     Err(e) => Response::err(Some(req.id), e),
                 };
@@ -277,9 +283,17 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
     dispatch_from(hub, &Caller::Person, m, p)
 }
 
-/// Every request/response method, for `caller` (the DNA review guard). Unit-testable
-/// without a socket.
+/// Every request/response method, for `caller`: refused first when [`crate::access`] does
+/// not give it to who the caller is. Unit-testable without a socket.
 pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Value, RpcError> {
+    let who = hub.identify(caller);
+    crate::access::check(m, &who)?;
+    dispatch_as(hub, caller, &who, m, p)
+}
+
+/// [`dispatch_from`] once `who` (what [`Hub::identify`] made of `caller`) has passed
+/// [`crate::access::check`]. The hub's own guards still check `caller` where they need to.
+fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) -> Result<Value, RpcError> {
     match m {
         method::TASK_CREATE => out(hub.create_task_from(caller, params(p)?)),
         method::TASK_LIST => {
@@ -303,7 +317,7 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
         method::MESSAGE_REORDER => out(hub.reorder_queued(params(p)?)),
         method::PERMISSION_LIST => out(hub.permissions()),
         method::PERMISSION_ANSWER => out(hub.answer_permission(params(p)?)),
-        method::HOOK_EVENT => out(hub.apply_hook_envelope(params(p)?).map(|()| json!({}))),
+        method::HOOK_EVENT => out(hub.apply_hook_as(who, params(p)?).map(|()| json!({}))),
         method::DAEMON_STATUS => out(Ok(hub.status())),
         method::SESSION_HIBERNATE => out(hub.hibernate(&params::<TaskRef>(p)?.task)),
         method::SESSION_WAKE => out(hub.wake(&params::<TaskRef>(p)?.task)),
@@ -561,12 +575,11 @@ mod tests {
         assert_eq!(e.code, code::INVALID_PARAMS);
         let confirm = json!({"task": t.id, "origin": "github.com/acme/app"});
         assert_eq!(dispatch(&k.hub, method::SKILL_CONFIRM_ORIGIN, confirm).unwrap()["tenant"], "github.com/acme");
-        // task.create from an agent gets the pinned origin; skill.learn from it is refused.
+        // task.create and skill.learn from an agent are refused.
         let agent = Peer::spawn(&[(AGENT_ENV, &t.id)], k.dir.path());
         let create = json!({"repo": k.repo, "agent": "codex", "branch": "from-agent", "goal": "g"});
-        let v = dispatch_from(&k.hub, &agent.caller(), method::TASK_CREATE, create).unwrap();
-        let id = v["id"].as_str().unwrap().to_string();
-        assert_eq!(k.hub.lock().store.skill_origin_of(&id).unwrap().unwrap().observed, None);
+        let e = dispatch_from(&k.hub, &agent.caller(), method::TASK_CREATE, create).unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN);
         let lint = json!({"name": "x", "description": "d", "body": "sudo rm -rf /\n", "scope": "personal"});
         let f = dispatch(&k.hub, method::SKILL_LINT, lint).unwrap();
         assert!(f.as_array().unwrap().iter().any(|f| f["rule"] == "shell"), "{f}");
@@ -627,8 +640,76 @@ mod tests {
             v["relevant"][0]["title"].as_str().unwrap().to_string()
         };
         assert_eq!((ctx(false), ctx(true)), ("Use <b> here".to_string(), "Use &lt;b> here".to_string()));
-        let v = dispatch_from(&k.hub, &agent.caller(), method::DNA_TASK_CONTEXT, json!({"task": t.id})).unwrap();
-        assert_eq!(v["relevant"][0]["title"], "Use &lt;b> here");
+        // An agent reads memory through its MCP server (dna.search / dna.get), not this.
+        let e = dispatch_from(&k.hub, &agent.caller(), method::DNA_TASK_CONTEXT, json!({"task": t.id})).unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN);
+    }
+
+    /// Table-driven over every classified method: a person is served, an agent and a caller
+    /// that could not be checked are refused (before their params are read) exactly where
+    /// `access::ACCESS` says.
+    #[test]
+    fn agents_and_unchecked_callers_reach_only_the_methods_the_table_gives_them() {
+        use crate::access::{Access, ACCESS};
+        use crate::hub::dna::tests::Peer;
+        use mirante_core::claude_launch::AGENT_ENV;
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "own").task;
+        let agent = Peer::spawn(&[(AGENT_ENV, &t.id)], k.dir.path());
+        // These take over the connection; the socket test below covers them.
+        let streams = [method::EVENTS_SUBSCRIBE, method::ATTACH, method::DAEMON_SHUTDOWN];
+        for (m, access) in ACCESS {
+            if streams.contains(m) {
+                continue;
+            }
+            let person = dispatch(&k.hub, m, Value::Null);
+            assert!(!matches!(&person, Err(e) if e.code == code::METHOD_NOT_FOUND), "{m} is not served");
+            assert!(!matches!(&person, Err(e) if e.code == code::FORBIDDEN), "{m} refused a person: {person:?}");
+            for (caller, allowed) in
+                [(agent.caller(), *access != Access::Person), (Caller::Unknown, *access == Access::Anyone)]
+            {
+                let r = dispatch_from(&k.hub, &caller, m, Value::Null);
+                let refused = matches!(&r, Err(e) if e.code == code::FORBIDDEN);
+                assert_eq!(refused, !allowed, "{m} from {caller:?}: {r:?}");
+            }
+        }
+        // Refused before anything runs: an agent's task.create makes no task.
+        let create = json!({"repo": k.repo, "agent": "codex", "branch": "from-agent", "goal": "g"});
+        let e = dispatch_from(&k.hub, &agent.caller(), method::TASK_CREATE, create).unwrap_err();
+        assert!(e.message.contains("Mirante-launched agents are refused"), "{}", e.message);
+        assert_eq!(k.hub.list_tasks(false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn over_the_socket_an_agent_gets_status_and_its_own_hooks_but_no_stream_or_shutdown() {
+        let k = Kit::new();
+        let (sock, flag) = serve_kit(&k);
+        if ["MIRANTE_TASK", "MIRANTE_TASK_ID"].iter().any(|k| std::env::var_os(k).is_some()) {
+            return; // these tests run inside a Mirante agent: this process is no person
+        }
+        let other = k.create(AgentKind::Claude, "other").task;
+        *k.factory.driver.root.lock().unwrap() = crate::driver::proctree::proc_of(std::process::id() as i32);
+        let own = k.started(AgentKind::Claude, "agent").task;
+        let code_of = |r: Result<Value, ClientError>| match r {
+            Err(ClientError::Rpc(e)) => e.code,
+            other => panic!("{other:?}"),
+        };
+        let call = |m: &str, p: Value| Client::connect(&sock).unwrap().call::<Value>(m, p);
+        assert!(call(method::DAEMON_STATUS, Value::Null).is_ok());
+        assert_eq!(code_of(call(method::EVENTS_SUBSCRIBE, json!({}))), code::FORBIDDEN);
+        assert_eq!(code_of(call(method::ATTACH, json!({"task": own.id, "rows": 24, "cols": 80}))), code::FORBIDDEN);
+        assert_eq!(code_of(call(method::DAEMON_SHUTDOWN, json!({}))), code::FORBIDDEN);
+        assert_eq!(code_of(call(method::TASK_LIST, Value::Null)), code::FORBIDDEN);
+        assert_eq!(code_of(call(method::DNA_STATUS, json!({"repo": k.repo}))), code::FORBIDDEN);
+        let hook = |task: &str| {
+            let payload = json!({"hook_event_name": "Notification", "message": "m"}).to_string();
+            json!({"task": task, "payload": payload, "ts_ms": 1})
+        };
+        assert!(call(method::HOOK_EVENT, hook(&own.id)).is_ok());
+        assert_eq!(code_of(call(method::HOOK_EVENT, hook(&other.id))), code::FORBIDDEN);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!flag.load(Ordering::SeqCst), "an agent shut the daemon down");
+        assert!(k.hub.get_task(&own.id).unwrap().live);
     }
 
     #[test]
@@ -661,9 +742,10 @@ mod tests {
         // The CLI asks first, so it never prompts on a terminal it cannot decide from.
         assert_eq!(code_of(c.call(method::DNA_MAY_REVIEW, Value::Null)), code::FORBIDDEN);
         assert_eq!(code_of(c.call(method::DNA_ENABLE, json!({"repo": k.repo}))), code::FORBIDDEN);
-        // Reads stay open to agents.
-        let status: Result<Value, ClientError> = c.call(method::DNA_STATUS, json!({"repo": k.repo}));
+        // The daemon's own status stays open to agents; a repo's memory status does not.
+        let status: Result<Value, ClientError> = c.call(method::DAEMON_STATUS, Value::Null);
         assert!(status.is_ok(), "{status:?}");
+        assert_eq!(code_of(c.call(method::DNA_STATUS, json!({"repo": k.repo}))), code::FORBIDDEN);
     }
 
     #[test]

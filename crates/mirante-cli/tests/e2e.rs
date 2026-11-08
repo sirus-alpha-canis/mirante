@@ -709,3 +709,71 @@ fn memory_note_actions_without_a_terminal_are_refused_before_the_daemon() {
     }
     assert!(!env.home.join("daemon.sock").exists(), "the daemon was never started");
 }
+
+/// What a Mirante-launched agent's process tree may do over the real socket: its memory MCP
+/// server (`mirante-mcp`, own task) searches and proposes; the `mirante` CLI run from inside
+/// the agent (the agent env marker) is refused lifecycle methods like `new` and `ls`.
+#[test]
+fn an_agent_tree_reaches_its_memory_server_but_no_lifecycle_method() {
+    use mirante_core::model::AgentKind;
+    use mirante_ipc::types::{CreateTask, DnaProposals, ProposalView};
+    use std::io::Write;
+    let env = Env::new();
+    let repo = env.repo.clone();
+    env.ok_in(&repo, &["memory", "enable"]);
+    let create = CreateTask {
+        repo: repo.to_string_lossy().into_owned(),
+        agent: AgentKind::Claude,
+        branch: "agent".into(),
+        base: None,
+        goal: "g".into(),
+        title: None,
+    };
+    let t: TaskView = env.client().call(method::TASK_CREATE, create).unwrap();
+    env.commit(Path::new(&t.task.worktree_path), "src/a.rs", "fn spool() {\n    write();\n}\n");
+
+    let mut mcp = env
+        .cmd(&bin("mirante-mcp"))
+        .env("MIRANTE_TASK_ID", &t.task.id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let call = |id: u32, name: &str, args: Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}});
+    let anchor = json!([{"path": "src/a.rs", "start_line": 1, "end_line": 3}]);
+    let propose = json!({"title": "Spool", "kind": "fact", "body": "Writes go to the spool.", "anchors": anchor});
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        call(2, "memory_search", json!({"query": "spool"})),
+        call(3, "memory_propose", propose),
+    ];
+    {
+        let mut stdin = mcp.stdin.take().unwrap();
+        for line in &input {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let out = mcp.wait_with_output().unwrap();
+    let replies: Vec<Value> =
+        String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 3, "{replies:?}");
+    for r in &replies[1..] {
+        assert_ne!(r["result"]["isError"], true, "{r}");
+    }
+    assert!(replies[2]["result"]["content"][0]["text"].as_str().unwrap().contains("waiting for a person's review"));
+    let pending: Vec<ProposalView> = env.client().call(method::DNA_PROPOSALS, DnaProposals::default()).unwrap();
+    assert_eq!(pending.len(), 1);
+
+    // The CLI from inside the agent: refused, and nothing was created.
+    for args in [&["ls"][..], &["new", &repo.to_string_lossy(), "--agent", "claude", "--branch", "x", "hi"]] {
+        let out = env.cmd(&bin("mirante")).args(args).env("MIRANTE_TASK", &t.task.id).stdin(Stdio::null()).output();
+        let out = out.unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!out.status.success(), "mirante {args:?}: {text}");
+        assert!(text.contains("Mirante-launched agents are refused"), "mirante {args:?}: {text}");
+    }
+    let tasks: Vec<TaskView> = env.client().call(method::TASK_LIST, Value::Null).unwrap();
+    assert_eq!(tasks.len(), 1);
+}
