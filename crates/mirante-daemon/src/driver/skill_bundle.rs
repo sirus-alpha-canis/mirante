@@ -315,8 +315,10 @@ pub fn write_skill_bundle(
 /// Whether the `claude` at `bin` accepts `--append-system-prompt-file` (Claude 2.1.285
 /// does, without listing it in `--help`). Probed once per binary (path, size, mtime) with
 /// a root flag and `plugin validate` of a path that does not exist: no session starts and
-/// no model is called. A refusal, a failure or a probe longer than `timeout` is `false`
-/// (the caller then passes the text inline).
+/// no model is called; it runs in the temp directory with the updater and non-essential
+/// traffic off. A refusal ("unknown" or "unrecognized" option or argument, any case), a
+/// failure or a probe longer than `timeout` is `false` (the caller then passes the text
+/// inline).
 pub fn append_file_supported(bin: &Path, timeout: Duration) -> bool {
     /// (path, size, mtime in ns) → accepted.
     type Probed = HashMap<(PathBuf, u64, i128), bool>;
@@ -340,10 +342,16 @@ pub fn append_file_supported(bin: &Path, timeout: Duration) -> bool {
 }
 
 fn probe(bin: &Path, timeout: Duration) -> bool {
-    let missing = std::env::temp_dir().join(format!("mirante-probe-none-{}", std::process::id()));
+    let tmp = std::env::temp_dir();
+    let missing = tmp.join(format!("mirante-probe-none-{}", std::process::id()));
     let mut cmd = Command::new(bin);
+    // Run outside any repo (no project settings or hooks are read), without the updater or
+    // non-essential traffic.
     cmd.args(["--append-system-prompt-file", "/dev/null", "plugin", "validate", "--json"])
         .arg(&missing)
+        .current_dir(&tmp)
+        .env("DISABLE_AUTOUPDATER", "1")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -370,7 +378,10 @@ fn probe(bin: &Path, timeout: Duration) -> bool {
         use std::io::Read;
         let _ = e.by_ref().take(64 * 1024).read_to_string(&mut err);
     }
-    !err.contains("unknown option")
+    let err = err.to_ascii_lowercase();
+    !["unknown option", "unrecognized option", "unrecognized argument", "unknown argument"]
+        .iter()
+        .any(|r| err.contains(r))
 }
 
 #[cfg(test)]
@@ -639,6 +650,37 @@ pub(crate) mod tests {
         assert!(t.elapsed() < Duration::from_secs(5));
         assert!(!append_file_supported(&d.path().join("missing"), Duration::from_secs(1)));
     }
+    /// The probe runs in a temp directory (never a repo), with Claude's updater and
+    /// non-essential traffic off, and reads any spelling of an unknown-option refusal.
+    #[test]
+    fn the_probe_runs_quietly_in_a_temp_dir_and_reads_any_refusal() {
+        let d = TestDir::new();
+        let log = d.path().join("probe-env");
+        let yes = script(
+            d.path(),
+            "claude-quiet",
+            &format!(
+                "{{ pwd; echo \"$DISABLE_AUTOUPDATER\"; echo \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\"; }} > {}\nexit 1",
+                log.display()
+            ),
+        );
+        assert!(append_file_supported(&yes, Duration::from_secs(10)));
+        let seen = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = seen.lines().collect();
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let cwd = std::fs::canonicalize(lines[0]).unwrap();
+        assert!(cwd.starts_with(&tmp), "{cwd:?} not under {tmp:?}");
+        assert_eq!(&lines[1..], ["1", "1"], "{seen}");
+        for (name, err) in [
+            ("claude-upper", "error: Unknown option '--append-system-prompt-file'"),
+            ("claude-unrec", "error: unrecognized option '--append-system-prompt-file'"),
+            ("claude-unrec2", "Error: Unrecognized argument --append-system-prompt-file"),
+        ] {
+            let no = script(d.path(), name, &format!("echo \"{err}\" >&2\nexit 1"));
+            assert!(!append_file_supported(&no, Duration::from_secs(10)), "{err}");
+        }
+    }
+
     /// Live check (no network, no session): `MIRANTE_LIVE_CLAUDE=/path/to/claude cargo test
     /// -p mirante-daemon live_claude -- --ignored` validates a generated plugin with
     /// `claude plugin validate --json` and probes the hidden system-prompt flag.
