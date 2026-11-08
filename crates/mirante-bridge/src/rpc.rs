@@ -25,6 +25,11 @@ pub const ALLOWED: &[&str] = &[
     method::SESSION_INTERRUPT,
     method::SESSION_RESIZE,
     method::MESSAGE_SEND,
+    // The editable queue (spec §2.4): list, edit, remove, reorder queued messages.
+    method::MESSAGE_LIST_QUEUED,
+    method::MESSAGE_EDIT,
+    method::MESSAGE_REMOVE,
+    method::MESSAGE_REORDER,
     method::PERMISSION_LIST,
     method::PERMISSION_ANSWER,
     method::DAEMON_STATUS,
@@ -110,6 +115,37 @@ mod tests {
         let fake = FakeDaemon::start(&d.path().join("d.sock"));
         let e = call(&fake.socket, method::TASK_GET, json!({"task": "missing"})).unwrap_err();
         assert!(matches!(e, BridgeError::Rpc { code: c, .. } if c == code::NOT_FOUND), "{e:?}");
+    }
+
+    /// The cockpit's whole reach into the daemon, pinned: widening it must be a deliberate
+    /// edit of this list (and of `apps/cockpit/src/security.test.ts`).
+    #[test]
+    fn the_allowlist_is_exactly_these_methods() {
+        let expected = [
+            "task.create",
+            "task.list",
+            "task.get",
+            "task.archive",
+            "task.events",
+            "task.diff",
+            "session.start",
+            "session.resume",
+            "session.trust",
+            "session.stop",
+            "session.interrupt",
+            "session.resize",
+            "message.send",
+            "message.list_queued",
+            "message.edit",
+            "message.remove",
+            "message.reorder",
+            "permission.list",
+            "permission.answer",
+            "daemon.status",
+            "session.hibernate",
+            "session.wake",
+        ];
+        assert_eq!(ALLOWED, expected);
     }
 
     #[test]

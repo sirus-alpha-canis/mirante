@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import capabilities from "../src-tauri/capabilities/default.json";
 import conf from "../src-tauri/tauri.conf.json";
 import shell from "../src-tauri/src/lib.rs?raw";
+import bridgeRpc from "../../../crates/mirante-bridge/src/rpc.rs?raw";
+import { M } from "./lib/protocol";
 
 describe("Tauri security baseline", () => {
   const csp = conf.app.security.csp;
@@ -45,5 +47,38 @@ describe("Tauri security baseline", () => {
     const opener = capabilities.permissions.find((p) => typeof p !== "string");
     expect(opener).toEqual({ identifier: "opener:allow-open-url", allow: [{ url: "https://github.com/*" }] });
     expect(capabilities.windows).toEqual(["main"]);
+  });
+
+  it("reaches the daemon only through the bridge's allowlist, pinned here too", () => {
+    // `mirante_bridge::rpc::ALLOWED`, as written in the source (constant names).
+    const block = /pub const ALLOWED: &\[&str\] = &\[([\s\S]*?)\];/.exec(bridgeRpc)?.[1] ?? "";
+    const allowed = [...block.matchAll(/method::([A-Z_]+)/g)].map((m) => m[1]);
+    expect(allowed).toEqual([
+      "TASK_CREATE",
+      "TASK_LIST",
+      "TASK_GET",
+      "TASK_ARCHIVE",
+      "TASK_EVENTS",
+      "TASK_DIFF",
+      "SESSION_START",
+      "SESSION_RESUME",
+      "SESSION_TRUST",
+      "SESSION_STOP",
+      "SESSION_INTERRUPT",
+      "SESSION_RESIZE",
+      "MESSAGE_SEND",
+      "MESSAGE_LIST_QUEUED",
+      "MESSAGE_EDIT",
+      "MESSAGE_REMOVE",
+      "MESSAGE_REORDER",
+      "PERMISSION_LIST",
+      "PERMISSION_ANSWER",
+      "DAEMON_STATUS",
+      "SESSION_HIBERNATE",
+      "SESSION_WAKE",
+    ]);
+    // Every method the cockpit calls is one of them ("message.list_queued" is MESSAGE_LIST_QUEUED).
+    const wire = new Set(allowed.map((c) => c.toLowerCase().replace("_", ".")));
+    for (const m of Object.values(M)) expect(wire, m).toContain(m);
   });
 });
