@@ -647,12 +647,21 @@ impl Hub {
     }
 
     pub fn attach(&self, p: AttachParams) -> Result<(Arc<dyn Driver>, Attachment)> {
-        let (task_id, _, driver) = self.live_driver(&p.task)?;
+        let (task_id, session_id, driver) = self.live_driver(&p.task)?;
         let driver = driver.ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
         let a = driver.attach(p.rows.max(10), p.cols.max(40))?;
         let mut st = self.lock();
-        st.event(Some(&task_id), "attached", json!({ "attachment": a.id }))?;
-        st.publish();
+        // Audit the session's first attach only: a view that comes back re-attaches, and an
+        // event per re-attach would be noise in the log and a refresh in every client.
+        let first = st
+            .live
+            .get_mut(&task_id)
+            .filter(|l| l.session_id == session_id)
+            .is_some_and(|l| !std::mem::replace(&mut l.attach_recorded, true));
+        if first {
+            st.event(Some(&task_id), "attached", json!({ "attachment": a.id }))?;
+            st.publish();
+        }
         Ok((driver, a))
     }
 
@@ -1419,6 +1428,19 @@ mod tests {
         assert_eq!(a.initial, b"screen");
         assert_eq!(a.output.recv().unwrap(), b"live");
         assert!(k.calls().contains(&"attach:30x100".to_string()));
+    }
+
+    /// The cockpit re-attaches whenever a terminal view comes back: the audit keeps the
+    /// session's first attach, not one event (and one refresh in every client) per view.
+    #[test]
+    fn only_the_first_attach_of_a_session_is_recorded() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        for _ in 0..3 {
+            k.hub.attach(AttachParams { task: t.id.clone(), rows: 30, cols: 100 }).unwrap();
+        }
+        let attached = k.kinds(&t.id).iter().filter(|k| *k == "attached").count();
+        assert_eq!(attached, 1);
     }
 
     /// Tool call `t2` belongs to a side agent (`a-1`): one agent never has two dialogs open

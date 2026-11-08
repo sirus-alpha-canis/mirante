@@ -180,6 +180,8 @@ pub(crate) struct Live {
     /// This session's `SessionStart` hook was seen (told to the driver once it is attached,
     /// when the hook beat the spawn).
     pub(crate) saw_session_start: bool,
+    /// The session's first attach was recorded (later ones are not: see `Hub::attach`).
+    pub(crate) attach_recorded: bool,
     /// Why Mirante is ending this session (`mirante:stopped`, `mirante:hibernated`,
     /// `mirante:daemon_shutdown`), set before the driver is told to stop: the process's
     /// exit, which the pump thread may apply before the caller ends the session itself,
@@ -281,6 +283,7 @@ impl Live {
             sandbox: None,
             idle_since: Some(Instant::now()),
             saw_session_start: false,
+            attach_recorded: false,
             ending: None,
         }
     }

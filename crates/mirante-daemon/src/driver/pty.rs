@@ -13,8 +13,9 @@
 //!   runs) that is still the same process. Only then is it reaped and the exit reported. A
 //!   stop or drop after the exit uses the same snapshot.
 //! - Output fans out to attached clients over bounded queues. A client that falls behind
-//!   gets a full repaint; a new client starts from a repaint that also restores the input
-//!   modes (bracketed paste, cursor keys, mouse) the agent switched on.
+//!   gets a full repaint; a new client starts from the mirror's scrollback (as lines) and a
+//!   repaint that also restores the input modes (bracketed paste, cursor keys, mouse) the
+//!   agent switched on.
 //!
 //! The process tree is ended when the `PtyProcess` is dropped.
 use std::io::{self, Read, Write};
@@ -107,10 +108,41 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Rows the mirror keeps after they scroll off the screen, replayed to a client that
+/// attaches (32 bytes a cell: about 4 MB at 120 columns).
+pub(super) const SCROLLBACK_ROWS: usize = 1000;
+
 /// Bytes that redraw `screen` on a fresh terminal, input modes included.
 fn repaint_of(screen: &vt100::Screen) -> Vec<u8> {
     let mut out = b"\x1b[2J\x1b[H".to_vec();
     out.extend_from_slice(screen.state_formatted().as_bytes());
+    out
+}
+
+/// [`repaint_of`] preceded by the mirror's scrollback: its rows as lines, then enough
+/// line feeds to push the last of them off a fresh terminal's screen (into its own
+/// scrollback), so the screen's repaint (which clears the screen) loses none of them.
+fn repaint_with_history(screen: &mut vt100::Screen) -> Vec<u8> {
+    let total = screen.scrollback_len();
+    let mut out = Vec::new();
+    if total > 0 {
+        let (rows, cols) = screen.size();
+        let rows = usize::from(rows.get());
+        let mut start = 0;
+        while start < total {
+            // At offset k the view's first k rows are the last k rows of the scrollback.
+            screen.set_scrollback(total - start);
+            let take = rows.min(total - start);
+            for row in screen.rows_formatted(0, cols.get()).take(take) {
+                out.extend_from_slice(row.as_bytes());
+                out.extend_from_slice(b"\x1b[m\r\n");
+            }
+            start += take;
+        }
+        screen.set_scrollback(0);
+        out.extend(std::iter::repeat_n(b'\n', rows.saturating_sub(1)));
+    }
+    out.extend_from_slice(&repaint_of(screen));
     out
 }
 
@@ -123,21 +155,28 @@ fn pump(
     answers: &mpsc::Sender<Vec<u8>>,
 ) {
     let mut f = lock(fanout);
-    let mut live = Vec::new();
+    // Clients first: the parse below is the slow part and they need none of it. Both happen
+    // under the fanout lock, so an attach still sees a screen that matches its stream.
+    let live: Vec<u8> = chunk_pieces
+        .iter()
+        .filter_map(|p| match p {
+            Piece::Bytes(b) => Some(b.as_slice()),
+            Piece::Query(_) => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    if !live.is_empty() {
+        f.send(&live);
+    }
     for piece in chunk_pieces {
         match piece {
-            Piece::Bytes(b) => {
-                lock(parser).process(&b);
-                live.extend_from_slice(&b);
-            }
+            Piece::Bytes(b) => lock(parser).process(&b),
             Piece::Query(q) => {
                 let cursor = lock(parser).screen().cursor_position();
                 let _ = answers.send(termq::answer(q, cursor));
             }
         }
-    }
-    if !live.is_empty() {
-        f.send(&live);
     }
     if f.needs_repaint() {
         // A client fell behind and lost chunks (bounded queue): send it the whole screen,
@@ -168,7 +207,7 @@ impl PtyProcess {
         let tty = root.and_then(|r| proctree::controlling_tty(r.pid));
         let mut reader = pair.master.try_clone_reader().map_err(other)?;
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(other)?));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(nz(spec.rows), nz(spec.cols), 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(nz(spec.rows), nz(spec.cols), SCROLLBACK_ROWS)));
         let fanout = Arc::new(Mutex::new(Fanout::default()));
         let p = Arc::new(PtyProcess {
             master: Mutex::new(pair.master),
@@ -278,10 +317,11 @@ impl PtyProcess {
         repaint_of(lock(&self.parser).screen())
     }
 
-    /// A new client: its repaint and a live stream that continues exactly after it.
+    /// A new client: the scrollback and a repaint, and a live stream that continues exactly
+    /// after them.
     pub fn attach(&self) -> (u64, Vec<u8>, mpsc::Receiver<Vec<u8>>) {
         let mut f = lock(&self.fanout);
-        let initial = repaint_of(lock(&self.parser).screen());
+        let initial = repaint_with_history(lock(&self.parser).screen_mut());
         let (id, rx) = f.subscribe();
         (id, initial, rx)
     }
@@ -437,6 +477,24 @@ mod tests {
         let (_, initial, _rx) = p.attach();
         let text = String::from_utf8_lossy(&initial);
         assert!(text.contains("hello") && text.contains("\x1b[?2004h"), "{text:?}");
+    }
+
+    /// A client that attaches later still gets what scrolled off the screen (the mirror
+    /// keeps scrollback), as plain lines before the screen's own repaint.
+    #[test]
+    fn attach_replays_the_scrollback_before_the_screen() {
+        let p = PtyProcess::spawn(&sh("i=1; while [ $i -le 60 ]; do echo row$i; i=$((i+1)); done; sleep 5"), |_| {})
+            .unwrap();
+        wait_for("row60", || p.grid().contains("row60"));
+        let (_, initial, _rx) = p.attach();
+        let text = String::from_utf8_lossy(&initial);
+        let first = text.find("row1\x1b[m\r\n").unwrap_or_else(|| panic!("the scrollback's first row: {text:?}"));
+        let screen = text.find("\x1b[2J").expect("the screen's repaint");
+        assert!(first < screen, "{text:?}");
+        assert!(text[screen..].contains("row60"), "{text:?}");
+        // Only the attach replays history: a slow client's repaint is the screen alone.
+        assert!(!String::from_utf8_lossy(&p.repaint()).contains("row1\x1b"));
+        assert_eq!(p.parser.lock().unwrap().screen().scrollback(), 0, "the mirror is back on the live screen");
     }
 
     #[test]
