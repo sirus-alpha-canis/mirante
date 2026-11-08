@@ -24,12 +24,16 @@ export function useDiff(taskId: string, version: number): DiffState {
   return s.taskId === taskId ? s.diff : { state: "loading" };
 }
 
-export function diffTotals(d: TaskDiff): { files: number; added: number; removed: number } {
+/** Changed (tracked) files with their line counts, and untracked files apart: git has no
+ * line counts for those, so they are never shown as "+0 −0". */
+export function diffTotals(d: TaskDiff): { changed: number; untracked: number; added: number; removed: number } {
   let added = 0;
   let removed = 0;
   for (const f of d.files) {
     added += f.added ?? 0;
     removed += f.removed ?? 0;
   }
-  return { files: d.files.length + d.untracked.length, added, removed };
+  return { changed: d.files.length, untracked: d.untracked.length, added, removed };
 }
+
+export const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;

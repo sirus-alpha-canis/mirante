@@ -155,10 +155,24 @@ describe("AgentCard", () => {
 
   it("a finished turn shows the diff summary and opens the PR page", async () => {
     const h = setup({ "task.diff": diff }, task("b", { status: "idle" }), [ev(1, "b", "turn_started"), ev(2, "b", "turn_ended")]);
-    expect(await screen.findByText(/2 files changed/)).toBeInTheDocument();
-    expect(screen.getByRole("group", { name: "Turn finished" })).toBeInTheDocument();
+    const done = await screen.findByRole("group", { name: "Turn finished" });
+    await within(done).findByText(/1 file changed/);
+    expect(done).toHaveTextContent("1 file changed, +10 −2 vs main · 1 new untracked file");
     await userEvent.click(screen.getByRole("button", { name: "Open PR" }));
     expect(h.env.openUrl).toHaveBeenCalledWith(diff.compare_url);
+  });
+
+  it("only untracked files: counted as such, with no +0 −0", async () => {
+    const only = { ...diff, files: [], untracked: [".serena/project.yml", ".serena/cache/x"] };
+    setup({ "task.diff": only }, task("b", { status: "idle" }), [ev(1, "b", "turn_ended")]);
+    const done = await screen.findByRole("group", { name: "Turn finished" });
+    expect(done).toHaveTextContent("2 new untracked files");
+    expect(done).not.toHaveTextContent(/files? changed|\+0/);
+  });
+
+  it("no change at all says so", async () => {
+    setup({ "task.diff": { ...diff, files: [], untracked: [] } }, task("b", { status: "idle" }), [ev(1, "b", "turn_ended")]);
+    expect(await screen.findByRole("group", { name: "Turn finished" })).toHaveTextContent("No changes vs main");
   });
 
   it("an unpushed branch cannot open a PR yet", async () => {

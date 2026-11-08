@@ -223,6 +223,15 @@ describe("Detail (V1 classic)", () => {
     expect(screen.getByText("Reading the diff…")).toBeInTheDocument();
   });
 
+  it("the Diff tab counts untracked files apart, with no +0 −0 for them", async () => {
+    const h = makeEnv({ "task.diff": { base: "main", merge_base: "abcdef123456", files: [], untracked: [".serena/a", ".serena/b"], patch: "", truncated: false, compare_url: null, pushed: false } });
+    h.load([task("a", { status: "working" })]);
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} initialTab="Diff" />);
+    const summary = (await screen.findByText(/2 new untracked files/)).closest("p")!;
+    expect(summary).toHaveTextContent("No changes against main (abcdef12) · 2 new untracked files");
+    expect(summary).not.toHaveTextContent("+0");
+  });
+
   it("Open PR that fails to open the browser says so", async () => {
     const h = makeEnv({ "task.diff": { base: "main", merge_base: "abcdef123456", files: [], untracked: [], patch: "", truncated: false, compare_url: "https://github.com/acme/shop/compare/main...feat/a", pushed: true } });
     h.load([task("a", { status: "working" })]);

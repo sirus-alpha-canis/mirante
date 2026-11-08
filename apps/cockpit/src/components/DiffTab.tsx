@@ -1,6 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { useEnv } from "../env";
-import { diffTotals, useDiff } from "./useDiff";
+import { DiffCounts } from "./DoneCard";
+import { useDiff } from "./useDiff";
 
 function lineClass(l: string): string {
   if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("diff ") || l.startsWith("index ")) return "d-meta";
@@ -35,7 +36,6 @@ export function DiffTab({ taskId, version }: { taskId: string; version: number }
   if (d.state === "loading") return <p className="muted">Reading the diff…</p>;
   if (d.state === "error") return <p className="error">Diff unavailable: {d.error}</p>;
   const { diff } = d;
-  const t = diffTotals(diff);
   const openPr = (url: string) => {
     setOpenError(false);
     openUrl(url).catch(() => setOpenError(true));
@@ -43,8 +43,14 @@ export function DiffTab({ taskId, version }: { taskId: string; version: number }
   return (
     <div className="diff">
       <p>
-        {t.files} files, <span className="add">+{t.added}</span> <span className="del">−{t.removed}</span> against{" "}
-        <code>{diff.base}</code> ({diff.merge_base.slice(0, 8)})
+        <DiffCounts
+          diff={diff}
+          against={
+            <>
+              against <code>{diff.base}</code> ({diff.merge_base.slice(0, 8)})
+            </>
+          }
+        />
         {diff.compare_url && (
           <button className="btn btn-small" disabled={!diff.pushed} onClick={() => openPr(diff.compare_url!)}>
             {diff.pushed ? "Open PR" : "Open PR (push first)"}
