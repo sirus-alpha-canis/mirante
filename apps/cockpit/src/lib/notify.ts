@@ -1,11 +1,13 @@
 // Native notification when a task starts needing the user, unless that task is already on
 // screen in the focused window (the decision is the client's: only it knows what is shown).
-import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { isPermissionGranted, onAction, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import type { TaskView } from "./protocol";
 
 export interface Note {
   title: string;
   body: string;
+  /** The task a click on it opens (none for a summary). */
+  taskId?: string;
 }
 
 /** Past this many tasks at once (a reconnect, a restarted daemon), one summary instead. */
@@ -28,7 +30,7 @@ export function clean(text: string): string {
 
 export function notificationFor(t: TaskView): Note {
   const why = t.boot === "trust_prompt" ? "asks to trust its folder" : "needs you";
-  return { title: clean(`${t.branch} ${why}`), body: clean(t.title) };
+  return { title: clean(`${t.branch} ${why}`), body: clean(t.title), taskId: t.id };
 }
 
 /** What to show for the tasks that just started needing the user, all at once. */
@@ -68,4 +70,52 @@ export function createNotifier(api: NotificationApi): (n: Note) => Promise<void>
   };
 }
 
-export const notify = createNotifier({ isPermissionGranted, requestPermission, sendNotification });
+/** The task a clicked notification is about: its `extra.task` when the platform reports it,
+ * else the task of the last notification sent with that title. */
+export function clickedTask(
+  performed: { actionId: string; notification: { title?: string; extra?: Record<string, unknown> } | null },
+  sentTitles: ReadonlyMap<string, string>,
+): string | null {
+  if (performed.actionId !== "tap" || !performed.notification) return null;
+  const extra = performed.notification.extra?.task;
+  if (typeof extra === "string") return extra;
+  return (performed.notification.title && sentTitles.get(performed.notification.title)) || null;
+}
+
+// Titles of notifications sent this run, to their task (the newest 50).
+const sent = new Map<string, string>();
+
+export const notify = createNotifier({
+  isPermissionGranted,
+  requestPermission,
+  sendNotification: (n) => {
+    if (n.taskId) {
+      sent.delete(n.title);
+      sent.set(n.title, n.taskId);
+      while (sent.size > 50) sent.delete(sent.keys().next().value!);
+    }
+    sendNotification({ title: n.title, body: n.body, ...(n.taskId ? { extra: { task: n.taskId } } : {}) });
+  },
+});
+
+/** Calls `fn` with the task of each notification the person clicks (the app is brought
+ * forward by the system). */
+export function onNotificationClick(fn: (taskId: string) => void): () => void {
+  let stop: (() => void) | null = null;
+  let stopped = false;
+  onAction((e) => {
+    const id = clickedTask(e, sent);
+    if (id) fn(id);
+  })
+    .then((l) => {
+      if (stopped) void l.unregister();
+      else stop = () => void l.unregister();
+    })
+    .catch(() => {
+      // No listener (an older plugin, or refused): a click just brings the app forward.
+    });
+  return () => {
+    stopped = true;
+    stop?.();
+  };
+}

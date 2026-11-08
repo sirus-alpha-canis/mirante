@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The cockpit window: native notifications (permission check, request, send; nothing else of the plugin), opening GitHub pages and local dev servers (http://localhost or 127.0.0.1 on an explicit port) in the browser, and the native folder picker (open only) for adding a project. Nothing else (no fs, shell, http).",
+  "description": "The cockpit window: native notifications (permission check, request, send, and listening for a click on one; nothing else of the plugin), opening GitHub pages and local dev servers (http://localhost or 127.0.0.1 on an explicit port) in the browser, and the native folder picker (open only) for adding a project. Nothing else (no fs, shell, http).",
   "windows": [
     "main"
   ],
@@ -9,6 +9,7 @@
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
     "notification:allow-notify",
+    "notification:allow-register-listener",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

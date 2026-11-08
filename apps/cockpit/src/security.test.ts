@@ -44,13 +44,15 @@ describe("Tauri security baseline", () => {
 
   it("grants only notifications, opening github.com and localhost URLs, and the folder picker", () => {
     // Notifications: exactly the three commands the plugin's \`window.Notification\` shim
-    // calls (is_permission_granted, request_permission, notify); not the plugin's default
-    // set (channels, pending/active lists, cancel, listeners…).
+    // calls (is_permission_granted, request_permission, notify), and register_listener so a
+    // click on a task's notification opens it (\`onAction\`); not the plugin's default set
+    // (channels, pending/active lists, cancel, action types…).
     const ids = capabilities.permissions.map((p) => (typeof p === "string" ? p : p.identifier));
     expect(ids).toEqual([
       "notification:allow-is-permission-granted",
       "notification:allow-request-permission",
       "notification:allow-notify",
+      "notification:allow-register-listener",
       "opener:allow-open-url",
       // The native "Choose…" folder picker (Add project): `open` only, no save/ask/message.
       "dialog:allow-open",

@@ -6,15 +6,24 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
-import type { Env } from "./env";
+import { type Env, safeStorage } from "./env";
 import { daemonStart, homeDir, pathKind, rpc, subscribe } from "./lib/daemon";
-import { notify } from "./lib/notify";
+import { notify, onNotificationClick } from "./lib/notify";
 import { createCockpit } from "./store/cockpit";
 
 const env: Env = {
   cockpit: createCockpit({ rpc, subscribe }),
   rpc,
-  storage: window.localStorage,
+  // Even reading `localStorage` can throw (blocked site data): then nothing is remembered.
+  storage: safeStorage(
+    (() => {
+      try {
+        return window.localStorage;
+      } catch {
+        return null;
+      }
+    })(),
+  ),
   openUrl: (url) => openUrl(url),
   startDaemon: daemonStart,
   notify: (n) => void notify(n).catch(() => {}),
@@ -25,6 +34,7 @@ const env: Env = {
   },
   homeDir,
   pathKind,
+  onNoteClick: onNotificationClick,
 };
 
 createRoot(document.getElementById("root")!).render(

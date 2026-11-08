@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { task } from "../test/fixtures";
-import { clean, createNotifier, notificationFor, notificationsFor, SUMMARY_OVER, shouldNotify } from "./notify";
+import { clean, clickedTask, createNotifier, notificationFor, notificationsFor, SUMMARY_OVER, shouldNotify } from "./notify";
 
 describe("shouldNotify", () => {
   it("stays quiet only when the task is on screen in the focused window", () => {
@@ -12,7 +12,7 @@ describe("shouldNotify", () => {
 
   it("says why", () => {
     expect(notificationFor(task("a", { boot: "trust_prompt" })).title).toBe("feat/a asks to trust its folder");
-    expect(notificationFor(task("a", { status: "needs_you" }))).toEqual({ title: "feat/a needs you", body: "goal of a" });
+    expect(notificationFor(task("a", { status: "needs_you" }))).toEqual({ title: "feat/a needs you", body: "goal of a", taskId: "a" });
   });
 });
 
@@ -64,5 +64,16 @@ describe("createNotifier", () => {
     expect(a.sendNotification).toHaveBeenCalledWith({ title: "2", body: "" });
     await notify({ title: "3", body: "" });
     expect(a.isPermissionGranted).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("clickedTask", () => {
+  it("a click on a task's notification names its task (extra first, else by title); actions and summaries none", () => {
+    const titles = new Map([["feat/a needs you", "a"]]);
+    expect(clickedTask({ actionId: "tap", notification: { title: "x", extra: { task: "b" } } }, titles)).toBe("b");
+    expect(clickedTask({ actionId: "tap", notification: { title: "feat/a needs you", extra: {} } }, titles)).toBe("a");
+    expect(clickedTask({ actionId: "tap", notification: { title: "3 agents need you" } }, titles)).toBeNull();
+    expect(clickedTask({ actionId: "other", notification: { title: "feat/a needs you" } }, titles)).toBeNull();
+    expect(clickedTask({ actionId: "tap", notification: null }, titles)).toBeNull();
   });
 });
