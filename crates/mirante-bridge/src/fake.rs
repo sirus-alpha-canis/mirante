@@ -79,6 +79,12 @@ impl FakeDaemon {
         seq
     }
 
+    /// Sends `line` as is to every subscriber (for undecodable input); not recorded.
+    pub fn push_raw(&self, line: &str) {
+        let mut s = self.shared.lock().unwrap();
+        s.subscribers.retain_mut(|w| w.write_all(format!("{line}\n").as_bytes()).is_ok());
+    }
+
     /// Closes every open connection (as a daemon restart would), keeping the boot id.
     pub fn drop_connections(&self) {
         let mut s = self.shared.lock().unwrap();

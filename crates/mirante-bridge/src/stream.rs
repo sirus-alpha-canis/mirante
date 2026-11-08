@@ -2,11 +2,13 @@
 //! When the connection drops (daemon restart, or the daemon cut a subscriber that fell
 //! behind) it reconnects with backoff and asks to resume from the last `seq` + `boot_id`;
 //! the daemon then replays what was missed, or sends a full snapshot (new boot, gap too big).
+//! A line it cannot decode is skipped, logged and counted ([`Stream::skipped`]): reconnecting
+//! would only replay it, forever.
 use std::io::BufReader;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -33,11 +35,17 @@ pub enum StreamMsg {
 /// The running stream. Dropping it (or [`Stream::stop`]) ends the thread.
 pub struct Stream {
     stop: Arc<AtomicBool>,
+    skipped: Arc<AtomicU64>,
     conn: Arc<Mutex<Option<UnixStream>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Stream {
+    /// Lines from the daemon that could not be decoded and were skipped.
+    pub fn skipped(&self) -> u64 {
+        self.skipped.load(Ordering::SeqCst)
+    }
+
     pub fn stop(mut self) {
         self.halt();
     }
@@ -62,17 +70,24 @@ impl Drop for Stream {
 /// Starts the stream thread; `emit` is called from it for every message, in order.
 pub fn spawn(socket: PathBuf, emit: impl Fn(StreamMsg) + Send + 'static) -> Stream {
     let stop = Arc::new(AtomicBool::new(false));
+    let skipped = Arc::new(AtomicU64::new(0));
     let conn = Arc::new(Mutex::new(None));
-    let (s, c) = (stop.clone(), conn.clone());
-    let thread = std::thread::spawn(move || run(socket, emit, s, c));
-    Stream { stop, conn, thread: Some(thread) }
+    let (s, k, c) = (stop.clone(), skipped.clone(), conn.clone());
+    let thread = std::thread::spawn(move || run(socket, emit, s, k, c));
+    Stream { stop, skipped, conn, thread: Some(thread) }
 }
 
-fn run(socket: PathBuf, emit: impl Fn(StreamMsg), stop: Arc<AtomicBool>, conn: Arc<Mutex<Option<UnixStream>>>) {
+fn run(
+    socket: PathBuf,
+    emit: impl Fn(StreamMsg),
+    stop: Arc<AtomicBool>,
+    skipped: Arc<AtomicU64>,
+    conn: Arc<Mutex<Option<UnixStream>>>,
+) {
     let mut resume = SubscribeParams::default();
     let mut backoff = BACKOFF_START;
     while !stop.load(Ordering::SeqCst) {
-        let error = match once(&socket, &mut resume, &emit, &stop, &conn, &mut backoff) {
+        let error = match once(&socket, &mut resume, &emit, &stop, &skipped, &conn, &mut backoff) {
             Ok(()) => "the daemon closed the event stream".to_string(),
             Err(e) => e,
         };
@@ -94,6 +109,7 @@ fn once(
     resume: &mut SubscribeParams,
     emit: &impl Fn(StreamMsg),
     stop: &AtomicBool,
+    skipped: &AtomicU64,
     conn: &Mutex<Option<UnixStream>>,
     backoff: &mut Duration,
 ) -> Result<(), String> {
@@ -112,11 +128,17 @@ fn once(
         let Some(line) = read_line(&mut reader).map_err(|e| e.to_string())? else {
             return Ok(());
         };
-        let n: mirante_ipc::rpc::Notification = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-        if n.method != method::EVENT {
-            continue;
-        }
-        let event: Event = serde_json::from_value(n.params).map_err(|e| e.to_string())?;
+        let decoded = serde_json::from_str::<mirante_ipc::rpc::Notification>(&line)
+            .and_then(|n| if n.method == method::EVENT { serde_json::from_value(n.params).map(Some) } else { Ok(None) });
+        let event: Event = match decoded {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(e) => {
+                let n = skipped.fetch_add(1, Ordering::SeqCst) + 1;
+                eprintln!("mirante-bridge: skipped an undecodable event from the daemon ({n} so far): {e}");
+                continue;
+            }
+        };
         *resume = SubscribeParams { since_seq: Some(event.seq), boot_id: Some(event.boot_id.clone()) };
         emit(StreamMsg::Event { event });
     }
@@ -185,6 +207,25 @@ mod tests {
         let subs: Vec<serde_json::Value> =
             fake.calls().into_iter().filter(|(m, _)| m == method::EVENTS_SUBSCRIBE).map(|(_, p)| p).collect();
         assert_eq!(subs, vec![json!({}), json!({"since_seq": 1, "boot_id": "boot-1"})]);
+    }
+
+    #[test]
+    fn an_undecodable_event_is_skipped_and_counted_not_a_reconnect() {
+        let d = TestDir::new();
+        let fake = FakeDaemon::start(&d.path().join("d.sock"));
+        let (tx, rx) = mpsc::channel();
+        let s = spawn(fake.socket.clone(), move |m| tx.send(m).unwrap());
+        connected(&rx);
+        fake.push_raw(r#"{"jsonrpc":"2.0","method":"event","params":{"seq":"not a number"}}"#);
+        fake.push_raw("not json at all");
+        fake.push_event(Some("t1"), "step", json!({}));
+        match next(&rx) {
+            StreamMsg::Event { event } => assert_eq!(event.seq, 1),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s.skipped(), 2);
+        let subs = fake.methods().iter().filter(|m| *m == method::EVENTS_SUBSCRIBE).count();
+        assert_eq!(subs, 1, "the stream reconnected");
     }
 
     #[test]
