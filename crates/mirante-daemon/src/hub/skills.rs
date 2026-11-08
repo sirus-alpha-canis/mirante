@@ -578,6 +578,36 @@ impl Hub {
         }
     }
 
+    /// `skill.tenants` for a socket caller (people only, see [`Hub::skill_reads`]).
+    pub fn skill_tenants_from(&self, c: &Caller) -> Result<Vec<TenantView>> {
+        self.skill_reads(c)?;
+        self.skill_tenants()
+    }
+
+    /// `skill.list` for a socket caller.
+    pub fn skill_list_from(&self, c: &Caller, p: SkillListParams) -> Result<Vec<SkillSummary>> {
+        self.skill_reads(c)?;
+        self.skill_list(p)
+    }
+
+    /// `skill.get` for a socket caller.
+    pub fn skill_get_from(&self, c: &Caller, p: SkillGet) -> Result<SkillView> {
+        self.skill_reads(c)?;
+        self.skill_get(p)
+    }
+
+    /// `skill.proposals` for a socket caller.
+    pub fn skill_proposals_from(&self, c: &Caller, q: SkillProposals) -> Result<Vec<SkillProposalView>> {
+        self.skill_reads(c)?;
+        self.skill_proposals(q)
+    }
+
+    /// `skill.task_skills` for a socket caller.
+    pub fn skill_task_skills_from(&self, c: &Caller, p: SkillTaskParams) -> Result<TaskSkills> {
+        self.skill_reads(c)?;
+        self.skill_task_skills(p)
+    }
+
     /// `{}` for a person, `Forbidden` otherwise (the CLI asks before prompting).
     pub fn skill_may_review(&self, c: &Caller) -> Result<serde_json::Value> {
         self.require_skill_person(c).map(|()| serde_json::json!({}))
@@ -1812,8 +1842,15 @@ pub(crate) mod tests {
             forbidden(k.hub.skill_add(&c, add));
             forbidden(k.hub.skill_may_review(&c));
             // The library is not an agent's to read either: its skills come at session start.
+            // Each socket read guards itself (not only the dispatch).
             forbidden(k.hub.skill_reads(&c));
+            forbidden(k.hub.skill_tenants_from(&c));
+            forbidden(k.hub.skill_list_from(&c, SkillListParams::default()));
+            forbidden(k.hub.skill_get_from(&c, SkillGet { name: "a".into(), version: None }));
+            forbidden(k.hub.skill_proposals_from(&c, SkillProposals::default()));
+            forbidden(k.hub.skill_task_skills_from(&c, SkillTaskParams { task: t.id.clone() }));
         }
+        assert!(k.hub.skill_proposals_from(&Caller::Person, SkillProposals::default()).is_ok());
         assert_eq!(k.hub.lock().store.skill_proposal(&p.proposal.id).unwrap().status, "pending");
         k.hub.skill_may_review(&Caller::Person).unwrap();
     }

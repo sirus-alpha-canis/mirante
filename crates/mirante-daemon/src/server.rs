@@ -345,32 +345,26 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         }
         method::DNA_NOTE_ACTION => out(hub.dna_note_action(caller, params(p)?)),
         method::DNA_MAY_REVIEW => out(hub.require_person(caller).map(|()| json!({}))),
-        method::SKILL_TENANTS => out(hub.skill_reads(caller).and_then(|()| hub.skill_tenants())),
+        method::SKILL_TENANTS => out(hub.skill_tenants_from(caller)),
         method::SKILL_LEARN => out(hub.skill_learn(caller, params(p)?)),
         method::SKILL_LIST => {
             let q = if p.is_null() { Default::default() } else { params(p)? };
-            out(hub.skill_reads(caller).and_then(|()| hub.skill_list(q)))
+            out(hub.skill_list_from(caller, q))
         }
-        method::SKILL_GET => {
-            let q = params(p)?;
-            out(hub.skill_reads(caller).and_then(|()| hub.skill_get(q)))
-        }
+        method::SKILL_GET => out(hub.skill_get_from(caller, params(p)?)),
         method::SKILL_CONFIRM_ORIGIN => out(hub.skill_confirm_origin(caller, params(p)?)),
         method::SKILL_LINT => out(hub.skill_lint(params(p)?)),
         method::SKILL_PROPOSE => out(hub.skill_propose(caller, params(p)?)),
         method::SKILL_ADD => out(hub.skill_add(caller, params(p)?)),
         method::SKILL_PROPOSALS => {
             let q = if p.is_null() { Default::default() } else { params(p)? };
-            out(hub.skill_reads(caller).and_then(|()| hub.skill_proposals(q)))
+            out(hub.skill_proposals_from(caller, q))
         }
         method::SKILL_REVIEW => out(hub.skill_review(caller, params(p)?)),
         method::SKILL_ACTION => out(hub.skill_action(caller, params(p)?)),
         method::SKILL_MAY_REVIEW => out(hub.skill_may_review(caller)),
         method::SKILL_MINE => out(hub.skill_mine(caller, params(p)?)),
-        method::SKILL_TASK_SKILLS => {
-            let q = params(p)?;
-            out(hub.skill_reads(caller).and_then(|()| hub.skill_task_skills(q)))
-        }
+        method::SKILL_TASK_SKILLS => out(hub.skill_task_skills_from(caller, params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
