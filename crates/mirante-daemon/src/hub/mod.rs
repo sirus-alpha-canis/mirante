@@ -29,6 +29,7 @@ pub mod memory;
 pub mod messages;
 pub mod queue;
 pub mod session;
+pub mod skills;
 
 pub type Result<T> = std::result::Result<T, HubError>;
 pub type EventRx = mpsc::Receiver<(String, DriverEvent)>;
@@ -315,6 +316,10 @@ pub struct Hub {
     pub(crate) claude_inline: AtomicBool,
     /// DNA: one refresh at a time per repo (taken before, never while holding, the hub lock).
     pub(crate) dna_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Skills: where `ssh-keygen` and the ssh host aliases are.
+    pub(crate) skill_conf: Mutex<skills::SkillConf>,
+    /// Skills: signatures that verified (see `hub::skills`).
+    pub(crate) skill_sigs: Mutex<HashSet<String>>,
 }
 
 /// Highest event seq in the store (0 when empty).
@@ -481,6 +486,8 @@ impl Hub {
             boot_timeout: Duration::from_secs(45),
             claude_inline: AtomicBool::new(false),
             dna_gates: Mutex::default(),
+            skill_conf: Mutex::default(),
+            skill_sigs: Mutex::default(),
         };
         Ok((hub, rx))
     }
@@ -511,10 +518,19 @@ impl Hub {
     }
 
     pub fn create_task(&self, p: CreateTask) -> Result<TaskView> {
+        self.create_task_from(&dna::Caller::Person, p)
+    }
+
+    /// Creates a task for `caller`. Its origin (and tenant) is fixed now, before any agent
+    /// runs, against the origin pinned for the checkout: only a person's first task pins it
+    /// (see `Store::skill_create_origin`).
+    pub fn create_task_from(&self, caller: &dna::Caller, p: CreateTask) -> Result<TaskView> {
         if p.goal.trim().is_empty() {
             return Err(HubError::Invalid("the goal is empty".into()));
         }
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
+        let by_person = self.identify(caller) == dna::Identity::Person;
+        let (checkout, origin, tenant) = self.origin_info(&repo);
         // Worktree first, then the task row (rolled back below if the row fails). A crash in
         // between leaves a checkout no task owns: recovery reports it as an orphan and never
         // deletes it (it may hold the user's branch). The other order would need a row
@@ -533,6 +549,10 @@ impl Hub {
         let mut st = self.lock();
         match st.store.create_task(new) {
             Ok(task) => {
+                // No origin row: the task gets no skills (fail closed); the task itself stands.
+                if let Err(e) = st.store.skill_create_origin(&task.id, &checkout, &origin, &tenant, by_person) {
+                    st.log_error(Some(&task.id), "task origin", &e);
+                }
                 let v = st.view(task)?;
                 st.publish();
                 Ok(v)
@@ -747,6 +767,8 @@ pub(crate) mod testkit {
             let factory = Arc::new(FakeFactory::default());
             let (mut hub, rx) = Hub::new(open(&paths), paths, Box::new(factory.clone())).unwrap();
             hub.set_boot_timeout(std::time::Duration::ZERO);
+            // No ~/.ssh/config of the machine running the tests.
+            hub.set_ssh_home(None);
             Kit { hub: Arc::new(hub), rx, factory, repo, dir }
         }
 

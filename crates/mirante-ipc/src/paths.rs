@@ -61,6 +61,21 @@ impl Paths {
         self.home.join("sessions").join(task_id)
     }
 
+    /// The skill library: `<home>/skills/<name>/v<N>/` (0700, created on first accept).
+    pub fn skills(&self) -> PathBuf {
+        self.home.join("skills")
+    }
+
+    /// Mirante's skill signing key and `allowed_signers` (0700).
+    pub fn keys(&self) -> PathBuf {
+        self.home.join("keys")
+    }
+
+    /// Private scratch (0700): signatures copied out for `ssh-keygen -Y verify`.
+    pub fn tmp(&self) -> PathBuf {
+        self.home.join("tmp")
+    }
+
     pub fn log(&self) -> PathBuf {
         self.home.join("daemon.log")
     }
@@ -178,6 +193,9 @@ mod tests {
         assert_eq!(p.session_dir("t1"), PathBuf::from("/h/sessions/t1"));
         assert_eq!(p.log(), PathBuf::from("/h/daemon.log"));
         assert_eq!(p.lock(), PathBuf::from("/h/daemon.lock"));
+        assert_eq!(p.skills(), PathBuf::from("/h/skills"));
+        assert_eq!(p.keys(), PathBuf::from("/h/keys"));
+        assert_eq!(p.tmp(), PathBuf::from("/h/tmp"));
     }
 
     #[test]

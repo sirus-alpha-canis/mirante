@@ -281,7 +281,7 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
 /// without a socket.
 pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Value, RpcError> {
     match m {
-        method::TASK_CREATE => out(hub.create_task(params(p)?)),
+        method::TASK_CREATE => out(hub.create_task_from(caller, params(p)?)),
         method::TASK_LIST => {
             let l: ListParams = if p.is_null() { ListParams::default() } else { params(p)? };
             out(hub.list_tasks(l.archived))
@@ -328,6 +328,11 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
         }
         method::DNA_NOTE_ACTION => out(hub.dna_note_action(caller, params(p)?)),
         method::DNA_MAY_REVIEW => out(hub.require_person(caller).map(|()| json!({}))),
+        method::SKILL_TENANTS => out(hub.skill_tenants()),
+        method::SKILL_LEARN => out(hub.skill_learn(caller, params(p)?)),
+        method::SKILL_LIST => out(hub.skill_list(if p.is_null() { Default::default() } else { params(p)? })),
+        method::SKILL_GET => out(hub.skill_get(params(p)?)),
+        method::SKILL_CONFIRM_ORIGIN => out(hub.skill_confirm_origin(caller, params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
@@ -511,6 +516,38 @@ mod tests {
         let q = dispatch(&k.hub, method::DNA_PROPOSALS, Value::Null).unwrap();
         assert_eq!(q, json!([]));
         assert_eq!(dispatch(&k.hub, method::DNA_DISABLE, repo).unwrap()["enabled"], false);
+    }
+
+    #[test]
+    fn skill_methods_are_served_and_validate_params() {
+        use crate::hub::dna::tests::Peer;
+        use mirante_core::claude_launch::AGENT_ENV;
+        let k = Kit::new();
+        crate::hub::skills::tests::set_origin(&k.repo, "git@github.com:acme/app.git");
+        let t = k.create(AgentKind::Claude, "s").task;
+        assert_eq!(dispatch(&k.hub, method::SKILL_TENANTS, Value::Null).unwrap()[0]["tenant"], "github.com/acme");
+        let e = dispatch(&k.hub, method::SKILL_LEARN, json!({"tenant": "github.com/acme"})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        let v = dispatch(&k.hub, method::SKILL_LEARN, json!({"tenant": "github.com/acme", "enabled": true})).unwrap();
+        assert_eq!(v["learning"], true);
+        assert_eq!(dispatch(&k.hub, method::SKILL_LIST, Value::Null).unwrap(), json!([]));
+        assert_eq!(dispatch(&k.hub, method::SKILL_LIST, json!({"status": "retired"})).unwrap(), json!([]));
+        let e = dispatch(&k.hub, method::SKILL_LIST, json!({"status": "bogus"})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        let e = dispatch(&k.hub, method::SKILL_GET, json!({"name": "nope"})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        let e = dispatch(&k.hub, method::SKILL_GET, json!({})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        let confirm = json!({"task": t.id, "origin": "github.com/acme/app"});
+        assert_eq!(dispatch(&k.hub, method::SKILL_CONFIRM_ORIGIN, confirm).unwrap()["tenant"], "github.com/acme");
+        // task.create from an agent gets the pinned origin; skill.learn from it is refused.
+        let agent = Peer::spawn(&[(AGENT_ENV, &t.id)], k.dir.path());
+        let create = json!({"repo": k.repo, "agent": "codex", "branch": "from-agent", "goal": "g"});
+        let v = dispatch_from(&k.hub, &agent.caller(), method::TASK_CREATE, create).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(k.hub.lock().store.skill_origin_of(&id).unwrap().unwrap().observed, None);
+        let off = json!({"tenant": "github.com/acme", "enabled": false});
+        assert_eq!(dispatch_from(&k.hub, &agent.caller(), method::SKILL_LEARN, off).unwrap_err().code, code::FORBIDDEN);
     }
 
     #[test]

@@ -44,6 +44,20 @@ pub mod method {
     pub const DAEMON_DOCTOR: &str = "daemon.doctor";
     /// Kills one orphan the user picked from `daemon.doctor` ([`super::KillOrphan`]).
     pub const DAEMON_KILL_ORPHAN: &str = "daemon.kill_orphan";
+    /// Tenants (normalized origin owners) with learning state and counts (`{}` →
+    /// `Vec<`[`super::TenantView`]`>`).
+    pub const SKILL_TENANTS: &str = "skill.tenants";
+    /// A person turns mining on or off for a tenant ([`super::SkillLearn`] →
+    /// [`super::TenantView`]).
+    pub const SKILL_LEARN: &str = "skill.learn";
+    /// The library ([`super::SkillListParams`] → `Vec<`[`super::SkillSummary`]`>`).
+    pub const SKILL_LIST: &str = "skill.list";
+    /// One skill, a version of it, its files and verification ([`super::SkillGet`] →
+    /// [`super::SkillView`]).
+    pub const SKILL_GET: &str = "skill.get";
+    /// A person confirms a checkout's origin after it changed ([`super::SkillConfirmOrigin`]
+    /// → [`super::OriginConfirmed`]).
+    pub const SKILL_CONFIRM_ORIGIN: &str = "skill.confirm_origin";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -770,4 +784,103 @@ mod dna_tests {
         assert_eq!(g.at.repo.as_deref(), Some("/r"));
         assert_eq!(serde_json::to_value(DnaRef::default()).unwrap(), json!({}));
     }
+}
+
+/// A tenant: the owner part of normalized origins (`github.com/acme`, `dev.azure.com/org`,
+/// `local/<hash>`). Mining reads a tenant's tasks only while `learning` is on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantView {
+    pub tenant: String,
+    pub learning: bool,
+    /// Tasks whose origin is in this tenant.
+    pub tasks: usize,
+    /// Skills scoped to this tenant (org or repo); personal skills are not counted.
+    pub skills: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillLearn {
+    pub tenant: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillListParams {
+    /// Only skills that apply in this tenant (personal ones always do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// `active` or `retired`; both when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// A skill in the library list. `verified`: the current version on disk matches the
+/// manifest a person accepted and its signature (`reason` says what failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSummary {
+    pub name: String,
+    pub version: u32,
+    /// `personal`, `org:<prefix>` or `repo:<key>`.
+    pub scope: String,
+    /// `always` or `on_demand`.
+    pub activation: String,
+    /// `active` or `retired`.
+    pub status: String,
+    pub description: String,
+    /// The current manifest hash (`skill.action` needs it back as `expect_hash`).
+    pub manifest_hash: String,
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub injected_30d: usize,
+    pub used_30d: usize,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillGet {
+    pub name: String,
+    /// Default: the current version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+/// A bundled file of a skill version (text only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillFileView {
+    pub path: String,
+    pub text: String,
+}
+
+/// One version of a skill. `manifest`, `skill_md` and `files` are filled only when that
+/// version verifies (a changed folder's text is never shown as the skill's).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillView {
+    #[serde(flatten)]
+    pub summary: SkillSummary,
+    /// The version shown (the current one unless asked).
+    pub shown_version: u32,
+    pub manifest: Option<mirante_core::skills::format::Manifest>,
+    pub skill_md: String,
+    pub files: Vec<SkillFileView>,
+    /// Versions on disk, ascending.
+    pub versions: Vec<u32>,
+    /// E.g. a personal skill learned in a client's tasks.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillConfirmOrigin {
+    /// A task of the checkout (id, branch or id suffix).
+    pub task: String,
+    /// The origin key the person confirms: the checkout's pinned one or its live one.
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginConfirmed {
+    pub origin: String,
+    pub tenant: String,
+    /// Tasks of the checkout fixed to this origin that get skills again.
+    pub cleared: usize,
 }

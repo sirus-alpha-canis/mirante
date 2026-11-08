@@ -362,8 +362,8 @@ impl Store {
     /// - the live origin is the pinned one: the task gets it;
     /// - it differs: the task keeps the pinned origin and tenant, and `observed` records the
     ///   live one (no skills until a person confirms; see [`Store::skill_confirm_origin`]);
-    /// - nothing is pinned yet: a person's task pins the live origin (`skill.origin_pinned`);
-    ///   anyone else's gets it as `observed` too.
+    /// - nothing is pinned yet: a person's task pins the live origin; anyone else's gets it
+    ///   as `observed` too.
     ///
     /// Written once: a second write fails (the primary key) and triggers refuse any update
     /// but the confirmation's.
@@ -375,16 +375,14 @@ impl Store {
         live_tenant: &str,
         by_person: bool,
     ) -> Result<TaskOrigin> {
-        let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pinned = repo_origin(&tx, repo)?;
         let (origin, tenant, observed) = match pinned {
             Some((o, t)) if o == live_origin => (o, t, None),
             Some((o, t)) => (o, t, Some(live_origin.to_string())),
             None if by_person => {
+                // The person's `task_created` is the audit trail of this pin.
                 pin(&tx, repo, live_origin, live_tenant)?;
-                let payload = json!({ "repo": repo, "origin": live_origin, "tenant": live_tenant });
-                insert_event(&tx, &boot, Some(task), "skill.origin_pinned", &payload)?;
                 (live_origin.to_string(), live_tenant.to_string(), None)
             }
             None => (live_origin.to_string(), live_tenant.to_string(), Some(live_origin.to_string())),
@@ -1027,7 +1025,6 @@ mod tests {
         assert_eq!(s.skill_confirm_origin("/r/.git", "github.com/acme/api", "github.com/acme").unwrap(), 2);
         assert_eq!(s.skill_origin_of(&c).unwrap().unwrap().observed, None);
         assert!(kinds(&s).contains(&"skill.origin_confirmed".to_string()));
-        assert!(kinds(&s).contains(&"skill.origin_pinned".to_string()));
     }
 
     #[test]
