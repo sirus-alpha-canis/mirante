@@ -27,6 +27,7 @@ pub mod proctree;
 pub mod pty;
 pub mod real;
 pub mod screen;
+pub mod skill_bundle;
 pub mod termq;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

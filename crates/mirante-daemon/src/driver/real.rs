@@ -16,6 +16,13 @@
 //! Repo memory (only for repos where it was enabled, `SpawnRequest::mcp`): Claude gets
 //! `--mcp-config <session dir>/mcp.json` and the read-only memory tools pre-allowed in its
 //! settings; Codex gets `-c mcp_servers.mirante-memory.*` overrides. Per task, never global.
+//!
+//! Skills (`SpawnRequest::skills`, see [`super::skill_bundle`]): Claude gets
+//! `--plugin-dir <bundle>/claude-plugin` for the on-demand ones and
+//! `--append-system-prompt-file <bundle>/always.md` for the always-on ones (inline
+//! `--append-system-prompt` when that hidden flag is refused), both before `--mcp-config`.
+//! A bundle that cannot be written is reported as a step and the session starts without
+//! skills.
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -23,7 +30,7 @@ use std::sync::Arc;
 
 use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
 use mirante_core::claude_launch::{
-    launch_spec, mcp_json, memory_allow, settings_json, LaunchInput, AGENT_ENV, MCP_SERVER, TASK_ENV,
+    launch_spec, mcp_json, memory_allow, settings_json, AlwaysOn, LaunchInput, AGENT_ENV, MCP_SERVER, TASK_ENV,
 };
 use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
@@ -32,6 +39,7 @@ use mirante_ipc::types::AgentBinView;
 use super::claude::{ClaudeDriver, ClaudeTiming};
 use super::codex::{codex_env_to_scrub, ChildEnv, CodexDriver, CodexTiming};
 use super::pty::PtySpec;
+pub use super::skill_bundle::{append_file_supported, write_skill_bundle, SkillBundle};
 use super::{Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
 #[derive(Debug, Clone)]
@@ -172,6 +180,39 @@ fn parent_env() -> Vec<String> {
     std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
 }
 
+/// What Claude's launch carries beyond the settings: the MCP config and the skills.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClaudeExtras<'a> {
+    pub mcp_config: Option<&'a Path>,
+    pub plugin_dir: Option<&'a Path>,
+    pub always: Option<AlwaysOn<'a>>,
+}
+
+/// How the bundle's always-on text reaches Claude: the file when `file_flag` (the binary
+/// accepts `--append-system-prompt-file`), else the text inline.
+pub fn claude_always(b: &SkillBundle, file_flag: bool) -> Option<AlwaysOn<'_>> {
+    match (&b.always_file, &b.always_text) {
+        (Some(f), _) if file_flag => Some(AlwaysOn::File(f)),
+        (_, Some(t)) => Some(AlwaysOn::Inline(t)),
+        _ => None,
+    }
+}
+
+/// How long the `--append-system-prompt-file` probe may take.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The session's skills on disk for `agent`, or `None` (none, or they could not be written:
+/// reported as a `skills_failed` step, and the session starts without them).
+fn skill_bundle_for(req: &SpawnRequest, agent: AgentKind, sink: &Sink) -> Option<SkillBundle> {
+    match write_skill_bundle(&req.paths, &req.task.id, &req.session_id, req.skills.as_ref(), agent) {
+        Ok(b) => b,
+        Err(e) => {
+            sink.emit(DriverEvent::Step(serde_json::json!({ "type": "skills_failed", "error": e })));
+            None
+        }
+    }
+}
+
 /// The PTY launch for `req`, and the native session id pinned for a fresh start
 /// (`None` when resuming: the id to resume is `req.resume`).
 pub fn claude_spec(
@@ -180,7 +221,7 @@ pub fn claude_spec(
     settings: &Path,
     size: (u16, u16),
     parent_env: Vec<String>,
-    mcp_config: Option<&Path>,
+    extras: ClaudeExtras<'_>,
 ) -> std::io::Result<(PtySpec, Option<String>)> {
     let spec = launch_spec(LaunchInput {
         claude_bin: claude,
@@ -190,7 +231,9 @@ pub fn claude_spec(
         session_id: &req.session_id,
         resume: req.resume.as_deref(),
         parent_env,
-        mcp_config,
+        mcp_config: extras.mcp_config,
+        plugin_dir: extras.plugin_dir,
+        always: extras.always,
     });
     let mut args = spec.args;
     let pinned = match req.resume {
@@ -259,8 +302,17 @@ impl RealFactory {
         let claude = resolve_agent(Agent::Claude)?;
         let hook = hook_bin()?;
         let (settings, mcp) = write_claude_config(req, &hook)?;
-        let (mut pty, pinned) =
-            claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env(), mcp.as_deref())?;
+        let bundle = skill_bundle_for(req, AgentKind::Claude, &sink);
+        let always = bundle.as_ref().and_then(|b| {
+            let file_flag = b.always_file.is_some() && append_file_supported(&claude, PROBE_TIMEOUT);
+            claude_always(b, file_flag)
+        });
+        let extras = ClaudeExtras {
+            mcp_config: mcp.as_deref(),
+            plugin_dir: bundle.as_ref().and_then(|b| b.plugin_dir.as_deref()),
+            always,
+        };
+        let (mut pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env(), extras)?;
         pty.env_set.extend(agent_path_env(&claude, std::env::var("PATH").ok().as_deref()));
         let driver = ClaudeDriver::spawn(pty, sink.clone(), ClaudeTiming::default(), req.resume.is_some())?;
         if let Some(id) = pinned {
@@ -383,9 +435,15 @@ mod tests {
     #[test]
     fn a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session() {
         let parent = vec!["CLAUDECODE".to_string(), "ANTHROPIC_API_KEY".to_string()];
-        let (spec, pinned) =
-            claude_spec(&request(None), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), parent, None)
-                .unwrap();
+        let (spec, pinned) = claude_spec(
+            &request(None),
+            Path::new("/bin/claude"),
+            Path::new("/h/s.json"),
+            (40, 120),
+            parent,
+            ClaudeExtras::default(),
+        )
+        .unwrap();
         let id = pinned.expect("fresh start pins an id");
         let args = spec.args.join(" ");
         assert!(args.contains(&format!("--session-id {id}")), "{args}");
@@ -453,7 +511,8 @@ mod tests {
         );
 
         // The full launch: `--mcp-config` followed only by `--flag value` pairs.
-        let (spec, _) = claude_spec(&req, Path::new("/bin/claude"), &settings, (40, 120), vec![], Some(&mcp)).unwrap();
+        let extras = ClaudeExtras { mcp_config: Some(&mcp), ..ClaudeExtras::default() };
+        let (spec, _) = claude_spec(&req, Path::new("/bin/claude"), &settings, (40, 120), vec![], extras).unwrap();
         let i = spec.args.iter().position(|a| a == "--mcp-config").unwrap();
         assert_eq!(spec.args[i + 1], mcp.to_str().unwrap());
         assert_eq!((spec.args.len() - i) % 2, 0, "{:?}", spec.args);
@@ -482,7 +541,7 @@ mod tests {
             Path::new("/h/s.json"),
             (40, 120),
             vec![],
-            None,
+            ClaudeExtras::default(),
         )
         .unwrap();
         assert_eq!(pinned, None);
@@ -520,5 +579,40 @@ mod tests {
         assert_eq!(r[0].source.as_deref(), Some("MIRANTE_CLAUDE_BIN"));
         assert_eq!(r[1].agent, "codex");
         assert!(r[1].path.is_none() && r[1].error.as_deref().is_some_and(|e| e.contains("no codex")), "{:?}", r[1]);
+    }
+    #[test]
+    fn claude_gets_its_session_bundle_before_mcp_config_with_the_inline_fallback() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.paths = Paths::new(&d.path().join("home"));
+        std::fs::create_dir_all(req.paths.home()).unwrap();
+        req.mcp = Some(PathBuf::from("/opt/m/mirante-mcp"));
+        req.skills = Some(crate::driver::skill_bundle::tests::sample());
+        let (settings, mcp) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
+        let b = write_skill_bundle(&req.paths, &req.task.id, &req.session_id, req.skills.as_ref(), AgentKind::Claude)
+            .unwrap()
+            .unwrap();
+        for (supported, flag, value) in [
+            (true, "--append-system-prompt-file", b.always_file.as_ref().unwrap().to_str().unwrap().to_string()),
+            (false, "--append-system-prompt", b.always_text.clone().unwrap()),
+        ] {
+            let extras = ClaudeExtras {
+                mcp_config: mcp.as_deref(),
+                plugin_dir: b.plugin_dir.as_deref(),
+                always: claude_always(&b, supported),
+            };
+            let (spec, _) = claude_spec(&req, Path::new("/bin/claude"), &settings, (40, 120), vec![], extras).unwrap();
+            let at = |f: &str| spec.args.iter().position(|a| a == f).unwrap();
+            assert_eq!(spec.args[at(flag) + 1], value);
+            assert_eq!(spec.args[at("--plugin-dir") + 1], b.plugin_dir.as_ref().unwrap().to_str().unwrap());
+            let i = at("--mcp-config");
+            assert!(at("--plugin-dir") < i && at(flag) < i, "{:?}", spec.args);
+            assert_eq!((spec.args.len() - i) % 2, 0, "{:?}", spec.args);
+            assert!(spec.args[i + 2..].iter().step_by(2).all(|a| a.starts_with("--")), "{:?}", spec.args);
+        }
+        // No skills: neither flag.
+        let (spec, _) =
+            claude_spec(&req, Path::new("/bin/claude"), &settings, (40, 120), vec![], ClaudeExtras::default()).unwrap();
+        assert!(!spec.args.iter().any(|a| a == "--plugin-dir" || a.starts_with("--append-system-prompt")));
     }
 }

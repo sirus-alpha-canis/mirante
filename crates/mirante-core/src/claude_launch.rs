@@ -172,6 +172,27 @@ pub fn memory_allow() -> Vec<String> {
     ["memory_search", "memory_get"].iter().map(|t| format!("mcp__{MCP_SERVER}__{t}")).collect()
 }
 
+/// The name of the per-session plugin Mirante generates for a task's on-demand skills;
+/// Claude invokes them as `mirante-skills:<name>`.
+pub const PLUGIN_NAME: &str = "mirante-skills";
+
+/// `.claude-plugin/plugin.json` of that plugin: a name, a version and a description,
+/// nothing else (no hooks, MCP servers, commands or agents: the plugin only carries
+/// `skills/`).
+pub fn plugin_json() -> Value {
+    json!({ "name": PLUGIN_NAME, "version": "0.0.0", "description": "Skills Mirante injected for this task" })
+}
+
+/// How the always-on skills reach Claude's system prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlwaysOn<'a> {
+    /// `--append-system-prompt-file <path>` (a flag Claude 2.1.285 accepts but does not
+    /// list in `--help`).
+    File(&'a Path),
+    /// `--append-system-prompt <text>`, for a Claude that refuses the file flag.
+    Inline(&'a str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchInput<'a> {
     pub claude_bin: &'a Path,
@@ -186,6 +207,10 @@ pub struct LaunchInput<'a> {
     pub parent_env: Vec<String>,
     /// The per-task MCP config ([`mcp_json`]), only for repos with memory enabled.
     pub mcp_config: Option<&'a Path>,
+    /// The per-session plugin holding the on-demand skills (`--plugin-dir`).
+    pub plugin_dir: Option<&'a Path>,
+    /// The always-on skills' text.
+    pub always: Option<AlwaysOn<'a>>,
 }
 
 /// Everything a PTY spawner needs, with no I/O done yet.
@@ -200,6 +225,22 @@ pub struct LaunchSpec {
 
 pub fn launch_spec(input: LaunchInput<'_>) -> LaunchSpec {
     let mut args = vec!["--settings".to_string(), input.settings_path.to_string_lossy().into_owned()];
+    // Skills before `--mcp-config`, which is variadic (see below).
+    if let Some(dir) = input.plugin_dir {
+        args.push("--plugin-dir".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    match input.always {
+        Some(AlwaysOn::File(f)) => {
+            args.push("--append-system-prompt-file".to_string());
+            args.push(f.to_string_lossy().into_owned());
+        }
+        Some(AlwaysOn::Inline(text)) => {
+            args.push("--append-system-prompt".to_string());
+            args.push(text.to_string());
+        }
+        None => {}
+    }
     if let Some(mcp) = input.mcp_config {
         // Variadic in Claude's CLI: every argument after it must be a `--flag value` pair,
         // or the value would be read as another config.
@@ -366,6 +407,8 @@ mod tests {
             resume: None,
             parent_env: vec!["CMUX_AGENT_Y".into()],
             mcp_config: None,
+            plugin_dir: None,
+            always: None,
         };
         let spec = launch_spec(input.clone());
         assert_eq!(spec.program, PathBuf::from("/usr/local/bin/claude"));
@@ -401,6 +444,8 @@ mod tests {
             resume: Some("sess-9"),
             parent_env: vec![],
             mcp_config: None,
+            plugin_dir: None,
+            always: None,
         }
     }
 
@@ -438,5 +483,66 @@ mod tests {
             json!(["mcp__mirante-memory__memory_search", "mcp__mirante-memory__memory_get"])
         );
         assert!(!memory_allow().iter().any(|t| t.contains("propose")));
+    }
+    /// `--mcp-config` is variadic: after it, only `--flag value` pairs.
+    fn assert_pairs_after_mcp(args: &[String]) {
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!((args.len() - i) % 2, 0, "{args:?}");
+        assert!(args[i + 2..].iter().step_by(2).all(|a| a.starts_with("--")), "{args:?}");
+    }
+
+    #[test]
+    fn plugin_dir_and_always_file_flags_come_before_mcp_config_and_are_pairs() {
+        let spec = launch_spec(LaunchInput {
+            mcp_config: Some(Path::new("/m/s/t1/mcp.json")),
+            plugin_dir: Some(Path::new("/m/s/t1/skills/s1/claude-plugin")),
+            always: Some(AlwaysOn::File(Path::new("/m/s/t1/skills/s1/always.md"))),
+            ..input()
+        });
+        let at = |f: &str| spec.args.iter().position(|a| a == f).unwrap_or_else(|| panic!("{f}: {:?}", spec.args));
+        let (plugin, always, mcp) = (at("--plugin-dir"), at("--append-system-prompt-file"), at("--mcp-config"));
+        assert_eq!(spec.args[plugin + 1], "/m/s/t1/skills/s1/claude-plugin");
+        assert_eq!(spec.args[always + 1], "/m/s/t1/skills/s1/always.md");
+        assert!(plugin < mcp && always < mcp, "{:?}", spec.args);
+        assert_eq!(spec.args.iter().filter(|a| *a == "--plugin-dir").count(), 1);
+        assert_pairs_after_mcp(&spec.args);
+        // Every flag before `--mcp-config` is a pair too: nothing positional anywhere.
+        assert!(spec.args.iter().step_by(2).all(|a| a.starts_with("--")), "{:?}", spec.args);
+
+        // The inline fallback (a Claude without the hidden flag) is a pair as well.
+        let text = "<mirante-skills>\n--not-a-flag\n</mirante-skills>\n";
+        let spec = launch_spec(LaunchInput {
+            mcp_config: Some(Path::new("/m/mcp.json")),
+            always: Some(AlwaysOn::Inline(text)),
+            ..input()
+        });
+        let i = spec.args.iter().position(|a| a == "--append-system-prompt").unwrap();
+        assert_eq!(spec.args[i + 1], text);
+        assert!(i < spec.args.iter().position(|a| a == "--mcp-config").unwrap());
+        assert!(!spec.args.iter().any(|a| a == "--append-system-prompt-file"));
+        assert_pairs_after_mcp(&spec.args);
+    }
+
+    #[test]
+    fn no_skills_no_flags() {
+        for spec in [launch_spec(input()), launch_spec(LaunchInput { mcp_config: Some(Path::new("/m")), ..input() })] {
+            assert!(
+                !spec.args.iter().any(|a| a == "--plugin-dir" || a.starts_with("--append-system-prompt")),
+                "{:?}",
+                spec.args
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_json_names_mirante_skills() {
+        let v = plugin_json();
+        assert_eq!(v["name"], "mirante-skills");
+        assert_eq!(v["name"], PLUGIN_NAME);
+        assert_eq!(v["version"], "0.0.0");
+        assert_eq!(v["description"], "Skills Mirante injected for this task");
+        // Nothing that would load code or grant anything: no hooks, MCP servers, commands
+        // or agents declared.
+        assert_eq!(v.as_object().unwrap().len(), 3, "{v}");
     }
 }
