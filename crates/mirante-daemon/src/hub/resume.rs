@@ -10,7 +10,13 @@
 //! until it eases, also when it tightens at the moment of the launch).
 //!
 //! Only what the immediately previous daemon run ended comes back (its shutdown, or the
-//! sessions this run found live after a crash), within [`RESUME_MAX_AGE_MS`]. Never resumed:
+//! sessions this run found live after a crash), within [`RESUME_MAX_AGE_MS`] of when the
+//! session went quiet (for a crash: the task's last event before the daemon died, not the
+//! recovery that found it). Recovery marks each candidate it queues
+//! (`session.auto_resume_pending`): a run that goes down before resuming it leaves it to the
+//! next run, which resumes it when the newest such marker is the previous run's. A run that
+//! is shutting down launches nothing and consumes nothing; one whose auto-resume is turned
+//! off skips the candidates it has left. Never resumed:
 //! a task the person stopped, started or stopped again since, a hibernated one (it stays
 //! hibernated until woken), an archived one, one already live again, one whose conversation
 //! never got a native id (nothing to resume), and one that this daemon had itself resumed
@@ -46,6 +52,11 @@ pub const RESUME_MAX_AGE_MS: i64 = 12 * 3_600_000;
 /// Why a launch made by auto-resume waits instead of failing.
 pub const MEMORY_TIGHT: &str = "memory is tight";
 
+/// Written by recovery for each candidate it queues (`{boot}`: the run that queued it). A
+/// run that goes down before resuming it leaves it pending, and the next run resumes it
+/// when the newest such marker is from the run just before.
+pub const PENDING: &str = "session.auto_resume_pending";
+
 /// Event kinds that consume an auto-resume candidate.
 fn is_marker(kind: &str) -> bool {
     matches!(kind, "session.auto_resumed" | "session.auto_resume_failed" | "session.auto_resume_skipped")
@@ -56,6 +67,9 @@ fn is_marker(kind: &str) -> bool {
 /// auto-resume already acted on it (resumed, failed or skipped).
 fn daemon_end(events: &[Event]) -> Option<usize> {
     for (i, e) in events.iter().enumerate().rev() {
+        if e.kind == PENDING {
+            continue;
+        }
         if e.kind == "session_launch" || is_marker(&e.kind) {
             return None;
         }
@@ -91,12 +105,25 @@ pub fn verdict(events: &[Event], current_boot: &str, previous_boot: Option<&str>
     let end = &events[i];
     let crash = end.payload["cause"] == "mirante:daemon_restart";
     // A crash is found (and the session ended) by this run's recovery; a shutdown is the
-    // previous run's own.
-    let by_last_run = if crash { end.boot_id == current_boot } else { previous_boot == Some(end.boot_id.as_str()) };
+    // previous run's own. A candidate the previous run queued but did not get to (it went
+    // down first) is that run's too: its newest pending marker says so.
+    let pending = events[i + 1..].iter().rev().find(|e| e.kind == PENDING);
+    let by_last_run = match pending {
+        Some(p) => previous_boot == Some(p.boot_id.as_str()),
+        None if crash => end.boot_id == current_boot,
+        None => previous_boot == Some(end.boot_id.as_str()),
+    };
     if !by_last_run {
         return Verdict::No;
     }
-    if now_ms.saturating_sub(end.ts_ms) > RESUME_MAX_AGE_MS {
+    // When the session really ended: a crash's end is written at recovery, maybe long after;
+    // the task's last event from the run that crashed is when it went quiet.
+    let ended_at = if crash {
+        events[..i].iter().rev().find(|e| e.boot_id != end.boot_id).map_or(end.ts_ms, |e| e.ts_ms)
+    } else {
+        end.ts_ms
+    };
+    if now_ms.saturating_sub(ended_at) > RESUME_MAX_AGE_MS {
         return Verdict::Skip("it ended more than 12 h ago");
     }
     let launched_by_auto_resume =
@@ -229,10 +256,11 @@ impl Hub {
     }
 
     /// Waits until a resume may launch: auto-resume still on, the memory guard sampled
-    /// (when it runs) and not pausing new sessions. `false`: auto-resume was turned off.
+    /// (when it runs) and not pausing new sessions. `false`: auto-resume was turned off, or
+    /// the daemon is going down.
     fn wait_for_room(&self, started: Instant, wait_sample: bool) -> bool {
         loop {
-            if !self.auto_resume_enabled() {
+            if !self.auto_resume_enabled() || self.is_shutting_down() {
                 return false;
             }
             let st = self.lock();
@@ -257,6 +285,12 @@ impl Hub {
             }
             loop {
                 if !self.wait_for_room(started, wait_sample) {
+                    // Turned off: the candidates left are said so (consumed). Going down:
+                    // they stay pending for the next run.
+                    if !self.is_shutting_down() {
+                        let pos = tasks.iter().position(|t| t == task_id).unwrap_or(0);
+                        self.skip_all(&tasks[pos..], "auto-resume was turned off");
+                    }
                     return resumed;
                 }
                 let r = self.launch(StartSession { task: task_id.clone(), prompt: None }, true, true);
@@ -264,6 +298,8 @@ impl Hub {
                 let (kind, payload) = match r {
                     // Memory tightened between the wait and the launch: wait again.
                     Ok(Launch::Refused(MEMORY_TIGHT)) => continue,
+                    // The daemon is going down: the candidate is left for the next run.
+                    Ok(Launch::Refused(super::session::SHUTTING_DOWN)) => return resumed,
                     Ok(Launch::Refused(why)) => ("session.auto_resume_skipped", json!({ "reason": why })),
                     // Someone else got there first (the person resumed it meanwhile).
                     Err(HubError::Conflict(why)) => ("session.auto_resume_skipped", json!({ "reason": why })),
@@ -285,6 +321,17 @@ impl Hub {
             }
         }
         resumed
+    }
+
+    /// A `session.auto_resume_skipped` for each of `tasks`.
+    fn skip_all(&self, tasks: &[String], why: &str) {
+        let mut st = self.lock();
+        for task_id in tasks {
+            if let Err(e) = st.event(Some(task_id), "session.auto_resume_skipped", json!({ "reason": why })) {
+                st.log_error(Some(task_id), "auto-resume", &e);
+            }
+        }
+        st.publish();
     }
 
     /// [`Hub::run_auto_resume`] on its own thread (the daemon serves meanwhile).
@@ -366,6 +413,46 @@ mod tests {
         assert!(!hub.get_task(&fresh).unwrap().live);
         assert!(kinds(&hub, &fresh).contains(&"session.auto_resume_skipped".to_string()));
         assert!(hub.get_task(&asleep).unwrap().hibernated);
+    }
+
+    #[test]
+    fn auto_resume_stops_when_the_daemon_goes_down_and_consumes_nothing() {
+        let k = file_kit();
+        let t = live_with_native(&k, "live", "nat-live");
+        k.hub.shutdown();
+        let (hub, r) = restarted(&k);
+        assert_eq!(r.resume, vec![t.clone()]);
+        hub.shutdown();
+        assert!(hub.run_auto_resume(&r.resume, false).is_empty());
+        let k2 = kinds(&hub, &t);
+        assert!(!k2.iter().any(|e| is_marker(e)), "{k2:?}");
+        // So the next run still brings it back.
+        drop(hub);
+        let (_hub, r) = restarted(&k);
+        assert_eq!(r.resume, vec![t]);
+    }
+
+    /// A run that resumed some of its candidates and went down before the rest leaves the
+    /// rest for the next run (it wrote events, so it is the "previous run" then).
+    #[test]
+    fn two_back_to_back_restarts_keep_the_candidates_not_yet_resumed() {
+        let k = file_kit();
+        let a = live_with_native(&k, "a", "nat-a");
+        let b = live_with_native(&k, "b", "nat-b");
+        k.hub.shutdown();
+        let (hub2, r) = restarted(&k);
+        let mut want = vec![a.clone(), b.clone()];
+        want.sort();
+        let mut got = r.resume.clone();
+        got.sort();
+        assert_eq!(got, want);
+        assert_eq!(hub2.run_auto_resume(std::slice::from_ref(&a), false), vec![a.clone()]);
+        hub2.shutdown();
+        drop(hub2);
+        let (_hub3, r) = restarted(&k);
+        let mut got = r.resume.clone();
+        got.sort();
+        assert_eq!(got, want, "b was waiting its turn when the second run went down");
     }
 
     #[test]
@@ -492,19 +579,27 @@ mod tests {
         assert!(hub.get_task(&a).unwrap().live && hub.get_task(&b).unwrap().live);
     }
 
-    /// Review 2: only what the immediately previous daemon run ended comes back.
+    /// Review 2: only what the immediately previous daemon run ended comes back. A run
+    /// whose auto-resume was turned off before it got to a candidate says so (skipped), so
+    /// a later run does not bring it back.
     #[test]
     fn a_session_ended_by_an_earlier_run_is_not_resumed() {
         let k = file_kit();
         let t = live_with_native(&k, "a", "nat-a");
         k.hub.shutdown();
-        // A run that brought nothing back (it did other work), then another restart.
         let (hub2, r2) = restarted(&k);
         assert_eq!(r2.resume, vec![t.clone()]);
+        hub2.set_auto_resume(false);
+        assert!(hub2.run_auto_resume(&r2.resume, false).is_empty());
+        assert!(kinds(&hub2, &t).contains(&"session.auto_resume_skipped".to_string()));
         hub2.lock().event(None, "settings_changed", json!({ "auto_resume": true })).unwrap();
         drop(hub2);
         let (_hub3, r3) = restarted(&k);
         assert!(r3.resume.is_empty(), "{:?}", r3.resume);
+        // Pending since a run before the previous one: not this run's to resume.
+        let end = ended("mirante:daemon_shutdown", "a", 0);
+        let evs = [end, ev(PENDING, json!({}), "b", 1), ev("x", json!({}), "c", 2)];
+        assert_eq!(verdict(&evs, "d", Some("c"), 10), Verdict::No);
     }
 
     /// Review 2: with auto-resume off, the candidates are marked (once), so a later run
@@ -579,6 +674,34 @@ mod tests {
         assert_eq!(verdict(&[launch(true, "prev"), shut], "cur", Some("prev"), now), Verdict::Resume);
         // The person stopped it: not the daemon's.
         assert_eq!(verdict(&[ended("mirante:stopped", "prev", now)], "cur", Some("prev"), now), Verdict::No);
+    }
+
+    #[test]
+    fn a_candidate_a_run_left_pending_is_still_one_for_the_next_run() {
+        let now = 50 * 3_600_000;
+        let shut = ended("mirante:daemon_shutdown", "a", now - 1000);
+        let pending = |boot: &str| ev(PENDING, json!({ "boot": boot }), boot, now - 500);
+        // Run b queued it and went down before resuming it (b wrote other events, so b is
+        // the previous run, not a).
+        assert_eq!(verdict(&[shut.clone(), pending("b")], "c", Some("b"), now), Verdict::Resume);
+        assert!(ended_by_daemon(&[shut.clone(), pending("b")]));
+        // Pending since an older run: that run's own end was not this one's to resume.
+        assert_eq!(verdict(&[shut.clone(), pending("b")], "d", Some("c"), now), Verdict::No);
+        // A crash found by b's recovery, queued, then b went down too.
+        let crash = ended("mirante:daemon_restart", "b", now - 800);
+        assert_eq!(verdict(&[crash, pending("b")], "c", Some("b"), now), Verdict::Resume);
+    }
+
+    #[test]
+    fn a_crash_s_age_counts_from_the_task_s_last_event_before_it() {
+        let now = 50 * 3_600_000;
+        let last = ev("step", json!({}), "a", now - RESUME_MAX_AGE_MS - 60_000);
+        // The crash is written by this run's recovery, now: the session itself went quiet
+        // more than 12 h ago, when the daemon died.
+        let crash = ended("mirante:daemon_restart", "cur", now - 5);
+        assert!(matches!(verdict(&[last, crash.clone()], "cur", Some("a"), now), Verdict::Skip(_)));
+        let recent = ev("step", json!({}), "a", now - 3_600_000);
+        assert_eq!(verdict(&[recent, crash], "cur", Some("a"), now), Verdict::Resume);
     }
 
     #[test]

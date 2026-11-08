@@ -294,7 +294,12 @@ fn resume_candidate(st: &mut State, task_id: &str, run: (&str, Option<&str>, i64
     let (current, previous, now) = run;
     let why = match verdict(&st.store.task_events(task_id)?, current, previous, now) {
         Verdict::No => return Ok(false),
-        Verdict::Resume if auto_resume => return Ok(true),
+        Verdict::Resume if auto_resume => {
+            // Queued for this run: if it goes down before the resume, the next run still
+            // knows the candidate is the previous run's (see `resume::verdict`).
+            st.event(Some(task_id), crate::hub::resume::PENDING, json!({ "boot": current }))?;
+            return Ok(true);
+        }
         Verdict::Resume => "auto-resume is off",
         Verdict::Skip(why) => why,
     };
