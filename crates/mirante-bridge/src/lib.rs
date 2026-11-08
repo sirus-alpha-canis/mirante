@@ -17,5 +17,7 @@ pub mod stream;
 
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
+#[cfg(any(test, feature = "fake"))]
+pub mod fake_dna;
 
 pub use rpc::{call, BridgeError};

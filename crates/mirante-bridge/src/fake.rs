@@ -19,6 +19,7 @@ struct Shared {
     tasks: Vec<Value>,
     subscribers: Vec<UnixStream>,
     open: Vec<UnixStream>,
+    dna: crate::fake_dna::DnaDemo,
 }
 
 #[derive(Clone)]
@@ -133,7 +134,11 @@ fn serve(shared: Arc<Mutex<Shared>>, conn: UnixStream) {
 }
 
 fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcError> {
-    let s = shared.lock().unwrap();
+    let mut s = shared.lock().unwrap();
+    let s = &mut *s;
+    if let Some(r) = s.dna.answer(m, p, &s.tasks) {
+        return r;
+    }
     match m {
         method::DAEMON_STATUS => Ok(json!({"pid": 1, "boot_id": s.boot_id, "version": "fake", "live_sessions": 0})),
         method::TASK_LIST => Ok(Value::Array(s.tasks.clone())),

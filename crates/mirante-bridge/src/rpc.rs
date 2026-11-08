@@ -35,6 +35,19 @@ pub const ALLOWED: &[&str] = &[
     method::DAEMON_STATUS,
     method::SESSION_HIBERNATE,
     method::SESSION_WAKE,
+    // Repo memory (DNA). Never `dna.propose`: agents propose through their MCP server and
+    // people write notes in their editor; the cockpit only reviews, confirms and retires.
+    method::DNA_STATUS,
+    method::DNA_ENABLE,
+    method::DNA_DISABLE,
+    method::DNA_GRAPH,
+    method::DNA_SEARCH,
+    method::DNA_GET,
+    method::DNA_CHECK,
+    method::DNA_TASK_CONTEXT,
+    method::DNA_PROPOSALS,
+    method::DNA_REVIEW,
+    method::DNA_NOTE_ACTION,
 ];
 
 /// `session.start` waits for the agent to boot (up to 45 s in the daemon).
@@ -144,6 +157,17 @@ mod tests {
             "daemon.status",
             "session.hibernate",
             "session.wake",
+            "dna.status",
+            "dna.enable",
+            "dna.disable",
+            "dna.graph",
+            "dna.search",
+            "dna.get",
+            "dna.check",
+            "dna.task_context",
+            "dna.proposals",
+            "dna.review",
+            "dna.note_action",
         ];
         assert_eq!(ALLOWED, expected);
     }
@@ -158,6 +182,7 @@ mod tests {
             method::DAEMON_KILL_ORPHAN,
             method::EVENTS_SUBSCRIBE,
             method::ATTACH,
+            method::DNA_PROPOSE,
             "x.y",
         ];
         for m in refused {

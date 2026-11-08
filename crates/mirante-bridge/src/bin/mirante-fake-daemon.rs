@@ -1,6 +1,6 @@
-//! `mirante-fake-daemon <socket>`: the scripted fake daemon with demo tasks, for working on
-//! the cockpit UI without agents and for the app smoke test. Prints `call <method>` for
-//! every request it receives. Not a daemon: it never starts agents or touches git.
+//! `mirante-fake-daemon <socket>`: the scripted fake daemon with demo tasks and a demo repo
+//! memory (`dna.*`), for working on the cockpit UI without agents and for the app smoke
+//! test. Prints `call <method>` for every request it receives. Not a daemon: it never starts agents or touches git.
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -25,6 +25,11 @@ fn main() {
         Some("t-codex-1"),
         "permission_requested",
         json!({"permission_id": "p-1", "tool": "command", "detail": "npm install"}),
+    );
+    fake.push_event(
+        Some("t-claude-1"),
+        "dna.proposed",
+        json!({"id": "p-1", "title": "Login tokens are refreshed by the session layer"}),
     );
     println!("fake daemon on {}", socket.display());
     let mut seen = 0;

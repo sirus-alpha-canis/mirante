@@ -84,7 +84,20 @@ describe("Tauri security baseline", () => {
       "DAEMON_STATUS",
       "SESSION_HIBERNATE",
       "SESSION_WAKE",
+      "DNA_STATUS",
+      "DNA_ENABLE",
+      "DNA_DISABLE",
+      "DNA_GRAPH",
+      "DNA_SEARCH",
+      "DNA_GET",
+      "DNA_CHECK",
+      "DNA_TASK_CONTEXT",
+      "DNA_PROPOSALS",
+      "DNA_REVIEW",
+      "DNA_NOTE_ACTION",
     ]);
+    // Never DNA_PROPOSE: agents propose through MCP; people write notes in their editor.
+    expect(block).not.toContain("DNA_PROPOSE");
     // Every method the cockpit calls is one of them ("message.list_queued" is MESSAGE_LIST_QUEUED).
     const wire = new Set(allowed.map((c) => c.toLowerCase().replace("_", ".")));
     for (const m of Object.values(M)) expect(wire, m).toContain(m);

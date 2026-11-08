@@ -41,7 +41,9 @@ binaries the daemon resolved and from where.
 ### Without agents: the fake daemon
 
 The scripted fake daemon serves three demo tasks (working, needs-you with a permission card,
-ready for review) and adds a step every two seconds:
+ready for review) and adds a step every two seconds. Its repo memory (`dna.*`) is a 6-note demo
+graph for `/repos/mirante` (one stale note, one unreviewed, one dangling link) with two pending
+proposals; `/repos/shop` starts with memory off, to show the enable path:
 
 ```bash
 mkdir -p /tmp/mr-ui
