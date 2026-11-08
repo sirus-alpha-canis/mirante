@@ -377,13 +377,11 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
     out
 }
 
-/// Indented body lines (at most `max` of them), each cleaned for the terminal.
-fn body_lines(out: &mut String, body: &str, max: usize) {
-    for l in body.lines().take(max) {
-        out.push_str(&format!("  | {}\n", line(l, 300)));
-    }
-    if body.lines().count() > max {
-        out.push_str("  | …\n");
+/// Every line of `body`, indented and cleaned for the terminal, none cut: a person accepts
+/// (or retires, rescopes…) exactly the text shown, and skills are capped at 128 KiB anyway.
+fn body_lines(out: &mut String, body: &str) {
+    for l in body.lines() {
+        out.push_str(&format!("  | {}\n", line(l, usize::MAX)));
     }
 }
 
@@ -441,11 +439,11 @@ pub fn skill_view(v: &SkillView) -> String {
     }
     if !v.skill_md.is_empty() {
         out.push('\n');
-        body_lines(&mut out, &v.skill_md, 200);
+        body_lines(&mut out, &v.skill_md);
     }
     for f in &v.files {
         out.push_str(&format!("\n  file {}:\n", line(&f.path, 200)));
-        body_lines(&mut out, &f.text, 40);
+        body_lines(&mut out, &f.text);
     }
     out
 }
@@ -514,9 +512,10 @@ pub fn skill_proposal(v: &SkillProposalView, scope: Option<&str>, activation: Op
         out.push_str(&format!("  seen in task {}: {}\n", line(short(&e.task), 8), line(&e.text, 200)));
     }
     out.push('\n');
-    body_lines(&mut out, &p.body, 60);
+    body_lines(&mut out, &p.body);
     for f in &p.files {
-        out.push_str(&format!("  + file {}\n", line(&f.path, 200)));
+        out.push_str(&format!("\n  file {}:\n", line(&f.path, 200)));
+        body_lines(&mut out, &f.text);
     }
     out
 }
@@ -772,5 +771,44 @@ mod tests {
         assert!(card.contains("  | line one\n"), "{card}");
         let table = skill_proposals_table(&[v]);
         assert!(table.contains("1 error(s)") && table.contains("agent"), "{table}");
+    }
+
+    /// Accept approves what the card shows: every line of the body, every char of a long
+    /// line, and the full text of every bundled file (cleaned, never cut).
+    #[test]
+    fn a_skill_proposal_card_and_skill_view_show_everything_accept_approves() {
+        let mut body: String = (1..=72).map(|i| format!("line {i}\n")).collect();
+        let long = format!("start {} end-of-long-line", "x".repeat(400));
+        body.push_str(&long);
+        let file_text: String = (1..=50).map(|i| format!("ref {i}\n")).collect::<String>() + "\u{1b}[2Jlast ref";
+        let v: SkillProposalView = serde_json::from_value(serde_json::json!({
+            "id": "sp-1", "origin": "agent", "task_id": "t1", "tenant": "github.com/acme", "kind": "new",
+            "name": "x", "base_hash": null, "scope": "repo:github.com/acme/app", "activation": "always",
+            "description": "d", "body": body,
+            "files": [{"path": "reference/notes.md", "text": file_text}], "evidence": [], "fingerprint": null,
+            "lint": [], "redactions": 0, "status": "pending", "version": null, "decision_note": "",
+            "created_at": 0, "decided_at": null, "warnings": []
+        }))
+        .unwrap();
+        let card = skill_proposal(&v, None, None);
+        assert!(card.contains("  | line 61\n") && card.contains("  | line 72\n"), "{card}");
+        assert!(card.contains(&long), "the 400-char line is cut: {card}");
+        assert!(card.contains("file reference/notes.md") && card.contains("  | ref 50\n"), "{card}");
+        assert!(card.contains("[2Jlast ref") && !card.contains('\u{1b}'), "{card:?}");
+        assert!(!card.contains('…'), "{card}");
+
+        let s: SkillView = serde_json::from_value(serde_json::json!({
+            "name": "x", "version": 1, "scope": "personal", "activation": "always",
+            "status": "active", "description": "d", "verified": true, "reason": null,
+            "manifest_hash": "h", "injected_30d": 0, "used_30d": 0, "updated_at": 0,
+            "shown_version": 1, "manifest": null,
+            "skill_md": (1..=250).map(|i| format!("md {i}\n")).collect::<String>() + &long,
+            "files": [{"path": "reference/notes.md", "text": file_text}],
+            "versions": [1], "warnings": []
+        }))
+        .unwrap();
+        let shown = skill_view(&s);
+        assert!(shown.contains("  | md 250\n") && shown.contains(&long), "{shown}");
+        assert!(shown.contains("  | ref 50\n") && shown.contains("last ref") && !shown.contains('…'), "{shown}");
     }
 }
