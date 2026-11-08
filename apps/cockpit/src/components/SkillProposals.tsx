@@ -5,7 +5,7 @@
 // (always on goes into the system prompt) and any cross-client warning. Long content may be
 // collapsed to scan the queue, but Accept is off while anything is hidden.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { lineDiff, splitLines } from "../lib/lineDiff";
 import type { Finding, SkillEdits, SkillProposalView, SkillView } from "../lib/protocol";
@@ -87,15 +87,15 @@ function Diff({ before, after, version }: { before: string; after: string; versi
 
 function Refine({ p, body }: { p: SkillProposalView; body: string }) {
   const { rpc } = useEnv();
-  const s = useStore();
+  const allTasks = useSelect((s) => s.tasks);
   const [open, setOpen] = useState(false);
   const [tasks, setTasks] = useState<{ id: string; label: string }[] | null>(null);
   const [pick, setPick] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const inFlight = useRef(false);
   const candidates = useMemo(
-    () => Object.values(s.tasks).filter((t) => t.lifecycle !== "archived" && t.live),
-    [s.tasks],
+    () => Object.values(allTasks).filter((t) => t.lifecycle !== "archived" && t.live),
+    [allTasks],
   );
   useEffect(() => {
     if (!open) return;
@@ -176,7 +176,7 @@ type Current = { state: "none" } | { state: "loading" } | { state: "ready"; view
 
 function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: string, conflict: boolean): void }) {
   const { rpc } = useEnv();
-  const s = useStore();
+  const branchOf = useSelect((s) => (p.task_id ? s.tasks[p.task_id]?.branch : undefined));
   const [name, setName] = useState(p.name);
   const [description, setDescription] = useState(p.description);
   const [body, setBody] = useState(p.body);
@@ -193,7 +193,7 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
-  const branch = p.task_id ? (s.tasks[p.task_id]?.branch ?? p.task_id) : null;
+  const branch = p.task_id ? (branchOf ?? p.task_id) : null;
 
   // The version this edit is measured against (reloaded when the daemon says it moved).
   useEffect(() => {

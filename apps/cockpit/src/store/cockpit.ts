@@ -3,7 +3,7 @@
 // permission events, and load each task's history (`task.events`) after a full snapshot.
 // Replies can arrive out of order: each one is dropped when a newer one for the same thing
 // was already applied.
-import { useSyncExternalStore } from "react";
+import { useRef, useSyncExternalStore } from "react";
 import type { DaemonEvent, PermissionView, QueuedMessage, StreamMsg, TaskView } from "../lib/protocol";
 import { M, RpcCode } from "../lib/protocol";
 import { type Action, initialState, reduce, type State } from "./state";
@@ -207,7 +207,23 @@ export function createCockpit(t: Transport): Cockpit {
   };
 }
 
-/** The whole state (a stable reference until it changes); derive with useMemo. */
-export function useCockpitState(c: Cockpit): State {
-  return useSyncExternalStore(c.subscribe, c.getState);
+
+/**
+ * What `select` picks from the store, re-rendering only when that changes (`equal`, by
+ * default `Object.is`): a component reading one task's feed does not render for another
+ * task's event. A selector that builds a new array or object each time needs a shallow
+ * `equal` (see `shallow` in env.tsx).
+ */
+export function useCockpitSelect<T>(c: Cockpit, select: (s: State) => T, equal: (a: T, b: T) => boolean = Object.is): T {
+  const last = useRef<{ state: State; select: (s: State) => T; value: T } | null>(null);
+  const snapshot = () => {
+    const state = c.getState();
+    const prev = last.current;
+    if (prev && prev.state === state && prev.select === select) return prev.value;
+    const picked = select(state);
+    const value = prev && equal(prev.value, picked) ? prev.value : picked;
+    last.current = { state, select, value };
+    return value;
+  };
+  return useSyncExternalStore(c.subscribe, snapshot);
 }

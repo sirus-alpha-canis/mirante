@@ -2,7 +2,7 @@
 // made, waiting for a person. Nothing is ever accepted automatically. Title and body are
 // editable before Accept (the daemon redacts them again); Reject takes an optional note.
 import { useEffect, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { citation, dnaErrorText, proposals, review, shortCommit } from "../lib/dna";
 import type { ProposalView, ReviewedView } from "../lib/protocol";
@@ -20,7 +20,7 @@ export type Decision = { conflict: false; result: ReviewedView } | { conflict: t
 
 function ProposalCard({ p, onDecided }: { p: ProposalView; onDecided(d: Decision): void }) {
   const { rpc } = useEnv();
-  const s = useStore();
+  const branchOf = useSelect((s) => (p.task_id ? s.tasks[p.task_id]?.branch : undefined));
   const [title, setTitle] = useState(p.title);
   const [body, setBody] = useState(p.body);
   const [rejecting, setRejecting] = useState(false);
@@ -28,7 +28,7 @@ function ProposalCard({ p, onDecided }: { p: ProposalView; onDecided(d: Decision
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
-  const branch = p.task_id ? (s.tasks[p.task_id]?.branch ?? p.task_id) : null;
+  const branch = p.task_id ? (branchOf ?? p.task_id) : null;
   const decide = async (accept: boolean) => {
     if (inFlight.current) return;
     inFlight.current = true;

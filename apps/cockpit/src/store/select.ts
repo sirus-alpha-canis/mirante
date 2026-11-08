@@ -56,7 +56,7 @@ export interface Project {
 }
 
 /** Repos from the registry plus every repo a task runs in, by name. */
-export function projects(s: State, registry: string[]): Project[] {
+export function projects(s: Pick<State, "tasks">, registry: string[]): Project[] {
   const paths = new Set(registry);
   for (const t of Object.values(s.tasks)) if (t.lifecycle !== "archived") paths.add(t.repo_path);
   return [...paths]

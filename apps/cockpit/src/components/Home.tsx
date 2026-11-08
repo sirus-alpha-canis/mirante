@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { shallow, useEnv, useSelect } from "../env";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { columnOf, COLUMN_LABEL, type Column, type Project, repoName } from "../store/select";
 import { AgentCard } from "./AgentCard";
@@ -23,15 +23,17 @@ export function Home(props: {
   draft: string;
   onDraft(v: string): void;
 }) {
-  const s = useStore();
   const env = useEnv();
+  const tasks = useSelect((s) => s.tasks);
   const cards = useMemo(
     () =>
-      Object.values(s.tasks)
+      Object.values(tasks)
         .filter((t) => t.repo_path === props.project && t.lifecycle !== "archived")
         .sort((a, b) => a.created_at - b.created_at),
-    [s.tasks, props.project],
+    [tasks, props.project],
   );
+  // Each card's column (for the announcement below): renders when one changes, not per event.
+  const columns = useSelect((s) => Object.fromEntries(cards.map((t) => [t.id, columnOf(t, s.feed[t.id])])), shallow);
   const composer = useRef<HTMLTextAreaElement>(null);
   const [agent, setAgent] = useState<AgentKind>(() => loadAgent(env.storage));
   const pickAgent = (a: AgentKind) => {
@@ -44,15 +46,14 @@ export function Home(props: {
   };
   // One polite region says when a card changes state (not every new line on every card).
   const [announce, setAnnounce] = useState("");
-  const columns = useRef<Map<string, Column> | null>(null);
+  const seen = useRef<Record<string, Column> | null>(null);
   useEffect(() => {
-    const now = new Map(cards.map((t) => [t.id, columnOf(t, s.feed[t.id])]));
-    const before = columns.current;
-    columns.current = now;
+    const before = seen.current;
+    seen.current = columns;
     if (!before) return;
-    const changed = cards.filter((t) => before.has(t.id) && before.get(t.id) !== now.get(t.id));
-    if (changed.length > 0) setAnnounce(changed.map((t) => `${t.title}: ${COLUMN_LABEL[now.get(t.id)!]}`).join(". "));
-  }, [cards, s.feed]);
+    const changed = cards.filter((t) => t.id in before && before[t.id] !== columns[t.id]);
+    if (changed.length > 0) setAnnounce(changed.map((t) => `${t.title}: ${COLUMN_LABEL[columns[t.id]]}`).join(". "));
+  }, [cards, columns]);
   return (
     <div className="home">
       <LeftRail

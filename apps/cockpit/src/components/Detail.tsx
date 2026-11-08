@@ -1,7 +1,8 @@
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { type KeyboardEvent, memo, useEffect, useMemo, useRef, useState } from "react";
+import { shallow, useEnv, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { M, type TaskView } from "../lib/protocol";
+import type { FeedItem } from "../store/state";
 import { useDnaKey, useDnaRev } from "../lib/useDna";
 import { columnOf, COLUMN_LABEL, type Column, pendingPerms, turnsEnded } from "../store/select";
 import { FeedLine } from "./AgentCard";
@@ -20,17 +21,21 @@ const GROUPS: Column[] = ["needs_you", "working", "review", "idle"];
 const TABS = ["Steps", "Terminal", "Diff", "Memory"] as const;
 export type Tab = (typeof TABS)[number];
 
-function TaskList({ selected, onSelect }: { selected: string; onSelect(id: string): void }) {
-  const s = useStore();
+const NO_FEED: FeedItem[] = [];
+
+const TaskList = memo(function TaskList({ selected, onSelect }: { selected: string; onSelect(id: string): void }) {
+  const tasks = useSelect((s) => s.tasks);
+  // Each task's column: renders when one changes, not on every event.
+  const columns = useSelect((s) => Object.fromEntries(Object.values(s.tasks).map((t) => [t.id, columnOf(t, s.feed[t.id])])), shallow);
   const groups = useMemo(
     () =>
       GROUPS.map((g) => ({
         g,
-        tasks: Object.values(s.tasks)
-          .filter((t) => columnOf(t, s.feed[t.id]) === g)
+        tasks: Object.values(tasks)
+          .filter((t) => columns[t.id] === g)
           .sort((a, b) => b.updated_at - a.updated_at),
       })).filter((x) => x.tasks.length > 0),
-    [s],
+    [tasks, columns],
   );
   return (
     <nav className="tasklist" aria-label="Tasks">
@@ -57,7 +62,7 @@ function TaskList({ selected, onSelect }: { selected: string; onSelect(id: strin
       ))}
     </nav>
   );
-}
+});
 
 /** Interrupt / Stop / Resume: one at a time; Stop asks first; a new action clears the error. */
 function Actions({ t }: { t: TaskView }) {
@@ -143,11 +148,11 @@ export function Detail({
   focusTerminalNonce?: number;
   inlineAnswers?: boolean;
 }) {
-  const s = useStore();
   const [tab, setTab] = useState<Tab>(initialTab ?? "Steps");
-  const t = s.tasks[taskId];
-  const feed = s.feed[taskId] ?? [];
-  const perms = useMemo(() => pendingPerms(s.perms, taskId), [s.perms, taskId]);
+  // This task's slices only: another task's event does not render the detail.
+  const t = useSelect((s) => s.tasks[taskId]);
+  const feed = useSelect((s) => s.feed[taskId]) ?? NO_FEED;
+  const perms = useSelect((s) => pendingPerms(s.perms, taskId), shallow);
   // Repo memory: refetched when the repo's memory changes or a turn ends (the branch moved).
   useDnaKey(t?.repo_path ?? null);
   const dnaVersion = useDnaRev(t?.repo_path ?? null);

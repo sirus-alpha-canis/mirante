@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { useStore } from "../env";
+import { memo } from "react";
+import { shallow, useSelect } from "../env";
 import type { TaskView } from "../lib/protocol";
 import { columnOf, lastLines, pendingPerms, turnsEnded } from "../store/select";
 import type { FeedItem } from "../store/state";
@@ -9,7 +9,7 @@ import { PermissionCard } from "./PermissionCard";
 import { SkillsCount } from "./SkillsChip";
 import { TrustCard } from "./TrustCard";
 
-export function FeedLine({ item }: { item: FeedItem }) {
+export const FeedLine = memo(function FeedLine({ item }: { item: FeedItem }) {
   const who = item.kind === "message" ? (item.mode === "queue" ? "you · queued" : "you · steer") : null;
   return (
     <li className={`line line-${item.kind} ${item.ok === false ? "line-failed" : ""}`}>
@@ -17,11 +17,11 @@ export function FeedLine({ item }: { item: FeedItem }) {
       <span className="text">{item.text}</span>
     </li>
   );
-}
+});
 
 /** One task in the project feed: the dispatch, live progress, and whatever needs the user.
  * `onOpen(id, "Terminal")` opens V1 on the task's Terminal tab (Claude cards answered there). */
-export function AgentCard({
+export const AgentCard = memo(function AgentCard({
   t,
   onOpen,
   inlineAnswers = false,
@@ -31,10 +31,10 @@ export function AgentCard({
   /** `daemon.status.claude_inline_answers` (false when unknown). */
   inlineAnswers?: boolean;
 }) {
-  const s = useStore();
-  const feed = s.feed[t.id];
+  // Its own task's slices only: another task's event does not render this card.
+  const feed = useSelect((s) => s.feed[t.id]);
   const col = columnOf(t, feed);
-  const perms = useMemo(() => pendingPerms(s.perms, t.id), [s.perms, t.id]);
+  const perms = useSelect((s) => pendingPerms(s.perms, t.id), shallow);
   // The task waits on the user but its request has not loaded (or is a dialog Mirante does
   // not model): the terminal is where it can be answered.
   const unexplained = t.status === "needs_you" && perms.length === 0 && t.boot !== "trust_prompt";
@@ -80,4 +80,4 @@ export function AgentCard({
       {col === "review" && <DoneCard taskId={t.id} version={turnsEnded(feed)} onOpen={() => onOpen(t.id)} />}
     </article>
   );
-}
+});

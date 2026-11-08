@@ -2,7 +2,7 @@
 import { createContext, useContext } from "react";
 import type { Note } from "./lib/notify";
 import type { Cockpit } from "./store/cockpit";
-import { useCockpitState } from "./store/cockpit";
+import { useCockpitSelect } from "./store/cockpit";
 import type { State } from "./store/state";
 
 export interface Env {
@@ -32,6 +32,19 @@ export function useEnv(): Env {
   return env;
 }
 
-export function useStore(): State {
-  return useCockpitState(useEnv().cockpit);
+/** Arrays element by element, plain objects key by key (`Object.is` each). */
+export function shallow<T>(a: T, b: T): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  const ob = b as Record<string, unknown>;
+  return ka.every((k) => Object.hasOwn(ob, k) && Object.is((a as Record<string, unknown>)[k], ob[k]));
+}
+
+/** `useCockpitSelect` on the env's store: the slice `select` picks, re-rendering only when
+ * it changes by `equal`. */
+export function useSelect<T>(select: (s: State) => T, equal: (a: T, b: T) => boolean = Object.is): T {
+  return useCockpitSelect(useEnv().cockpit, select, equal);
 }

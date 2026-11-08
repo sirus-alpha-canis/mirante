@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { dnaStatus } from "../lib/dna";
 import { RpcCode } from "../lib/protocol";
@@ -27,7 +27,7 @@ export function LeftRail(props: {
   status: DaemonStatus | null;
 }) {
   const { storage, rpc, cockpit, pickFolder, homeDir, pathKind } = useEnv();
-  const s = useStore();
+  const tasks = useSelect((s) => s.tasks);
   // The selected project's memory proposals waiting for a person (none when its memory is
   // off, the daemon is older, or the path is no repo).
   const sel = props.selected;
@@ -50,14 +50,14 @@ export function LeftRail(props: {
   const [error, setError] = useState<string | null>(null);
   const agents = useMemo(() => {
     const live = (a: AgentKind) =>
-      Object.values(s.tasks)
+      Object.values(tasks)
         .filter((t) => t.agent === a && t.live)
         .sort((x, y) => x.created_at - y.created_at);
     return [
       { agent: "claude" as const, live: live("claude") },
       { agent: "codex" as const, live: live("codex") },
     ];
-  }, [s.tasks]);
+  }, [tasks]);
   // The agent whose live sessions are listed to pick from (it has several).
   const [picking, setPicking] = useState<AgentKind | null>(null);
   const openTask = (t: TaskView) => {

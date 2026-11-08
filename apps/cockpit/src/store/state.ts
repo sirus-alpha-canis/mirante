@@ -404,6 +404,29 @@ function taskEffect(tasks: Record<string, TaskView>, e: DaemonEvent): Record<str
   }
 }
 
+/** Structural equality of JSON-shaped values (daemon replies). */
+export function same(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  const ob = b as Record<string, unknown>;
+  return ka.every((k) => Object.hasOwn(ob, k) && same((a as Record<string, unknown>)[k], ob[k]));
+}
+
+/** `next` with each entry that equals `prev`'s kept as `prev`'s object; `prev` itself when
+ * nothing differs (so views of unchanged rows, and of nothing, do not render again). */
+function keepSame<T>(prev: Record<string, T>, next: Record<string, T>): Record<string, T> {
+  let changed = Object.keys(prev).length !== Object.keys(next).length;
+  for (const k of Object.keys(next)) {
+    if (k in prev && same(prev[k], next[k])) next[k] = prev[k];
+    else changed = true;
+  }
+  return changed ? next : prev;
+}
+
 export function reduce(s: State, a: Action): State {
   switch (a.type) {
     case "connected": {
@@ -447,12 +470,13 @@ export function reduce(s: State, a: Action): State {
       };
     }
     case "task":
-      return { ...s, tasks: { ...s.tasks, [a.view.id]: a.view } };
+      return same(s.tasks[a.view.id], a.view) ? s : { ...s, tasks: { ...s.tasks, [a.view.id]: a.view } };
     case "tasks": {
       const tasks: Record<string, TaskView> = {};
       for (const t of a.views) tasks[t.id] = t;
       for (const id of a.keep ?? []) if (s.tasks[id]) tasks[id] = s.tasks[id];
-      return { ...s, tasks };
+      const kept = keepSame(s.tasks, tasks);
+      return kept === s.tasks ? s : { ...s, tasks: kept };
     }
     case "permissions": {
       const asked = a.rev ?? Infinity;
@@ -480,7 +504,8 @@ export function reduce(s: State, a: Action): State {
           perms[id] = { ...perms[id], status: "expired" };
         }
       }
-      return { ...s, perms };
+      const kept = keepSame(s.perms, perms);
+      return kept === s.perms ? s : { ...s, perms: kept };
     }
     case "history": {
       let perms = s.perms;
@@ -498,11 +523,13 @@ export function reduce(s: State, a: Action): State {
         const item = ownsLine(perms, e) ? feedItem(e) : null;
         if (item) items.push(item);
       }
+      const feed = addFeed(s.feed, a.taskId, items);
+      if (feed === s.feed && perms === s.perms && skills.sessionSkills === s.sessionSkills && !(a.taskId in s.historyErrors)) return s;
       const { [a.taskId]: _cleared, ...historyErrors } = s.historyErrors;
-      return { ...s, feed: addFeed(s.feed, a.taskId, items), perms, permRev, historyErrors, sessionSkills: skills.sessionSkills };
+      return { ...s, feed, perms, permRev, historyErrors, sessionSkills: skills.sessionSkills };
     }
     case "queue":
-      return { ...s, queues: { ...s.queues, [a.taskId]: a.list } };
+      return same(s.queues[a.taskId], a.list) ? s : { ...s, queues: { ...s.queues, [a.taskId]: a.list } };
     case "historyFailed":
       return { ...s, historyErrors: { ...s.historyErrors, [a.taskId]: a.error } };
     case "dnaKey":

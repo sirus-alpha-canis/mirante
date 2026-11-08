@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
 import type { DaemonStatus, TaskView } from "../lib/protocol";
@@ -76,17 +76,18 @@ export function HibernateButton({ t }: { t: TaskView }) {
 
 /** The daemon's memory guard: machine pressure, the heaviest sessions, the latest notices. */
 export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; onOpen?(taskId: string): void }) {
-  const s = useStore();
+  const tasks = useSelect((s) => s.tasks);
+  const memory = useSelect((s) => s.memory);
   const sys = systemMemory(status);
   const heavy = useMemo(
     () =>
-      Object.values(s.tasks)
+      Object.values(tasks)
         .filter((t) => taskMemory(t) || isHibernated(t))
         .sort((a, b) => (taskMemory(b)?.bytes ?? 0) - (taskMemory(a)?.bytes ?? 0))
         .slice(0, 5),
-    [s.tasks],
+    [tasks],
   );
-  const notices = s.memory.slice(-3).reverse();
+  const notices = memory.slice(-3).reverse();
   return (
     <section className="memory" aria-label="Memory guard">
       <h2>Memory</h2>
@@ -126,7 +127,7 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
         <ul className="mem-notices" aria-label="Memory notices">
           {notices.map((n) => (
             <li key={n.seq} className="small">
-              {n.task_id && s.tasks[n.task_id] ? `${s.tasks[n.task_id].branch}: ` : ""}
+              {n.task_id && tasks[n.task_id] ? `${tasks[n.task_id].branch}: ` : ""}
               {n.text}
             </li>
           ))}

@@ -1,11 +1,14 @@
-import { useMemo } from "react";
-import { useStore } from "../env";
+import { shallow, useSelect } from "../env";
 import { BOARD, COLUMN_LABEL, tasksIn } from "../store/select";
+import type { State } from "../store/state";
+import type { TaskView } from "../lib/protocol";
+
+const selectColumns = (s: State) => BOARD.map((c) => ({ c, tasks: tasksIn(s, c) }));
+const sameColumns = (a: { tasks: TaskView[] }[], b: { tasks: TaskView[] }[]) => a.every((x, i) => shallow(x.tasks, b[i].tasks));
 
 /** Right rail: every project's tasks by what they need. */
 export function Board({ onOpen }: { onOpen(id: string): void }) {
-  const s = useStore();
-  const cols = useMemo(() => BOARD.map((c) => ({ c, tasks: tasksIn(s, c) })), [s]);
+  const cols = useSelect(selectColumns, sameColumns);
   return (
     <aside className="board" aria-label="Board">
       {cols.map(({ c, tasks }) => (

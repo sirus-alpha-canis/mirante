@@ -5,7 +5,7 @@
 // origins to choose from. The agent card's count needs no call: it reads the session's
 // `skill.injected` / `skill.refused` events.
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import type { TaskSkills } from "../lib/protocol";
 import { confirmOrigin, skillErrorText, taskSkills } from "../lib/skills";
 import { useTaskSkillsVersion } from "../lib/useSkills";
@@ -70,7 +70,7 @@ function ConfirmOrigin({ task, ts, onDone }: { task: string; ts: TaskSkills; onD
 /** The detail header's chip and its popover. Nothing without a daemon that has skills. */
 export function SkillsChip({ task }: { task: string }) {
   const { rpc } = useEnv();
-  const s = useStore();
+  const session = useSelect((s) => s.sessionSkills[task]);
   const version = useTaskSkillsVersion(task);
   const [ts, setTs] = useState<TaskSkills | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -91,7 +91,6 @@ export function SkillsChip({ task }: { task: string }) {
   }, [rpc, task, version, nonce]);
   if (!ts) return error ? <span className="skill-chip skill-chip-warn" title={error}>Skills unavailable</span> : null;
   const warn = !ts.confirmed || ts.refused.length > 0;
-  const session = s.sessionSkills[task];
   const state = (name: string) => {
     if (!session?.names.includes(name)) return "next session";
     return session.used.includes(name) ? "injected, used" : "injected";
@@ -145,8 +144,7 @@ export function SkillsChip({ task }: { task: string }) {
 
 /** The agent card's count: what the task's latest session was given (from its events). */
 export function SkillsCount({ task }: { task: string }) {
-  const s = useStore();
-  const got = s.sessionSkills[task];
+  const got = useSelect((s) => s.sessionSkills[task]);
   if (!got) return null;
   const refused = got.refused.length > 0 ? ` · ${got.refused.length} refused` : "";
   return (

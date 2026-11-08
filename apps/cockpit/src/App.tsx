@@ -11,9 +11,9 @@ import { type DaemonStatus, M, type TaskView } from "./lib/protocol";
 import { loadRepos } from "./lib/repos";
 import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, THEME_KEY, type Theme } from "./lib/theme";
-import { useCockpitState } from "./store/cockpit";
+import { useCockpitSelect } from "./store/cockpit";
 import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
-import type { State } from "./store/state";
+import { type Connection, same, type State } from "./store/state";
 
 export type Mode = "home" | "detail" | "grid" | "brain" | "skills";
 
@@ -38,10 +38,13 @@ export function visibleTasks(s: State, mode: Mode, project: string | null, taskI
   return new Set(Object.values(s.tasks).filter((t) => t.repo_path === project && t.lifecycle !== "archived").map((t) => t.id));
 }
 
-function ConnectionBanner({ s, env }: { s: State; env: Env }) {
+const selectTasks = (s: State) => s.tasks;
+const selectConnection = (s: State) => s.connection;
+
+function ConnectionBanner({ connection, env }: { connection: Connection; env: Env }) {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
-  if (s.connection.state === "live") return null;
+  if (connection.state === "live") return null;
   const start = () => {
     setStarting(true);
     setError(null);
@@ -51,12 +54,12 @@ function ConnectionBanner({ s, env }: { s: State; env: Env }) {
       .finally(() => setStarting(false));
   };
   return (
-    <div className={`banner banner-${s.connection.state}`} role="status" aria-label="Daemon connection">
-      {s.connection.state === "connecting" ? (
+    <div className={`banner banner-${connection.state}`} role="status" aria-label="Daemon connection">
+      {connection.state === "connecting" ? (
         "Connecting to the Mirante daemon…"
       ) : (
         <>
-          Daemon not reachable ({s.connection.error}). Retrying in {Math.round(s.connection.retryMs / 100) / 10}s.{" "}
+          Daemon not reachable ({connection.error}). Retrying in {Math.round(connection.retryMs / 100) / 10}s.{" "}
           <button className="btn btn-small" disabled={starting} onClick={start}>
             Start daemon
           </button>
@@ -70,7 +73,9 @@ function ConnectionBanner({ s, env }: { s: State; env: Env }) {
 export function App({ env }: { env: Env }) {
   const mac = useMemo(onMac, []);
   const hints = useMemo(() => hintsFor(mac), [mac]);
-  const s = useCockpitState(env.cockpit);
+  // Only what App itself shows: the views below select their own slices.
+  const tasks = useCockpitSelect(env.cockpit, selectTasks);
+  const connection = useCockpitSelect(env.cockpit, selectConnection);
   const [mode, setMode] = useState<Mode>("home");
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
   const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
@@ -89,12 +94,19 @@ export function App({ env }: { env: Env }) {
   const [theme, setTheme] = useState<Theme>(() => loadTheme(env.storage));
   const [status, setStatus] = useState<DaemonStatus | null>(null);
 
-  const projs = useMemo(() => projects(s, repos), [s, repos]);
+  // Kept while equal: a task refresh that changes no project leaves Home's props alone.
+  const projsRef = useRef<ReturnType<typeof projects>>([]);
+  const projs = useMemo(() => {
+    const next = projects({ tasks }, repos);
+    if (!same(projsRef.current, next)) projsRef.current = next;
+    return projsRef.current;
+  }, [tasks, repos]);
   const current = project ?? projs[0]?.path ?? null;
 
-  // What is on screen as of the last render: read when an event arrives, before re-render.
-  const visible = useRef<Set<string>>(new Set());
-  visible.current = visibleTasks(s, mode, current, taskId);
+  // The view as of the last render; what it shows is worked out from the state before a
+  // change (App does not render for every event).
+  const view = useRef({ mode, current, taskId });
+  view.current = { mode, current, taskId };
 
   useEffect(() => {
     env.cockpit.connect().catch(() => {});
@@ -114,8 +126,12 @@ export function App({ env }: { env: Env }) {
     const off = env.cockpit.onChange((prev, next) => {
       // The first snapshot is what the user left, not news.
       if (prev.bootId === null) return;
-      for (const t of newlyNeedingYou(prev, next)) {
-        if (shouldNotify(t.id, visible.current, document.hasFocus())) due.set(t.id, t);
+      const fresh = newlyNeedingYou(prev, next);
+      if (fresh.length === 0) return;
+      const { mode, current, taskId } = view.current;
+      const visible = visibleTasks(prev, mode, current, taskId);
+      for (const t of fresh) {
+        if (shouldNotify(t.id, visible, document.hasFocus())) due.set(t.id, t);
       }
       if (due.size > 0 && !timer) timer = setTimeout(flush, NOTIFY_BATCH_MS);
     });
@@ -125,7 +141,7 @@ export function App({ env }: { env: Env }) {
     };
   }, [env]);
 
-  const live = s.connection.state === "live";
+  const live = connection.state === "live";
   useEffect(() => {
     // Away from the daemon nothing is known: no stale memory numbers, no stale inline-answers flag.
     if (!live) {
@@ -140,7 +156,8 @@ export function App({ env }: { env: Env }) {
       env
         .rpc<DaemonStatus>(M.daemonStatus)
         .then(
-          (v) => !stopped && setStatus(v ?? null),
+          // A poll that says the same keeps the object: nothing below renders again.
+          (v) => !stopped && setStatus((cur) => (same(cur, v ?? null) ? cur : (v ?? null))),
           () => !stopped && setStatus(null),
         )
         .finally(() => {
@@ -174,7 +191,7 @@ export function App({ env }: { env: Env }) {
     }
   }, [mode, beforeGrid]);
   // From a task's detail, the brain shows that task's repo (its project).
-  const detailRepo = mode === "detail" && taskId ? s.tasks[taskId]?.repo_path : undefined;
+  const detailRepo = mode === "detail" && taskId ? tasks[taskId]?.repo_path : undefined;
   const toggleBrain = useCallback(() => {
     if (mode === "brain") {
       setMode(beforeBrain);
@@ -254,7 +271,7 @@ export function App({ env }: { env: Env }) {
           setMode("home");
         },
       })),
-      ...Object.values(s.tasks)
+      ...Object.values(tasks)
         .filter((t) => t.lifecycle !== "archived")
         .map((t) =>
           // A Claude request is answered in its own TUI unless the daemon types answers (a
@@ -264,7 +281,7 @@ export function App({ env }: { env: Env }) {
             : { id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) },
         ),
     ],
-    [projs, s.tasks, theme, open, toggleGrid, toggleBrain, openReview, mode, hints, inlineAnswers],
+    [projs, tasks, theme, open, toggleGrid, toggleBrain, openReview, mode, hints, inlineAnswers],
   );
 
   return (
@@ -296,7 +313,7 @@ export function App({ env }: { env: Env }) {
             <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
           </button>
         </header>
-        <ConnectionBanner s={s} env={env} />
+        <ConnectionBanner connection={connection} env={env} />
         {mode === "home" && (
           <Home
             projects={projs}

@@ -1,7 +1,7 @@
 // The Memory tab of a task: notes this task's branch puts at risk, notes relevant to it,
 // and what it proposed. Everything shown is the daemon's person view, rendered as text.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { citation, dnaEnable, dnaErrorText, taskContext } from "../lib/dna";
 import type { NoteSummary, ProposalView, TaskMemoryContext, TaskView } from "../lib/protocol";
@@ -104,7 +104,7 @@ function Section({ title, empty, children, count }: { title: string; empty: stri
  * task's turns ends (the agent has had its chance to propose). */
 function AskToPropose({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
-  const ended = turnsEnded(useStore().feed[t.id] ?? []);
+  const ended = useSelect((s) => turnsEnded(s.feed[t.id]));
   const [busy, setBusy] = useState(false);
   const [sentAt, setSentAt] = useState<number | null>(null);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);

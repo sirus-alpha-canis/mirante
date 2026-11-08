@@ -58,3 +58,16 @@ describe("grid", () => {
     expect(g[1].id).toBe("w7");
   });
 });
+
+describe("shallow", () => {
+  it("compares arrays and objects one level deep", async () => {
+    const { shallow } = await import("../env");
+    const a = { id: "a" };
+    expect(shallow([a], [a])).toBe(true);
+    expect(shallow([a], [{ id: "a" }])).toBe(false);
+    expect(shallow({ x: a }, { x: a })).toBe(true);
+    expect(shallow({ x: a }, { x: a, y: 1 })).toBe(false);
+    expect(shallow([], {})).toBe(false);
+    expect(shallow(undefined, undefined)).toBe(true);
+  });
+});

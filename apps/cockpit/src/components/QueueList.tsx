@@ -1,5 +1,5 @@
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { M, type QueuedMessage, RpcCode, type TaskView } from "../lib/protocol";
 
@@ -13,7 +13,7 @@ type Act = "edit" | "up" | "down";
  */
 export function QueueList({ t }: { t: TaskView }) {
   const { rpc, cockpit } = useEnv();
-  const list = useStore().queues[t.id];
+  const list = useSelect((s) => s.queues[t.id]);
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

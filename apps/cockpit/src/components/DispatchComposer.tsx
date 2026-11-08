@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useEnv, useStore } from "../env";
+import { useEnv, useSelect } from "../env";
 import {
   applySuggestion,
   branchFromGoal,
@@ -80,7 +80,7 @@ export function DispatchComposer(props: {
   inputRef?: Ref<HTMLTextAreaElement>;
 }) {
   const { rpc, cockpit } = useEnv();
-  const s = useStore();
+  const tasks = useSelect((s) => s.tasks);
   const [error, setError] = useState<string | null>(null);
   const [originNote, setOriginNote] = useState<{ text: string; warn: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -100,8 +100,8 @@ export function DispatchComposer(props: {
   const [edited, setEdited] = useState<string | null>(null);
   const power = isPowerSyntax(props.value);
   const takenIn = useCallback(
-    (path: string | null) => new Set(Object.values(s.tasks).filter((t) => t.repo_path === path).map((t) => t.branch)),
-    [s.tasks],
+    (path: string | null) => new Set(Object.values(tasks).filter((t) => t.repo_path === path).map((t) => t.branch)),
+    [tasks],
   );
   const taken = useMemo(() => takenIn(repo), [takenIn, repo]);
   const auto = nextFreeBranch(branchFromGoal(props.value), taken);

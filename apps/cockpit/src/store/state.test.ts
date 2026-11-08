@@ -353,3 +353,31 @@ describe("skills (skill.*) events", () => {
     expect(line("step", { type: "skills_failed", error: "disk full" })).toBe("skills not given to this session: disk full");
   });
 });
+
+describe("no-op updates keep the state (nothing re-renders)", () => {
+  it("a task.get that changed nothing", () => {
+    const s = connected();
+    expect(reduce(s, { type: "task", view: { ...s.tasks.t1 } })).toBe(s);
+    expect(reduce(s, { type: "task", view: { ...s.tasks.t1, status: "working" } })).not.toBe(s);
+  });
+
+  it("a task.list that changed nothing, and one that changed a row keeps the others' objects", () => {
+    const s = connected(initialState, [task("t1"), task("t2")]);
+    expect(reduce(s, { type: "tasks", views: [{ ...s.tasks.t1 }, { ...s.tasks.t2 }] })).toBe(s);
+    const r = reduce(s, { type: "tasks", views: [{ ...s.tasks.t1 }, { ...s.tasks.t2, status: "working" }] });
+    expect(r.tasks.t1).toBe(s.tasks.t1);
+    expect(r.tasks.t2.status).toBe("working");
+  });
+
+  it("a queue, permission list or history that brings nothing new", () => {
+    let s = connected();
+    s = reduce(s, { type: "queue", taskId: "t1", list: [{ id: "q1", text: "x" }] });
+    expect(reduce(s, { type: "queue", taskId: "t1", list: [{ id: "q1", text: "x" }] })).toBe(s);
+    const perm = { id: "p1", task_id: "t1", session_id: "s1", tool: "Bash", detail: "ls", status: "pending" as const, created_at: 1, answered_at: null, task_title: "", branch: "feat/t1" };
+    s = reduce(s, { type: "permissions", list: [perm] });
+    expect(reduce(s, { type: "permissions", list: [{ ...perm }] })).toBe(s);
+    const events = [ev(6, "t1", "turn_ended")];
+    s = reduce(s, { type: "history", taskId: "t1", events });
+    expect(reduce(s, { type: "history", taskId: "t1", events })).toBe(s);
+  });
+});
