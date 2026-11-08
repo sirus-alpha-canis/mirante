@@ -2,6 +2,7 @@
 //! against the code they cite. Pure library: no daemon, no network. Every git call goes
 //! through [`crate::git::Git`].
 pub mod anchor;
+pub mod check;
 pub mod note;
 
 use sha2::{Digest, Sha256};
@@ -14,7 +15,7 @@ pub const MAX_ANCHORS: usize = 8;
 pub const MAX_NOTES: usize = 2000;
 pub const MAX_CITED_FILE: u64 = 2 * 1024 * 1024;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum DnaError {
     #[error("invalid anchor {0:?}: {1}")]
     Anchor(String, &'static str),
