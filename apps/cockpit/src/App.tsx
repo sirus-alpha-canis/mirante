@@ -17,6 +17,13 @@ import type { State } from "./store/state";
 export type Mode = "home" | "detail" | "grid" | "brain";
 
 export const STATUS_POLL_MS = 5000;
+
+/** A form field with what the person is typing (not the terminal: on macOS ⌘ chords pass
+ * through it, and leaving it loses nothing). View chords wait there: switching views would
+ * unmount the field and lose the edit. */
+function isFormField(target: EventTarget | null): boolean {
+  return isTypingTarget(target) && !(target instanceof Element && target.closest(".xterm"));
+}
 /** Tasks that start needing the user within this window share one decision: past two, a
  * single summary (a reconnect replays missed events one by one, a restart sends them all). */
 export const NOTIFY_BATCH_MS = 250;
@@ -66,7 +73,7 @@ export function App({ env }: { env: Env }) {
   const [mode, setMode] = useState<Mode>("home");
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
   const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
-  // Bumped by every "Review memory": the brain reopens on its review queue.
+  // Bumped by every "Review memory": the brain (open or not) switches to its review queue.
   const [reviewNonce, setReviewNonce] = useState(0);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [detailTab, setDetailTab] = useState<"Terminal" | undefined>(undefined);
@@ -163,23 +170,27 @@ export function App({ env }: { env: Env }) {
       setMode("grid");
     }
   }, [mode, beforeGrid]);
+  // From a task's detail, the brain shows that task's repo (its project).
+  const detailRepo = mode === "detail" && taskId ? s.tasks[taskId]?.repo_path : undefined;
   const toggleBrain = useCallback(() => {
     if (mode === "brain") {
       setMode(beforeBrain);
     } else {
+      if (detailRepo) setProject(detailRepo);
       setBeforeBrain(mode);
       setReviewNonce(0);
       setMode("brain");
     }
-  }, [mode, beforeBrain]);
+  }, [mode, beforeBrain, detailRepo]);
   const openReview = useCallback(
     (path?: string) => {
-      if (path) setProject(path);
+      const repo = path ?? detailRepo;
+      if (repo) setProject(repo);
       if (mode !== "brain") setBeforeBrain(mode);
       setReviewNonce((n) => n + 1);
       setMode("brain");
     },
-    [mode],
+    [mode, detailRepo],
   );
 
   useEffect(() => {
@@ -196,6 +207,7 @@ export function App({ env }: { env: Env }) {
       // Off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K, Ctrl+G…). On macOS
       // ⌘ is no terminal key, so ⌘K opens the command bar even from the terminal.
       if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
+      if ((a === "brain" || a === "grid" || a === "home") && isFormField(e.target)) return;
       e.preventDefault();
       if (a === "palette") setPalette((p) => !p);
       if (a === "grid") toggleGrid();
@@ -293,7 +305,7 @@ export function App({ env }: { env: Env }) {
           />
         )}
         {mode === "grid" && <Grid onOpen={open} status={status} />}
-        {mode === "brain" && <Brain key={`${current}-${reviewNonce}`} repo={current} review={reviewNonce > 0} />}
+        {mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
         {palette && (
           <CommandBar
             commands={commands}

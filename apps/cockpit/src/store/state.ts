@@ -65,6 +65,10 @@ export interface State {
   /** Repo memory: bumped per repo on `dna.*` events, so memory views refetch (see
    * [`dnaRev`]). `"*"`: an event whose repo is unknown (every repo refetches). */
   dnaVersion: Record<string, number>;
+  /** A path a view names a repo by (a project, a task's `repo_path`) → the daemon's key for
+   * that repo's memory (`DnaStatus.repo`: git's top level, canonical), learned from
+   * `dna.status` replies. `dna.*` events name the key. */
+  dnaKeys: Record<string, string>;
 }
 
 export const FEED_CAP = 300;
@@ -81,14 +85,19 @@ export const initialState: State = {
   queues: {},
   historyErrors: {},
   dnaVersion: {},
+  dnaKeys: {},
 };
 
 /** Events that change what memory views show. */
 const DNA_REFETCH = new Set(["dna.indexed", "dna.changed", "dna.proposed", "dna.decided"]);
 
-/** When `repo`'s memory views last had to refetch (a counter; compare for change). */
-export function dnaRev(s: Pick<State, "dnaVersion">, repo: string): number {
-  return (s.dnaVersion[repo] ?? 0) + (s.dnaVersion["*"] ?? 0);
+/** When `repo`'s memory views last had to refetch (a counter; compare for change). `repo`
+ * is any path of the repo: events keyed by its canonical key count once that key is known
+ * (see `dnaKey`), events keyed by the path itself count always. */
+export function dnaRev(s: Pick<State, "dnaVersion" | "dnaKeys">, repo: string): number {
+  const key = s.dnaKeys[repo];
+  const viaKey = key && key !== repo ? (s.dnaVersion[key] ?? 0) : 0;
+  return (s.dnaVersion[repo] ?? 0) + viaKey + (s.dnaVersion["*"] ?? 0);
 }
 
 function dnaEffect(v: State["dnaVersion"], tasks: Record<string, TaskView>, e: DaemonEvent): State["dnaVersion"] {
@@ -110,7 +119,9 @@ export type Action =
   | { type: "permissions"; list: PermissionView[]; rev?: number }
   | { type: "history"; taskId: string; events: DaemonEvent[] }
   | { type: "queue"; taskId: string; list: QueuedMessage[] }
-  | { type: "historyFailed"; taskId: string; error: string };
+  | { type: "historyFailed"; taskId: string; error: string }
+  /** `path`'s memory is the daemon's `key` (a `dna.status` reply said so). */
+  | { type: "dnaKey"; path: string; key: string };
 
 /** Events that close a card. `permission_answered` always comes first from the daemon; the
  * others refine it (or stand alone when the answer was lost or is outside the page). */
@@ -409,5 +420,7 @@ export function reduce(s: State, a: Action): State {
       return { ...s, queues: { ...s.queues, [a.taskId]: a.list } };
     case "historyFailed":
       return { ...s, historyErrors: { ...s.historyErrors, [a.taskId]: a.error } };
+    case "dnaKey":
+      return s.dnaKeys[a.path] === a.key ? s : { ...s, dnaKeys: { ...s.dnaKeys, [a.path]: a.key } };
   }
 }

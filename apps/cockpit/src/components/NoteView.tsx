@@ -63,7 +63,11 @@ export function NoteBody({ body, onOpen }: { body: string; onOpen(slug: string):
   );
 }
 
-type Loaded = { state: "loading" } | { state: "ready"; note: Note } | { state: "error"; error: string };
+type Loaded =
+  | { state: "loading" }
+  /** `stale`: the last refetch failed; the note shown is the one loaded before. */
+  | { state: "ready"; note: Note; stale?: string }
+  | { state: "error"; error: string };
 
 /**
  * Loads `slug` (from `at`: a repo or a task's repo) and refetches when `version` changes.
@@ -91,6 +95,12 @@ export function NoteView({
   const [busy, setBusy] = useState(false);
   const inFlight = useRef(false);
   const atKey = JSON.stringify(at);
+  // Another note (or place): never show the previous one while it loads.
+  const shownFor = useRef(`${atKey} ${slug}`);
+  if (shownFor.current !== `${atKey} ${slug}`) {
+    shownFor.current = `${atKey} ${slug}`;
+    if (loaded.state !== "loading") setLoaded({ state: "loading" });
+  }
   useEffect(() => {
     let live = true;
     dnaGet(rpc, JSON.parse(atKey) as DnaAt, slug)
@@ -102,7 +112,9 @@ export function NoteView({
       .catch((e) => {
         if (!live) return;
         const missing = e instanceof DaemonError && e.code === RpcCode.NOT_FOUND;
-        setLoaded({ state: "error", error: missing ? `No note named ${slug} (a link to a missing note).` : dnaErrorText(e) });
+        const error = missing ? `No note named ${slug} (a link to a missing note).` : dnaErrorText(e);
+        // A failed refetch of the same note keeps it on screen, with why it may be out of date.
+        setLoaded((cur) => (cur.state === "ready" && cur.note.slug === slug && !missing ? { ...cur, stale: error } : { state: "error", error }));
       });
     return () => {
       live = false;
@@ -164,6 +176,11 @@ export function NoteView({
             Retire
           </button>
         </div>
+      )}
+      {loaded.stale && (
+        <p className="error small" role="status">
+          Could not refresh this note: {loaded.stale}
+        </p>
       )}
       {error && (
         <p className="error" role="alert">

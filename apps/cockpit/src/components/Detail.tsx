@@ -2,8 +2,8 @@ import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react"
 import { useEnv, useStore } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { M, type TaskView } from "../lib/protocol";
+import { useDnaKey, useDnaRev } from "../lib/useDna";
 import { columnOf, COLUMN_LABEL, type Column, pendingPerms, turnsEnded } from "../store/select";
-import { dnaRev } from "../store/state";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
@@ -146,7 +146,8 @@ export function Detail({
   const feed = s.feed[taskId] ?? [];
   const perms = useMemo(() => pendingPerms(s.perms, taskId), [s.perms, taskId]);
   // Repo memory: refetched when the repo's memory changes or a turn ends (the branch moved).
-  const dnaVersion = t ? dnaRev(s, t.repo_path) : 0;
+  useDnaKey(t?.repo_path ?? null);
+  const dnaVersion = useDnaRev(t?.repo_path ?? null);
   const memory = useTaskMemory(taskId, dnaVersion + turnsEnded(feed));
   const atRisk = atRiskCount(memory.mem);
   const tabLabel = (name: Tab) => (name === "Memory" && atRisk > 0 ? `Memory (${atRisk} at risk)` : name);

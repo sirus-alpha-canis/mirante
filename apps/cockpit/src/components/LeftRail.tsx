@@ -4,7 +4,7 @@ import { dnaStatus } from "../lib/dna";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { addRepo, loadRepos, removeRepo } from "../lib/repos";
 import type { Project } from "../store/select";
-import { dnaRev } from "../store/state";
+import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
 
 export function LeftRail(props: {
@@ -17,23 +17,26 @@ export function LeftRail(props: {
   onReview?(path: string): void;
   status: DaemonStatus | null;
 }) {
-  const { storage, rpc } = useEnv();
+  const { storage, rpc, cockpit } = useEnv();
   const s = useStore();
   // The selected project's memory proposals waiting for a person (none when its memory is
   // off, the daemon is older, or the path is no repo).
   const sel = props.selected;
-  const version = sel ? dnaRev(s, sel) : 0;
+  const version = useDnaRev(sel);
   const [pending, setPending] = useState<{ path: string; n: number } | null>(null);
   useEffect(() => {
     if (!sel) return;
     let live = true;
     dnaStatus(rpc, sel)
-      .then((r) => live && setPending({ path: sel, n: r.available && r.status?.enabled ? (r.status.pending ?? 0) : 0 }))
+      .then((r) => {
+        if (r.available) learnDnaKey(cockpit, sel, r.status);
+        if (live) setPending({ path: sel, n: r.available && r.status?.enabled ? (r.status.pending ?? 0) : 0 });
+      })
       .catch(() => live && setPending({ path: sel, n: 0 }));
     return () => {
       live = false;
     };
-  }, [rpc, sel, version]);
+  }, [rpc, cockpit, sel, version]);
   const [path, setPath] = useState("");
   const [error, setError] = useState<string | null>(null);
   const agents = useMemo(() => {

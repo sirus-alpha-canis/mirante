@@ -1,11 +1,12 @@
 // The Memory tab of a task: notes this task's branch puts at risk, notes relevant to it,
 // and what it proposed. Everything shown is the daemon's person view, rendered as text.
-import { useCallback, useEffect, useState } from "react";
-import { useEnv } from "../env";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useEnv, useStore } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { citation, dnaEnable, dnaErrorText, taskContext } from "../lib/dna";
 import type { NoteSummary, ProposalView, TaskMemoryContext, TaskView } from "../lib/protocol";
 import { M, RpcCode } from "../lib/protocol";
+import { turnsEnded } from "../store/select";
 import { NoteView, StatePill } from "./NoteView";
 
 export type TaskMemory =
@@ -99,25 +100,40 @@ function Section({ title, empty, children, count }: { title: string; empty: stri
   );
 }
 
+/** Asks at most once per turn: after a request is queued the button waits until one of the
+ * task's turns ends (the agent has had its chance to propose). */
 function AskToPropose({ t }: { t: TaskView }) {
   const { rpc } = useEnv();
+  const ended = turnsEnded(useStore().feed[t.id] ?? []);
   const [busy, setBusy] = useState(false);
+  const [sentAt, setSentAt] = useState<number | null>(null);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const inFlight = useRef(false);
+  const waiting = sentAt !== null && sentAt === ended;
   const ask = async () => {
+    if (inFlight.current || waiting) return;
+    inFlight.current = true;
     setBusy(true);
     setResult(null);
     try {
       await rpc(M.messageSend, { task: t.id, text: PROPOSE_REQUEST, mode: "queue" });
+      setSentAt(ended);
       setResult({ ok: true, text: "Request queued for the agent (delivered when its turn ends). Its proposals arrive in the review queue." });
     } catch (e) {
       setResult({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
   return (
     <p>
-      <button className="btn btn-small" disabled={busy || !t.live} onClick={ask} title={t.live ? undefined : "Resume the session first"}>
+      <button
+        className="btn btn-small"
+        disabled={busy || waiting || !t.live}
+        onClick={ask}
+        title={!t.live ? "Resume the session first" : waiting ? "Asked already: waiting for the agent's turn to end" : undefined}
+      >
         Ask agent to propose memory
       </button>{" "}
       {result && <span className={result.ok ? "muted small" : "error"}>{result.text}</span>}

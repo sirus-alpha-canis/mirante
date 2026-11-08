@@ -9,6 +9,7 @@ import type {
   NoteSummary,
   NoteView,
   ProposalView,
+  ReviewedView,
   TaskMemoryContext,
 } from "./protocol";
 import { M, RpcCode } from "./protocol";
@@ -66,7 +67,7 @@ export interface ReviewParams {
   note?: string;
 }
 
-export const review = (rpc: Rpc, p: ReviewParams) => rpc<ProposalView>(M.dnaReview, p);
+export const review = (rpc: Rpc, p: ReviewParams) => rpc<ReviewedView>(M.dnaReview, p);
 
 export type NoteActionKind = "confirm" | "retire";
 

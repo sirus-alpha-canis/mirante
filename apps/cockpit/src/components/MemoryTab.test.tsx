@@ -179,6 +179,62 @@ describe("Memory tab", () => {
     expect(await screen.findByText(/queued for the agent/)).toBeInTheDocument();
   });
 
+  it("asks once per turn: a double click sends one message, and the button waits for the turn to end", async () => {
+    let release: (v: unknown) => void = () => {};
+    const h = open({ "dna.task_context": context(), "message.send": () => new Promise((r) => (release = r)) });
+    const btn = await screen.findByRole("button", { name: "Ask agent to propose memory" });
+    await userEvent.dblClick(btn);
+    release({ delivered: "queue", queued: 1 });
+    expect(await screen.findByText(/queued for the agent/)).toBeInTheDocument();
+    expect(h.calls.filter((c) => c[0] === "message.send")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Ask agent to propose memory" })).toBeDisabled();
+    h.env.cockpit.dispatch({ type: "event", event: ev(60, "t1", "turn_ended", { idx: 1 }) });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Ask agent to propose memory" })).toBeEnabled());
+  });
+
+  it("a failed refetch keeps the note on screen with the error beside it", async () => {
+    let fail = false;
+    const h = open({
+      "dna.task_context": context({ relevant: [summary("hook-spool", "Hook spool")] }),
+      "dna.get": () => (fail ? rpcError(RpcCode.DRIVER, "disk on fire") : note("hook-spool", "Hook spool")),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Hook spool" }));
+    await screen.findByRole("article", { name: "Hook spool" });
+    fail = true;
+    h.env.cockpit.dispatch({ type: "event", event: ev(61, null, "dna.changed", { repo: "/r/app", slug: "hook-spool" }) });
+    expect(await screen.findByText(/disk on fire/)).toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "Hook spool" })).toBeInTheDocument();
+  });
+
+  it("following a link shows the new note loading, never the old one", async () => {
+    let release: (v: unknown) => void = () => {};
+    open({
+      "dna.task_context": context({ relevant: [summary("hook-spool", "Hook spool")] }),
+      "dna.get": (p: Record<string, unknown>) =>
+        p.slug === "other" ? new Promise((r) => (release = r)) : note("hook-spool", "Hook spool", { body: "[[other]]" }),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Hook spool" }));
+    const view = await screen.findByRole("article", { name: "Hook spool" });
+    await userEvent.click(within(view).getByRole("button", { name: "other" }));
+    expect(await screen.findByText("Reading the note…")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "Hook spool" })).toBeNull();
+    release(note("other", "The other note"));
+    expect(await screen.findByRole("article", { name: "The other note" })).toBeInTheDocument();
+  });
+
+  it("refetches on an event keyed by the repo's top level when the task names a subdirectory", async () => {
+    const h = makeEnv({ "dna.task_context": context(), "dna.status": { repo: "/r/app", enabled: true, dir: true, notes: 0, stale: 0, unreviewed: 0, pending: 0, invalid: 0, head: null } });
+    h.load([task("t1", { repo_path: "/r/app/sub", status: "working" })]);
+    renderWith(h.env, <Detail taskId="t1" onSelect={() => {}} initialTab="Memory" />);
+    await screen.findByRole("region", { name: "Relevant notes" });
+    await waitFor(() => expect(h.calls).toContainEqual(["dna.status", { repo: "/r/app/sub" }]));
+    const n = () => h.calls.filter((c) => c[0] === "dna.task_context").length;
+    await waitFor(() => expect(h.env.cockpit.getState().dnaKeys["/r/app/sub"]).toBe("/r/app"));
+    const before = n();
+    h.env.cockpit.dispatch({ type: "event", event: ev(62, null, "dna.changed", { repo: "/r/app", slug: "x" }) });
+    await waitFor(() => expect(n()).toBe(before + 1));
+  });
+
   it("tab label counts at-risk notes", async () => {
     open({ "dna.task_context": context({ at_risk: [{ ...summary("a", "A"), reason: "r" }] }) }, "Steps");
     expect(await screen.findByRole("tab", { name: "Memory (1 at risk)" })).toBeInTheDocument();

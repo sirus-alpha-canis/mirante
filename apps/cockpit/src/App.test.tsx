@@ -280,6 +280,17 @@ describe("App", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("view chords wait while a field is being typed in; ⌘K still opens the command bar", () => {
+    setup();
+    const box = screen.getByRole("textbox", { name: "Dispatch an agent" });
+    for (const key of ["b", "g"]) {
+      fireEvent.keyDown(box, { key, code: `Key${key.toUpperCase()}`, ...mod });
+      expect(screen.getByRole("button", { name: /Home/ })).toHaveAttribute("aria-pressed", "true");
+    }
+    fireEvent.keyDown(box, { key: "k", code: "KeyK", ...mod });
+    expect(screen.getByRole("dialog", { name: "Command bar" })).toBeInTheDocument();
+  });
+
   it("visibleTasks follows the mode", () => {
     const h = makeEnv();
     h.load([task("a"), task("b", { repo_path: "/x" })]);
@@ -302,5 +313,34 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "k", ...mod });
     await userEvent.type(screen.getByRole("combobox"), "Go to Brain{Enter}");
     expect(screen.getByRole("button", { name: /Brain/ })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  const DNA = {
+    "dna.status": (p: Record<string, unknown>) => ({ repo: p.repo, enabled: true, dir: true, notes: 0, stale: 0, unreviewed: 0, pending: 1, invalid: 0, head: null }),
+    "dna.graph": { nodes: [], links: [] },
+    "dna.proposals": [],
+  };
+
+  it("Review memory from inside the brain switches its panel without starting it over", async () => {
+    const h = setup(DNA);
+    fireEvent.keyDown(window, { key: "b", ...mod });
+    await userEvent.type(await screen.findByRole("searchbox", { name: "Search memory" }), "kept");
+    const graphs = () => h.calls.filter((c) => c[0] === "dna.graph").length;
+    const n = graphs();
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    await userEvent.type(screen.getByRole("combobox"), "Review memory{Enter}");
+    expect(await screen.findByRole("region", { name: "Memory review queue" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search memory" })).toHaveValue("kept");
+    expect(graphs()).toBe(n);
+  });
+
+  it("the brain opened from a task's detail shows that task's repo", async () => {
+    setup(DNA);
+    // Home starts on the first project (other); the task a lives in /repos/shop.
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    await userEvent.type(screen.getByRole("combobox"), "goal of a{Enter}");
+    expect(screen.getByRole("button", { name: "Detail" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(window, { key: "b", ...mod });
+    expect(await screen.findByRole("heading", { name: "Memory of shop" })).toBeInTheDocument();
   });
 });

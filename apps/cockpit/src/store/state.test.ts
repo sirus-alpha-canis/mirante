@@ -291,4 +291,16 @@ describe("repo memory (dna.*) events", () => {
     const same = reduce(s, { type: "event", event: ev(11, "t1", "turn_started") });
     expect(same.dnaVersion).toBe(s.dnaVersion);
   });
+
+  it("an event keyed by the daemon's canonical repo refetches views that know the repo by another path", () => {
+    // The task was created from a subdirectory; the daemon keys memory by git's top level.
+    let s = connected(initialState, [task("t1", { repo_path: "/tmp/app/sub" })]);
+    s = reduce(s, { type: "dnaKey", path: "/tmp/app/sub", key: "/private/tmp/app" });
+    s = reduce(s, { type: "dnaKey", path: "/tmp/app", key: "/private/tmp/app" });
+    s = reduce(s, { type: "event", event: ev(6, null, "dna.changed", { repo: "/private/tmp/app", slug: "a" }) });
+    s = reduce(s, { type: "event", event: ev(7, "t1", "dna.proposed", { id: "q", title: "Q", repo: "/private/tmp/app" }) });
+    expect([dnaRev(s, "/tmp/app/sub"), dnaRev(s, "/tmp/app"), dnaRev(s, "/private/tmp/app"), dnaRev(s, "/other")]).toEqual([2, 2, 2, 0]);
+    // Learning the same key again changes nothing.
+    expect(reduce(s, { type: "dnaKey", path: "/tmp/app", key: "/private/tmp/app" })).toBe(s);
+  });
 });

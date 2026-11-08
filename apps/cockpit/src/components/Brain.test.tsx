@@ -3,6 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { DnaGraph, DnaStatus, NoteSummary, NoteView } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
+import { MAX_GRAPH_NODES } from "../lib/graphLayout";
+import { ev } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { Brain } from "./Brain";
 
@@ -69,7 +71,10 @@ describe("Brain", () => {
     expect(screen.getByRole("button", { name: "Hook spool, fresh, reviewed" })).toHaveClass("node-fresh");
     expect(screen.getByRole("button", { name: "Worktrees, fresh, unreviewed" })).toHaveClass("node-unreviewed");
     expect(screen.getByRole("button", { name: "Old way, fresh, reviewed, retired" })).toHaveClass("node-retired");
-    const svg = screen.getByRole("img", { name: /Graph of 5 notes/ });
+    // A group, not an image: an image's children are presentational, which would hide the
+    // node buttons from assistive technology.
+    const svg = screen.getByRole("group", { name: /Graph of 5 notes/ });
+    expect(within(svg).getAllByRole("button")).toHaveLength(5);
     expect(svg.querySelectorAll("line.link")).toHaveLength(1);
     expect(svg.querySelectorAll("line.link-dangling")).toHaveLength(1);
     expect(within(svg).getByText("release-checklist")).toBeInTheDocument();
@@ -132,7 +137,7 @@ describe("Brain", () => {
     const h = setup({ "dna.status": { ...STATUS, enabled: false, notes: 0, pending: 0 } });
     expect(await screen.findByRole("button", { name: "Enable repo memory" })).toBeInTheDocument();
     expect(screen.getByText(/creates .mirante\/memory\/ in the repo/)).toBeInTheDocument();
-    expect(screen.queryByRole("img", { name: /Graph/ })).toBeNull();
+    expect(screen.queryByRole("group", { name: /Graph/ })).toBeNull();
     expect(h.calls.map((c) => c[0])).not.toContain("dna.graph");
   });
 
@@ -151,7 +156,52 @@ describe("Brain", () => {
     await userEvent.click(screen.getByRole("button", { name: "List" }));
     const list = screen.getByRole("list", { name: "Notes" });
     expect(within(list).getAllByRole("button")).toHaveLength(5);
-    expect(screen.queryByRole("img", { name: /Graph/ })).toBeNull();
+    expect(screen.queryByRole("group", { name: /Graph/ })).toBeNull();
+  });
+
+  it("refetches on an event keyed by the daemon's canonical repo, not only by the rail's path", async () => {
+    const h = setup({ "dna.status": { ...STATUS, repo: "/private/r/app" } });
+    await nodeButton("Hook spool, fresh, reviewed");
+    const graphs = () => h.calls.filter((c) => c[0] === "dna.graph").length;
+    const n = graphs();
+    h.env.cockpit.dispatch({ type: "event", event: ev(70, null, "dna.changed", { repo: "/private/r/app", slug: "x" }) });
+    await waitFor(() => expect(graphs()).toBe(n + 1));
+  });
+
+  it("missing notes count toward the drawing cap", async () => {
+    const nodes = Array.from({ length: MAX_GRAPH_NODES - 1 }, (_, i) => node(`n${i}`, `N${i}`));
+    const links = [
+      { src: "n0", dst: "gone-a", dangling: true },
+      { src: "n1", dst: "gone-b", dangling: true },
+    ];
+    setup({ "dna.graph": { nodes, links } });
+    expect(await screen.findByText(/too large to draw/)).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: /Graph/ })).toBeNull();
+  });
+
+  it("Review (n) counts down as proposals are decided in the panel", async () => {
+    const p = {
+      id: "p1",
+      repo: "/r/app",
+      task_id: null,
+      origin: "cli",
+      title: "P1",
+      kind: "fact",
+      body: "b",
+      anchors: [],
+      redactions: 0,
+      status: "pending",
+      slug: null,
+      decision_note: "",
+      created_at: 1,
+      decided_at: null,
+    };
+    setup({ "dna.proposals": [p], "dna.review": { ...p, status: "rejected", redacted: 0 } });
+    await userEvent.click(await screen.findByRole("button", { name: "Review (2)" }));
+    const card = await screen.findByRole("article", { name: "P1" });
+    await userEvent.click(within(card).getByRole("button", { name: "Reject" }));
+    await userEvent.click(within(card).getByRole("button", { name: "Reject proposal" }));
+    expect(await screen.findByRole("button", { name: "Review (1)" })).toBeInTheDocument();
   });
 
   it("an older daemon says memory is not available", async () => {

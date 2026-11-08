@@ -119,6 +119,45 @@ describe("ReviewQueue", () => {
     await waitFor(() => expect(h.calls.filter((x) => x[0] === "dna.proposals").length).toBe(n + 1));
   });
 
+  it("says how many secrets were redacted from the accepted edits", async () => {
+    setup({ "dna.proposals": [proposal("p1")], "dna.review": { ...proposal("p1"), status: "accepted", slug: "x", redacted: 2 } });
+    const c = await card("Proposal p1");
+    await userEvent.type(within(c).getByLabelText("Body"), " token ghp_x");
+    await userEvent.click(within(c).getByRole("button", { name: "Accept" }));
+    expect(await screen.findByText(/Accepted as x\. 2 secrets were redacted from your edits\./)).toBeInTheDocument();
+  });
+
+  it("a decision removes only that card: loaded pages stay, and an event refetch keeps them", async () => {
+    const page1 = Array.from({ length: 50 }, (_, i) => proposal(`a${i}`));
+    let all = [...page1, proposal("z")];
+    const h = setup({
+      "dna.proposals": (p: Record<string, unknown>) => {
+        const from = p.after ? all.findIndex((x) => x.id === p.after) + 1 : 0;
+        return all.slice(from, from + Number(p.limit));
+      },
+      "dna.review": (p: Record<string, unknown>) => {
+        all = all.filter((x) => x.id !== p.id);
+        return { ...proposal(String(p.id)), status: "rejected", redacted: 0 };
+      },
+    });
+    await card("Proposal a0");
+    await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await card("Proposal z")).toBeInTheDocument();
+    const lists = () => h.calls.filter((x) => x[0] === "dna.proposals").length;
+    const n = lists();
+    const c = await card("Proposal a3");
+    await userEvent.click(within(c).getByRole("button", { name: "Reject" }));
+    await userEvent.click(within(c).getByRole("button", { name: "Reject proposal" }));
+    await waitFor(() => expect(screen.queryByRole("article", { name: "Proposal a3" })).toBeNull());
+    expect(lists()).toBe(n);
+    expect(screen.getByRole("article", { name: "Proposal z" })).toBeInTheDocument();
+    // The daemon's dna.decided arrives: the refetch covers what was loaded, not one page.
+    h.env.cockpit.dispatch({ type: "event", event: ev(9, "t1", "dna.decided", { id: "a3", accepted: false, slug: null, repo: "/r/app" }) });
+    await waitFor(() => expect(lists()).toBe(n + 1));
+    expect(h.calls[h.calls.length - 1]).toEqual(["dna.proposals", { repo: "/r/app", limit: 100 }]);
+    expect(await card("Proposal z")).toBeInTheDocument();
+  });
+
   it("an empty queue says nothing waits", async () => {
     setup({ "dna.proposals": [] });
     expect(await screen.findByText("Nothing waits for review.")).toBeInTheDocument();

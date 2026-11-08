@@ -209,6 +209,11 @@ export interface CheckReport {
   unreviewed: number;
 }
 
+/** `ReviewedView`: what `dna.review` answers, the decided proposal plus how many secrets
+ * were redacted from the text that became the note (the person's edits included). An older
+ * daemon sends no `redacted`. */
+export type ReviewedView = ProposalView & { redacted?: number };
+
 /** A proposal's citation (`mirante_core::dna::anchor::Anchor`). */
 export interface ProposalAnchor {
   path: string;

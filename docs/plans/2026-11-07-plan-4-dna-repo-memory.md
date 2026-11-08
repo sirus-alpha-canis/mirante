@@ -122,17 +122,19 @@ path[#symbol]:L<start>-<end>@<commit 40|64 hex>~<fingerprint 16 hex>
 | `dna.task_context` | `{task, for_agent?}` → `{enabled, relevant, at_risk, proposals}` | cockpit; agents get the escaped view |
 | `dna.propose` | `{task, title, kind, body, anchors:[{path,symbol?,start,end}]}` → `ProposalView` | MCP (agent) and CLI |
 | `dna.proposals` | `{repo?, task?, id?, status? (pending by default; all), after?, limit? (50, max 200)}` → `ProposalView[]`, oldest first | cockpit, CLI |
-| `dna.review` | `{id, accept, title?, body?, note?}` → `ProposalView` | person only (Mirante-launched agents refused) |
+| `dna.review` | `{id, accept, title?, body?, note?}` → `ReviewedView` (the `ProposalView` fields plus `redacted`: secrets removed from the text that became the note, the person's edits included; Batch D review) | person only (Mirante-launched agents refused) |
 | `dna.note_action` | `{repo, slug, action: "confirm"\|"retire", expect_hash}` → `NoteView` | person only (Mirante-launched agents refused) |
 | `dna.may_review` | `{}` → `{}`, or `FORBIDDEN` with why | CLI, before it prompts (Batch C review) |
 
 **Events:**
-- `dna.proposed {id, title}` (with `task_id`)
-- `dna.decided {id, accepted, slug}`
+- `dna.proposed {id, title, repo}` (with `task_id`)
+- `dna.decided {id, accepted, slug, repo}`
 - `dna.indexed {repo, head, notes, stale, unreviewed, invalid}`, only when one of them changed since the last one
 - `dna.changed {repo, slug}`
 
 `dna.proposed`, `dna.decided` and `dna.changed` are written in the same store transaction as the state they report.
+
+> **As built (Batch D review):** every `dna.*` event names `repo`, the daemon's key for that repo's memory (git's top level, canonical; the same string as `DnaStatus.repo`). A task's `repo_path` stays what it was created from (canonical, possibly a subdirectory), so the cockpit keeps a path → key map (`State.dnaKeys`) learned from `dna.status` replies; `dnaRev(s, path)` counts events keyed by either.
 
 **Bridge allowlist** gets every method above except `dna.propose`. The cockpit never proposes; people write notes in their editor and confirm them.
 
@@ -1285,7 +1287,7 @@ it("dna events land in the task feed and never in the memory guard", () => {
   - TS mirrors of `DnaStatus`, `AnchorView`, `NoteSummary`, `NoteView`, `DnaGraph`, `ProposalView` and `TaskMemoryContext`.
   - `M.DNA_*` constants.
   - `dna.ts` wrappers: `dnaStatus`, `dnaEnable`, `dnaGraph`, `dnaGet`, `dnaSearch`, `dnaCheck`, `taskContext`, `proposals`, `review`, `noteAction`, plus `linkParts` and `stateLabel`.
-  - In `state.ts`, add a `dnaVersion: Record<repo, number>` bumped on `dna.indexed`, `dna.decided` and `dna.changed`, so views refetch. `feedItem` gains `dna.proposed` and `dna.decided` lines.
+  - In `state.ts`, add a `dnaVersion: Record<repo, number>` bumped on `dna.indexed`, `dna.proposed`, `dna.decided` and `dna.changed` (`DNA_REFETCH`), so views refetch. *As built (Batch D review):* keyed by the event's `repo`, with `dnaKeys` mapping a view's path to that key. `feedItem` gains `dna.proposed` and `dna.decided` lines.
 
 - [ ] **Step 4: Run and confirm.** Run `pnpm --dir apps/cockpit test && pnpm --dir apps/cockpit typecheck`. Expected: PASS.
 

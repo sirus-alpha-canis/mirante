@@ -2,13 +2,13 @@
 // selected note (or the review queue) beside it. SVG with a small deterministic layout
 // (lib/graphLayout), keyboard-reachable nodes, and a list view as the accessible fallback
 // (the only view past MAX_GRAPH_NODES). Every label is text; nothing is rendered as HTML.
-import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
-import { useEnv, useStore } from "../env";
+import { type KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEnv } from "../env";
 import { type DnaAvailability, dnaCheck, dnaErrorText, dnaGraph, dnaSearch, dnaStatus } from "../lib/dna";
 import { layout, MAX_GRAPH_NODES } from "../lib/graphLayout";
 import type { DnaGraph, NoteSummary } from "../lib/protocol";
+import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { repoName } from "../store/select";
-import { dnaRev } from "../store/state";
 import { EnableMemory } from "./MemoryTab";
 import { NoteView, StatePill } from "./NoteView";
 import { ReviewQueue } from "./ReviewQueue";
@@ -39,6 +39,12 @@ function nodeClass(n: NoteSummary): string {
 
 const ghostId = (slug: string) => `?${slug}`;
 
+/** The distinct missing notes `graph` links to (drawn as ghost nodes). */
+const ghostsOf = (graph: DnaGraph) => [...new Set(graph.links.filter((l) => l.dangling).map((l) => l.dst))];
+
+/** No search hits (one shared value, so the memoized graph is not redrawn for nothing). */
+const NO_HITS: ReadonlySet<string> = new Set();
+
 function Legend() {
   const items: [string, string][] = [
     ["node-fresh", "fresh"],
@@ -62,7 +68,7 @@ function Legend() {
   );
 }
 
-function Graph({
+const Graph = memo(function Graph({
   graph,
   selected,
   hits,
@@ -70,10 +76,10 @@ function Graph({
 }: {
   graph: DnaGraph;
   selected: string | null;
-  hits: Set<string>;
+  hits: ReadonlySet<string>;
   onSelect(slug: string): void;
 }) {
-  const ghosts = useMemo(() => [...new Set(graph.links.filter((l) => l.dangling).map((l) => l.dst))], [graph]);
+  const ghosts = useMemo(() => ghostsOf(graph), [graph]);
   const pos = useMemo(
     () =>
       layout(
@@ -94,7 +100,9 @@ function Graph({
     }
   };
   return (
-    <svg className="brain-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`Graph of ${graph.nodes.length} notes and their links`}>
+    // A group, not an image: an image's children are presentational, which would hide the
+    // node buttons from assistive technology.
+    <svg className="brain-svg" viewBox={`0 0 ${W} ${H}`} role="group" aria-label={`Graph of ${graph.nodes.length} notes and their links`}>
       <g aria-hidden="true">
         {graph.links.map((l, i) => {
           const a = pos[l.src];
@@ -142,7 +150,7 @@ function Graph({
       })}
     </svg>
   );
-}
+});
 
 type Loaded =
   | { state: "loading" }
@@ -153,15 +161,22 @@ type Loaded =
 
 type Panel = { kind: "note"; slug: string } | { kind: "review" } | null;
 
-/** The brain of `repo` (the project selected in the left rail). `review`: open on the
- * review queue. */
-export function Brain({ repo, review = false }: { repo: string | null; review?: boolean }) {
-  const { rpc } = useEnv();
-  const s = useStore();
-  const version = repo ? dnaRev(s, repo) : 0;
+/** The brain of `repo` (the selected project, or the open task's). Each new `reviewNonce`
+ * (above 0) switches the panel to the review queue, without starting the brain over. */
+export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNonce?: number }) {
+  const { rpc, cockpit } = useEnv();
+  const version = useDnaRev(repo);
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const [nonce, setNonce] = useState(0);
-  const [panel, setPanel] = useState<Panel>(review ? { kind: "review" } : null);
+  const [panel, setPanel] = useState<Panel>(reviewNonce > 0 ? { kind: "review" } : null);
+  // Stable, so the memoized graph redraws only when what it shows changes.
+  const select = useCallback((slug: string) => setPanel({ kind: "note", slug }), []);
+  const seenReview = useRef(reviewNonce);
+  useEffect(() => {
+    if (reviewNonce === seenReview.current) return;
+    seenReview.current = reviewNonce;
+    if (reviewNonce > 0) setPanel({ kind: "review" });
+  }, [reviewNonce]);
   const [filters, setFilters] = useState<Set<Filter>>(new Set());
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<{ slugs: Set<string>; text: string } | null>(null);
@@ -175,6 +190,7 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
     (async () => {
       const st: DnaAvailability = await dnaStatus(rpc, repo);
       if (!st.available) return live && setLoaded({ state: "unavailable" });
+      learnDnaKey(cockpit, repo, st.status);
       if (!st.status?.enabled) return live && setLoaded({ state: "off" });
       const graph = await dnaGraph(rpc, repo);
       if (live) setLoaded({ state: "ready", graph: { nodes: graph?.nodes ?? [], links: graph?.links ?? [] }, pending: st.status.pending ?? 0 });
@@ -182,7 +198,7 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
     return () => {
       live = false;
     };
-  }, [rpc, repo, version, nonce]);
+  }, [rpc, cockpit, repo, version, nonce]);
 
   const shown = useMemo<DnaGraph | null>(() => {
     if (loaded.state !== "ready") return null;
@@ -230,7 +246,8 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
       setChecking(false);
     }
   };
-  const select = (slug: string) => setPanel({ kind: "note", slug });
+  // A decision in the panel counts at once (the refetch its event causes confirms it).
+  const decided = () => setLoaded((l) => (l.state === "ready" ? { ...l, pending: Math.max(0, l.pending - 1) } : l));
   const selected = panel?.kind === "note" ? panel.slug : null;
 
   let body: React.ReactNode;
@@ -239,7 +256,9 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
   else if (loaded.state === "error") body = <p className="error">Repo memory unavailable: {loaded.error}</p>;
   else if (loaded.state === "off") body = <EnableMemory repo={repo} onEnabled={() => setNonce((n) => n + 1)} />;
   else if (shown) {
-    const tooLarge = shown.nodes.length > MAX_GRAPH_NODES;
+    // Missing notes are drawn too: they count toward what the layout has to place.
+    const drawn = shown.nodes.length + ghostsOf(shown).length;
+    const tooLarge = drawn > MAX_GRAPH_NODES;
     body = (
       <>
         <div className="brain-bar">
@@ -286,7 +305,11 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
             {checked}
           </p>
         )}
-        {tooLarge && <p className="muted small">The graph is too large to draw ({shown.nodes.length} notes); here is the list.</p>}
+        {tooLarge && (
+          <p className="muted small">
+            The graph is too large to draw ({shown.nodes.length} notes, {drawn - shown.nodes.length} missing); here is the list.
+          </p>
+        )}
         {loaded.graph.nodes.length === 0 ? (
           <p className="muted">No notes yet. Agents propose them (review them here); you can also write them in .mirante/memory/.</p>
         ) : asList || tooLarge ? (
@@ -302,7 +325,7 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
           </ul>
         ) : (
           <>
-            <Graph graph={shown} selected={selected} hits={hits?.slugs ?? new Set()} onSelect={select} />
+            <Graph graph={shown} selected={selected} hits={hits?.slugs ?? NO_HITS} onSelect={select} />
             <Legend />
           </>
         )}
@@ -321,7 +344,7 @@ export function Brain({ repo, review = false }: { repo: string | null; review?: 
       </section>
       <aside className="brain-panel" aria-label="Selected">
         {panel?.kind === "review" ? (
-          <ReviewQueue repo={repo} />
+          <ReviewQueue repo={repo} onDecided={decided} />
         ) : panel?.kind === "note" ? (
           <NoteView at={{ repo }} repo={repo} slug={panel.slug} version={version} onOpen={select} />
         ) : (
