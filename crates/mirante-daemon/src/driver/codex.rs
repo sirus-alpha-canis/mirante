@@ -409,12 +409,30 @@ pub fn render(method: &str, params: &Value) -> Option<String> {
     }
 }
 
-/// A feed step for the audit trail.
+/// Most characters of a command or an error kept in its feed step.
+const STEP_TEXT_CAP: usize = 1000;
+
+/// `text` as stored in a feed step: credentials masked ([`mirante_core::redact::redact`]),
+/// then at most [`STEP_TEXT_CAP`] characters.
+fn step_text(text: &str) -> String {
+    mirante_core::redact::redact(text).chars().take(STEP_TEXT_CAP).collect()
+}
+
+/// A feed step for the audit trail. What the agent ran and what Codex reported is stored:
+/// credentials are masked and long text is cut ([`step_text`]).
 fn step(method: &str, params: &Value) -> Option<Value> {
     let item = &params["item"];
     match (method, item["type"].as_str()) {
         ("item/completed", Some("commandExecution")) => {
-            Some(json!({ "type": "command", "command": item["command"], "exit_code": item["exitCode"] }))
+            let command = match &item["command"] {
+                Value::String(c) => json!(step_text(c)),
+                Value::Array(parts) => {
+                    let joined: Vec<&str> = parts.iter().filter_map(Value::as_str).collect();
+                    json!(step_text(&joined.join(" ")))
+                }
+                other => other.clone(),
+            };
+            Some(json!({ "type": "command", "command": command, "exit_code": item["exitCode"] }))
         }
         ("item/completed", Some("agentMessage")) => {
             let text = mirante_core::redact::redact(item["text"].as_str().unwrap_or(""));
@@ -423,11 +441,11 @@ fn step(method: &str, params: &Value) -> Option<Value> {
         }
         ("error", _) => Some(json!({
             "type": "codex_error",
-            "error": error_text(&params["error"]),
+            "error": step_text(&error_text(&params["error"])),
             "will_retry": params["willRetry"],
         })),
         ("turn/completed", _) if params["turn"]["status"] == "failed" => {
-            Some(json!({ "type": "turn_failed", "error": error_text(&params["turn"]["error"]) }))
+            Some(json!({ "type": "turn_failed", "error": step_text(&error_text(&params["turn"]["error"])) }))
         }
         ("thread/status/changed", _) if params["status"]["type"] == "systemError" => {
             Some(json!({ "type": "codex_system_error" }))
@@ -1451,6 +1469,28 @@ mod tests {
                 "error": {"code": -32603, "message": "no rollout found for thread id th-gone"}}))
         });
         assert!(matches!(d, Err(DriverError::NativeGone(ref m)) if m.contains("th-gone")), "{:?}", d.err());
+    }
+
+    #[test]
+    fn command_and_error_steps_are_redacted_and_capped() {
+        let token = format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let cmd = format!("curl -H 'Authorization: Bearer {token}' https://api.example.com {}", "x".repeat(5000));
+        let st = step("item/completed", &json!({"item": {"type": "commandExecution", "command": cmd, "exitCode": 0}}))
+            .unwrap();
+        let c = st["command"].as_str().unwrap();
+        assert!(!c.contains(&token) && c.contains("«redacted»"), "{c}");
+        assert_eq!(c.chars().count(), STEP_TEXT_CAP);
+        let err = json!({"message": format!("push failed: {token}")});
+        for (method, params) in [
+            ("error", json!({"error": err, "willRetry": false})),
+            ("turn/completed", json!({"turn": {"status": "failed", "error": err}})),
+        ] {
+            let st = step(method, &params).unwrap();
+            let e = st["error"].as_str().unwrap();
+            assert!(!e.contains(&token) && e.contains("«redacted»"), "{method}: {e}");
+        }
+        let long = json!({"error": {"message": "y".repeat(5000)}});
+        assert_eq!(step("error", &long).unwrap()["error"].as_str().unwrap().chars().count(), STEP_TEXT_CAP);
     }
 
     #[test]
