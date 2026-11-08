@@ -137,6 +137,20 @@ pub struct DoctorReport {
     /// Checkouts under the worktree root that no task owns (never deleted by Mirante).
     pub orphan_worktrees: Vec<String>,
     pub memory: Option<SystemView>,
+    /// The agent binaries the daemon would launch, and where it found them (absent from an
+    /// older daemon).
+    #[serde(default)]
+    pub agents: Vec<AgentBinView>,
+}
+
+/// One agent binary as the daemon resolves it: `path` and `source` (`MIRANTE_CLAUDE_BIN`,
+/// `PATH`, `well-known directory`), or `error` when none was found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBinView {
+    pub agent: String,
+    pub path: Option<String>,
+    pub source: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -291,6 +291,7 @@ impl Hub {
             orphan_processes: processes.iter().map(orphan_view).collect(),
             orphan_worktrees: st.orphan_checkouts(checkouts)?,
             memory: st.mem.system.clone(),
+            agents: crate::driver::real::agents_report(),
         })
     }
 

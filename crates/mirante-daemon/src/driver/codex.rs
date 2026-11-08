@@ -46,7 +46,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use mirante_core::claude_launch::{env_to_scrub, KNOWN_SHIM_DIRS};
+use mirante_core::agent_bin::{self, Agent, Lookup};
+use mirante_core::claude_launch::env_to_scrub;
 use mirante_core::model::Status;
 use mirante_ipc::types::BootState;
 use serde_json::{json, Value};
@@ -424,33 +425,17 @@ fn step(method: &str, params: &Value) -> Option<Value> {
     }
 }
 
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-fn in_shim_dir(p: &Path) -> bool {
-    let s = p.to_string_lossy();
-    KNOWN_SHIM_DIRS.iter().any(|d| s.contains(d))
-}
-
 /// `override_bin` (`MIRANTE_CODEX_BIN`) when set, else the first executable `codex` in
-/// `path_var` that is not (and does not resolve into) a known shim directory.
+/// `path_var` that is not (and does not resolve into) a known shim directory. The daemon
+/// itself also searches the well-known install directories (`mirante_core::agent_bin`).
 pub fn resolve_codex_bin(override_bin: Option<&str>, path_var: Option<&str>) -> Result<PathBuf, DriverError> {
-    if let Some(bin) = override_bin.filter(|b| !b.is_empty()) {
-        let p = PathBuf::from(bin);
-        return if is_executable(&p) {
-            Ok(p)
-        } else {
-            Err(DriverError::Failed(format!("MIRANTE_CODEX_BIN={bin} is not an executable file")))
-        };
-    }
-    let path_var = path_var.unwrap_or_default();
-    std::env::split_paths(path_var)
-        .filter(|dir| !dir.as_os_str().is_empty() && !in_shim_dir(dir))
-        .map(|dir| dir.join("codex"))
-        .find(|p| is_executable(p) && std::fs::canonicalize(p).is_ok_and(|real| !in_shim_dir(&real)))
-        .ok_or_else(|| DriverError::Failed(format!("no codex outside shim dirs in PATH={path_var}")))
+    let l = Lookup {
+        override_bin: override_bin.map(str::to_string),
+        path_var: path_var.map(str::to_string),
+        home: None,
+        well_known: false,
+    };
+    agent_bin::resolve(Agent::Codex, &l).map(|r| r.path).map_err(DriverError::Failed)
 }
 
 /// Variables removed before spawning codex: the Claude nested-session set plus every
@@ -935,6 +920,13 @@ fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, tim
     }
 }
 
+/// Changes to the inherited environment for the codex process: variables removed, then set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChildEnv<'a> {
+    pub remove: &'a [String],
+    pub set: &'a [(String, String)],
+}
+
 impl CodexDriver {
     /// Spawns `codex app-server` in `cwd` in its own process group, stderr appended to
     /// `stderr_log`, and connects (see [`CodexDriver::connect`]).
@@ -942,7 +934,7 @@ impl CodexDriver {
         bin: &Path,
         cwd: &str,
         resume: Option<&str>,
-        env_remove: &[String],
+        env: ChildEnv<'_>,
         stderr_log: &Path,
         sink: Sink,
         timing: CodexTiming,
@@ -955,9 +947,10 @@ impl CodexDriver {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
             .process_group(0);
-        for k in env_remove {
+        for k in env.remove {
             cmd.env_remove(k);
         }
+        cmd.envs(env.set.iter().map(|(k, v)| (k, v)));
         if std::env::var_os("RUST_LOG").is_none() {
             cmd.env("RUST_LOG", "warn");
         }
@@ -1757,7 +1750,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let log = dir.join("codex-stderr.log");
         let cwd = dir.to_string_lossy().into_owned();
-        let d = CodexDriver::spawn(&bin, &cwd, None, &[], &log, Sink::new("s1", tx), timing()).unwrap();
+        let d = CodexDriver::spawn(&bin, &cwd, None, ChildEnv::default(), &log, Sink::new("s1", tx), timing()).unwrap();
         (d, rx)
     }
 

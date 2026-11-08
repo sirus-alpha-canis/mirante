@@ -2,15 +2,14 @@
 //! Rules from docs/spikes/FINDINGS.md §4: use the real binary (skip wrapper shims), scrub
 //! nested-session variables but never auth ones, pass `--permission-mode manual`, and add
 //! hooks through `--settings` (additive to the user's ~/.claude).
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
 
-/// PATH entries that hold wrapper shims rather than the real `claude` binary.
-pub const KNOWN_SHIM_DIRS: [&str; 1] = [".cmuxterm/cmux-cli-shims"];
+pub use crate::agent_bin::KNOWN_SHIM_DIRS;
+use crate::agent_bin::{self, Agent, Lookup};
 
 /// Inherited variables that make a child `claude` believe it is nested inside another
 /// Claude Code session (or a terminal wrapper's integration). Auth variables are kept.
@@ -77,53 +76,30 @@ pub fn is_protected(key: &str) -> bool {
     PROTECTED_ENV.contains(&key) || PROTECTED_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
-fn is_executable(p: &Path) -> bool {
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-fn is_shim_dir(dir: &Path) -> bool {
-    let s = dir.to_string_lossy();
-    KNOWN_SHIM_DIRS.iter().any(|shim| s.contains(shim))
-}
-
-/// True when `bin`, after following symlinks, lives in a shim directory (a symlink in a
-/// clean PATH entry can still point at a wrapper). Unresolvable paths count as shims.
-fn resolves_into_shim_dir(bin: &Path) -> bool {
-    match std::fs::canonicalize(bin) {
-        Ok(real) => real.parent().is_none_or(is_shim_dir),
-        Err(_) => true,
-    }
-}
-
 /// POSIX single-quote escaping: the result is one literal shell word.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The real `claude`: `override_bin` (from `MIRANTE_CLAUDE_BIN`) when set, else the first
-/// executable `claude` in `path_var` outside known shim directories.
+/// The real `claude` from an explicit override and PATH only (no well-known directories):
+/// `override_bin` (from `MIRANTE_CLAUDE_BIN`) when set, else the first executable `claude`
+/// in `path_var` outside known shim directories.
 pub fn resolve_claude_bin(override_bin: Option<&str>, path_var: Option<&str>) -> Result<PathBuf> {
-    if let Some(bin) = override_bin.filter(|b| !b.is_empty()) {
-        let p = PathBuf::from(bin);
-        return if is_executable(&p) {
-            Ok(p)
-        } else {
-            Err(CoreError::ClaudeNotFound(format!("MIRANTE_CLAUDE_BIN={bin} is not an executable file")))
-        };
-    }
-    let path_var = path_var.unwrap_or_default();
-    std::env::split_paths(path_var)
-        .filter(|dir| !dir.as_os_str().is_empty() && !is_shim_dir(dir))
-        .map(|dir| dir.join("claude"))
-        .find(|p| is_executable(p) && !resolves_into_shim_dir(p))
-        .ok_or_else(|| CoreError::ClaudeNotFound(format!("no claude outside shim dirs in PATH={path_var}")))
+    let l = Lookup {
+        override_bin: override_bin.map(str::to_string),
+        path_var: path_var.map(str::to_string),
+        home: None,
+        well_known: false,
+    };
+    agent_bin::resolve(Agent::Claude, &l).map(|r| r.path).map_err(CoreError::ClaudeNotFound)
 }
 
-/// `resolve_claude_bin` with the process's own `MIRANTE_CLAUDE_BIN` and `PATH`.
+/// The real `claude` for this process: `MIRANTE_CLAUDE_BIN`, PATH, then the well-known
+/// install directories (see [`agent_bin`]).
 pub fn resolve_claude_bin_from_env() -> Result<PathBuf> {
-    let over = std::env::var("MIRANTE_CLAUDE_BIN").ok();
-    let path = std::env::var("PATH").ok();
-    resolve_claude_bin(over.as_deref(), path.as_deref())
+    agent_bin::resolve(Agent::Claude, &Lookup::from_env(Agent::Claude))
+        .map(|r| r.path)
+        .map_err(CoreError::ClaudeNotFound)
 }
 
 /// Variables to remove before spawning an agent: the nested-session and terminal lists
@@ -214,6 +190,7 @@ pub fn launch_spec(input: LaunchInput<'_>) -> LaunchSpec {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    use std::os::unix::fs::PermissionsExt;
 
     fn fake_bin(dir: &Path, name: &str, mode: u32) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();

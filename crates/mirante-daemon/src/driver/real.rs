@@ -1,7 +1,9 @@
 //! The production driver factory: the real `claude` in a PTY with Mirante's scoped hook
 //! settings, or the real `codex app-server` in auto-edits mode (its stderr in a private log
 //! under `~/.mirante/sessions/<task>/`). Binaries: `MIRANTE_CLAUDE_BIN` /
-//! `MIRANTE_CODEX_BIN`, else PATH without wrapper shims. The hook command:
+//! `MIRANTE_CODEX_BIN`, else PATH, else the well-known install directories, never a wrapper
+//! shim (`mirante_core::agent_bin`); an agent found outside PATH runs with its directory
+//! first on PATH (an npm agent needs the `node` beside it). The hook command:
 //! `MIRANTE_HOOK_BIN`, else `mirante-hook` next to the daemon executable.
 //!
 //! Claude's launch comes from Plan 2a's `claude_launch::launch_spec` (real binary, env
@@ -15,12 +17,14 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mirante_core::claude_launch::{launch_spec, resolve_claude_bin_from_env, settings_json, LaunchInput};
+use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
+use mirante_core::claude_launch::{launch_spec, settings_json, LaunchInput};
 use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
+use mirante_ipc::types::AgentBinView;
 
 use super::claude::{ClaudeDriver, ClaudeTiming};
-use super::codex::{codex_env_to_scrub, resolve_codex_bin, CodexDriver, CodexTiming};
+use super::codex::{codex_env_to_scrub, ChildEnv, CodexDriver, CodexTiming};
 use super::pty::PtySpec;
 use super::{Driver, DriverError, DriverEvent, DriverFactory, Sink, SpawnRequest};
 
@@ -135,13 +139,43 @@ pub fn claude_spec(
     Ok((pty, pinned))
 }
 
+/// `PATH` for an agent at `bin`: its directory first when PATH lacks it, else nothing to set.
+pub fn agent_path_env(bin: &Path, path_var: Option<&str>) -> Vec<(String, String)> {
+    child_path(bin, path_var).map(|p| vec![("PATH".to_string(), p)]).unwrap_or_default()
+}
+
+fn resolve_agent(agent: Agent) -> Result<PathBuf, DriverError> {
+    agent_bin::resolve(agent, &Lookup::from_env(agent)).map(|r| r.path).map_err(DriverError::Failed)
+}
+
+/// Each agent binary as this daemon would resolve it (for `mirante doctor`).
+pub fn agents_report() -> Vec<AgentBinView> {
+    agents_report_with(Lookup::from_env)
+}
+
+pub fn agents_report_with(lookup: impl Fn(Agent) -> Lookup) -> Vec<AgentBinView> {
+    [Agent::Claude, Agent::Codex]
+        .into_iter()
+        .map(|agent| match agent_bin::resolve(agent, &lookup(agent)) {
+            Ok(r) => AgentBinView {
+                agent: agent.exe().to_string(),
+                path: Some(r.path.to_string_lossy().into_owned()),
+                source: Some(r.source.to_string()),
+                error: None,
+            },
+            Err(e) => AgentBinView { agent: agent.exe().to_string(), path: None, source: None, error: Some(e) },
+        })
+        .collect()
+}
+
 impl RealFactory {
     fn claude(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
-        let claude = resolve_claude_bin_from_env().map_err(|e| DriverError::Failed(e.to_string()))?;
+        let claude = resolve_agent(Agent::Claude)?;
         let hook = hook_bin()?;
         let settings = req.paths.session_dir(&req.task.id).join("claude-settings.json");
         write_private(&settings, &settings_json(&hook.to_string_lossy(), &[]).to_string())?;
-        let (pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env())?;
+        let (mut pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env())?;
+        pty.env_set.extend(agent_path_env(&claude, std::env::var("PATH").ok().as_deref()));
         let driver = ClaudeDriver::spawn(pty, sink.clone(), ClaudeTiming::default(), req.resume.is_some())?;
         if let Some(id) = pinned {
             // Known before Claude prints anything: a crash during boot can still be resumed.
@@ -152,8 +186,8 @@ impl RealFactory {
     }
 
     fn codex(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
-        let over = std::env::var("MIRANTE_CODEX_BIN").ok();
-        let bin = resolve_codex_bin(over.as_deref(), std::env::var("PATH").ok().as_deref())?;
+        let bin = resolve_agent(Agent::Codex)?;
+        let env_set = agent_path_env(&bin, std::env::var("PATH").ok().as_deref());
         let log = req.paths.session_dir(&req.task.id).join("codex-stderr.log");
         // Appended, never truncated: the last session's stderr explains its crash.
         prepare_append_log(&log, STDERR_LOG_CAP)?;
@@ -162,7 +196,7 @@ impl RealFactory {
             &bin,
             &req.task.worktree_path,
             req.resume.as_deref(),
-            &env_remove,
+            ChildEnv { remove: &env_remove, set: &env_set },
             &log,
             sink,
             CodexTiming::default(),
@@ -282,5 +316,36 @@ mod tests {
         let args = spec.args.join(" ");
         assert!(args.contains("--resume nat-1") && !args.contains("--session-id"), "{args}");
         assert_eq!(env(&spec, "MIRANTE_SESSION_ID"), Some("sess-42"));
+    }
+
+    #[test]
+    fn an_agent_outside_path_runs_with_its_directory_first() {
+        // nvm's codex is `#!/usr/bin/env node`: node lives next to it, not on a GUI PATH.
+        let codex = Path::new("/h/.nvm/versions/node/v22.14.0/bin/codex");
+        assert_eq!(
+            agent_path_env(codex, Some("/usr/bin:/bin")),
+            vec![("PATH".to_string(), "/h/.nvm/versions/node/v22.14.0/bin:/usr/bin:/bin".to_string())]
+        );
+        assert!(agent_path_env(Path::new("/usr/bin/claude"), Some("/usr/bin:/bin")).is_empty());
+    }
+
+    #[test]
+    fn the_agents_report_says_where_each_binary_came_from() {
+        let d = TestDir::new();
+        let bin = d.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let l = |agent| mirante_core::agent_bin::Lookup {
+            override_bin: (agent == Agent::Claude).then(|| bin.to_string_lossy().into_owned()),
+            path_var: Some(String::new()),
+            home: None,
+            well_known: false,
+        };
+        let r = agents_report_with(l);
+        assert_eq!(r[0].agent, "claude");
+        assert_eq!(r[0].path.as_deref(), Some(bin.to_str().unwrap()));
+        assert_eq!(r[0].source.as_deref(), Some("MIRANTE_CLAUDE_BIN"));
+        assert_eq!(r[1].agent, "codex");
+        assert!(r[1].path.is_none() && r[1].error.as_deref().is_some_and(|e| e.contains("no codex")), "{:?}", r[1]);
     }
 }

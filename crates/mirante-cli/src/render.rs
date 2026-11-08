@@ -156,6 +156,20 @@ pub fn doctor_report(d: &DoctorReport) -> String {
         Some(m) => out.push_str(&format!("{}\n", memory_line(m))),
         None => out.push_str("memory: not sampled yet\n"),
     }
+    if !d.agents.is_empty() {
+        out.push_str("agents (as the daemon resolves them):\n");
+        for a in &d.agents {
+            match (&a.path, &a.error) {
+                (Some(p), _) => {
+                    let from = a.source.as_deref().map(|s| format!("  (from {s})")).unwrap_or_default();
+                    out.push_str(&format!("  {}  {p}{from}\n", fit(&a.agent, 6)));
+                }
+                (None, e) => {
+                    out.push_str(&format!("  {}  not found: {}\n", fit(&a.agent, 6), e.as_deref().unwrap_or("?")));
+                }
+            }
+        }
+    }
     if d.orphan_processes.is_empty() {
         out.push_str("orphan processes: none\n");
     } else {
@@ -341,10 +355,41 @@ mod tests {
             }],
             orphan_worktrees: vec![],
             memory: Some(s),
+            agents: vec![],
         };
         let r = doctor_report(&d);
         assert!(r.contains("pid 4242  cwd /w/app/feat  node server.js") && r.contains("mirante doctor --kill <pid>"));
         assert!(r.contains("orphan checkouts: none"));
+    }
+
+    #[test]
+    fn doctor_says_which_agent_binaries_the_daemon_found_and_where() {
+        use mirante_ipc::types::AgentBinView;
+        let d = DoctorReport {
+            orphan_processes: vec![],
+            orphan_worktrees: vec![],
+            memory: None,
+            agents: vec![
+                AgentBinView {
+                    agent: "claude".into(),
+                    path: Some("/Users/me/.local/bin/claude".into()),
+                    source: Some("well-known directory".into()),
+                    error: None,
+                },
+                AgentBinView {
+                    agent: "codex".into(),
+                    path: None,
+                    source: None,
+                    error: Some("no codex in PATH=/usr/bin".into()),
+                },
+            ],
+        };
+        let r = doctor_report(&d);
+        assert!(r.contains("agents (as the daemon resolves them):\n"), "{r}");
+        assert!(r.contains("  claude  /Users/me/.local/bin/claude  (from well-known directory)\n"), "{r}");
+        assert!(r.contains("  codex   not found: no codex in PATH=/usr/bin\n"), "{r}");
+        let old = DoctorReport { agents: vec![], ..d };
+        assert!(!doctor_report(&old).contains("agents"));
     }
 
     #[test]
