@@ -637,6 +637,17 @@ pub use mirante_core::dna::index::RefreshReport as CheckReport;
 /// A proposal as the review queue shows it.
 pub use mirante_core::dna::index::Proposal as ProposalView;
 
+/// What `dna.review` answers: the decided proposal (its fields, flattened) and how many
+/// secrets were redacted from the text that became the note, the person's edits included
+/// (0 on reject).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewedView {
+    #[serde(flatten)]
+    pub proposal: ProposalView,
+    #[serde(default)]
+    pub redacted: usize,
+}
+
 /// Code a proposed note cites: committed lines of the task's worktree at its HEAD.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposeAnchor {

@@ -34,7 +34,15 @@ fn anchor(path: &str, symbol: &str, start: u32, end: u32, state: &str, reason: O
            "state": state, "reason": reason, "now_start": null, "now_end": null})
 }
 
-fn note(slug: &str, title: &str, kind: &'static str, state: &'static str, reviewed: bool, body: &str, a: Value) -> DemoNote {
+fn note(
+    slug: &str,
+    title: &str,
+    kind: &'static str,
+    state: &'static str,
+    reviewed: bool,
+    body: &str,
+    a: Value,
+) -> DemoNote {
     DemoNote {
         slug: slug.into(),
         title: title.into(),
@@ -248,7 +256,9 @@ impl DnaDemo {
                         .iter()
                         .filter(|n| {
                             q.split_whitespace().all(|w| {
-                                n.title.to_lowercase().contains(w) || n.body.to_lowercase().contains(w) || n.slug.contains(w)
+                                n.title.to_lowercase().contains(w)
+                                    || n.body.to_lowercase().contains(w)
+                                    || n.slug.contains(w)
                             })
                         })
                         .map(Self::summary)
@@ -285,7 +295,8 @@ impl DnaDemo {
                             v
                         })
                         .collect();
-                    let relevant: Vec<Value> = ["worktree-per-task", "hub-dedupes-hook-events"].iter().filter_map(|s| pick(s)).collect();
+                    let relevant: Vec<Value> =
+                        ["worktree-per-task", "hub-dedupes-hook-events"].iter().filter_map(|s| pick(s)).collect();
                     let props: Vec<&Value> = self.proposals.iter().filter(mine).collect();
                     json!({"enabled": true, "relevant": relevant, "at_risk": at_risk, "proposals": props})
                 } else {
@@ -364,7 +375,10 @@ impl DnaDemo {
         x["slug"] = slug;
         x["decision_note"] = json!(p["note"].as_str().unwrap_or(""));
         x["decided_at"] = json!(1_700_000_200_000u64);
-        Ok(x.clone())
+        // `dna.review` answers the proposal plus how many secrets the edits had (none here).
+        let mut out = x.clone();
+        out["redacted"] = json!(0);
+        Ok(out)
     }
 
     fn note_action(&mut self, p: &Value) -> Result<Value, RpcError> {
@@ -376,7 +390,9 @@ impl DnaDemo {
             return Err(conflict("the note changed on disk since it was read; reload and try again"));
         }
         match action {
-            "confirm" if n.state == "stale" => return Err(conflict("anchor 1 is stale: re-cite it or retire the note")),
+            "confirm" if n.state == "stale" => {
+                return Err(conflict("anchor 1 is stale: re-cite it or retire the note"))
+            }
             "confirm" => n.reviewed = true,
             "retire" => {
                 n.status = "retired";
@@ -413,14 +429,19 @@ mod tests {
         let mut d = DnaDemo::default();
         let pending = |d: &mut DnaDemo| d.answer(method::DNA_PROPOSALS, &json!({}), &[]).unwrap().unwrap();
         assert_eq!(pending(&mut d).as_array().unwrap().len(), 2);
-        let r = d.answer(method::DNA_REVIEW, &json!({"id": "p-1", "accept": true, "title": "Edited"}), &[]).unwrap().unwrap();
+        let r = d
+            .answer(method::DNA_REVIEW, &json!({"id": "p-1", "accept": true, "title": "Edited"}), &[])
+            .unwrap()
+            .unwrap();
         assert_eq!((r["status"].as_str(), r["slug"].as_str()), (Some("accepted"), Some("accepted-note-1")));
+        assert_eq!(r["redacted"], 0);
         let again = d.answer(method::DNA_REVIEW, &json!({"id": "p-1", "accept": false}), &[]).unwrap();
         assert_eq!(again.unwrap_err().code, code::CONFLICT);
         assert_eq!(pending(&mut d).as_array().unwrap().len(), 1);
         let all = d.answer(method::DNA_PROPOSALS, &json!({"status": "all"}), &[]).unwrap().unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2);
-        let n = d.answer(method::DNA_GET, &json!({"repo": DEMO_REPO, "slug": "accepted-note-1"}), &[]).unwrap().unwrap();
+        let n =
+            d.answer(method::DNA_GET, &json!({"repo": DEMO_REPO, "slug": "accepted-note-1"}), &[]).unwrap().unwrap();
         assert_eq!(n["title"], "Edited");
     }
 
@@ -429,8 +450,12 @@ mod tests {
         let mut d = DnaDemo::default();
         let get = |d: &mut DnaDemo, s: &str| d.answer(method::DNA_GET, &json!({"slug": s}), &[]).unwrap().unwrap();
         let act = |d: &mut DnaDemo, s: &str, a: &str, h: &str| {
-            d.answer(method::DNA_NOTE_ACTION, &json!({"repo": DEMO_REPO, "slug": s, "action": a, "expect_hash": h}), &[])
-                .unwrap()
+            d.answer(
+                method::DNA_NOTE_ACTION,
+                &json!({"repo": DEMO_REPO, "slug": s, "action": a, "expect_hash": h}),
+                &[],
+            )
+            .unwrap()
         };
         let w = get(&mut d, "worktree-per-task");
         assert_eq!(act(&mut d, "worktree-per-task", "confirm", "nope").unwrap_err().code, code::CONFLICT);
@@ -445,7 +470,8 @@ mod tests {
     #[test]
     fn task_context_follows_the_task_repo() {
         let mut d = DnaDemo::default();
-        let tasks = [json!({"id": "t-claude-1", "repo_path": DEMO_REPO}), json!({"id": "t-x", "repo_path": "/repos/shop"})];
+        let tasks =
+            [json!({"id": "t-claude-1", "repo_path": DEMO_REPO}), json!({"id": "t-x", "repo_path": "/repos/shop"})];
         let c = d.answer(method::DNA_TASK_CONTEXT, &json!({"task": "t-claude-1"}), &tasks).unwrap().unwrap();
         assert_eq!((c["enabled"].as_bool(), c["at_risk"].as_array().unwrap().len()), (Some(true), 1));
         assert_eq!(c["proposals"][0]["id"], "p-1");

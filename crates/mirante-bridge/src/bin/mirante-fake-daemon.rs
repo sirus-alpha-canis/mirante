@@ -29,7 +29,7 @@ fn main() {
     fake.push_event(
         Some("t-claude-1"),
         "dna.proposed",
-        json!({"id": "p-1", "title": "Login tokens are refreshed by the session layer"}),
+        json!({"id": "p-1", "title": "Login tokens are refreshed by the session layer", "repo": "/repos/mirante"}),
     );
     println!("fake daemon on {}", socket.display());
     let mut seen = 0;

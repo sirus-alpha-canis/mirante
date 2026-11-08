@@ -237,7 +237,7 @@ fn decide(
         params![id, to, slug, note, now_ms()],
     )?;
     let p = load_proposal(tx, id)?;
-    let payload = json!({ "id": p.id, "accepted": accepted, "slug": p.slug });
+    let payload = json!({ "id": p.id, "accepted": accepted, "slug": p.slug, "repo": p.repo });
     insert_event(tx, boot_id, p.task_id.as_deref(), "dna.decided", &payload)?;
     Ok(p)
 }
@@ -517,7 +517,13 @@ impl Store {
             ],
         )?;
         let out = load_proposal(&tx, &id)?;
-        insert_event(&tx, &boot, p.task_id.as_deref(), "dna.proposed", &json!({ "id": out.id, "title": out.title }))?;
+        insert_event(
+            &tx,
+            &boot,
+            p.task_id.as_deref(),
+            "dna.proposed",
+            &json!({ "id": out.id, "title": out.title, "repo": out.repo }),
+        )?;
         tx.commit()?;
         Ok(out)
     }
@@ -1075,7 +1081,10 @@ mod store_tests {
             ]
         );
         let ev = s.events_since(0, 1000).unwrap();
-        assert_eq!(ev[2].payload, serde_json::json!({ "id": p.id, "accepted": true, "slug": "slug-a" }));
+        // Every dna.* event names its repo (the key the cockpit refetches by).
+        assert_eq!(ev[0].payload, serde_json::json!({ "id": p.id, "title": p.title, "repo": "r" }));
+        assert_eq!(ev[2].payload, serde_json::json!({ "id": p.id, "accepted": true, "slug": "slug-a", "repo": "r" }));
+        assert_eq!(ev[3].payload["repo"], "r");
         assert_eq!(ev[4].payload, serde_json::json!({ "repo": "r", "slug": "slug-a" }));
         // A refused decision writes neither the state nor an event.
         assert!(s.dna_decide(&p.id, false, None, "").is_err());

@@ -20,7 +20,7 @@ use mirante_core::redact::redact_counted;
 use mirante_core::CoreError;
 use mirante_ipc::types::{
     AnchorView, AtRisk, CheckReport, DnaGet, DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview,
-    DnaSearch, DnaStatus, DnaTaskContext, GraphLink, NoteAction, NoteSummary, NoteView, ProposalView,
+    DnaSearch, DnaStatus, DnaTaskContext, GraphLink, NoteAction, NoteSummary, NoteView, ProposalView, ReviewedView,
 };
 use serde_json::json;
 
@@ -787,7 +787,7 @@ impl Hub {
     /// A person's decision. Accept writes `.mirante/memory/<slug>.md` (never overwriting;
     /// left uncommitted for the user) and records its exact content as reviewed; reject
     /// writes nothing. A failed write leaves the proposal pending.
-    pub fn dna_review(&self, caller: &Caller, r: DnaReview) -> Result<ProposalView> {
+    pub fn dna_review(&self, caller: &Caller, r: DnaReview) -> Result<ReviewedView> {
         self.require_person(caller)?;
         let p = self.lock().store.dna_proposal(&r.id).map_err(|e| match e {
             CoreError::NotFound { .. } => HubError::NotFound(format!("no proposal {}", r.id)),
@@ -806,11 +806,11 @@ impl Hub {
             let mut st = self.lock();
             let d = st.store.dna_decide(&p.id, false, None, &why).map_err(as_conflict)?;
             st.publish();
-            return Ok(d);
+            return Ok(ReviewedView { proposal: d, redacted: 0 });
         }
         self.require_enabled(&p.repo)?;
         let repo = PathBuf::from(&p.repo);
-        let (title, body, _) =
+        let (title, body, redacted) =
             clean_text(r.title.as_deref().unwrap_or(&p.title), r.body.as_deref().unwrap_or(&p.body))?;
         let kind = Kind::parse(&p.kind).ok_or_else(|| HubError::Invalid(format!("kind {:?}", p.kind)))?;
         let n = Note {
@@ -847,7 +847,7 @@ impl Hub {
         if let Err(e) = self.dna_refresh(&repo) {
             self.lock().log_error(d.task_id.as_deref(), "dna reindex after accept", &e);
         }
-        Ok(d)
+        Ok(ReviewedView { proposal: d, redacted })
     }
 }
 
@@ -1221,7 +1221,7 @@ pub(crate) mod tests {
         let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Spool", "Falls back.", "src/a.rs", 2, 4)).unwrap();
         let edited =
             DnaReview { title: Some("Hook spool fallback".into()), note: Some("ok".into()), ..review_accept(&p.id) };
-        let d = k.hub.dna_review(&Caller::Person, edited).unwrap();
+        let d = k.hub.dna_review(&Caller::Person, edited).unwrap().proposal;
         assert_eq!(
             (d.status.as_str(), d.slug.as_deref(), d.decision_note.as_str()),
             ("accepted", Some("hook-spool-fallback"), "ok")
@@ -1255,7 +1255,7 @@ pub(crate) mod tests {
         commit_in(&t.worktree_path, "src/z.rs", "z\n");
         let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Spool", "b", "src/a.rs", 2, 4)).unwrap();
         assert_eq!(p.anchors[0].commit, head_of(&t.worktree_path));
-        let d = k.hub.dna_review(&Caller::Person, review_accept(&p.id)).unwrap();
+        let d = k.hub.dna_review(&Caller::Person, review_accept(&p.id)).unwrap().proposal;
         let text = std::fs::read_to_string(k.repo.join(format!(".mirante/memory/{}.md", d.slug.unwrap()))).unwrap();
         let n = mirante_core::dna::note::parse(&text).unwrap();
         assert_eq!((n.anchors[0].commit.clone(), n.anchors[0].start), (head_of(&k.repo), 2));
@@ -1278,7 +1278,25 @@ pub(crate) mod tests {
         assert!(matches!(&act, Err(HubError::Conflict(m)) if m.contains("not enabled")), "{act:?}");
         // Rejecting writes nothing, so it stays possible.
         let r = DnaReview { id: p.id.clone(), accept: false, ..Default::default() };
-        assert_eq!(k.hub.dna_review(&Caller::Person, r).unwrap().status, "rejected");
+        assert_eq!(k.hub.dna_review(&Caller::Person, r).unwrap().proposal.status, "rejected");
+    }
+
+    #[test]
+    fn an_edited_accept_reports_the_secrets_it_redacted() {
+        let k = Kit::new();
+        let t = proposing(&k, "mem");
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Tok", "b", "src/a.rs", 1, 1)).unwrap();
+        let body = "Use token ghp_abcdefghijklmnopqrstuvwxyz0123456789 here.".to_string();
+        let d = k.hub.dna_review(&Caller::Person, DnaReview { body: Some(body), ..review_accept(&p.id) }).unwrap();
+        assert_eq!((d.proposal.status.as_str(), d.redacted), ("accepted", 1));
+        let text = std::fs::read_to_string(k.repo.join(".mirante/memory/tok.md")).unwrap();
+        assert!(!text.contains("ghp_abc"), "{text}");
+        // The wire shape is the proposal's fields plus `redacted`.
+        let wire = serde_json::to_value(&d).unwrap();
+        assert_eq!((wire["status"].as_str(), wire["redacted"].as_u64()), (Some("accepted"), Some(1)));
+        // An unedited accept and a reject redact nothing new.
+        let q = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Plain", "b", "src/a.rs", 1, 1)).unwrap();
+        assert_eq!(k.hub.dna_review(&Caller::Person, review_accept(&q.id)).unwrap().redacted, 0);
     }
 
     #[test]
@@ -1287,7 +1305,7 @@ pub(crate) mod tests {
         let t = proposing(&k, "mem");
         write_note(&k.repo, "a", "mine");
         let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "A", "b", "src/a.rs", 1, 1)).unwrap();
-        let d = k.hub.dna_review(&Caller::Person, review_accept(&p.id)).unwrap();
+        let d = k.hub.dna_review(&Caller::Person, review_accept(&p.id)).unwrap().proposal;
         assert_eq!(d.slug.as_deref(), Some("a-2"));
         assert_eq!(std::fs::read_to_string(k.repo.join(".mirante/memory/a.md")).unwrap(), "mine");
         assert!(k.repo.join(".mirante/memory/a-2.md").exists());
@@ -1303,7 +1321,7 @@ pub(crate) mod tests {
             .hub
             .dna_review(&Caller::Person, DnaReview { id: p.id.clone(), accept: false, ..Default::default() })
             .unwrap();
-        assert_eq!((d.status.as_str(), d.slug), ("rejected", None));
+        assert_eq!((d.proposal.status.as_str(), d.proposal.slug, d.redacted), ("rejected", None, 0));
         let after: Vec<_> = std::fs::read_dir(k.repo.join(".mirante/memory")).unwrap().collect();
         assert_eq!(before.len(), after.len());
         assert!(k.kinds(&t.id).contains(&"dna.decided".to_string()));
