@@ -462,6 +462,17 @@ impl Store {
         Ok(page)
     }
 
+    /// The task's events after `after_seq`, oldest first (through `events_task`).
+    pub fn task_events_after(&self, task_id: &str, after_seq: u64) -> Result<Vec<Event>> {
+        let after = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, boot_id, task_id, kind, payload, ts_ms FROM events WHERE task_id = ?1 AND seq > ?2 \
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![task_id, after], event_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn task_events(&self, task_id: &str) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, boot_id, task_id, kind, payload, ts_ms FROM events WHERE task_id = ?1 ORDER BY seq",
@@ -514,6 +525,21 @@ mod task_tests {
             .unwrap();
         assert!(plan.iter().any(|p| p.contains("events_task")), "{plan:?}");
         assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{plan:?}");
+    }
+
+    #[test]
+    fn task_events_after_reads_only_the_newer_ones() {
+        let mut s = Store::open_in_memory().unwrap();
+        let a = s.create_task(sample_task("pa")).unwrap();
+        let b = s.create_task(sample_task("pb")).unwrap();
+        for n in 0..4 {
+            s.append_event(Some(&a.id), "step", &json!({ "n": n })).unwrap();
+            s.append_event(Some(&b.id), "step", &json!({ "n": n })).unwrap();
+        }
+        let all = s.task_events(&a.id).unwrap();
+        assert_eq!(s.task_events_after(&a.id, 0).unwrap(), all);
+        assert_eq!(s.task_events_after(&a.id, all[1].seq).unwrap(), all[2..].to_vec());
+        assert!(s.task_events_after(&a.id, all.last().unwrap().seq).unwrap().is_empty());
     }
 
     #[test]

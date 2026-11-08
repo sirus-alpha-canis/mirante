@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use mirante_core::hook::HookEvent;
-use mirante_core::model::{Lifecycle, PermissionStatus, Status, Task};
+use mirante_core::model::{Event, Lifecycle, PermissionStatus, Status, Task};
 use mirante_ipc::types::HookEnvelope;
 use serde_json::{json, Value};
 
@@ -72,19 +72,29 @@ impl Hub {
         let now = mirante_core::model::now_ms();
         let auto_resume = self.auto_resume_enabled();
         for task in st.store.list_tasks(false)? {
-            if let Err(e) = end_stale_session(&mut st, &task.id, &mut report) {
+            // The task's log is read once; what recovery itself writes is read back as a tail.
+            let mut events = match st.store.task_events(&task.id) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    st.log_error(Some(&task.id), "recovery: reading events", &e);
+                    continue;
+                }
+            };
+            if let Err(e) = end_stale_session(&mut st, &task.id, &events, &mut report) {
                 st.log_error(Some(&task.id), "recovery", &e);
             }
-            match was_hibernated(&st, &task.id) {
-                Ok(true) => {
-                    st.mem.hibernated.insert(task.id.clone());
-                }
-                Ok(false) => {}
-                Err(e) => st.log_error(Some(&task.id), "recovery: hibernation mark", &e),
+            let last = events.last().map_or(0, |e| e.seq);
+            match st.store.task_events_after(&task.id, last) {
+                Ok(tail) => events.extend(tail),
+                Err(e) => st.log_error(Some(&task.id), "recovery: reading events", &e),
+            }
+            if was_hibernated(&events) {
+                st.mem.hibernated.insert(task.id.clone());
             }
             let active = matches!(task.lifecycle, Lifecycle::Active | Lifecycle::Created);
             if active {
-                if let Err(e) = resume_candidate(&mut st, &task.id, (&current, previous.as_deref(), now), auto_resume)
+                let run = (current.as_str(), previous.as_deref(), now);
+                if let Err(e) = resume_candidate(&mut st, &task.id, &events, run, auto_resume)
                     .map(|yes| yes.then(|| report.resume.push(task.id.clone())))
                 {
                     st.log_error(Some(&task.id), "recovery: auto-resume", &e);
@@ -218,12 +228,11 @@ fn is_claimed(p: &Path) -> bool {
 /// event log: by message id (`message_sent`, `message_requeued`, and the user's
 /// `queue_changed` edits, removals and reorders), or by text for events written before
 /// queued messages had ids.
-fn unsent_queue(st: &State, task_id: &str, session_id: &str) -> Result<Vec<String>> {
-    let events = st.store.task_events(task_id)?;
+fn unsent_queue(events: &[Event], session_id: &str) -> Vec<String> {
     let started =
         events.iter().position(|e| e.kind == "session_started" && e.payload["session_id"].as_str() == Some(session_id));
     let Some(start) = started else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let text = |p: &Value| p["text"].as_str().map(str::to_string);
     let id = |p: &Value| p["id"].as_str().map(str::to_string);
@@ -274,28 +283,33 @@ fn unsent_queue(st: &State, task_id: &str, session_id: &str) -> Result<Vec<Strin
             _ => {}
         }
     }
-    Ok(queue.into_iter().map(|(_, t)| t).collect())
+    queue.into_iter().map(|(_, t)| t).collect()
 }
 
 /// The task's last session ended in a hibernation (`memory.hibernated` /
 /// `memory.auto_hibernated` after its latest `session_launch`): the mark lives in memory,
 /// so a restart rebuilds it from the trail and `mirante wake` keeps working.
-fn was_hibernated(st: &State, task_id: &str) -> Result<bool> {
-    let events = st.store.task_events(task_id)?;
+fn was_hibernated(events: &[Event]) -> bool {
     let last = events
         .iter()
         .rev()
         .find(|e| matches!(e.kind.as_str(), "session_launch" | "memory.hibernated" | "memory.auto_hibernated"));
-    Ok(last.is_some_and(|e| e.kind != "session_launch"))
+    last.is_some_and(|e| e.kind != "session_launch")
 }
 
 /// Whether `task_id` is brought back by auto-resume (see `hub::resume::verdict`). A
 /// candidate that is not (too old, a crash loop, auto-resume off) is said once, with a
 /// `session.auto_resume_skipped` that also keeps later starts from trying it.
-fn resume_candidate(st: &mut State, task_id: &str, run: (&str, Option<&str>, i64), auto_resume: bool) -> Result<bool> {
+fn resume_candidate(
+    st: &mut State,
+    task_id: &str,
+    events: &[Event],
+    run: (&str, Option<&str>, i64),
+    auto_resume: bool,
+) -> Result<bool> {
     use crate::hub::resume::{verdict, Verdict};
     let (current, previous, now) = run;
-    let why = match verdict(&st.store.task_events(task_id)?, current, previous, now) {
+    let why = match verdict(events, current, previous, now) {
         Verdict::No => return Ok(false),
         Verdict::Resume if auto_resume => {
             // Queued for this run: if it goes down before the resume, the next run still
@@ -310,10 +324,10 @@ fn resume_candidate(st: &mut State, task_id: &str, run: (&str, Option<&str>, i64
     Ok(false)
 }
 
-fn end_stale_session(st: &mut State, task_id: &str, report: &mut Recovery) -> Result<()> {
+fn end_stale_session(st: &mut State, task_id: &str, events: &[Event], report: &mut Recovery) -> Result<()> {
     let live = st.store.live_session(task_id)?;
     if let Some(s) = &live {
-        let unsent = unsent_queue(st, task_id, &s.id)?;
+        let unsent = unsent_queue(events, &s.id);
         st.store.end_session(&s.id)?;
         if !unsent.is_empty() {
             st.event(
