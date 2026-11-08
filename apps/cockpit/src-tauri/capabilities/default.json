@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The cockpit window: native notifications (permission check, request, send; nothing else of the plugin), opening GitHub pull-request pages in the browser, and the native folder picker (open only) for adding a project. Nothing else (no fs, shell, http).",
+  "description": "The cockpit window: native notifications (permission check, request, send; nothing else of the plugin), opening GitHub pages and local dev servers (http://localhost or 127.0.0.1 on an explicit port) in the browser, and the native folder picker (open only) for adding a project. Nothing else (no fs, shell, http).",
   "windows": [
     "main"
   ],
@@ -14,6 +14,36 @@
       "allow": [
         {
           "url": "https://github.com/*"
+        },
+        {
+          "url": "http://localhost:[0-9]/*"
+        },
+        {
+          "url": "http://localhost:[0-9][0-9]/*"
+        },
+        {
+          "url": "http://localhost:[0-9][0-9][0-9]/*"
+        },
+        {
+          "url": "http://localhost:[0-9][0-9][0-9][0-9]/*"
+        },
+        {
+          "url": "http://localhost:[0-9][0-9][0-9][0-9][0-9]/*"
+        },
+        {
+          "url": "http://127.0.0.1:[0-9]/*"
+        },
+        {
+          "url": "http://127.0.0.1:[0-9][0-9]/*"
+        },
+        {
+          "url": "http://127.0.0.1:[0-9][0-9][0-9]/*"
+        },
+        {
+          "url": "http://127.0.0.1:[0-9][0-9][0-9][0-9]/*"
+        },
+        {
+          "url": "http://127.0.0.1:[0-9][0-9][0-9][0-9][0-9]/*"
         }
       ]
     },

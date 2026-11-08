@@ -1,5 +1,5 @@
 // The desktop shell's attack surface, pinned: a CSP with no remote origins or eval, and
-// capabilities limited to notifications, opening github.com pages and the folder picker. Widening either
+// capabilities limited to notifications, opening github.com and localhost pages and the folder picker. Widening either
 // must be a deliberate edit of this test.
 import { describe, expect, it } from "vitest";
 import capabilities from "../src-tauri/capabilities/default.json";
@@ -42,7 +42,7 @@ describe("Tauri security baseline", () => {
     expect(shell).toContain(".on_new_window(|_, _| NewWindowResponse::Deny)");
   });
 
-  it("grants only notifications, opening github.com URLs, and the folder picker", () => {
+  it("grants only notifications, opening github.com and localhost URLs, and the folder picker", () => {
     // Notifications: exactly the three commands the plugin's \`window.Notification\` shim
     // calls (is_permission_granted, request_permission, notify); not the plugin's default
     // set (channels, pending/active lists, cancel, listeners…).
@@ -56,7 +56,15 @@ describe("Tauri security baseline", () => {
       "dialog:allow-open",
     ]);
     const opener = capabilities.permissions.find((p) => typeof p !== "string");
-    expect(opener).toEqual({ identifier: "opener:allow-open-url", allow: [{ url: "https://github.com/*" }] });
+    // github.com pages, and a local dev server on an explicit port (1 to 5 digits, then the
+    // path: a "/" right after the port, so nothing such as "localhost:1@evil.example" or
+    // "localhost:1.evil.example" can name another host). Terminal links say "copy it" for
+    // the rest (see `openableLink`).
+    const local = (host: string) => ["[0-9]", "[0-9][0-9]", "[0-9][0-9][0-9]", "[0-9][0-9][0-9][0-9]", "[0-9][0-9][0-9][0-9][0-9]"].map((d) => ({ url: `http://${host}:${d}/*` }));
+    expect(opener).toEqual({
+      identifier: "opener:allow-open-url",
+      allow: [{ url: "https://github.com/*" }, ...local("localhost"), ...local("127.0.0.1")],
+    });
     expect(capabilities.windows).toEqual(["main"]);
     // The picker is asked for one folder, never files or several.
     expect(picker).toContain("directory: true");
@@ -146,7 +154,8 @@ describe("Tauri security baseline", () => {
     // cockpit re-reviews with SKILL_REREVIEW, whose folder the daemon names.
     expect(block).not.toContain("SKILL_ADD");
     // Every method the cockpit calls is one of them ("message.list_queued" is MESSAGE_LIST_QUEUED).
-    const wire = new Set(allowed.map((c) => c.toLowerCase().replace("_", ".")));
+    // The namespace is the constant's first word; the rest keeps its underscores.
+    const wire = new Set(allowed.map((c) => c.toLowerCase().replace(/^([a-z]+)_/, "$1.")));
     for (const m of Object.values(M)) expect(wire, m).toContain(m);
   });
 });
