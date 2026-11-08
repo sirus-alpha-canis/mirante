@@ -199,4 +199,9 @@ describe("AgentCard", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("pty gone");
     expect(screen.getByRole("button", { name: "Trust folder" })).toBeEnabled();
   });
+
+  it("shows how many skills the session was given, from its events", () => {
+    setup({}, task("s"), [ev(1, "s", "skill.injected", { session_id: "x", names: ["a", "b"] })]);
+    expect(screen.getByText("Skills 2")).toBeInTheDocument();
+  });
 });

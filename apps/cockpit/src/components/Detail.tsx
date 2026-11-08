@@ -12,6 +12,7 @@ import { atRiskCount, MemoryTab, useTaskMemory } from "./MemoryTab";
 import { MessageComposer } from "./MessageComposer";
 import { PermissionCard } from "./PermissionCard";
 import { QueueList } from "./QueueList";
+import { SkillsChip } from "./SkillsChip";
 import { TerminalTab } from "./TerminalTab";
 import { TrustCard } from "./TrustCard";
 
@@ -191,6 +192,7 @@ export function Detail({
             <h1>{t.title}</h1>
             <TaskBadges t={t} />
             <StatusPill column={columnOf(t, feed)} />
+            <SkillsChip key={`skills-${t.id}`} task={t.id} />
             <Actions key={t.id} t={t} />
           </header>
           {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}

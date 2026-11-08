@@ -62,7 +62,7 @@ describe("Detail (V1 classic)", () => {
     await userEvent.type(screen.getByLabelText("Message to the agent"), "stop");
     await userEvent.click(screen.getByRole("button", { name: "Steer now" }));
     await userEvent.click(await screen.findByRole("button", { name: "Interrupt and send" }));
-    const sent = () => h.calls.filter((c) => !c[0].startsWith("dna."));
+    const sent = () => h.calls.filter((c) => !c[0].startsWith("dna.") && !c[0].startsWith("skill."));
     await waitFor(() => expect(sent().map((c) => c[0])).toEqual(["message.send", "session.interrupt", "message.send"]));
     expect(sent()[2][1]).toMatchObject({ mode: "queue", text: "stop" });
   });
@@ -242,5 +242,20 @@ describe("Detail (V1 classic)", () => {
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Wake" }));
     expect(h.calls).toContainEqual(["session.wake", { task: "a" }]);
+  });
+
+  it("the header shows the task's skills chip", async () => {
+    setup({
+      "skill.task_skills": {
+        tenant: "github.com/acme",
+        origin: "github.com/acme/shop",
+        learning: false,
+        confirmed: true,
+        active: [{ name: "x", version: 1, activation: "always", scope: "personal" }],
+        refused: [],
+      },
+    });
+    const head = screen.getByRole("main", { name: "Task goal of a" }).querySelector("header") as HTMLElement;
+    expect(await within(head).findByRole("button", { name: "Skills 1" })).toBeInTheDocument();
   });
 });

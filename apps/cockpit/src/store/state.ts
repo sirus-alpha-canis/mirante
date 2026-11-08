@@ -83,6 +83,8 @@ export interface SessionSkills {
   session: string;
   names: string[];
   refused: { name: string; reason: string }[];
+  /** Injected skills the agent loaded (Claude's `Skill` tool), once each. */
+  used: string[];
 }
 
 export const FEED_CAP = 300;
@@ -133,11 +135,13 @@ function skillEffect(state: SkillSlice, e: DaemonEvent): SkillSlice {
   let sessionSkills = s.sessionSkills;
   if (e.kind === "skill.injected") {
     const names = Array.isArray(p.names) ? p.names.map(str) : [];
-    sessionSkills = { ...sessionSkills, [id]: { session, names, refused: [] } };
+    sessionSkills = { ...sessionSkills, [id]: { session, names, refused: [], used: [] } };
   } else if (e.kind === "skill.refused") {
-    const base = cur && cur.session === session ? cur : { session, names: [], refused: [] };
+    const base = cur && cur.session === session ? cur : { session, names: [], refused: [], used: [] };
     const refused = [...base.refused.filter((r) => r.name !== str(p.name)), { name: str(p.name), reason: str(p.reason) }];
     sessionSkills = { ...sessionSkills, [id]: { ...base, refused } };
+  } else if (e.kind === "skill.used" && cur && cur.session === session && !cur.used.includes(str(p.name))) {
+    sessionSkills = { ...sessionSkills, [id]: { ...cur, used: [...cur.used, str(p.name)] } };
   }
   return { ...s, skillTaskVersion, sessionSkills };
 }

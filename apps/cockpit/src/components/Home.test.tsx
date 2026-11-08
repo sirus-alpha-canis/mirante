@@ -235,3 +235,23 @@ describe("the rail's skills entry", () => {
     expect(await screen.findByRole("button", { name: "Skills" })).toBeInTheDocument();
   });
 });
+
+describe("dispatch and the task's origin", () => {
+  const created = (origin: unknown) => ({ ...task("n", { repo_path: "/repos/shop", branch: "feat/n" }), origin });
+  const go = async (origin: unknown) => {
+    const h = setup({ "task.create": created(origin), "session.start": { task: "n", boot: "ready", resumed: false, screen: "" } }, []);
+    await userEvent.type(screen.getByLabelText("Dispatch an agent"), "@claude shop/feat/n do it{Enter}");
+    return h;
+  };
+
+  it("says which client's skills a new task follows", async () => {
+    await go({ origin: "github.com/acme/shop", tenant: "github.com/acme", pinned: true });
+    expect(await screen.findByText(/feat\/n follows github.com\/acme\/shop \(client github.com\/acme\), pinned for this checkout now/)).toBeInTheDocument();
+  });
+
+  it("says when the origin waits for a confirmation", async () => {
+    await go({ origin: "github.com/acme/shop", tenant: "github.com/acme", observed: "github.com/evil/shop", pinned: false });
+    expect(await screen.findByText(/no skills until you confirm its origin/)).toBeInTheDocument();
+    expect(screen.getByText(/github.com\/evil\/shop/)).toBeInTheDocument();
+  });
+});

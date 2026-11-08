@@ -1,8 +1,20 @@
 import { type KeyboardEvent, type Ref, useRef, useState } from "react";
 import { useEnv } from "../env";
 import { DISPATCH_HELP, parseDispatch, resolveRepo } from "../lib/dispatch";
-import { M, type StartResult, type TaskView } from "../lib/protocol";
+import { type CreatedOrigin, M, type StartResult, type TaskView } from "../lib/protocol";
 import type { Project } from "../store/select";
+
+/** What `task.create` fixed for the new task's skills, in a person's words. */
+export function originText(branch: string, o: CreatedOrigin): { text: string; warn: boolean } {
+  if (o.observed) {
+    return {
+      text: `${branch} gets no skills until you confirm its origin: the checkout is pinned to ${o.origin}, but its remote now says ${o.observed}. Confirm it from the task's Skills chip.`,
+      warn: true,
+    };
+  }
+  const pinned = o.pinned ? ", pinned for this checkout now" : "";
+  return { text: `Skills: ${branch} follows ${o.origin} (client ${o.tenant})${pinned}.`, warn: false };
+}
 
 /** "@claude shop/feat/login add a login page" + Enter: new worktree, task and session. */
 export function DispatchComposer(props: {
@@ -15,6 +27,7 @@ export function DispatchComposer(props: {
 }) {
   const { rpc, cockpit } = useEnv();
   const [error, setError] = useState<string | null>(null);
+  const [originNote, setOriginNote] = useState<{ text: string; warn: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   // A ref, not `busy`: a second Enter (or key auto-repeat) arrives before React re-renders.
   const inFlight = useRef(false);
@@ -33,9 +46,11 @@ export function DispatchComposer(props: {
     inFlight.current = true;
     setBusy(true);
     setError(null);
+    setOriginNote(null);
     try {
       const v = await rpc<TaskView>(M.taskCreate, { repo: repo.path, agent, branch, goal });
       cockpit.dispatch({ type: "task", view: v });
+      if (v.origin) setOriginNote(originText(branch, v.origin));
       // Clear only what was dispatched: text typed meanwhile is the user's next message.
       if (latest.current === sent) props.onChange("");
       props.onDispatched?.(v.id);
@@ -87,6 +102,11 @@ export function DispatchComposer(props: {
       {error && (
         <p id="dispatch-error" className="error" role="alert">
           {error}
+        </p>
+      )}
+      {originNote && (
+        <p className={`small ${originNote.warn ? "warn" : "muted"}`} role="status">
+          {originNote.text}
         </p>
       )}
     </form>

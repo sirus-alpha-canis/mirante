@@ -6,6 +6,7 @@ import type { FeedItem } from "../store/state";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DoneCard } from "./DoneCard";
 import { PermissionCard } from "./PermissionCard";
+import { SkillsCount } from "./SkillsChip";
 import { TrustCard } from "./TrustCard";
 
 export function FeedLine({ item }: { item: FeedItem }) {
@@ -48,6 +49,7 @@ export function AgentCard({
           {t.title}
         </button>
         <TaskBadges t={t} />
+        <SkillsCount task={t.id} />
         <StatusPill column={col} />
       </header>
       {lines.length > 0 && (

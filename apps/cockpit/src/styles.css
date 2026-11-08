@@ -301,3 +301,10 @@ textarea.dna-input { resize: vertical; font-family: var(--mono); font-size: 12.5
 .diff-del { color: var(--danger); }
 .diff-add { color: var(--review); }
 .diff-same { color: var(--muted); }
+.skills-chip { position: relative; display: inline-flex; }
+.skill-chip { border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; font-size: 11.5px; background: var(--panel); color: var(--text); white-space: nowrap; }
+button.skill-chip { cursor: pointer; }
+.skill-chip-warn { border-color: var(--needs); color: var(--needs); background: var(--needs-bg); }
+.skills-pop { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; width: min(420px, 80vw); display: grid; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18); }
+.skills-pop p { margin: 0; overflow-wrap: anywhere; }
+.skill-confirm { border-left: 3px solid var(--needs); padding-left: 8px; }

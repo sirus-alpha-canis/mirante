@@ -323,12 +323,13 @@ describe("skills (skill.*) events", () => {
     s = reduce(s, { type: "event", event: ev(6, "t1", "skill.injected", { session_id: "s1", names: ["a", "b"] }) });
     s = reduce(s, { type: "event", event: ev(7, "t1", "skill.refused", { session_id: "s1", name: "c", reason: "modified on disk: SKILL.md" }) });
     expect(s.skillTaskVersion.t1).toBe(2);
-    expect(s.sessionSkills.t1).toEqual({ session: "s1", names: ["a", "b"], refused: [{ name: "c", reason: "modified on disk: SKILL.md" }] });
+    expect(s.sessionSkills.t1).toEqual({ session: "s1", names: ["a", "b"], refused: [{ name: "c", reason: "modified on disk: SKILL.md" }], used: [] });
     // A new session starts over.
     s = reduce(s, { type: "event", event: ev(8, "t1", "skill.injected", { session_id: "s2", names: ["a"] }) });
-    expect(s.sessionSkills.t1).toEqual({ session: "s2", names: ["a"], refused: [] });
+    expect(s.sessionSkills.t1).toEqual({ session: "s2", names: ["a"], refused: [], used: [] });
     s = reduce(s, { type: "event", event: ev(9, "t1", "skill.used", { session_id: "s2", name: "a", version: 1 }) });
     expect(s.skillTaskVersion.t1).toBe(4);
+    expect(s.sessionSkills.t1.used).toEqual(["a"]);
   });
 
   it("history replays what the session got", () => {
@@ -337,7 +338,7 @@ describe("skills (skill.*) events", () => {
       taskId: "t1",
       events: [ev(2, "t1", "skill.refused", { session_id: "s1", name: "c", reason: "over budget" }), ev(1, "t1", "skill.injected", { session_id: "s1", names: ["a"] })],
     });
-    expect(s.sessionSkills.t1).toEqual({ session: "s1", names: ["a"], refused: [{ name: "c", reason: "over budget" }] });
+    expect(s.sessionSkills.t1).toEqual({ session: "s1", names: ["a"], refused: [{ name: "c", reason: "over budget" }], used: [] });
   });
 
   it("skill events have feed lines", () => {
