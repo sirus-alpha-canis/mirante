@@ -661,6 +661,8 @@ impl Hub {
         let t = st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
         let v = st.view(t)?;
         st.publish();
+        drop(st);
+        self.mine_after_archive(&task.id);
         Ok(v)
     }
 

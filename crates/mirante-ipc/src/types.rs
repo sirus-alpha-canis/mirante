@@ -74,6 +74,9 @@ pub mod method {
     /// A person retires, restores, rescopes or rolls back a skill ([`super::SkillAction`] →
     /// [`super::SkillView`]).
     pub const SKILL_ACTION: &str = "skill.action";
+    /// A person finds repeated instructions in a learning tenant's tasks
+    /// ([`super::SkillMine`] → [`super::SkillMined`]).
+    pub const SKILL_MINE: &str = "skill.mine";
     /// `{}` when the caller may review skills, else `FORBIDDEN`.
     pub const SKILL_MAY_REVIEW: &str = "skill.may_review";
     /// Notification carrying one `mirante_core::model::Event`.
@@ -1028,4 +1031,19 @@ pub struct SkillAction {
     pub version: Option<u32>,
     /// The `manifest_hash` the person saw: refused if the skill moved on since.
     pub expect_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMine {
+    pub tenant: String,
+}
+
+/// What a mining run did: new proposals, pending ones whose evidence it updated, and
+/// clusters it skipped (covered by an active skill, rejected before, or over a cap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMined {
+    pub tenant: String,
+    pub proposed: usize,
+    pub updated: usize,
+    pub skipped: usize,
 }

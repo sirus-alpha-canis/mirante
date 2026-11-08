@@ -22,11 +22,13 @@ use mirante_core::skills::format::{
     check_description, check_file_path, is_name, parse_skill_md, render_skill_md, Activation, Manifest, ParsedSkill,
     Provenance, SignerRef, Source,
 };
+use mirante_core::skills::index::EvidenceItem;
 use mirante_core::skills::index::{
     Final, NewSkillProposal, ProposalFile, SkillCaps, SkillProposal, SkillProposalQuery, SkillRow,
 };
 use mirante_core::skills::library::{self, Bundle, VerifiedSkill};
 use mirante_core::skills::lint::{has_errors, lint, Draft, Finding, Severity};
+use mirante_core::skills::mine::{self, ActiveSkill, Kind, Params};
 use mirante_core::skills::origin::{self, Scope};
 use mirante_core::skills::sign::{SshKeygen, Verifier};
 use mirante_core::skills::{
@@ -36,8 +38,8 @@ use mirante_core::skills::{
 use mirante_core::CoreError;
 use mirante_ipc::types::{
     OriginConfirmed, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits, SkillFileView, SkillGet,
-    SkillLearn, SkillLintParams, SkillListParams, SkillProposalView, SkillProposals, SkillPropose, SkillReview,
-    SkillSummary, SkillView, TenantView,
+    SkillLearn, SkillLintParams, SkillListParams, SkillMine, SkillMined, SkillProposalView, SkillProposals,
+    SkillPropose, SkillReview, SkillSummary, SkillView, TenantView,
 };
 
 use super::dna::{today, Caller, Identity};
@@ -64,6 +66,9 @@ const PAGE_MAX: usize = 200;
 
 /// How deep an imported folder may nest (`a/b/c.md`).
 const MAX_IMPORT_LEVELS: usize = 3;
+
+/// How far back mining reads (60 days).
+const MINE_WINDOW_MS: i64 = 60 * 24 * 3600 * 1000;
 
 /// The window of the usage counts in lists.
 const USAGE_WINDOW_MS: i64 = 30 * 24 * 3600 * 1000;
@@ -955,6 +960,120 @@ impl Hub {
     }
 }
 
+impl Hub {
+    /// A person mines `tenant` (it must have learning on): see [`Hub::mine_tenant`].
+    pub fn skill_mine(&self, caller: &Caller, p: SkillMine) -> Result<SkillMined> {
+        self.require_skill_person(caller)?;
+        check_tenant(&p.tenant)?;
+        self.mine_tenant(&p.tenant)
+    }
+
+    /// Finds instructions the operator repeated in `tenant`'s confirmed tasks (the last 60
+    /// days) and queues them as proposals: the history is read under the lock, clustered
+    /// and drafted without it (no LLM; active skills verified from disk), then each draft is
+    /// inserted under it. A pending proposal with the same fingerprint gets the new evidence;
+    /// a rejected one is never proposed again. `skill.mined` reports the counts.
+    pub(crate) fn mine_tenant(&self, tenant: &str) -> Result<SkillMined> {
+        let since = now_ms() - MINE_WINDOW_MS;
+        let (history, rows, injected, mut taken) = {
+            let st = self.lock();
+            if !st.store.skill_learning(tenant)? {
+                return Err(HubError::Conflict(format!("skill learning is not enabled for {tenant}")));
+            }
+            let rows = st.store.skill_list()?;
+            let pending = st.store.skill_proposals(&SkillProposalQuery {
+                tenant: Some(tenant.to_string()),
+                status: Some("pending".into()),
+                limit: usize::MAX >> 1,
+                ..Default::default()
+            })?;
+            let mut taken: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+            taken.extend(pending.into_iter().map(|p| p.name));
+            (st.store.skill_history(tenant, since)?, rows, st.store.skill_injected_by_task()?, taken)
+        };
+        let active: Vec<ActiveSkill> = rows
+            .iter()
+            .filter(|r| r.status == "active")
+            .filter(|r| scope_tenant(&r.scope).is_none_or(|t| t == tenant))
+            .filter_map(|r| {
+                let v = self.skill_verify(&r.name, r.version, &r.manifest_hash).ok()?;
+                let md = v.files.iter().find(|(p, _)| p == SKILL_MD)?;
+                let body = parse_skill_md(std::str::from_utf8(&md.1).ok()?).ok()?.body;
+                Some(ActiveSkill {
+                    name: r.name.clone(),
+                    manifest_hash: r.manifest_hash.clone(),
+                    scope: r.scope.clone(),
+                    description: r.description.clone(),
+                    body,
+                })
+            })
+            .collect();
+        let params = Params { since_ms: since, ..Params::default() };
+        let clusters = mine::cluster(&mine::units(&history), &params);
+        let mut out = SkillMined { tenant: tenant.to_string(), proposed: 0, updated: 0, skipped: 0 };
+        for c in &clusters {
+            let Some(m) = mine::draft(c, &active, &injected, &taken) else {
+                out.skipped += 1;
+                continue;
+            };
+            taken.push(m.name.clone());
+            let (kind, base_hash) = match &m.kind {
+                Kind::New => ("new", None),
+                Kind::Edit { base_hash, .. } => ("edit", Some(base_hash.clone())),
+            };
+            let new = NewSkillProposal {
+                origin: "miner".into(),
+                task_id: None,
+                tenant: m.tenant.clone(),
+                kind: kind.into(),
+                name: m.name.clone(),
+                base_hash,
+                scope: m.scope.clone(),
+                activation: m.activation,
+                description: m.description.clone(),
+                body: m.body.clone(),
+                files: Vec::new(),
+                evidence: m
+                    .evidence
+                    .iter()
+                    .map(|e| EvidenceItem { task: e.task.clone(), text: e.text.clone() })
+                    .collect(),
+                fingerprint: Some(m.fingerprint.clone()),
+                lint: lint(&m.lint_draft()),
+                redactions: 0,
+            };
+            match self.lock().store.skill_insert_proposal(&new, CAPS) {
+                Ok(i) if i.new => out.proposed += 1,
+                Ok(_) => out.updated += 1,
+                Err(CoreError::Limit(_)) => out.skipped += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut st = self.lock();
+        let payload = serde_json::json!({
+            "tenant": tenant, "proposed": out.proposed, "updated": out.updated, "skipped": out.skipped,
+        });
+        st.event(None, "skill.mined", payload)?;
+        st.publish();
+        Ok(out)
+    }
+
+    /// After a task is archived: mines its tenant when learning is on and its origin is
+    /// confirmed. Errors are logged, never raised (the archive already happened).
+    pub(crate) fn mine_after_archive(&self, task_id: &str) {
+        let tenant = {
+            let st = self.lock();
+            match st.store.skill_origin_of(task_id) {
+                Ok(Some(o)) if o.observed.is_none() && st.store.skill_learning(&o.tenant).unwrap_or(false) => o.tenant,
+                _ => return,
+            }
+        };
+        if let Err(e) = self.mine_tenant(&tenant) {
+            self.lock().log_error(Some(task_id), "skill mining after archive", &e);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::{Path, PathBuf};
@@ -968,7 +1087,7 @@ pub(crate) mod tests {
     use mirante_core::skills::{FORMAT, SKILL_MD};
     use mirante_ipc::types::{
         CreateTask, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits, SkillGet, SkillInline,
-        SkillLearn, SkillListParams, SkillProposals, SkillPropose, SkillReview,
+        SkillLearn, SkillListParams, SkillMine, SkillMined, SkillProposals, SkillPropose, SkillReview,
     };
 
     use super::*;
@@ -1518,5 +1637,137 @@ pub(crate) mod tests {
             .unwrap();
         let pending = k.hub.skill_proposals(SkillProposals { task: Some(t.id.clone()), ..Default::default() }).unwrap();
         assert_eq!(pending.iter().map(|p| p.proposal.id.as_str()).collect::<Vec<_>>(), [b.proposal.id.as_str()]);
+    }
+    const CLIPPY: [&str; 4] = [
+        "Rode cargo clippy antes de commitar.",
+        "rode cargo clippy antes de commitar!",
+        "Rode cargo clippy, antes de commitar",
+        "RODE cargo clippy antes de commitar",
+    ];
+
+    fn mine(k: &Kit, tenant: &str) -> Result<SkillMined> {
+        k.hub.skill_mine(&Caller::Person, SkillMine { tenant: tenant.into() })
+    }
+
+    /// A second repo (its own checkout) whose origin is `url`.
+    fn other_repo(k: &Kit, url: &str) -> PathBuf {
+        let repo = crate::hub::testkit::git_repo(&k.dir.path().join("b"));
+        set_origin(&repo, url);
+        repo
+    }
+
+    fn task_in(k: &Kit, repo: &Path, branch: &str, goal: &str) -> mirante_core::model::Task {
+        let p = CreateTask {
+            repo: repo.to_string_lossy().into_owned(),
+            agent: AgentKind::Codex,
+            branch: branch.into(),
+            base: None,
+            goal: goal.into(),
+            title: None,
+        };
+        k.hub.create_task(p).unwrap().task
+    }
+
+    #[test]
+    fn mine_proposes_once_and_updates_evidence_on_rerun() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            create_in(&k, &Caller::Person, &format!("c{i}"), g);
+        }
+        let r = mine(&k, "github.com/acme").unwrap();
+        assert_eq!((r.proposed, r.updated), (1, 0));
+        let q = k.hub.skill_proposals(SkillProposals::default()).unwrap();
+        assert_eq!(q.len(), 1);
+        let p = &q[0].proposal;
+        assert_eq!((p.origin.as_str(), p.kind.as_str(), p.activation.as_str()), ("miner", "new", "always"));
+        assert_eq!((p.scope.as_str(), p.evidence.len()), ("repo:github.com/acme/app", 3));
+        assert!(p.description.starts_with("Instructions the operator repeated in 3 tasks"), "{}", p.description);
+        assert!(p.lint.is_empty(), "{:?}", p.lint);
+        create_in(&k, &Caller::Person, "c3", CLIPPY[3]);
+        let r = mine(&k, "github.com/acme").unwrap();
+        assert_eq!((r.proposed, r.updated), (0, 1));
+        let q = k.hub.skill_proposals(SkillProposals::default()).unwrap();
+        assert_eq!((q.len(), q[0].proposal.evidence.len()), (1, 4));
+    }
+
+    #[test]
+    fn mine_never_crosses_tenants_and_skips_non_learning_ones() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        let b = other_repo(&k, "git@github.com:other/x.git");
+        create_in(&k, &Caller::Person, "a1", CLIPPY[0]);
+        create_in(&k, &Caller::Person, "a2", CLIPPY[1]);
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            task_in(&k, &b, &format!("b{i}"), g);
+        }
+        // Two tasks in acme are not enough; other's three are another client's.
+        assert_eq!(mine(&k, "github.com/acme").unwrap().proposed, 0);
+        let off = mine(&k, "github.com/other");
+        assert!(matches!(&off, Err(HubError::Conflict(m)) if m.contains("not enabled")), "{off:?}");
+        assert!(k.hub.skill_proposals(SkillProposals::default()).unwrap().is_empty());
+        // An unconfirmed task (its origin changed) is not read either.
+        set_origin(&k.repo, "git@github.com:evil/x.git");
+        create_in(&k, &Caller::Person, "a3", CLIPPY[2]);
+        assert_eq!(mine(&k, "github.com/acme").unwrap().proposed, 0);
+    }
+
+    #[test]
+    fn rejected_fingerprints_are_not_reproposed() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            create_in(&k, &Caller::Person, &format!("c{i}"), g);
+        }
+        assert_eq!(mine(&k, "github.com/acme").unwrap().proposed, 1);
+        let id = k.hub.skill_proposals(SkillProposals::default()).unwrap()[0].proposal.id.clone();
+        k.hub.skill_review(&Caller::Person, SkillReview { id, accept: false, edits: None, note: None }).unwrap();
+        create_in(&k, &Caller::Person, "c3", CLIPPY[3]);
+        let r = mine(&k, "github.com/acme").unwrap();
+        assert_eq!((r.proposed, r.updated, r.skipped), (0, 0, 1));
+        assert!(k.hub.skill_proposals(SkillProposals::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_triggers_a_mine_of_that_tenant() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        let mut last = None;
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            last = Some(create_in(&k, &Caller::Person, &format!("c{i}"), g));
+        }
+        assert!(k.payloads("skill.mined").is_empty());
+        k.hub.archive(&last.unwrap().id).unwrap();
+        let mined = k.payloads("skill.mined");
+        assert_eq!(
+            (mined.len(), mined[0]["tenant"].as_str(), mined[0]["proposed"].as_u64()),
+            (1, Some("github.com/acme"), Some(1))
+        );
+        // A tenant without learning: archiving mines nothing and raises nothing.
+        let b = other_repo(&k, "git@github.com:other/x.git");
+        let t = task_in(&k, &b, "b0", CLIPPY[0]);
+        k.hub.archive(&t.id).unwrap();
+        assert_eq!(k.payloads("skill.mined").len(), 1);
+    }
+
+    #[test]
+    fn skill_mined_event_reports_counts() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            create_in(&k, &Caller::Person, &format!("c{i}"), g);
+        }
+        mine(&k, "github.com/acme").unwrap();
+        mine(&k, "github.com/acme").unwrap();
+        let counts: Vec<(u64, u64)> = k
+            .payloads("skill.mined")
+            .iter()
+            .map(|p| (p["proposed"].as_u64().unwrap(), p["updated"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(counts, [(1, 0), (0, 1)]);
+        // Person-only.
+        let agent = Peer::spawn(&[(AGENT_ENV, "x")], k.dir.path());
+        forbidden(k.hub.skill_mine(&agent.caller(), SkillMine { tenant: "github.com/acme".into() }));
+        forbidden(k.hub.skill_mine(&Caller::Unknown, SkillMine { tenant: "github.com/acme".into() }));
     }
 }

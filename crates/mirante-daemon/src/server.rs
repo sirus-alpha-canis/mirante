@@ -349,6 +349,7 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
         method::SKILL_REVIEW => out(hub.skill_review(caller, params(p)?)),
         method::SKILL_ACTION => out(hub.skill_action(caller, params(p)?)),
         method::SKILL_MAY_REVIEW => out(hub.skill_may_review(caller)),
+        method::SKILL_MINE => out(hub.skill_mine(caller, params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
