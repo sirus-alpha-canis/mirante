@@ -22,8 +22,9 @@ use mirante_ipc::types::{
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
-use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd, USAGE};
+use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd};
 use mirante_cli::{confirm, daemon_ctl, memcheck, render, skilllint, term};
+use mirante_core::branch_name::{branch_from_goal, next_free_branch};
 use mirante_core::skills::lint::has_errors;
 
 type Res = Result<(), Box<dyn Error>>;
@@ -309,7 +310,7 @@ fn watch(paths: &Paths) -> Res {
             Ok(())
         })();
         if let Err(e) = session {
-            eprintln!("mirante watch: {e}; reconnecting");
+            eprintln!("mirante watch: {}; reconnecting", render::strip_codes(&e.to_string()));
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -769,7 +770,7 @@ fn run(cmd: Cmd) -> Res {
     let paths = Paths::from_env()?;
     let color = term::is_tty(1);
     match cmd {
-        Cmd::Help => println!("{USAGE}"),
+        Cmd::Help(_) | Cmd::Version => unreachable!("answered before the daemon is involved"),
         Cmd::Daemon(DaemonCmd::Status) => match Client::connect(&paths.socket()) {
             // A socket path that cannot exist is a setup error, not "not running".
             Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e.into()),
@@ -817,19 +818,22 @@ fn run(cmd: Cmd) -> Res {
         }
         Cmd::New { repo, agent, branch, base, title, goal, trust } => {
             let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
+            let repo = repo.to_string_lossy().into_owned();
             let mut c = client(&paths)?;
-            let v: TaskView = c.call(
-                method::TASK_CREATE,
-                CreateTask {
-                    repo: repo.to_string_lossy().into_owned(),
-                    agent,
-                    branch,
-                    base,
-                    goal: goal.clone(),
-                    title,
-                },
-            )?;
+            let create = |branch: String, base: Option<String>| CreateTask {
+                repo: repo.clone(),
+                agent,
+                branch,
+                base,
+                goal: goal.clone(),
+                title: title.clone(),
+            };
+            let v: TaskView = match branch {
+                Some(branch) => c.call(method::TASK_CREATE, create(branch, base))?,
+                None => new_auto_branch(&mut c, &repo, &goal, base, create)?,
+            };
             println!("created {} on {} ({})", render::short(&v.task.id), v.task.branch, v.task.worktree_path);
+            notice(&format!("starting {} (its first launch can take a while)…", agent.as_str()));
             let r: StartResult =
                 c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal) })?;
             boot_flow(&mut c, r, trust)?;
@@ -921,33 +925,101 @@ fn run(cmd: Cmd) -> Res {
         }
         Cmd::Memory(m) => memory(&paths, m)?,
         Cmd::Skills(k) => skills(&paths, k)?,
-        Cmd::Archive { task } => {
-            let v: TaskView = client(&paths)?.call(method::TASK_ARCHIVE, TaskRef { task })?;
+        Cmd::Archive { task, stop } => {
+            let mut c = client(&paths)?;
+            if stop {
+                let v: TaskView = c.call(method::TASK_GET, TaskRef { task: task.clone() })?;
+                if v.live {
+                    let _: TaskView = c.call(method::SESSION_STOP, TaskRef { task: task.clone() })?;
+                    println!("{} stopped", render::short(&v.task.id));
+                }
+            }
+            let v: TaskView = c.call(method::TASK_ARCHIVE, TaskRef { task })?;
             println!("{} archived (branch {} kept)", render::short(&v.task.id), v.task.branch);
         }
     }
     Ok(())
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args::parse(&args) {
-        Err(e) => {
-            eprintln!("mirante: {e}\n\n{USAGE}");
-            ExitCode::from(2)
+/// Most auto-named branches tried before giving up (the cockpit's limit too).
+const MAX_RENAMES: usize = 50;
+
+/// `task.create` on `mirante/<slug-of-the-goal>`, past the branches this repo's tasks use,
+/// moving on to `-2`, `-3`… when git already has the name (the cockpit's rule). A base (the
+/// given one, else `HEAD`) makes the daemon refuse an existing branch instead of checking
+/// it out.
+fn new_auto_branch(
+    c: &mut Client,
+    repo: &str,
+    goal: &str,
+    base: Option<String>,
+    create: impl Fn(String, Option<String>) -> CreateTask,
+) -> Result<TaskView, Box<dyn Error>> {
+    let tasks: Vec<TaskView> = c.call(method::TASK_LIST, ListParams { archived: true })?;
+    let mut taken: Vec<String> =
+        tasks.into_iter().filter(|v| v.task.repo_path == repo).map(|v| v.task.branch).collect();
+    let name = branch_from_goal(goal);
+    let base = base.unwrap_or_else(|| "HEAD".to_string());
+    for _ in 0..=MAX_RENAMES {
+        let branch = next_free_branch(&name, &taken);
+        match c.call::<TaskView>(method::TASK_CREATE, create(branch.clone(), Some(base.clone()))) {
+            Err(ClientError::Rpc(e))
+                if e.code == code::INVALID_PARAMS && e.message.contains("branch already exists") =>
+            {
+                taken.push(branch)
+            }
+            r => return Ok(r?),
         }
-        Ok(cmd) => {
-            let check = matches!(cmd, Cmd::Memory(MemoryCmd::Check { .. }) | Cmd::Skills(SkillsCmd::Lint { .. }));
-            match run(cmd) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("mirante: {e}");
-                    if check && !e.is::<Findings>() && !e.is::<LintErrors>() {
-                        ExitCode::from(EXIT_CHECK_FAILED_TO_RUN)
-                    } else {
-                        ExitCode::FAILURE
-                    }
-                }
+    }
+    Err(format!("every name from {name} to {name}-{} is taken: pass --branch <name>", MAX_RENAMES + 1).into())
+}
+
+/// The message a person reads: without the daemon's internal error codes unless `verbose`.
+fn user_message(e: &dyn Error, verbose: bool) -> String {
+    if verbose {
+        e.to_string()
+    } else {
+        render::strip_codes(&e.to_string())
+    }
+}
+
+fn main() -> ExitCode {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let verbose = args.first().is_some_and(|a| a == "--verbose");
+    if verbose {
+        args.remove(0);
+    }
+    let cmd = match args::parse(&args) {
+        Err(e) => {
+            eprintln!("{}", args::usage_error(&args, &e));
+            return ExitCode::from(2);
+        }
+        Ok(cmd) => cmd,
+    };
+    match &cmd {
+        Cmd::Help(None) => {
+            println!("{}", args::usage());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Help(Some(name)) => {
+            print!("{}", args::command_usage(name).unwrap_or_default());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Version => {
+            println!("mirante {VERSION}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+    let check = matches!(cmd, Cmd::Memory(MemoryCmd::Check { .. }) | Cmd::Skills(SkillsCmd::Lint { .. }));
+    match run(cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mirante: {}", user_message(&*e, verbose));
+            if check && !e.is::<Findings>() && !e.is::<LintErrors>() {
+                ExitCode::from(EXIT_CHECK_FAILED_TO_RUN)
+            } else {
+                ExitCode::FAILURE
             }
         }
     }

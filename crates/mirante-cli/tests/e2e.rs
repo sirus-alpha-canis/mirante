@@ -1075,3 +1075,113 @@ fn a_too_long_mirante_home_is_an_error_not_not_running() {
     assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(err.contains("socket path is") && err.contains("MIRANTE_HOME"), "{err}");
 }
+
+#[test]
+fn new_names_the_branch_from_the_goal_like_the_cockpit() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    // git already has the first name: the task moves on to -2, then -3.
+    git(&env.repo, &["branch", "mirante/fix-the-login"]);
+    let out = env.ok(&["new", &repo, "--agent", "claude", "Fix the login!"]);
+    assert!(out.contains("on mirante/fix-the-login-2 "), "{out}");
+    let out = env.ok(&["new", &repo, "--agent", "claude", "fix the login"]);
+    assert!(out.contains("on mirante/fix-the-login-3 "), "{out}");
+    env.ok(&["archive", "--stop", "mirante/fix-the-login-3"]);
+    // An archived task's name stays taken.
+    let out = env.ok(&["new", &repo, "--agent", "claude", "fix the login"]);
+    assert!(out.contains("on mirante/fix-the-login-4 "), "{out}");
+}
+
+#[test]
+fn archive_stop_ends_the_session_then_archives() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "arc", "say", "hi"]);
+    wait_until("live", || env.task("arc").live);
+    let refused = env.mirante(&["archive", "arc"]);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && err.contains("stop it first"), "{err}");
+    assert!(!err.contains("(code "), "no internal code by default: {err}");
+    let verbose = env.mirante(&["--verbose", "archive", "arc"]);
+    assert!(String::from_utf8_lossy(&verbose.stderr).contains("(code "));
+    let out = env.ok(&["archive", "--stop", "arc"]);
+    assert!(out.contains("stopped") && out.contains("archived"), "{out}");
+}
+
+#[test]
+fn new_refuses_a_folder_or_agent_it_cannot_use_before_making_anything() {
+    let env = Env::new();
+    let plain = env.dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let out = env.mirante(&["new", plain.to_str().unwrap(), "--agent", "claude", "go"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("is not a git repository") && err.contains("git init"), "{err}");
+    assert!(!err.contains("(code "), "{err}");
+    // The daemon resolves agents with its own environment, set when it starts.
+    env.ok(&["daemon", "stop"]);
+    let bogus = env.dir.path().join("no-codex-here");
+    let out = env
+        .cmd(&bin("mirante"))
+        .env("MIRANTE_CODEX_BIN", &bogus)
+        .args(["new", env.repo.to_str().unwrap(), "--agent", "codex", "--branch", "cx", "go"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("MIRANTE_CODEX_BIN") && err.contains("mirante daemon restart"), "{err}");
+    let branches = Command::new("git").arg("-C").arg(&env.repo).args(["branch", "--list", "cx"]).output().unwrap();
+    assert!(branches.stdout.is_empty(), "no branch was made");
+    assert!(env.ok(&["ls", "--all"]).contains("no tasks"));
+}
+
+#[test]
+fn help_per_command_short_usage_errors_and_version() {
+    let env = Env::new();
+    for args in [&["new", "--help"][..], &["help", "new"]] {
+        let out = env.ok(args);
+        assert!(out.starts_with("usage:\n  mirante new <repo>"), "{out}");
+        assert!(!out.contains("skills lint"), "one command only: {out}");
+    }
+    let full = env.ok(&["help"]);
+    assert!(full.contains("skills lint") && full.contains("MIRANTE_CLAUDE_BIN"), "{full}");
+    let out = env.mirante(&["stop"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(err.starts_with("mirante: missing <task>\nusage:\n  mirante stop <task>"), "{err}");
+    assert!(err.trim_end().ends_with("run 'mirante help' for every command"), "{err}");
+    assert!(!err.contains("skills lint"), "{err}");
+    for v in ["--version", "-V"] {
+        assert_eq!(env.ok(&[v]), format!("mirante {}\n", env!("CARGO_PKG_VERSION")));
+    }
+    assert!(!env.home.join("daemon.sock").exists(), "help and version never start a daemon");
+}
+
+/// install.sh warms each binary up (the first launch is the slow one on macOS) with
+/// `--version`, which must do nothing else: no daemon, no stdin read, no state.
+#[test]
+fn every_binary_answers_version_without_side_effects() {
+    let env = Env::new();
+    for name in ["mirante", "mirante-daemon", "mirante-hook", "mirante-mcp"] {
+        for flag in ["--version", "-V"] {
+            // stdin stays open: a binary that read it would hang until the timeout.
+            let mut child = env
+                .cmd(&bin(name))
+                .arg(flag)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "{name} {flag} hangs");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{name} {flag}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{name} {}\n", env!("CARGO_PKG_VERSION")));
+        }
+    }
+    assert!(!env.home.exists(), "nothing was written under MIRANTE_HOME");
+}

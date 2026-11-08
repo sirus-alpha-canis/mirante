@@ -47,6 +47,10 @@ fn surface(args: &[String]) -> Result<Surface, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("mirante-mcp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let surface = match surface(&args) {
         Ok(s) => s,
         Err(e) => {

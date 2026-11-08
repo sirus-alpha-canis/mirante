@@ -4,35 +4,71 @@ use std::collections::HashMap;
 
 use mirante_core::model::AgentKind;
 
-pub const USAGE: &str = "\
-usage: mirante <command>
+/// One command's usage block (as the full help lists it) and the names it answers to.
+struct Help {
+    names: &'static [&'static str],
+    text: &'static str,
+}
 
-  new <repo> --agent claude|codex --branch <name> [--base <ref>] [--title <t>] [--trust] <goal...>
-                         create a worktree + task and start the agent with <goal>
-  ls [--all]             tasks with status and what needs you (--all: include archived)
-  show <task>            one task in detail
-  watch                  live status board (rings the bell when a task needs you)
-  attach <task>          live terminal (Claude) or event stream (Codex); detach with Ctrl-]
-  say <task> [--queue] <message...>
-                         steer now (default) or queue for the end of the running turn
-  queue ls <task>        the messages queued for the turn end, numbered (1 = next)
+const COMMANDS: &[Help] = &[
+    Help {
+        names: &["new"],
+        text: "  new <repo> --agent claude|codex [--branch <name>] [--base <ref>] [--title <t>] [--trust] <goal...>
+                         create a worktree + task and start the agent with <goal>; the branch
+                         defaults to mirante/<words-of-the-goal> (-2, -3… when taken)",
+    },
+    Help { names: &["ls", "list"], text: "  ls [--all]             tasks with status and what needs you (--all: include archived)" },
+    Help { names: &["show"], text: "  show <task>            one task in detail" },
+    Help { names: &["watch"], text: "  watch                  live status board (rings the bell when a task needs you)" },
+    Help {
+        names: &["attach"],
+        text: "  attach <task>          live terminal (Claude) or event stream (Codex); detach with Ctrl-]",
+    },
+    Help {
+        names: &["say"],
+        text: "  say <task> [--queue] <message...>
+                         steer now (default) or queue for the end of the running turn",
+    },
+    Help {
+        names: &["queue"],
+        text: "  queue ls <task>        the messages queued for the turn end, numbered (1 = next)
   queue edit <task> <n> <message...> | queue rm <task> <n> | queue mv <task> <n> <to>
-                         change, drop or move queued message <n> (not once it is delivered)
-  perms                  pending permission requests
-  allow <perm> | deny <perm>
+                         change, drop or move queued message <n> (not once it is delivered)",
+    },
+    Help { names: &["perms"], text: "  perms                  pending permission requests" },
+    Help {
+        names: &["allow", "deny"],
+        text: "  allow <perm> | deny <perm>
                          answer one request, once (never \"always\"); a Claude dialog is
                          answered in the terminal (offers to attach) unless the daemon runs
-                         with MIRANTE_CLAUDE_INLINE_ANSWERS=1 and has the evidence
-  interrupt <task>       stop the current step (Esc / turn/interrupt)
-  stop <task>            end the agent process (resumable)
-  resume <task> [--trust] [--fresh]
+                         with MIRANTE_CLAUDE_INLINE_ANSWERS=1 and has the evidence",
+    },
+    Help { names: &["interrupt"], text: "  interrupt <task>       stop the current step (Esc / turn/interrupt)" },
+    Help { names: &["stop"], text: "  stop <task>            end the agent process (resumable)" },
+    Help {
+        names: &["resume"],
+        text: "  resume <task> [--trust] [--fresh]
                          restart the agent on its native session (context kept);
-                         --fresh starts a new conversation instead (your explicit choice)
-  hibernate <task>       end an idle agent to free memory (resumable; never one waiting on you)
-  wake <task> [--trust]  resume a hibernated task on its native conversation
-  doctor [--kill <pid>]  orphan processes / checkouts and memory; --kill asks, then kills one orphan
-  archive <task>         remove the worktree (branch kept) and hide the task
-  memory enable|disable [<repo>]
+                         --fresh starts a new conversation instead (your explicit choice)",
+    },
+    Help {
+        names: &["hibernate"],
+        text: "  hibernate <task>       end an idle agent to free memory (resumable; never one waiting on you)",
+    },
+    Help { names: &["wake"], text: "  wake <task> [--trust]  resume a hibernated task on its native conversation" },
+    Help {
+        names: &["doctor"],
+        text: "  doctor [--kill <pid>]  orphan processes / checkouts, memory, agent binaries; --kill asks, then kills one orphan",
+    },
+    Help {
+        names: &["archive"],
+        text: "  archive [--stop] <task>
+                         remove the worktree (branch kept) and hide the task; --stop ends a
+                         live session first",
+    },
+    Help {
+        names: &["memory"],
+        text: "  memory enable|disable [<repo>]
                          repo memory for new sessions of the repo's tasks (explicit, per repo)
   memory ls [<repo>] | memory show <slug> [--repo <r>] | memory search <query...> [--repo <r>]
                          notes with their state (fresh, stale, unverifiable) and review
@@ -54,8 +90,11 @@ usage: mirante <command>
                          working tree)
   memory propose --task <task> --title <t> --kind fact|decision|pattern|gotcha
                  --cite <path:start-end[#symbol]>... <body...>
-                         propose a note yourself, citing committed code in the task worktree
-  skills tenant [<repo>]  the repo's normalized origin and client (tenant), and its learning state
+                         propose a note yourself, citing committed code in the task worktree",
+    },
+    Help {
+        names: &["skills"],
+        text: "  skills tenant [<repo>]  the repo's normalized origin and client (tenant), and its learning state
   skills learn on|off [<repo>]
                          let Mirante read this client's goals, messages and denied permissions
                          (on this machine only) to find repeated instructions; typed on the terminal
@@ -71,16 +110,93 @@ usage: mirante <command>
   skills mine [<repo>]   find instructions repeated in 3+ tasks of the repo's client (learning on)
   skills add <dir> --scope <s> [--activation always|on_demand]
                          propose a skill folder (SKILL.md + text files) for review
-  skills lint <SKILL.md> offline lint; exits 1 on an error finding, 3 when it could not run
-  daemon start|stop|restart|status
+  skills lint <SKILL.md> offline lint; exits 1 on an error finding, 3 when it could not run",
+    },
+    Help {
+        names: &["daemon"],
+        text: "  daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade;
                          the new daemon resumes them unless auto-resume is off
-                         (MIRANTE_AUTO_RESUME=off, or the cockpit's setting)
+                         (MIRANTE_AUTO_RESUME=off, or the cockpit's setting)",
+    },
+    Help {
+        names: &["help"],
+        text: "  help [<command>]       this text, or one command's (also: mirante <command> --help)
+  --version, -V          the version of this CLI",
+    },
+];
 
+const TERMS: &str = "\
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
-<repo> defaults to the git checkout of the current directory.
+<repo> is a git checkout (. for the current directory's).
 <scope> is personal, org:<host>/<owner>[/…] or repo:<host>/<path>.
 <perm> is a permission id or a unique suffix.";
+
+const ENV: &str = "\
+environment (the daemon reads it when it starts: run `mirante daemon restart` after a change):
+  MIRANTE_HOME                 where Mirante keeps its state (default ~/.mirante; keep it short)
+  MIRANTE_CLAUDE_BIN, MIRANTE_CODEX_BIN
+                               the real agent binaries (default: PATH, then the usual places)
+  MIRANTE_AUTO_RESUME=off      do not resume sessions when the daemon starts again
+  MIRANTE_CLAUDE_INLINE_ANSWERS=1
+                               let the daemon type Claude answers when it has the evidence
+  MIRANTE_MEM_BUDGET_MB, MIRANTE_IDLE_HIBERNATE_MIN, MIRANTE_MEMGUARD=off
+                               the memory guard's per-session budget, idle hibernation, off switch
+every variable: the Environment section of the README";
+
+const FLAGS: &str = "\
+global: --verbose before the command adds error codes to error messages";
+
+/// The full help: every command, the terms, the environment.
+pub fn usage() -> String {
+    let mut out = String::from("usage: mirante <command>\n\n");
+    for h in COMMANDS {
+        out.push_str(h.text);
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(TERMS);
+    out.push_str("\n\n");
+    out.push_str(FLAGS);
+    out.push_str("\n\n");
+    out.push_str(ENV);
+    out
+}
+
+/// `name`'s usage block (`None` for an unknown command), with the terms it uses.
+pub fn command_usage(name: &str) -> Option<String> {
+    let h = COMMANDS.iter().find(|h| h.names.contains(&name))?;
+    let mut out = String::from("usage:\n");
+    for line in h.text.lines() {
+        match line.strip_prefix("  ") {
+            Some(rest) if !rest.starts_with(' ') && !rest.starts_with('-') => {
+                out.push_str(&format!("  mirante {rest}\n"))
+            }
+            _ => out.push_str(&format!("{line}\n")),
+        }
+    }
+    let terms: Vec<&str> = TERMS.lines().filter(|l| l.split(' ').next().is_some_and(|t| h.text.contains(t))).collect();
+    if !terms.is_empty() {
+        out.push('\n');
+        out.push_str(&terms.join("\n"));
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// The command a command line names (its first word), when it is one `mirante` knows.
+pub fn command_of(args: &[String]) -> Option<&str> {
+    let first = args.first()?.as_str();
+    COMMANDS.iter().any(|h| h.names.contains(&first)).then_some(first)
+}
+
+/// What a usage error prints: the reason, that command's usage, and where the rest is.
+pub fn usage_error(args: &[String], reason: &str) -> String {
+    match command_of(args).and_then(command_usage) {
+        Some(u) => format!("mirante: {reason}\n{u}run 'mirante help' for every command"),
+        None => format!("mirante: {reason}\nrun 'mirante help' for every command"),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueCmd {
@@ -218,7 +334,8 @@ pub enum Cmd {
     New {
         repo: String,
         agent: AgentKind,
-        branch: String,
+        /// `None`: named from the goal (`mirante/<slug>`, `-2`, `-3`… when taken).
+        branch: Option<String>,
         base: Option<String>,
         title: Option<String>,
         goal: String,
@@ -258,6 +375,8 @@ pub enum Cmd {
     },
     Archive {
         task: String,
+        /// End a live session first.
+        stop: bool,
     },
     Hibernate {
         task: String,
@@ -272,7 +391,9 @@ pub enum Cmd {
     Daemon(DaemonCmd),
     Memory(MemoryCmd),
     Skills(SkillsCmd),
-    Help,
+    /// The full help, or one command's.
+    Help(Option<String>),
+    Version,
 }
 
 struct Parsed {
@@ -578,11 +699,19 @@ fn queue(args: &[String]) -> Result<QueueCmd, String> {
     }
 }
 
+/// `--help` or `-h` among a command's arguments (before a `--`).
+fn asks_help(rest: &[String]) -> bool {
+    rest.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h")
+}
+
 pub fn parse(args: &[String]) -> Result<Cmd, String> {
     let Some((sub, rest)) = args.split_first() else {
-        return Ok(Cmd::Help);
+        return Ok(Cmd::Help(None));
     };
     let none: &[&str] = &[];
+    if command_of(args).is_some() && sub != "help" && asks_help(rest) {
+        return Ok(Cmd::Help(Some(sub.clone())));
+    }
     match sub.as_str() {
         "new" => {
             let p = split(rest, &["--agent", "--branch", "--base", "--title"], &["--trust"])?;
@@ -593,7 +722,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 Some(other) => return Err(format!("unknown agent {other} (claude or codex)")),
                 None => return Err("missing --agent claude|codex".into()),
             };
-            let branch = p.values.get("--branch").cloned().ok_or("missing --branch <name>")?;
+            let branch = p.values.get("--branch").cloned();
             Ok(Cmd::New {
                 repo,
                 agent,
@@ -626,7 +755,11 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         "queue" => queue(rest).map(Cmd::Queue),
         "memory" => memory(rest).map(Cmd::Memory),
         "skills" => skills(rest).map(Cmd::Skills),
-        "perms" => Ok(Cmd::Perms),
+        "perms" => split(rest, none, none)?
+            .positional
+            .is_empty()
+            .then_some(Cmd::Perms)
+            .ok_or("perms takes no arguments".into()),
         "allow" | "deny" => Ok(Cmd::Answer { id: one(&split(rest, none, none)?, "perm")?, allow: sub == "allow" }),
         "interrupt" => Ok(Cmd::Interrupt { task: one(&split(rest, none, none)?, "task")? }),
         "stop" => Ok(Cmd::Stop { task: one(&split(rest, none, none)?, "task")? }),
@@ -635,7 +768,10 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             let has = |f: &str| p.bools.iter().any(|b| b == f);
             Ok(Cmd::Resume { task: one(&p, "task")?, trust: has("--trust"), fresh: has("--fresh") })
         }
-        "archive" => Ok(Cmd::Archive { task: one(&split(rest, none, none)?, "task")? }),
+        "archive" => {
+            let p = split(rest, none, &["--stop"])?;
+            Ok(Cmd::Archive { task: one(&p, "task")?, stop: !p.bools.is_empty() })
+        }
         "hibernate" => Ok(Cmd::Hibernate { task: one(&split(rest, none, none)?, "task")? }),
         "wake" => {
             let p = split(rest, none, &["--trust"])?;
@@ -659,7 +795,13 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             "status" => Ok(Cmd::Daemon(DaemonCmd::Status)),
             other => Err(format!("unknown daemon command {other}")),
         },
-        "help" | "-h" | "--help" => Ok(Cmd::Help),
+        "help" | "-h" | "--help" => match rest {
+            [] => Ok(Cmd::Help(None)),
+            [c] if COMMANDS.iter().any(|h| h.names.contains(&c.as_str())) => Ok(Cmd::Help(Some(c.clone()))),
+            [c] => Err(format!("unknown command {c}")),
+            _ => Err("help takes at most one <command>".into()),
+        },
+        "--version" | "-V" | "version" => Ok(Cmd::Version),
         other => Err(format!("unknown command {other}")),
     }
 }
@@ -679,7 +821,7 @@ mod tests {
             Cmd::New {
                 repo: "~/app".into(),
                 agent: AgentKind::Codex,
-                branch: "feat/login".into(),
+                branch: Some("feat/login".into()),
                 base: Some("release".into()),
                 title: None,
                 goal: "fix the login".into(),
@@ -692,7 +834,6 @@ mod tests {
     #[test]
     fn new_reports_what_is_missing() {
         assert_eq!(p("new . --branch b go").unwrap_err(), "missing --agent claude|codex");
-        assert_eq!(p("new . --agent claude go").unwrap_err(), "missing --branch <name>");
         assert_eq!(p("new . --agent claude --branch b").unwrap_err(), "missing <goal>");
         assert_eq!(p("new . --agent gpt --branch b go").unwrap_err(), "unknown agent gpt (claude or codex)");
         assert_eq!(p("new . --agent").unwrap_err(), "--agent needs a value");
@@ -818,7 +959,7 @@ mod tests {
 
     #[test]
     fn simple_commands() {
-        assert_eq!(p("").unwrap(), Cmd::Help);
+        assert_eq!(p("").unwrap(), Cmd::Help(None));
         assert_eq!(p("ls --all").unwrap(), Cmd::Ls { all: true });
         assert_eq!(p("allow ab12").unwrap(), Cmd::Answer { id: "ab12".into(), allow: true });
         assert_eq!(p("deny ab12").unwrap(), Cmd::Answer { id: "ab12".into(), allow: false });
@@ -912,5 +1053,55 @@ mod tests {
         assert_eq!(k("skills add d").unwrap_err(), "missing --scope personal|org:<prefix>|repo:<key>");
         assert_eq!(k("skills lint").unwrap_err(), "missing <SKILL.md>");
         assert_eq!(k("skills ls x").unwrap_err(), "ls takes no arguments");
+    }
+
+    #[test]
+    fn new_names_the_branch_itself_when_none_is_given() {
+        assert!(matches!(p("new . --agent claude fix the login").unwrap(), Cmd::New { branch: None, .. }));
+    }
+
+    #[test]
+    fn archive_can_stop_first() {
+        assert_eq!(p("archive feat").unwrap(), Cmd::Archive { task: "feat".into(), stop: false });
+        assert_eq!(p("archive --stop feat").unwrap(), Cmd::Archive { task: "feat".into(), stop: true });
+    }
+
+    #[test]
+    fn help_and_version() {
+        assert_eq!(p("help").unwrap(), Cmd::Help(None));
+        assert_eq!(p("--help").unwrap(), Cmd::Help(None));
+        assert_eq!(p("help new").unwrap(), Cmd::Help(Some("new".into())));
+        assert_eq!(p("new --help").unwrap(), Cmd::Help(Some("new".into())));
+        assert_eq!(p("memory accept -h").unwrap(), Cmd::Help(Some("memory".into())));
+        // After `--` it is text, not a flag.
+        assert!(matches!(p("say feat -- --help").unwrap(), Cmd::Say { .. }));
+        assert_eq!(p("help frobnicate").unwrap_err(), "unknown command frobnicate");
+        for v in ["--version", "-V", "version"] {
+            assert_eq!(p(v).unwrap(), Cmd::Version);
+        }
+    }
+
+    #[test]
+    fn a_command_has_its_own_usage_and_the_full_help_has_every_one() {
+        let new = command_usage("new").unwrap();
+        assert!(new.starts_with("usage:\n  mirante new <repo> --agent claude|codex [--branch <name>]"), "{new}");
+        assert!(new.contains("<repo> is a git checkout"), "{new}");
+        assert!(!new.contains("<perm>"), "{new}");
+        assert!(command_usage("deny").unwrap().contains("mirante allow <perm> | deny <perm>"));
+        assert!(command_usage("frobnicate").is_none());
+        let all = usage();
+        for h in COMMANDS {
+            assert!(all.contains(h.text), "{:?}", h.names);
+        }
+        assert!(all.contains("MIRANTE_HOME") && all.contains("MIRANTE_CLAUDE_BIN"), "{all}");
+    }
+
+    #[test]
+    fn a_usage_error_is_short_and_points_at_help() {
+        let args: Vec<String> = ["stop"].map(String::from).to_vec();
+        let e = usage_error(&args, "missing <task>");
+        assert_eq!(e, "mirante: missing <task>\nusage:\n  mirante stop <task>            end the agent process (resumable)\n\n<task> is a task id, a unique id suffix (4+ chars) or the branch name.\nrun 'mirante help' for every command");
+        let e = usage_error(&["frobnicate".to_string()], "unknown command frobnicate");
+        assert_eq!(e, "mirante: unknown command frobnicate\nrun 'mirante help' for every command");
     }
 }

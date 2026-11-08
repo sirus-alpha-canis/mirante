@@ -143,6 +143,29 @@ pub fn proposals_table(ps: &[ProposalView]) -> String {
     out
 }
 
+/// `msg` without the daemon's internal error codes (" (code -32602)"): a person reads the
+/// message; `--verbose` keeps the codes.
+pub fn strip_codes(msg: &str) -> String {
+    const MARK: &str = " (code ";
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(i) = rest.find(MARK) {
+        let after = &rest[i + MARK.len()..];
+        let digits = after.strip_prefix('-').unwrap_or(after);
+        let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+        let sign = after.len() - digits.len();
+        if n > 0 && digits[n..].starts_with(')') {
+            out.push_str(&rest[..i]);
+            rest = &after[sign + n + 1..];
+        } else {
+            out.push_str(&rest[..i + MARK.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Last 8 characters of an id (UUID v7 prefixes are time-based and collide; suffixes do not).
 pub fn short(id: &str) -> &str {
     let mut start = id.len().saturating_sub(8);
@@ -573,6 +596,14 @@ pub fn skill_proposal(v: &SkillProposalView, scope: Option<&str>, activation: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_codes_are_stripped_and_nothing_else() {
+        assert_eq!(strip_codes("no task feat (code 4)"), "no task feat");
+        assert_eq!(strip_codes("bad (code -32602)\nmore (code 7) end"), "bad\nmore end");
+        assert_eq!(strip_codes("see (code review) (code x)"), "see (code review) (code x)");
+        assert_eq!(strip_codes("plain"), "plain");
+    }
     use mirante_core::model::{PermissionStatus, Task};
 
     fn summary(slug: &str, state: &str, reviewed: bool) -> serde_json::Value {
