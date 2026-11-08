@@ -389,6 +389,7 @@ impl State {
             sandbox: live.and_then(|l| l.sandbox.clone()),
             memory: live.and(self.mem.sessions.get(&task.id)).map(memory::mem_view),
             hibernated: self.mem.hibernated.contains(&task.id),
+            origin: None,
             task,
         })
     }
@@ -549,11 +550,23 @@ impl Hub {
         let mut st = self.lock();
         match st.store.create_task(new) {
             Ok(task) => {
+                let pinned_before = st.store.skill_repo_origin(&checkout).ok().flatten().is_some();
                 // No origin row: the task gets no skills (fail closed); the task itself stands.
-                if let Err(e) = st.store.skill_create_origin(&task.id, &checkout, &origin, &tenant, by_person) {
-                    st.log_error(Some(&task.id), "task origin", &e);
-                }
-                let v = st.view(task)?;
+                let fixed = match st.store.skill_create_origin(&task.id, &checkout, &origin, &tenant, by_person) {
+                    Ok(o) => Some(o),
+                    Err(e) => {
+                        st.log_error(Some(&task.id), "task origin", &e);
+                        None
+                    }
+                };
+                let pinned_now = !pinned_before && st.store.skill_repo_origin(&checkout).ok().flatten().is_some();
+                let mut v = st.view(task)?;
+                v.origin = fixed.map(|o| mirante_ipc::types::CreatedOrigin {
+                    origin: o.origin,
+                    tenant: o.tenant,
+                    observed: o.observed,
+                    pinned: pinned_now,
+                });
                 st.publish();
                 Ok(v)
             }
@@ -1104,7 +1117,8 @@ mod tests {
         assert!(s.snapshot.resumed && s.snapshot.tasks.is_empty());
         assert_eq!(s.snapshot.seq, snap.seq);
         let kinds: Vec<&str> = s.replay.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(kinds, ["task_created", "task_created"]);
+        // The first task of the checkout pins its origin.
+        assert_eq!(kinds, ["task_created", "skill.origin_pinned", "task_created"]);
         assert_eq!(s.replay[0].seq, snap.seq + 1);
         // Another boot, or a seq from the future: a full snapshot.
         let other = k.hub.subscribe_from(Some(snap.seq), Some("old-boot")).unwrap();

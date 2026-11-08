@@ -165,6 +165,23 @@ pub struct TaskView {
     /// The session was hibernated to free memory (`mirante wake` resumes it).
     #[serde(default)]
     pub hibernated: bool,
+    /// `task.create` only: the origin fixed for the task's skills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CreatedOrigin>,
+}
+
+/// The origin `task.create` fixed for a task (its skills follow it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedOrigin {
+    /// The normalized origin key (`host/path`, or `local/<hash>`).
+    pub origin: String,
+    pub tenant: String,
+    /// The live origin when it is not confirmed: no skills until a person confirms it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<String>,
+    /// This task pinned the checkout's origin (its first, a person's).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// One live session's memory: the summed footprint of its process tree (macOS:
@@ -524,6 +541,7 @@ mod tests {
             sandbox: Some("net:off".into()),
             memory: Some(MemView { bytes: 1, peak: 2, budget: 3, state: "ok".into() }),
             hibernated: false,
+            origin: None,
         };
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["id"], "t1");

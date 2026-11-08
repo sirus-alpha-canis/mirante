@@ -1428,13 +1428,33 @@ pub(crate) mod tests {
     fn a_changed_origin_waits_for_a_person_to_confirm_it() {
         let k = Kit::new();
         set_origin(&k.repo, "git@github.com:acme/app.git");
-        // An agent's task.create pins nothing: its task is unconfirmed.
+        // A person's first task pins the origin, and task.create says which.
+        let p = CreateTask {
+            repo: k.repo.to_string_lossy().into_owned(),
+            agent: AgentKind::Claude,
+            branch: "b".into(),
+            base: None,
+            goal: "g".into(),
+            title: None,
+        };
+        let v = k.hub.create_task_from(&Caller::Person, p).unwrap();
+        let o = v.origin.clone().expect("task.create returns the origin");
+        assert_eq!(
+            (o.origin.as_str(), o.tenant.as_str(), o.observed, o.pinned),
+            ("github.com/acme/app", "github.com/acme", None, true)
+        );
+        let all = k.hub.lock().store.events_since(0, 1000).unwrap();
+        assert!(all.iter().any(|e| e.kind == "skill.origin_pinned" && e.payload["task"] == v.task.id.as_str()));
+        assert_eq!(k.hub.get_task(&v.task.id).unwrap().origin, None, "only task.create carries it");
+        // An agent's task (in-process: the socket refuses agents task.create) is unconfirmed
+        // even with the pinned origin: it never gets the tenant's skills without a person.
         let agent = Peer::spawn(&[(AGENT_ENV, "some-task")], k.dir.path());
         assert!(matches!(k.hub.identify(&agent.caller()), Identity::Agent { .. }));
         let a = create_in(&k, &agent.caller(), "a", "g");
-        assert!(k.hub.lock().store.skill_origin_of(&a.id).unwrap().unwrap().observed.is_some());
-        let b = create_in(&k, &Caller::Person, "b", "g");
-        assert_eq!(k.hub.lock().store.skill_origin_of(&b.id).unwrap().unwrap().observed, None);
+        assert_eq!(
+            k.hub.lock().store.skill_origin_of(&a.id).unwrap().unwrap().observed.as_deref(),
+            Some("github.com/acme/app")
+        );
         set_origin(&k.repo, "git@github.com:other/x.git");
         let c = create_in(&k, &Caller::Person, "c", "g");
         assert!(k.hub.lock().store.skill_origin_of(&c.id).unwrap().unwrap().observed.is_some());

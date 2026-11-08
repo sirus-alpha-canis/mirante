@@ -460,6 +460,7 @@ mod tests {
             sandbox: None,
             memory: None,
             hibernated: false,
+            origin: None,
         }
     }
 

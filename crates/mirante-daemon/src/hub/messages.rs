@@ -68,6 +68,12 @@ impl Hub {
     /// no earlier delivery is still starting its turn). Before the agent is ready, both
     /// modes queue.
     pub fn send(&self, m: SendMessage) -> Result<SendResult> {
+        self.send_by(m, "person")
+    }
+
+    /// [`Hub::send`], stamping who sent it (`person` or `agent`) on its `message_sent` /
+    /// `message_queued` event: mining reads only a person's words.
+    pub fn send_by(&self, m: SendMessage, by: &str) -> Result<SendResult> {
         if m.text.trim().is_empty() {
             return Err(HubError::Invalid("empty message".into()));
         }
@@ -102,7 +108,11 @@ impl Hub {
             let id = q.id.clone();
             l.queue.push_back(q);
             let position = l.queue.len();
-            st.event(Some(&task.id), "message_queued", json!({ "text": m.text, "position": position, "id": id }))?;
+            st.event(
+                Some(&task.id),
+                "message_queued",
+                json!({ "text": m.text, "position": position, "id": id, "by": by }),
+            )?;
             // An idle, ready agent with a backlog (an earlier delivery failed) takes the
             // next message now.
             st.kick(&task.id)?;
@@ -118,7 +128,7 @@ impl Hub {
             l.delivery_in_flight = Some(std::time::Instant::now());
         }
         let queued = l.queue.len();
-        st.event(Some(&task.id), "message_sent", json!({ "mode": m.mode, "text": m.text }))?;
+        st.event(Some(&task.id), "message_sent", json!({ "mode": m.mode, "text": m.text, "by": by }))?;
         st.publish();
         Ok(SendResult { delivered: SendMode::Steer, queued })
     }
@@ -280,7 +290,8 @@ impl Hub {
             (true, false) => PermissionStatus::AllowedOnce,
             (true, true) => PermissionStatus::AllowedSession,
         };
-        let answered = match st.store.answer_permission(&p.id, status) {
+        // Only a person reaches this (`permission.answer` is a person's method).
+        let answered = match st.store.answer_permission_by(&p.id, status, Some("person")) {
             Ok(answered) => answered,
             Err(e) => {
                 st.log_error(Some(&p.task_id), "permission answered by the agent but not recorded", &e);
@@ -362,6 +373,24 @@ mod tests {
         k.hook(&t.id, json!({"hook_event_name": "Stop"}));
         assert_eq!(k.calls(), vec!["send:use tabs".to_string(), "send:then run tests".to_string()]);
         assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 0);
+        // Who sent each message is on its event (mining reads only a person's words).
+        let by = |kind: &str| -> Vec<Value> {
+            let ev = k.hub.lock().store.task_events(&t.id).unwrap();
+            ev.into_iter().filter(|e| e.kind == kind).map(|e| e.payload["by"].clone()).collect()
+        };
+        assert_eq!(by("message_queued"), vec![json!("person")]);
+        // The steer is the person's; the queued delivery's own event names nobody.
+        assert_eq!(by("message_sent"), vec![json!("person"), Value::Null]);
+    }
+
+    #[test]
+    fn a_message_sent_by_an_agent_is_stamped_as_the_agent_s() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hub.send_by(SendMessage { task: t.id.clone(), text: "x".into(), mode: SendMode::Steer }, "agent").unwrap();
+        let ev = k.hub.lock().store.task_events(&t.id).unwrap();
+        let sent = ev.iter().find(|e| e.kind == "message_sent").unwrap();
+        assert_eq!(sent.payload["by"], "agent");
     }
 
     #[test]
@@ -447,6 +476,9 @@ mod tests {
         assert_eq!(k.calls(), vec!["answer:touch x:Bash:true".to_string()]);
         assert_eq!(k.hub.get_task(&t.id).unwrap().task.status, Status::Working);
         assert!(matches!(k.hub.answer_permission(AnswerPermission { id, allow: false }), Err(HubError::Conflict(_))));
+        let ev = k.hub.lock().store.task_events(&t.id).unwrap();
+        let answered = ev.iter().find(|e| e.kind == "permission_answered").unwrap();
+        assert_eq!(answered.payload["by"], "person", "a person's answer is stamped as theirs");
     }
 
     #[test]

@@ -24,6 +24,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("migrations/0006_dna_ledger_and_queue.sql")),
     (7, include_str!("migrations/0007_skills.sql")),
     (8, include_str!("migrations/0008_skill_signer.sql")),
+    (9, include_str!("migrations/0009_task_origin_by_person.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -174,10 +175,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 9);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 9);
     }
 
     #[test]
@@ -980,6 +981,19 @@ impl Store {
     /// Answers a pending request exactly once. `answer` must be `AllowedOnce` or `Denied`;
     /// there is no "always allow".
     pub fn answer_permission(&mut self, id: &str, answer: PermissionStatus) -> Result<PermissionRequest> {
+        self.answer_permission_by(id, answer, None)
+    }
+
+    /// [`Store::answer_permission`], recording who answered in `permission_answered`
+    /// (`by: "person"` for a person's `permission.answer`; absent when Mirante settled it:
+    /// a turn ended, a session died, a newer dialog replaced it). Mining reads only a
+    /// person's denials.
+    pub fn answer_permission_by(
+        &mut self,
+        id: &str,
+        answer: PermissionStatus,
+        by: Option<&str>,
+    ) -> Result<PermissionRequest> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let p = tx
             .query_row(
@@ -1010,7 +1024,10 @@ impl Store {
             &self.boot_id,
             Some(&p.task_id),
             "permission_answered",
-            &json!({ "permission_id": id, "answer": answer }),
+            &match by {
+                Some(by) => json!({ "permission_id": id, "answer": answer, "by": by }),
+                None => json!({ "permission_id": id, "answer": answer }),
+            },
         )?;
         let p = tx.query_row(
             &format!("SELECT {PERMISSION_COLUMNS} FROM permission_requests WHERE id = ?1"),

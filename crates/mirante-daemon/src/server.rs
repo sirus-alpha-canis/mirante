@@ -310,7 +310,10 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::SESSION_STOP => out(hub.stop(&params::<TaskRef>(p)?.task)),
         method::SESSION_INTERRUPT => out(hub.interrupt(&params::<TaskRef>(p)?.task).map(|()| json!({}))),
         method::SESSION_RESIZE => out(hub.resize(params(p)?).map(|()| json!({}))),
-        method::MESSAGE_SEND => out(hub.send(params(p)?)),
+        method::MESSAGE_SEND => {
+            let by = if *who == Identity::Person { "person" } else { "agent" };
+            out(hub.send_by(params(p)?, by))
+        }
         method::MESSAGE_LIST_QUEUED => out(hub.list_queued(&params::<QueueRef>(p)?.task_id)),
         method::MESSAGE_EDIT => out(hub.edit_queued(params(p)?)),
         method::MESSAGE_REMOVE => out(hub.remove_queued(&params::<QueuedRef>(p)?.id)),

