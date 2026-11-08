@@ -146,6 +146,11 @@ fn spellings(root: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// The working directory of `pid` (`None`: gone or unreadable).
+pub fn process_cwd(pid: i32) -> Option<PathBuf> {
+    sys::cwd(pid)
+}
+
 /// Processes re-parented to init (ppid 1), owned by us, whose cwd or command line points
 /// into `worktree_root`.
 pub fn find_orphans(worktree_root: &Path) -> Vec<Orphan> {

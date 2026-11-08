@@ -61,6 +61,14 @@ pub mod method {
     /// Reindex and recheck every anchor at the checkout's HEAD ([`super::DnaRef`] →
     /// [`super::CheckReport`]).
     pub const DNA_CHECK: &str = "dna.check";
+    /// An agent (or the CLI) proposes a note; it waits for a person's review
+    /// ([`super::DnaPropose`] → [`super::ProposalView`]).
+    pub const DNA_PROPOSE: &str = "dna.propose";
+    /// The review queue ([`super::DnaProposals`] → `Vec<`[`super::ProposalView`]`>`).
+    pub const DNA_PROPOSALS: &str = "dna.proposals";
+    /// A person accepts (writes the note) or rejects a proposal ([`super::DnaReview`] →
+    /// [`super::ProposalView`]). Refused from inside an agent's process tree.
+    pub const DNA_REVIEW: &str = "dna.review";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +620,52 @@ pub struct DnaGraph {
 
 /// `dna.check`: what the reindex found.
 pub use mirante_core::dna::index::RefreshReport as CheckReport;
+
+/// A proposal as the review queue shows it.
+pub use mirante_core::dna::index::Proposal as ProposalView;
+
+/// Code a proposed note cites: committed lines of the task's worktree at its HEAD.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposeAnchor {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaPropose {
+    pub task: String,
+    pub title: String,
+    /// `fact`, `decision`, `pattern` or `gotcha`.
+    pub kind: String,
+    pub body: String,
+    pub anchors: Vec<ProposeAnchor>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaProposals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// `pending`, `accepted` or `rejected`; all when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnaReview {
+    pub id: String,
+    pub accept: bool,
+    /// The person's edits, used instead of the proposed title / body on accept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Why (kept with the decision).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
 
 #[cfg(test)]
 mod dna_tests {

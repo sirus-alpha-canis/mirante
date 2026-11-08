@@ -5,16 +5,22 @@
 //! git and file reads run without the hub lock; only the store writes take it.
 use std::path::{Path, PathBuf};
 
-use mirante_core::dna::index::{self, IndexedAnchor, NoteRow, RefreshReport};
-use mirante_core::dna::{fsio, note, DnaError};
+use mirante_core::dna::anchor::check_path;
+use mirante_core::dna::check::{cite, is_dirty, rev_parse, AnchorState};
+use mirante_core::dna::index::{self, IndexedAnchor, NewProposal, NoteRow, RefreshReport};
+use mirante_core::dna::note::{Kind, Note, Status};
+use mirante_core::dna::{fsio, note, sha256_hex, DnaError, MAX_ANCHORS, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use mirante_core::git::Git;
+use mirante_core::model::{new_id, now_ms, Lifecycle};
+use mirante_core::redact::redact_counted;
+use mirante_core::CoreError;
 use mirante_ipc::types::{
-    AnchorView, CheckReport, DnaGet, DnaGraph, DnaRef, DnaSearch, DnaStatus, GraphLink, NoteSummary, NoteView,
+    AnchorView, CheckReport, DnaGet, DnaGraph, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus,
+    GraphLink, NoteSummary, NoteView, ProposalView,
 };
 use serde_json::json;
 
 use super::{Hub, HubError, Result};
-use mirante_core::dna::check::AnchorState;
 
 /// Who is calling: a person (in-process, tests), a socket peer by pid, or a peer whose pid
 /// could not be read.
@@ -24,6 +30,10 @@ pub enum Caller {
     Peer(i32),
     Unknown,
 }
+
+/// Pending proposals one task, and one repo, may have at once.
+const MAX_PENDING_PER_TASK: usize = 20;
+const MAX_PENDING_PER_REPO: usize = 200;
 
 /// Search results by default and at most.
 const SEARCH_DEFAULT: usize = 10;
@@ -97,6 +107,58 @@ pub(crate) fn summary(n: &NoteRow, reviewed: bool) -> NoteSummary {
 
 fn key_of(repo: &Path) -> String {
     repo.to_string_lossy().into_owned()
+}
+
+/// Today (UTC) as `YYYY-MM-DD`.
+fn today() -> String {
+    // Howard Hinnant's civil_from_days.
+    let z = now_ms().div_euclid(86_400_000) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A title and body as a note takes them: redacted, title trimmed and bounded, body
+/// bounded and ending in a newline. Returns them with the number of redactions.
+fn clean_text(title: &str, body: &str) -> Result<(String, String, usize)> {
+    let (title, a) = redact_counted(title.trim());
+    let (mut body, b) = redact_counted(body);
+    if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
+        return Err(HubError::Invalid(format!("the title must be 1..={MAX_TITLE_CHARS} characters")));
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return Err(HubError::Invalid(format!("the body is larger than {MAX_BODY_BYTES} bytes")));
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    Ok((title, body, a + b))
+}
+
+/// Creates the note under `base`, or `base-2`, `base-3`… past existing files. Never
+/// overwrites.
+fn create_unique(repo: &Path, base: &str, text: &str) -> std::result::Result<String, DnaError> {
+    let base = if base == "readme" { "readme-note" } else { base };
+    for n in 1..=100 {
+        let slug = if n == 1 {
+            base.to_string()
+        } else {
+            let suffix = format!("-{n}");
+            format!("{}{suffix}", base[..base.len().min(64 - suffix.len())].trim_end_matches('-'))
+        };
+        match fsio::create_note(repo, &slug, text) {
+            Ok(()) => return Ok(slug),
+            Err(DnaError::Io(m)) if m.ends_with("already exists") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(DnaError::Note(format!("too many notes named {base}")))
 }
 
 impl Hub {
@@ -191,10 +253,22 @@ impl Hub {
         self.dna_status_of(&repo)
     }
 
+    /// Ok for a person; `Forbidden` for a caller inside an agent's process tree (or one
+    /// whose pid could not be read). Defense in depth: agents run as the same uid.
+    pub(crate) fn require_person(&self, c: &Caller) -> Result<()> {
+        match c {
+            Caller::Unknown => Err(HubError::Forbidden("could not identify the caller".into())),
+            Caller::Peer(pid) if self.session_of_pid(*pid).is_some() => Err(HubError::Forbidden(
+                "memory review is a person's decision; it cannot be made from an agent session".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Creates `.mirante/memory/README.md` (kept if present) and turns injection on for new
     /// sessions of this repo's tasks.
     pub fn dna_enable(&self, at: &DnaRef, caller: &Caller) -> Result<DnaStatus> {
-        let _ = caller;
+        self.require_person(caller)?;
         let repo = self.dna_repo_of(at)?;
         fsio::init(&repo).map_err(dna_err)?;
         {
@@ -207,7 +281,7 @@ impl Hub {
 
     /// Turns injection off for new sessions. The files are left alone.
     pub fn dna_disable(&self, at: &DnaRef, caller: &Caller) -> Result<DnaStatus> {
-        let _ = caller;
+        self.require_person(caller)?;
         let repo = self.dna_repo_of(at)?;
         self.lock().store.dna_set_enabled(&key_of(&repo), false)?;
         self.dna_status_of(&repo)
@@ -276,6 +350,181 @@ impl Hub {
     }
 }
 
+impl Hub {
+    /// A proposed note, cited at the task worktree's HEAD, queued for a person's review.
+    /// An agent may only propose for its own task (found by its process tree, never by the
+    /// parameter); the CLI for any task.
+    pub fn dna_propose(&self, caller: &Caller, p: DnaPropose) -> Result<ProposalView> {
+        let agent_task = match caller {
+            Caller::Unknown => return Err(HubError::Forbidden("could not identify the caller".into())),
+            Caller::Peer(pid) => self.session_of_pid(*pid),
+            Caller::Person => None,
+        };
+        let task = self.lock().resolve(&p.task)?;
+        if agent_task.as_ref().is_some_and(|own| *own != task.id) {
+            return Err(HubError::Forbidden("an agent can only propose memory for its own task".into()));
+        }
+        if task.lifecycle == Lifecycle::Archived {
+            return Err(HubError::Conflict(format!("task {} is archived", task.branch)));
+        }
+        let repo = PathBuf::from(&task.repo_path);
+        let key = key_of(&repo);
+        {
+            let st = self.lock();
+            if !st.store.dna_repo(&key)?.is_some_and(|r| r.enabled) {
+                return Err(HubError::Conflict("memory is not enabled for this repo".into()));
+            }
+            if st.store.dna_pending_count(&task.id)? >= MAX_PENDING_PER_TASK {
+                return Err(HubError::Conflict(format!(
+                    "this task already has {MAX_PENDING_PER_TASK} proposals waiting for review"
+                )));
+            }
+            if st.store.dna_status(&key)?.pending >= MAX_PENDING_PER_REPO {
+                return Err(HubError::Conflict(format!(
+                    "this repo already has {MAX_PENDING_PER_REPO} proposals waiting for review"
+                )));
+            }
+        }
+        let kind = Kind::parse(&p.kind)
+            .ok_or_else(|| HubError::Invalid(format!("kind {:?}: use fact, decision, pattern or gotcha", p.kind)))?;
+        let (title, body, mut redactions) = clean_text(&p.title, &p.body)?;
+        if p.anchors.is_empty() || p.anchors.len() > MAX_ANCHORS {
+            return Err(HubError::Invalid(format!("a note cites 1..={MAX_ANCHORS} code ranges")));
+        }
+        // git, unlocked: cite committed lines at the worktree's HEAD.
+        let worktree = Path::new(&task.worktree_path);
+        let invalid = |e: DnaError| HubError::Invalid(e.to_string());
+        let commit = rev_parse(worktree, "HEAD").map_err(dna_err)?;
+        let mut anchors = Vec::with_capacity(p.anchors.len());
+        for a in &p.anchors {
+            check_path(&a.path).map_err(invalid)?;
+            if is_dirty(worktree, &a.path).map_err(dna_err)? {
+                return Err(HubError::Invalid(format!(
+                    "{} has uncommitted changes in the task's worktree: commit first, then cite",
+                    a.path
+                )));
+            }
+            let symbol = a.symbol.as_deref().map(redact_counted);
+            redactions += symbol.as_ref().map_or(0, |s| s.1);
+            anchors.push(
+                cite(worktree, &commit, &a.path, symbol.as_ref().map(|s| s.0.as_str()), a.start, a.end)
+                    .map_err(invalid)?,
+            );
+        }
+        // The note it would become must be valid now, so accepting it cannot fail on format.
+        let probe = Note {
+            id: new_id(),
+            title: title.clone(),
+            kind,
+            status: Status::Active,
+            created: today(),
+            source: format!("task:{}", task.id),
+            anchors: anchors.clone(),
+            body: body.clone(),
+        };
+        note::parse(&note::render(&probe)).map_err(invalid)?;
+        let mut st = self.lock();
+        let proposal = st.store.dna_insert_proposal(&NewProposal {
+            repo: key,
+            task_id: Some(task.id.clone()),
+            origin: if agent_task.is_some() { "agent" } else { "cli" }.into(),
+            title,
+            kind: kind.as_str().into(),
+            body,
+            anchors,
+            redactions,
+        })?;
+        st.event(Some(&task.id), "dna.proposed", json!({ "id": proposal.id, "title": proposal.title }))?;
+        st.publish();
+        Ok(proposal)
+    }
+
+    /// The review queue: proposals, oldest first, optionally of one repo and status.
+    pub fn dna_proposals(&self, q: DnaProposals) -> Result<Vec<ProposalView>> {
+        if let Some(s) = q.status.as_deref() {
+            if !matches!(s, "pending" | "accepted" | "rejected") {
+                return Err(HubError::Invalid(format!("status {s:?}: use pending, accepted or rejected")));
+            }
+        }
+        let key = match &q.repo {
+            Some(r) => Some(key_of(&self.dna_repo_of(&DnaRef { repo: Some(r.clone()), task: None })?)),
+            None => None,
+        };
+        Ok(self.lock().store.dna_proposals(key.as_deref(), q.status.as_deref())?)
+    }
+
+    /// A person's decision. Accept writes `.mirante/memory/<slug>.md` (never overwriting;
+    /// left uncommitted for the user) and records its exact content as reviewed; reject
+    /// writes nothing. A failed write leaves the proposal pending.
+    pub fn dna_review(&self, caller: &Caller, r: DnaReview) -> Result<ProposalView> {
+        self.require_person(caller)?;
+        let p = self.lock().store.dna_proposal(&r.id).map_err(|e| match e {
+            CoreError::NotFound { .. } => HubError::NotFound(format!("no proposal {}", r.id)),
+            e => e.into(),
+        })?;
+        if p.status != "pending" {
+            return Err(HubError::Conflict(format!("proposal {} was already {}", p.id, p.status)));
+        }
+        let why = r.note.unwrap_or_default();
+        let decided = |st: &mut super::State, d: &ProposalView| -> Result<()> {
+            st.event(
+                d.task_id.as_deref(),
+                "dna.decided",
+                json!({ "id": d.id, "accepted": d.status == "accepted", "slug": d.slug }),
+            )?;
+            st.publish();
+            Ok(())
+        };
+        let as_conflict = |e: CoreError| match e {
+            CoreError::InvalidTransition { .. } => HubError::Conflict(format!("proposal {} was already decided", r.id)),
+            e => e.into(),
+        };
+        if !r.accept {
+            let mut st = self.lock();
+            let d = st.store.dna_decide(&p.id, false, None, &why).map_err(as_conflict)?;
+            decided(&mut st, &d)?;
+            return Ok(d);
+        }
+        let (title, body, _) =
+            clean_text(r.title.as_deref().unwrap_or(&p.title), r.body.as_deref().unwrap_or(&p.body))?;
+        let kind = Kind::parse(&p.kind).ok_or_else(|| HubError::Invalid(format!("kind {:?}", p.kind)))?;
+        let n = Note {
+            id: new_id(),
+            title,
+            kind,
+            status: Status::Active,
+            created: today(),
+            source: p.task_id.as_ref().map_or_else(|| "cli".to_string(), |t| format!("task:{t}")),
+            anchors: p.anchors.clone(),
+            body,
+        };
+        let text = note::render(&n);
+        note::parse(&text).map_err(|e| HubError::Invalid(e.to_string()))?;
+        let repo = PathBuf::from(&p.repo);
+        fsio::init(&repo).map_err(dna_err)?;
+        let slug = create_unique(&repo, &note::slugify(&n.title), &text).map_err(dna_err)?;
+        let accepted = {
+            let mut st = self.lock();
+            st.store.dna_accept(&p.id, &slug, &why, &sha256_hex(text.as_bytes())).map_err(as_conflict).and_then(|d| {
+                decided(&mut st, &d)?;
+                Ok(d)
+            })
+        };
+        let d = match accepted {
+            Ok(d) => d,
+            Err(e) => {
+                // Decided by someone else meanwhile: take back the file this call wrote.
+                let _ = std::fs::remove_file(fsio::note_path(&repo, &slug));
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.dna_refresh(&repo) {
+            self.lock().log_error(d.task_id.as_deref(), "dna reindex after accept", &e);
+        }
+        Ok(d)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::Path;
@@ -283,8 +532,10 @@ pub(crate) mod tests {
 
     use mirante_core::dna::check::{cite, rev_parse};
     use mirante_core::dna::note::{render, Kind, Note, Status};
+    use mirante_core::dna::sha256_hex;
     use mirante_core::model::AgentKind;
-    use mirante_ipc::types::{DnaGet, DnaRef, DnaSearch};
+    use mirante_core::store::Store;
+    use mirante_ipc::types::{DnaGet, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, ProposeAnchor};
     use serde_json::Value;
 
     use super::*;
@@ -363,6 +614,213 @@ pub(crate) mod tests {
             note_text(&k.repo, "Hook spool fallback", "Falls back. See [[other]] and [[gone]].", "src/a.rs", 2, 4);
         write_note(&k.repo, "hook-spool", &spool);
         write_note(&k.repo, "other", &note_text(&k.repo, "Other thing", "Unrelated.", "src/a.rs", 5, 5));
+    }
+
+    pub fn propose(task: &str, title: &str, body: &str, path: &str, start: u32, end: u32) -> DnaPropose {
+        DnaPropose {
+            task: task.into(),
+            title: title.into(),
+            kind: "gotcha".into(),
+            body: body.into(),
+            anchors: vec![ProposeAnchor { path: path.into(), symbol: Some("spool".into()), start, end }],
+        }
+    }
+
+    fn review_accept(id: &str) -> DnaReview {
+        DnaReview { id: id.into(), accept: true, ..Default::default() }
+    }
+
+    /// A started session whose fake driver reports `pid` as its process-tree root.
+    pub fn started(k: &Kit, branch: &str, pid: i32) -> mirante_core::model::Task {
+        *k.factory.driver.root.lock().unwrap() = Some(crate::driver::proctree::Proc { pid, start: 1 });
+        k.started(AgentKind::Claude, branch).task
+    }
+
+    fn me() -> i32 {
+        std::process::id() as i32
+    }
+
+    /// Enabled memory and a task whose worktree has `src/a.rs` committed.
+    fn proposing(k: &Kit, branch: &str) -> mirante_core::model::Task {
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        let t = k.create(AgentKind::Claude, branch).task;
+        commit_in(&t.worktree_path, "src/a.rs", CODE);
+        t
+    }
+
+    #[test]
+    fn propose_validates_cites_commits_and_redacts() {
+        let k = Kit::new();
+        let t = proposing(&k, "mem");
+        let p = k
+            .hub
+            .dna_propose(
+                &Caller::Person,
+                propose(&t.id, "Spool", "uses TOKEN=sk-ant-api03-abcdefghijklmnopqrstu", "src/a.rs", 2, 4),
+            )
+            .unwrap();
+        assert_eq!((p.status.as_str(), p.redactions, p.origin.as_str()), ("pending", 1, "cli"));
+        assert!(!p.body.contains("sk-ant"), "{}", p.body);
+        assert_eq!(p.anchors[0].commit, head_of(&t.worktree_path));
+        assert_eq!((p.anchors[0].start, p.anchors[0].end, p.anchors[0].symbol.as_deref()), (2, 4, Some("spool")));
+        assert_eq!(p.task_id.as_deref(), Some(t.id.as_str()));
+        assert!(k.kinds(&t.id).contains(&"dna.proposed".to_string()));
+        let queue =
+            k.hub.dna_proposals(DnaProposals { repo: Some(k.repo.to_string_lossy().into()), status: None }).unwrap();
+        assert_eq!(queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), [p.id.as_str()]);
+        assert_eq!(k.hub.dna_status(&k.repo_ref()).unwrap().pending, 1);
+    }
+
+    #[test]
+    fn propose_refuses_uncited_dirty_sensitive_out_of_range_and_floods() {
+        let k = Kit::new();
+        let t0 = k.create(AgentKind::Claude, "off").task;
+        let off = k.hub.dna_propose(&Caller::Person, propose(&t0.id, "T", "b", "README", 1, 1));
+        assert!(
+            matches!(&off, Err(HubError::Conflict(m)) if m.contains("memory is not enabled for this repo")),
+            "{off:?}"
+        );
+
+        let t = proposing(&k, "mem");
+        let invalid = |p: DnaPropose| match k.hub.dna_propose(&Caller::Person, p) {
+            Err(HubError::Invalid(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        let mut none = propose(&t.id, "T", "b", "src/a.rs", 1, 1);
+        none.anchors.clear();
+        invalid(none);
+        std::fs::write(Path::new(&t.worktree_path).join("src/a.rs"), "changed\n").unwrap();
+        assert!(invalid(propose(&t.id, "T", "b", "src/a.rs", 1, 1)).contains("commit"));
+        git(Path::new(&t.worktree_path), &["checkout", "--", "src/a.rs"]);
+        commit_in(&t.worktree_path, ".env", "SECRET=1\n");
+        invalid(propose(&t.id, "T", "b", ".env", 1, 1));
+        invalid(propose(&t.id, "T", "b", "src/a.rs", 9, 10));
+        invalid(propose(&t.id, "T", &"x".repeat(16 * 1024 + 1), "src/a.rs", 1, 1));
+        invalid(propose(&t.id, &"t".repeat(121), "b", "src/a.rs", 1, 1));
+        let mut kind = propose(&t.id, "T", "b", "src/a.rs", 1, 1);
+        kind.kind = "rumor".into();
+        invalid(kind);
+        for _ in 0..20 {
+            k.hub.dna_propose(&Caller::Person, propose(&t.id, "T", "b", "src/a.rs", 1, 1)).unwrap();
+        }
+        let flood = k.hub.dna_propose(&Caller::Person, propose(&t.id, "T", "b", "src/a.rs", 1, 1));
+        assert!(matches!(flood, Err(HubError::Conflict(_))), "{flood:?}");
+    }
+
+    #[test]
+    fn accept_writes_the_note_records_review_and_indexes_it() {
+        let k = Kit::new();
+        let t = proposing(&k, "mem");
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Spool", "Falls back.", "src/a.rs", 2, 4)).unwrap();
+        let edited =
+            DnaReview { title: Some("Hook spool fallback".into()), note: Some("ok".into()), ..review_accept(&p.id) };
+        let d = k.hub.dna_review(&Caller::Person, edited).unwrap();
+        assert_eq!(
+            (d.status.as_str(), d.slug.as_deref(), d.decision_note.as_str()),
+            ("accepted", Some("hook-spool-fallback"), "ok")
+        );
+        let file = k.repo.join(".mirante/memory/hook-spool-fallback.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let n = mirante_core::dna::note::parse(&text).unwrap();
+        assert_eq!(
+            (n.title.as_str(), n.anchors.clone(), n.source.clone()),
+            ("Hook spool fallback", p.anchors.clone(), format!("task:{}", t.id))
+        );
+        assert_eq!(n.body, "Falls back.\n");
+        let key = k.repo.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(k.hub.lock().store.dna_is_reviewed(&key, "hook-spool-fallback", &sha256_hex(text.as_bytes())).unwrap());
+        assert!(k.kinds(&t.id).contains(&"dna.decided".to_string()));
+        let v = k.hub.dna_get(DnaGet { at: k.repo_ref(), slug: "hook-spool-fallback".into() }).unwrap();
+        assert!(v.summary.reviewed);
+        let again = k.hub.dna_review(&Caller::Person, review_accept(&p.id));
+        assert!(matches!(again, Err(HubError::Conflict(_))), "{again:?}");
+        // Never committed for the user.
+        let log = Command::new("git").arg("-C").arg(&k.repo).args(["status", "--porcelain"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains(".mirante/"));
+    }
+
+    #[test]
+    fn accept_slug_collision_gets_a_suffix_and_never_overwrites() {
+        let k = Kit::new();
+        let t = proposing(&k, "mem");
+        write_note(&k.repo, "a", "mine");
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "A", "b", "src/a.rs", 1, 1)).unwrap();
+        let d = k.hub.dna_review(&Caller::Person, review_accept(&p.id)).unwrap();
+        assert_eq!(d.slug.as_deref(), Some("a-2"));
+        assert_eq!(std::fs::read_to_string(k.repo.join(".mirante/memory/a.md")).unwrap(), "mine");
+        assert!(k.repo.join(".mirante/memory/a-2.md").exists());
+    }
+
+    #[test]
+    fn reject_writes_nothing() {
+        let k = Kit::new();
+        let t = proposing(&k, "mem");
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Nope", "b", "src/a.rs", 1, 1)).unwrap();
+        let before: Vec<_> = std::fs::read_dir(k.repo.join(".mirante/memory")).unwrap().collect();
+        let d = k
+            .hub
+            .dna_review(&Caller::Person, DnaReview { id: p.id.clone(), accept: false, ..Default::default() })
+            .unwrap();
+        assert_eq!((d.status.as_str(), d.slug), ("rejected", None));
+        let after: Vec<_> = std::fs::read_dir(k.repo.join(".mirante/memory")).unwrap().collect();
+        assert_eq!(before.len(), after.len());
+        assert!(k.kinds(&t.id).contains(&"dna.decided".to_string()));
+    }
+
+    #[test]
+    fn review_and_note_actions_are_refused_from_an_agent_tree() {
+        let k = Kit::new();
+        let t = started(&k, "g", me());
+        let caller = Caller::Peer(me()); // this test process is the "agent root"
+        assert_eq!(k.hub.session_of_pid(me()), Some(t.id.clone()));
+        assert!(matches!(k.hub.dna_review(&caller, review_accept("x")), Err(HubError::Forbidden(_))));
+        assert!(matches!(k.hub.dna_enable(&k.repo_ref(), &caller), Err(HubError::Forbidden(_))));
+        assert!(matches!(k.hub.dna_disable(&k.repo_ref(), &caller), Err(HubError::Forbidden(_))));
+        assert!(matches!(k.hub.dna_review(&Caller::Unknown, review_accept("x")), Err(HubError::Forbidden(_))));
+        // A pid outside every agent tree is a person (the review then fails on the id).
+        let other = Caller::Peer(1);
+        assert!(matches!(k.hub.dna_review(&other, review_accept("x")), Err(HubError::NotFound(_))));
+    }
+
+    #[test]
+    fn a_process_working_in_a_worktree_counts_as_an_agent() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Claude, "orphan").task;
+        let mut child = Command::new("/bin/sleep").arg("30").current_dir(&t.worktree_path).spawn().unwrap();
+        let pid = child.id() as i32;
+        assert_eq!(k.hub.session_of_pid(pid), Some(String::new()));
+        assert!(matches!(k.hub.dna_enable(&k.repo_ref(), &Caller::Peer(pid)), Err(HubError::Forbidden(_))));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn propose_from_an_agent_tree_must_name_its_own_task() {
+        let k = Kit::new();
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        let mine = started(&k, "mine", me());
+        commit_in(&mine.worktree_path, "src/a.rs", CODE);
+        let other = k.create(AgentKind::Claude, "other").task;
+        commit_in(&other.worktree_path, "src/a.rs", CODE);
+        let caller = Caller::Peer(me());
+        let claimed = k.hub.dna_propose(&caller, propose(&other.id, "T", "b", "src/a.rs", 1, 1));
+        assert!(matches!(claimed, Err(HubError::Forbidden(_))), "{claimed:?}");
+        let p = k.hub.dna_propose(&caller, propose(&mine.id, "T", "b", "src/a.rs", 1, 1)).unwrap();
+        assert_eq!(p.origin, "agent");
+        let unknown = k.hub.dna_propose(&Caller::Unknown, propose(&mine.id, "T", "b", "src/a.rs", 1, 1));
+        assert!(matches!(unknown, Err(HubError::Forbidden(_))), "{unknown:?}");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_proposal_pending() {
+        let k = Kit::with_store(|_| Store::open_in_memory().unwrap());
+        let t = proposing(&k, "mem");
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "T", "b", "src/a.rs", 1, 1)).unwrap();
+        let mem = k.repo.join(".mirante/memory");
+        std::fs::rename(&mem, k.repo.join(".mirante/elsewhere")).unwrap();
+        std::os::unix::fs::symlink(k.repo.join(".mirante/elsewhere"), &mem).unwrap();
+        assert!(k.hub.dna_review(&Caller::Person, review_accept(&p.id)).is_err());
+        assert_eq!(k.hub.lock().store.dna_proposal(&p.id).unwrap().status, "pending");
     }
 
     #[test]

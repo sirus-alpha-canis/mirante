@@ -106,6 +106,38 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     }
 }
 
+/// The pid of the process on the other end of a connected Unix socket (macOS
+/// `LOCAL_PEERPID`, Linux `SO_PEERCRED`): who is calling, for the DNA review guard.
+pub fn peer_pid(stream: &UnixStream) -> io::Result<i32> {
+    let fd = stream.as_raw_fd();
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: pid/len are valid for writes of the declared size.
+        let rc = unsafe {
+            libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&mut pid as *mut libc::pid_t).cast(), &mut len)
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: cred/len are valid for writes of the declared size.
+        let rc = unsafe {
+            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len)
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.pid)
+    }
+}
+
 pub fn my_uid() -> u32 {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
@@ -174,6 +206,7 @@ fn handle_with(
         let e = RpcError::new(code::FORBIDDEN, "peer uid does not match the daemon's");
         return write_line(&mut writer, &Response::err(None, e));
     }
+    let caller = peer_pid(&stream).map_or(Caller::Unknown, Caller::Peer);
     // A connection that never sends its first request must not hold a slot forever. Later
     // requests may be far apart (a watch board's query connection), so only the first is timed.
     stream.set_read_timeout(Some(limits.first_line_timeout))?;
@@ -211,7 +244,7 @@ fn handle_with(
                 return Ok(());
             }
             _ => {
-                let resp = match dispatch(hub, &req.method, req.params) {
+                let resp = match dispatch_from(hub, &caller, &req.method, req.params) {
                     Ok(v) => Response::ok(req.id, v),
                     Err(e) => Response::err(Some(req.id), e),
                 };
@@ -231,8 +264,14 @@ fn out<T: Serialize>(r: hub::Result<T>) -> Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))
 }
 
-/// Every request/response method. Unit-testable without a socket.
+/// [`dispatch_from`] as a person (tests and in-process callers).
 pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
+    dispatch_from(hub, &Caller::Person, m, p)
+}
+
+/// Every request/response method, for `caller` (the DNA review guard). Unit-testable
+/// without a socket.
+pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Value, RpcError> {
     match m {
         method::TASK_CREATE => out(hub.create_task(params(p)?)),
         method::TASK_LIST => {
@@ -263,12 +302,18 @@ pub fn dispatch(hub: &Hub, m: &str, p: Value) -> Result<Value, RpcError> {
         method::DAEMON_DOCTOR => out(hub.doctor()),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),
-        method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, &Caller::Person)),
-        method::DNA_DISABLE => out(hub.dna_disable(&params(p)?, &Caller::Person)),
+        method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, caller)),
+        method::DNA_DISABLE => out(hub.dna_disable(&params(p)?, caller)),
         method::DNA_GRAPH => out(hub.dna_graph(&params(p)?)),
         method::DNA_SEARCH => out(hub.dna_search(params(p)?)),
         method::DNA_GET => out(hub.dna_get(params(p)?)),
         method::DNA_CHECK => out(hub.dna_check(&params(p)?)),
+        method::DNA_PROPOSE => out(hub.dna_propose(caller, params(p)?)),
+        method::DNA_PROPOSALS => {
+            let q = if p.is_null() { Default::default() } else { params(p)? };
+            out(hub.dna_proposals(q))
+        }
+        method::DNA_REVIEW => out(hub.dna_review(caller, params(p)?)),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
@@ -445,6 +490,34 @@ mod tests {
         let e = dispatch(&k.hub, method::DNA_SEARCH, json!({"repo": k.repo})).unwrap_err();
         assert_eq!(e.code, code::INVALID_PARAMS);
         assert_eq!(dispatch(&k.hub, method::DNA_DISABLE, repo).unwrap()["enabled"], false);
+    }
+
+    #[test]
+    fn peer_pid_is_this_process_over_a_socketpair() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_pid(&a).unwrap(), std::process::id() as i32);
+    }
+
+    #[test]
+    fn review_over_the_socket_is_refused_from_inside_an_agent_tree() {
+        let k = Kit::new();
+        let (sock, _) = serve_kit(&k);
+        let review = json!({"id": "nope", "accept": false});
+        let code_of = |r: Result<Value, ClientError>| match r {
+            Err(ClientError::Rpc(e)) => e.code,
+            other => panic!("{other:?}"),
+        };
+        let mut c = Client::connect(&sock).unwrap();
+        assert_eq!(code_of(c.call(method::DNA_REVIEW, review.clone())), code::NOT_FOUND);
+        *k.factory.driver.root.lock().unwrap() =
+            Some(crate::driver::proctree::Proc { pid: std::process::id() as i32, start: 1 });
+        k.started(AgentKind::Claude, "agent");
+        let mut c = Client::connect(&sock).unwrap();
+        assert_eq!(code_of(c.call(method::DNA_REVIEW, review)), code::FORBIDDEN);
+        assert_eq!(code_of(c.call(method::DNA_ENABLE, json!({"repo": k.repo}))), code::FORBIDDEN);
+        // Reads stay open to agents.
+        let status: Result<Value, ClientError> = c.call(method::DNA_STATUS, json!({"repo": k.repo}));
+        assert!(status.is_ok(), "{status:?}");
     }
 
     #[test]
