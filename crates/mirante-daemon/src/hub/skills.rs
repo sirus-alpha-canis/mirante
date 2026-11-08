@@ -491,6 +491,24 @@ fn errors_line(findings: &[Finding]) -> String {
         .join("; ")
 }
 
+/// Why a verified version fails today's lint (errors only), if it does.
+fn lint_now(v: &VerifiedSkill) -> Option<String> {
+    let mut d =
+        Draft { name: v.manifest.name.clone(), description: v.manifest.description.clone(), ..Default::default() };
+    for (path, bytes) in &v.files {
+        if path == SKILL_MD {
+            match std::str::from_utf8(bytes).ok().and_then(|t| parse_skill_md(t).ok()) {
+                Some(p) => d.body = p.body,
+                None => return Some(format!("its {SKILL_MD} does not parse")),
+            }
+        } else {
+            d.files.push((path.clone(), bytes.clone()));
+        }
+    }
+    let findings = lint(&d);
+    has_errors(&findings).then(|| format!("fails lint now: {}", errors_line(&findings)))
+}
+
 /// A skill's files: (path, bytes).
 type Files = Vec<(String, Vec<u8>)>;
 
@@ -1327,6 +1345,11 @@ impl Hub {
             };
             if let Some(why) = mismatch {
                 r.refused.push((row.name, row.version, why.into()));
+                continue;
+            }
+            // Lint again: a version accepted before a rule existed is not injected.
+            if let Some(why) = lint_now(&v) {
+                r.refused.push((row.name, row.version, why));
                 continue;
             }
             let size = v.files.iter().find(|(p, _)| p == SKILL_MD).map_or(0, |(_, b)| b.len());
@@ -2439,6 +2462,23 @@ pub(crate) mod tests {
         );
         assert!(k.kinds(&t.id).contains(&"skill.refused".to_string()));
         assert!(k.payloads("skill.injected").is_empty());
+    }
+
+    /// Lint runs again at injection: a version accepted before a rule existed (Claude's
+    /// `` !`cmd` ``, run at skill load) is refused, not injected.
+    #[test]
+    fn a_skill_that_fails_lint_now_is_refused_at_injection() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "bang", 1, Scope::org("github.com/acme"), Activation::OnDemand, "Now: !`date`\n");
+        install(&k, "fine", 1, Scope::org("github.com/acme"), Activation::Always, "Fine.\n");
+        k.started(AgentKind::Claude, "t");
+        assert_eq!(spawned(&k), Some((strs(&["fine"]), vec![])));
+        let refused = k.payloads("skill.refused");
+        assert_eq!(refused[0]["name"].as_str(), Some("bang"));
+        let why = refused[0]["reason"].as_str().unwrap();
+        assert!(why.contains("lint") && why.contains("shell"), "{why}");
     }
 
     /// The index row is not signed: injection takes scope, agents and activation from the

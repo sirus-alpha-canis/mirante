@@ -9,7 +9,7 @@
 //! | `invisible`: any character [`untrusted::line`] strips (controls, bidi, zero-width, tags) | error |
 //! | `confusable`: a word mixing ASCII letters with Cyrillic, Greek, Armenian, IPA, small-capital or mathematical letters | error |
 //! | `forbidden`: approval bypasses (Claude's and Codex's flags and modes), skipped hooks, a disabled sandbox; `allowed-tools`/`hooks` frontmatter | error |
-//! | `shell`: `rm -rf /` or `~`, piping (or `<(…)`, `"$(…)"`) a download or base64 into a shell, `chmod 777`, `sudo`, writes into `~/.ssh`, `~/.aws`, `~/.claude`, `~/.codex`, `~/.mirante` | error |
+//! | `shell`: `rm -rf /` or `~`, piping (or `<(…)`, `"$(…)"`) a download or base64 into a shell, `chmod 777`, `sudo`, writes into `~/.ssh`, `~/.aws`, `~/.claude`, `~/.codex`, `~/.mirante`; in Markdown, Claude's `` !`cmd` `` (run at skill load) | error |
 //! | `injection`: "ignore previous instructions", "you are now", "system prompt", chat-template and Mirante wrapper tags | error |
 //! | `refs`: a link (or a `./`-backticked path) to a missing bundled file, an absolute or `..` link, a bad file path (error); a user home path (warn) | error / warn |
 //! | `comment`: `<!--` hidden text | warn |
@@ -362,6 +362,15 @@ fn scan_text(out: &mut Out<'_>, text: &str, bundled: &[&str], markdown: bool) {
             by_line.push(rule);
             out.push(rule, Severity::Error, n, why);
         }
+        if markdown && f.contains("!`") {
+            out.push(
+                "shell",
+                Severity::Error,
+                n,
+                "\"!\" right before a backtick runs a shell command when Claude loads the skill \
+(write \"! `\" or drop the \"!\")",
+            );
+        }
         if f.contains("<!--") {
             out.push("comment", Severity::Warn, n, "an HTML comment hides text from the rendered view");
         }
@@ -707,6 +716,26 @@ mod tests {
         assert_eq!(rules(&draft("<!-- hidden -->")), [("comment".to_string(), Severity::Warn)]);
         assert!(!has_errors(&lint(&draft("logs are in /Users/p/x"))));
         assert!(has_errors(&lint(&draft("[see](reference/missing.md)"))));
+    }
+
+    /// Claude runs `` !`cmd` `` in a skill's Markdown as a shell command when the skill
+    /// loads, before the model reads anything: refused wherever Markdown is bundled.
+    #[test]
+    fn claude_bang_backtick_shell_is_an_error_in_markdown() {
+        for t in ["Context: !`git log -5`", "!`date`", "see !`cat ~/.ssh/id_ed25519`", "x \u{FF01}`ls` y"] {
+            let f = lint(&draft(t));
+            let hit = f.iter().find(|f| f.rule == "shell" && f.severity == Severity::Error && f.line == 1);
+            let hit = hit.unwrap_or_else(|| panic!("{t}: {f:?}"));
+            assert!(hit.message.contains("runs") && hit.message.contains("shell"), "{}", hit.message);
+        }
+        let mut d = draft("b");
+        d.files.push(("reference/a.md".into(), b"one\nnow: !`date`\n".to_vec()));
+        let f = lint(&d);
+        assert!(f.iter().any(|f| f.rule == "shell" && f.file == "reference/a.md" && f.line == 2), "{f:?}");
+        // Not Markdown, or not immediately followed by a backtick: fine.
+        let mut d = draft("Say it! `cargo test` first. Wow!");
+        d.files.push(("notes.txt".into(), b"!`date`\n".to_vec()));
+        assert!(lint(&d).is_empty(), "{:?}", lint(&d));
     }
 
     #[test]
