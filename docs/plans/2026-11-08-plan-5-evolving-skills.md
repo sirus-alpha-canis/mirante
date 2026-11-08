@@ -238,7 +238,7 @@ docs/dogfood/skills.md                           (new)
         ("https://x-access-token:ghp_abc@github.com/o/r.git/", "github.com/o/r"),
         ("ssh://git@github.com:22/o/r", "github.com/o/r"),
         ("git@gh-x:o/r.git", "github.com/o/r"),
-        ("contoso@azure-work:v3/contoso/Proj Name/Web-App", "dev.azure.com/contoso/g2s site b2c/site-b2c"),
+        ("contoso@azure-work:v3/contoso/Proj%20Name/Web-App", "dev.azure.com/contoso/proj name/web-app"),
         ("https://contoso@dev.azure.com/contoso/Proj/_git/Repo", "dev.azure.com/contoso/proj/repo"),
         ("https://contoso.visualstudio.com/Proj/_git/Repo", "dev.azure.com/contoso/proj/repo"),
     ] { assert_eq!(normalize(url, &a).unwrap().key(), want, "{url}"); }

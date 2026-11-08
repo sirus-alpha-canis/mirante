@@ -1,3 +1,15 @@
 /target
 *.log
 .DS_Store
+
+# Local tooling and state (never commit)
+.serena/
+.idea/
+.vscode/
+.claude/settings.local.json
+.mirante/
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+!.env.example
