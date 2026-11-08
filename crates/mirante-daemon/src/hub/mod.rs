@@ -340,6 +340,8 @@ pub struct Hub {
     /// The miner thread's queue of archived tasks (see [`Hub::spawn_miner`]); without one
     /// (tests), archiving mines inline.
     pub(crate) miner: Mutex<Option<mpsc::Sender<String>>>,
+    /// `daemon.settings` changes, one at a time (read, write, apply).
+    pub(crate) settings_gate: Mutex<()>,
     /// The daemon is going down ([`Hub::shutdown`]): set under the hub lock; launches are
     /// refused, auto-resume stops, new connections are turned away.
     pub(crate) shutting_down: AtomicBool,
@@ -532,6 +534,7 @@ impl Hub {
             claude_inline: AtomicBool::new(false),
             auto_resume: AtomicBool::new(true),
             auto_resume_env_off: AtomicBool::new(false),
+            settings_gate: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
             spawning: std::sync::atomic::AtomicUsize::new(0),
             resume_gap: resume::RESUME_GAP,

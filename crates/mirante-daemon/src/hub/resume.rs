@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mirante_core::model::{Event, Lifecycle};
-use mirante_ipc::types::{DaemonSettings, SettingsParams, StartSession};
+use mirante_ipc::types::{BootState, DaemonSettings, SettingsParams, StartSession};
 use serde_json::json;
 
 use super::session::Launch;
@@ -42,7 +42,8 @@ pub const DAEMON_CAUSES: [&str; 2] = ["mirante:daemon_shutdown", "mirante:daemon
 
 /// How often a waiting resume looks at the memory guard again.
 pub(crate) const POLL: Duration = Duration::from_millis(200);
-/// Longest wait for the memory guard's first sample before resuming anyway.
+/// Longest wait for the memory guard's first samples (enough to see a climb, `UP_SAMPLES`)
+/// before resuming anyway.
 pub(crate) const FIRST_SAMPLE_WAIT: Duration = Duration::from_secs(10);
 /// Between two resumes: the memory guard steps up after `UP_SAMPLES` samples 2 s apart,
 /// plus time for the resumed agent to settle.
@@ -245,12 +246,22 @@ impl Hub {
     /// `daemon.settings`: the settings, after applying the ones given (persisted).
     pub fn settings(&self, p: SettingsParams) -> Result<DaemonSettings> {
         if let Some(on) = p.auto_resume {
-            save_auto_resume(&self.paths.settings(), on)
-                .map_err(|e| HubError::Conflict(format!("could not save the settings: {e}")))?;
-            self.set_auto_resume(on);
-            let mut st = self.lock();
-            st.event(None, "settings_changed", json!({ "auto_resume": on }))?;
-            st.publish();
+            // One change at a time: the file and this daemon's flag end up the same.
+            let _gate = self.settings_gate.lock().unwrap_or_else(|p| p.into_inner());
+            let path = self.paths.settings();
+            if read_settings(&path)["auto_resume"].as_bool() != Some(on) {
+                save_auto_resume(&path, on)
+                    .map_err(|e| HubError::Conflict(format!("could not save the settings: {e}")))?;
+            }
+            let was = self.auto_resume.swap(on, Ordering::SeqCst);
+            if was != on {
+                // Saved already: a failure to record it is logged, not returned.
+                let mut st = self.lock();
+                if let Err(e) = st.event(None, "settings_changed", json!({ "auto_resume": on })) {
+                    st.log_error(None, "settings change not recorded", &e);
+                }
+                st.publish();
+            }
         }
         Ok(DaemonSettings { auto_resume: self.auto_resume_enabled(), forced_by_env: self.auto_resume_forced_off() })
     }
@@ -264,7 +275,9 @@ impl Hub {
                 return false;
             }
             let st = self.lock();
-            let sampled = !wait_sample || st.mem.system.is_some() || started.elapsed() >= FIRST_SAMPLE_WAIT;
+            // One sample cannot show a climb: the guard steps up after `UP_SAMPLES` in a row.
+            let enough = st.mem.samples >= crate::memguard::policy::UP_SAMPLES;
+            let sampled = !wait_sample || enough || started.elapsed() >= FIRST_SAMPLE_WAIT;
             if sampled && !st.mem.paused {
                 return true;
             }
@@ -274,7 +287,7 @@ impl Hub {
     }
 
     /// Resumes `tasks` one at a time (see the module doc). `wait_sample`: the memory guard
-    /// runs, so its first sample is awaited (at most [`FIRST_SAMPLE_WAIT`]) before the first
+    /// runs, so its first `UP_SAMPLES` samples are awaited (at most [`FIRST_SAMPLE_WAIT`]) before the first
     /// resume. Returns the tasks resumed.
     pub fn run_auto_resume(&self, tasks: &[String], wait_sample: bool) -> Vec<String> {
         let started = Instant::now();
@@ -303,6 +316,11 @@ impl Hub {
                     Ok(Launch::Refused(why)) => ("session.auto_resume_skipped", json!({ "reason": why })),
                     // Someone else got there first (the person resumed it meanwhile).
                     Err(HubError::Conflict(why)) => ("session.auto_resume_skipped", json!({ "reason": why })),
+                    // The agent was gone before it booted: not a resume.
+                    Ok(Launch::Started(res)) if res.boot == BootState::Exited => (
+                        "session.auto_resume_failed",
+                        json!({ "error": "the agent exited while starting", "boot": res.boot }),
+                    ),
                     Ok(Launch::Started(res)) => {
                         let session = st.live.get(task_id).map(|l| l.session_id.clone());
                         resumed.push(task_id.clone());
@@ -485,6 +503,85 @@ mod tests {
         let done = worker.join().unwrap();
         assert_eq!(done.len(), 2);
         assert!(hub.get_task(&a).unwrap().live && hub.get_task(&b).unwrap().live);
+    }
+
+    /// One sample cannot show a climb (the guard steps up after `UP_SAMPLES` in a row): the
+    /// first resume waits for that many.
+    #[test]
+    fn the_first_resume_waits_for_enough_samples_to_see_a_climb() {
+        let k = file_kit();
+        let a = live_with_native(&k, "a", "nat-a");
+        k.hub.shutdown();
+        let (hub, r) = restarted(&k);
+        let hub = Arc::new(hub);
+        {
+            let mut st = hub.lock();
+            st.mem.samples = 1;
+            st.mem.system = Some(
+                serde_json::from_value(json!({"level": "normal", "total": 1, "free": 1, "swap_used": 0,
+                    "swap_total": 0, "paused": false}))
+                .unwrap(),
+            );
+        }
+        let worker = {
+            let (hub, ids) = (Arc::clone(&hub), r.resume.clone());
+            std::thread::spawn(move || hub.run_auto_resume(&ids, true))
+        };
+        std::thread::sleep(POLL * 3);
+        assert!(!hub.get_task(&a).unwrap().live, "resumed after one sample");
+        hub.lock().mem.samples = crate::memguard::policy::UP_SAMPLES;
+        assert_eq!(worker.join().unwrap(), vec![a.clone()]);
+    }
+
+    /// A resume whose agent is gone before it booted is a failure, not a resume.
+    #[test]
+    fn an_agent_that_exits_at_launch_is_a_failed_resume() {
+        let k = file_kit();
+        let a = live_with_native(&k, "a", "nat-a");
+        k.hub.shutdown();
+        let (hub, r) = restarted(&k);
+        let hub = Arc::new(hub);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *k.factory.spawn_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let worker = {
+            let (hub, ids) = (Arc::clone(&hub), r.resume.clone());
+            std::thread::spawn(move || hub.run_auto_resume(&ids, false))
+        };
+        entered.recv().unwrap();
+        // The session ends while its agent is being spawned (it exits at once).
+        let session = hub.lock().live[&a].session_id.clone();
+        hub.lock().finish_session(&a, &session, "mirante:process_exited").unwrap();
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_empty());
+        let k2 = kinds(&hub, &a);
+        assert!(k2.contains(&"session.auto_resume_failed".to_string()), "{k2:?}");
+        assert!(!k2.contains(&"session.auto_resumed".to_string()), "{k2:?}");
+    }
+
+    #[test]
+    fn a_setting_that_does_not_change_is_not_an_event_and_saves_are_serialized() {
+        let k = file_kit();
+        let changed = |hub: &Hub| {
+            let st = hub.lock();
+            st.store.events_since(0, 10_000).unwrap().iter().filter(|e| e.kind == "settings_changed").count()
+        };
+        k.hub.settings(SettingsParams { auto_resume: Some(true) }).unwrap();
+        assert_eq!(changed(&k.hub), 0, "already on: nothing changed");
+        k.hub.settings(SettingsParams { auto_resume: Some(false) }).unwrap();
+        assert_eq!(changed(&k.hub), 1);
+        let hub = Arc::clone(&k.hub);
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let hub = Arc::clone(&hub);
+                std::thread::spawn(move || hub.settings(SettingsParams { auto_resume: Some(i % 2 == 0) }).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // What is saved is what this daemon runs with.
+        assert_eq!(load_auto_resume(&k.hub.paths().settings()), k.hub.auto_resume_enabled());
     }
 
     #[test]

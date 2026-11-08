@@ -29,6 +29,8 @@ const GIB: u64 = 1 << 30;
 #[derive(Debug, Default)]
 pub(crate) struct MemShared {
     pub(crate) system: Option<SystemView>,
+    /// Samples the guard has taken since the daemon started.
+    pub(crate) samples: u32,
     /// New sessions and queued deliveries wait (the policy paused them).
     pub(crate) paused: bool,
     pub(crate) sessions: std::collections::HashMap<String, SessionMem>,
@@ -194,6 +196,7 @@ impl Hub {
             }
             let paused = st.mem.paused;
             st.mem.system = Some(system_view(policy.level().as_str(), &system, paused));
+            st.mem.samples = st.mem.samples.saturating_add(1);
             for a in actions {
                 if let Err(e) = st.apply_mem_action(a, &mut hibernate) {
                     st.log_error(None, "memory guard", &e);
