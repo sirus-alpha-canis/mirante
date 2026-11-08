@@ -10,6 +10,7 @@ pub mod git;
 pub mod hook;
 pub mod model;
 pub mod redact;
+pub mod skills;
 pub mod status;
 pub mod store;
 pub mod transcript_tail;
