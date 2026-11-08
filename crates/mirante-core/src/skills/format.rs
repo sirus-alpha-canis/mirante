@@ -62,6 +62,11 @@ pub struct Provenance {
     pub source: Source,
     pub task: Option<String>,
     pub proposal: Option<String>,
+    /// The tenant the skill was first learned in, carried from version to version (an
+    /// accepted edit, a rescope, a rollback), so widening it later still warns. Absent
+    /// when it was never learned in a tenant (and in versions written before this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_in: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,7 +419,7 @@ mod tests {
             scope: Scope::org("github.com/sirus-alpha-canis"),
             files: vec![FileEntry::of(SKILL_MD, md.as_bytes()), FileEntry::of("reference/a.md", b"ref\n")],
             parent: Some("a".repeat(64)),
-            provenance: Provenance { source: Source::Miner, task: None, proposal: Some("p1".into()) },
+            provenance: Provenance { source: Source::Miner, task: None, proposal: Some("p1".into()), learned_in: None },
             signer: SignerRef { principal: "mirante-local".into(), key: "SHA256:abc".into() },
             created: "2026-11-08".into(),
         }

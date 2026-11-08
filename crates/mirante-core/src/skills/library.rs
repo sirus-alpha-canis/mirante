@@ -383,7 +383,7 @@ mod tests {
                 scope: Scope::org("github.com/acme"),
                 files: Vec::new(),
                 parent: None,
-                provenance: Provenance { source: Source::Cli, task: None, proposal: None },
+                provenance: Provenance { source: Source::Cli, task: None, proposal: None, learned_in: None },
                 signer: SignerRef { principal: String::new(), key: String::new() },
                 created: "2026-11-08".into(),
             },

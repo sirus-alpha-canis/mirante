@@ -312,25 +312,35 @@ impl Hub {
             .collect())
     }
 
-    /// The tenant a skill was learned in (its proposal's, else its task's), when it was.
+    /// The tenant a skill was learned in: what its manifest carries (kept from version to
+    /// version), else its proposal's tenant, else its task's, when it was.
     pub(crate) fn learned_in(&self, m: &Manifest) -> Option<String> {
-        let st = self.lock();
-        if let Some(t) =
-            m.provenance.proposal.as_ref().and_then(|id| st.store.skill_proposal(id).ok()).map(|p| p.tenant)
-        {
-            return Some(t).filter(|t| t != "personal");
+        if let Some(t) = &m.provenance.learned_in {
+            return Some(t.clone());
         }
-        let task = m.provenance.task.as_ref()?;
-        st.store.skill_origin_of(task).ok().flatten().map(|o| o.tenant)
+        let tenant = {
+            let st = self.lock();
+            m.provenance.proposal.as_ref().and_then(|id| st.store.skill_proposal(id).ok()).map(|p| p.tenant)
+        };
+        self.learned_from(tenant, m.provenance.task.as_deref())
     }
 
-    /// The warnings a scope of a skill learned in `learned` carries.
+    /// A proposal's tenant (none for a person's personal one), else `task`'s tenant.
+    fn learned_from(&self, proposal_tenant: Option<String>, task: Option<&str>) -> Option<String> {
+        if let Some(t) = proposal_tenant {
+            return Some(t).filter(|t| t != "personal");
+        }
+        self.lock().store.skill_origin_of(task?).ok().flatten().map(|o| o.tenant)
+    }
+
+    /// The warnings a scope of a skill learned in `learned` carries: personal, or any scope
+    /// in another tenant, takes it to other clients' repos.
     pub(crate) fn scope_warnings(scope: &Scope, learned: Option<&str>) -> Vec<String> {
-        match (scope, learned) {
-            (Scope::Personal, Some(t)) => {
-                vec![format!("learned in {t}; personal skills reach every repo, including other clients'")]
-            }
-            _ => Vec::new(),
+        let Some(t) = learned else { return Vec::new() };
+        match scope_tenant(scope) {
+            None => vec![format!("learned in {t}; personal skills reach every repo, including other clients'")],
+            Some(other) if other != t => vec![format!("learned in {t}; scoped to {other}, another client's")],
+            Some(_) => Vec::new(),
         }
     }
 
@@ -877,6 +887,16 @@ impl Hub {
         if has_errors(&findings) {
             return Err(HubError::Invalid(format!("lint: {}", errors_line(&findings))));
         }
+        // Where it was learned: an edit keeps what the version it edits says (a person's
+        // re-review names no tenant), else this proposal's tenant or task's.
+        let inherited = match (&parent, &current) {
+            (Some(_), Some(row)) => self
+                .skill_verify(&row.name, row.version, &row.manifest_hash)
+                .ok()
+                .and_then(|v| self.learned_in(&v.manifest)),
+            _ => None,
+        };
+        let learned_in = inherited.or_else(|| self.learned_from(Some(p.tenant.clone()), p.task_id.as_deref()));
         let version = self.next_version(&name, current.as_ref().map(|r| r.version))?;
         let mut all = vec![(SKILL_MD.to_string(), render_skill_md(&name, &description, &body).into_bytes())];
         all.extend(files);
@@ -895,6 +915,7 @@ impl Hub {
                     source: source_of(&p.origin),
                     task: p.task_id.clone(),
                     proposal: Some(p.id.clone()),
+                    learned_in,
                 },
                 signer: SignerRef { principal: String::new(), key: String::new() },
                 created: today(),
@@ -980,6 +1001,7 @@ impl Hub {
                 })?;
                 let version = self.next_version(&row.name, Some(row.version))?;
                 let mut manifest = src.manifest.clone();
+                manifest.provenance.learned_in = self.learned_in(&src.manifest);
                 manifest.version = version;
                 manifest.parent = Some(row.manifest_hash.clone());
                 manifest.created = today();
@@ -1367,7 +1389,7 @@ pub(crate) mod tests {
                 scope: scope.clone(),
                 files: Vec::new(),
                 parent: None,
-                provenance: Provenance { source: Source::Cli, task: None, proposal: None },
+                provenance: Provenance { source: Source::Cli, task: None, proposal: None, learned_in: None },
                 signer: SignerRef { principal: String::new(), key: String::new() },
                 created: "2026-11-08".into(),
             },
@@ -1852,6 +1874,53 @@ pub(crate) mod tests {
         assert_eq!(v.warnings, [warn]);
         let q = k.hub.skill_proposals(SkillProposals { status: Some("all".into()), ..Default::default() }).unwrap();
         assert_eq!(q[0].warnings, [warn]);
+    }
+
+    /// Any scope outside the tenant a skill was learned in warns, not only personal; and
+    /// an accepted edit (here a person's re-review that names no task) keeps where the skill
+    /// was first learned, so a later widening still warns.
+    #[test]
+    fn widening_warns_for_any_other_tenant_and_edits_keep_where_it_was_learned() {
+        let acme = Some("github.com/acme");
+        let other = Scope::org("github.com/other");
+        assert_eq!(
+            Hub::scope_warnings(&other, acme),
+            ["learned in github.com/acme; scoped to github.com/other, another client's"]
+        );
+        assert!(Hub::scope_warnings(&Scope::Repo("github.com/acme/app".into()), acme).is_empty());
+        assert!(Hub::scope_warnings(&Scope::org("github.com/acme"), acme).is_empty());
+        assert!(Hub::scope_warnings(&other, None).is_empty());
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        let t = learning(&k, "t");
+        let p = k.hub.skill_propose(&Caller::Person, propose(&t.id, Some("w"), None, "Wide.\n")).unwrap();
+        k.hub.skill_review(&Caller::Person, accept(&p.proposal.id)).unwrap();
+        // A person re-reviews it as personal through skill add (tenant "personal", no task).
+        let add = SkillAdd {
+            dir: None,
+            inline: Some(SkillInline { name: "w".into(), description: "Wider".into(), body: "Wider.\n".into() }),
+            scope: "personal".into(),
+            activation: None,
+        };
+        let e = k.hub.skill_add(&Caller::Person, add).unwrap();
+        assert_eq!(e.proposal.kind, "edit");
+        k.hub.skill_review(&Caller::Person, accept(&e.proposal.id)).unwrap();
+        let v = k.hub.skill_get(SkillGet { name: "w".into(), version: None }).unwrap();
+        assert_eq!(v.summary.version, 2);
+        assert_eq!(v.manifest.as_ref().unwrap().provenance.learned_in.as_deref(), acme);
+        let warn = "learned in github.com/acme; personal skills reach every repo, including other clients'";
+        assert_eq!(v.warnings, [warn]);
+        // A rescope (a new version from verified bytes) keeps it too.
+        let hash = v.summary.manifest_hash.clone();
+        let rescope = SkillAction {
+            name: "w".into(),
+            action: SkillActionKind::Rescope,
+            expect_hash: hash,
+            scope: Some("org:github.com/other".into()),
+            version: None,
+        };
+        let v = k.hub.skill_action(&Caller::Person, rescope).unwrap();
+        assert_eq!(v.warnings, ["learned in github.com/acme; scoped to github.com/other, another client's"]);
     }
 
     #[test]
