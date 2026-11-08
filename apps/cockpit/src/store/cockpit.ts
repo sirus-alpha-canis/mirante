@@ -70,6 +70,8 @@ export interface Cockpit {
   connect(): Promise<void>;
   /** Reloads a task's queued messages (`message.list_queued`), coalesced like refreshes. */
   refreshQueue(taskId: string): void;
+  /** Loads a task's history (`task.events`) again (after it failed). */
+  loadHistory(taskId: string): Promise<void>;
   /** Called after each state change with (previous, next). */
   onChange(fn: (prev: State, next: State) => void): () => void;
 }
@@ -170,6 +172,9 @@ export function createCockpit(t: Transport): Cockpit {
           // Missed events follow; the rows they touch are refreshed one by one, but rows
           // changed by events older than the stream's buffer are only right after a list.
           refreshList();
+          // Histories that could not be loaded get another try now the daemon answers.
+          const failed = Object.keys(state.historyErrors);
+          pool(failed.map((id) => () => loadHistory(id)), HISTORY_CONCURRENCY).catch(() => {});
         } else {
           const ids = m.snapshot.tasks.map((v) => v.id);
           pool(ids.map((id) => () => loadHistory(id)), HISTORY_CONCURRENCY).catch(() => {});
@@ -213,6 +218,7 @@ export function createCockpit(t: Transport): Cockpit {
     },
     dispatch,
     refreshQueue,
+    loadHistory,
     connect,
   };
 }

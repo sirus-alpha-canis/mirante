@@ -467,6 +467,19 @@ export function same(a: unknown, b: unknown): boolean {
   return ka.every((k) => Object.hasOwn(ob, k) && same((a as Record<string, unknown>)[k], ob[k]));
 }
 
+/** `m` without the entries whose key is no task of `tasks` (`m` itself when none goes). */
+function keepIds<T>(m: Record<string, T>, tasks: Record<string, TaskView>): Record<string, T> {
+  return keepTasks(m, (_v, k) => k, tasks);
+}
+
+function keepTasks<T>(m: Record<string, T>, taskOf: (v: T, k: string) => string, tasks: Record<string, TaskView>): Record<string, T> {
+  const gone = Object.keys(m).filter((k) => !(taskOf(m[k], k) in tasks));
+  if (gone.length === 0) return m;
+  const out = { ...m };
+  for (const k of gone) delete out[k];
+  return out;
+}
+
 /** `next` with each entry that equals `prev`'s kept as `prev`'s object; `prev` itself when
  * nothing differs (so views of unchanged rows, and of nothing, do not render again). */
 function keepSame<T>(prev: Record<string, T>, next: Record<string, T>): Record<string, T> {
@@ -485,7 +498,22 @@ export function reduce(s: State, a: Action): State {
       if (snap.resumed) return { ...s, connection: { state: "live" }, bootId: snap.boot_id, seq: snap.seq };
       const tasks: Record<string, TaskView> = {};
       for (const t of snap.tasks) tasks[t.id] = t;
-      return { ...s, connection: { state: "live" }, bootId: snap.boot_id, seq: snap.seq, tasks };
+      const base = { ...s, connection: { state: "live" } as Connection, bootId: snap.boot_id, seq: snap.seq, tasks };
+      // What belonged to tasks no longer there goes.
+      const perms = keepTasks(s.perms, (p) => p.task_id, tasks);
+      if (s.bootId !== null && snap.boot_id !== s.bootId) {
+        // A new daemon: its sessions, queues, notices and event numbers start over. Histories
+        // are loaded again (they would not merge: seqs restart with the boot).
+        return { ...base, perms, feed: {}, queues: {}, sessionSkills: {}, historyErrors: {}, memory: [] };
+      }
+      return {
+        ...base,
+        perms,
+        feed: keepIds(s.feed, tasks),
+        queues: keepIds(s.queues, tasks),
+        historyErrors: keepIds(s.historyErrors, tasks),
+        sessionSkills: keepIds(s.sessionSkills, tasks),
+      };
     }
     case "disconnected":
       return { ...s, connection: { state: "down", error: a.error, retryMs: a.retryMs } };

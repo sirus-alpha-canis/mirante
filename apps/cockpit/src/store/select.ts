@@ -37,10 +37,26 @@ export function tasksIn(s: State, col: Column, repo?: string): TaskView[] {
     .sort((a, b) => b.updated_at - a.updated_at);
 }
 
+const NO_PERMS: Perm[] = [];
+// Pending requests by task, built once per permissions object (every card and the detail
+// ask for theirs on each change).
+const pendingIndex = new WeakMap<State["perms"], Map<string, Perm[]>>();
+
+/** `taskId`'s pending requests, oldest first (the same array while `perms` is the same). */
 export function pendingPerms(perms: State["perms"], taskId: string): Perm[] {
-  return Object.values(perms)
-    .filter((p) => p.task_id === taskId && p.status === "pending")
-    .sort((a, b) => a.created_at - b.created_at);
+  let idx = pendingIndex.get(perms);
+  if (!idx) {
+    idx = new Map();
+    for (const p of Object.values(perms)) {
+      if (p.status !== "pending") continue;
+      const list = idx.get(p.task_id);
+      if (list) list.push(p);
+      else idx.set(p.task_id, [p]);
+    }
+    for (const list of idx.values()) list.sort((a, b) => a.created_at - b.created_at);
+    pendingIndex.set(perms, idx);
+  }
+  return idx.get(taskId) ?? NO_PERMS;
 }
 
 export function repoName(path: string): string {

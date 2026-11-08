@@ -149,6 +149,31 @@ describe("createCockpit", () => {
     expect(c.getState().historyErrors.t1).toBe("no task t1");
   });
 
+  it("loadHistory retries a task's failed history on demand, and a resumed stream retries the failed ones", async () => {
+    let fail = true;
+    const t = fakeTransport({
+      "permission.list": [],
+      "task.list": [],
+      "task.events": async (p: { task: string }) => {
+        if (fail) throw { kind: "rpc", code: 1, message: `no ${p.task}` };
+        return [ev(1, p.task, "turn_ended")];
+      },
+    });
+    const c = createCockpit(t);
+    await c.connect();
+    t.push({ type: "connected", snapshot: snapshot([task("t1"), task("t2")], 1) });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(Object.keys(c.getState().historyErrors).sort()).toEqual(["t1", "t2"]);
+    fail = false;
+    await c.loadHistory("t1");
+    expect(c.getState().historyErrors.t1).toBeUndefined();
+    expect(c.getState().feed.t1).toHaveLength(1);
+    t.push({ type: "connected", snapshot: snapshot([], 1, { resumed: true }) });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(c.getState().historyErrors).toEqual({});
+    expect(c.getState().feed.t2).toHaveLength(1);
+  });
+
   it("drops a task.get reply older than one already applied", async () => {
     let n = 0;
     const t = fakeTransport({

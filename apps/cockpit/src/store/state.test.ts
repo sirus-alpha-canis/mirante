@@ -13,6 +13,32 @@ describe("reduce", () => {
     expect([s.bootId, s.seq, Object.keys(s.tasks)]).toEqual(["b1", 5, ["t1"]]);
   });
 
+  it("a new daemon boot starts the per-boot state over: queues, session skills, history errors, notices, feeds", () => {
+    let s = connected(initialState, [task("t1"), task("t2")]);
+    s = reduce(s, { type: "event", event: ev(6, "t1", "step", { type: "tool", tool: "Read", summary: "a", ok: true }) });
+    s = reduce(s, { type: "event", event: ev(7, "t2", "permission_requested", { permission_id: "p2", tool: "Bash", detail: "ls" }) });
+    s = reduce(s, { type: "event", event: ev(8, "t1", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "ls" }) });
+    s = reduce(s, { type: "queue", taskId: "t1", list: [{ id: "m1", text: "hi" }] });
+    s = reduce(s, { type: "historyFailed", taskId: "t1", error: "busy" });
+    s = reduce(s, { type: "event", event: ev(9, "t1", "skill.injected", { session_id: "s1", names: ["x"] }) });
+    s = reduce(s, { type: "event", event: ev(10, null, "memory.pressure", { level: "warn" }) });
+    expect(s.memory.length).toBeGreaterThan(0);
+    const r = reduce(s, { type: "connected", snapshot: snapshot([task("t1")], 1, { boot_id: "b2" }) });
+    expect(r.bootId).toBe("b2");
+    expect([r.queues, r.sessionSkills, r.historyErrors, r.memory, r.feed]).toEqual([{}, {}, {}, [], {}]);
+    // The gone task's cards are dropped; the live task's stay until permission.list says.
+    expect(Object.keys(r.perms)).toEqual(["p1"]);
+  });
+
+  it("a full snapshot of the same boot drops what belonged to tasks no longer there", () => {
+    let s = connected(initialState, [task("t1"), task("t2")]);
+    s = reduce(s, { type: "event", event: ev(6, "t2", "step", { type: "tool", tool: "Read", summary: "a", ok: true }) });
+    s = reduce(s, { type: "event", event: ev(7, "t2", "permission_requested", { permission_id: "p2", tool: "Bash", detail: "ls" }) });
+    s = reduce(s, { type: "queue", taskId: "t2", list: [] });
+    const r = reduce(s, { type: "connected", snapshot: snapshot([task("t1")], 7) });
+    expect([Object.keys(r.feed), Object.keys(r.perms), Object.keys(r.queues)]).toEqual([[], [], []]);
+  });
+
   it("a resumed snapshot keeps the state", () => {
     const s = connected();
     const r = reduce(s, { type: "connected", snapshot: snapshot([], 5, { resumed: true }) });
