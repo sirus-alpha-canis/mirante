@@ -1184,6 +1184,30 @@ impl Hub {
         Ok(out)
     }
 
+    /// The thread that mines after archives, off the request path: [`Hub::archive`] hands
+    /// it the task and answers at once.
+    pub fn spawn_miner(self: &std::sync::Arc<Self>) -> std::thread::JoinHandle<()> {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        *self.miner.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        let hub = std::sync::Arc::clone(self);
+        std::thread::spawn(move || {
+            for task in rx {
+                hub.mine_after_archive(&task);
+            }
+        })
+    }
+
+    /// Queues `task_id` for the miner thread, or mines inline when there is none.
+    pub(crate) fn mine_later(&self, task_id: &str) {
+        let queued = match self.miner.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Some(tx) => tx.send(task_id.to_string()).is_ok(),
+            None => false,
+        };
+        if !queued {
+            self.mine_after_archive(task_id);
+        }
+    }
+
     /// After a task is archived: mines its tenant when learning is on and its origin is
     /// confirmed. Errors are logged, never raised (the archive already happened).
     pub(crate) fn mine_after_archive(&self, task_id: &str) {
@@ -2223,6 +2247,34 @@ pub(crate) mod tests {
         let b = other_repo(&k, "git@github.com:other/x.git");
         let t = task_in(&k, &b, "b0", CLIPPY[0]);
         k.hub.archive(&t.id).unwrap();
+        assert_eq!(k.payloads("skill.mined").len(), 1);
+    }
+
+    /// With a miner thread (the daemon runs one), archiving hands the tenant's mining to it
+    /// and answers at once: mining is never on the archive request's path.
+    #[test]
+    fn archive_hands_mining_to_the_miner_thread() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        let mut last = None;
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            last = Some(create_in(&k, &Caller::Person, &format!("c{i}"), g));
+        }
+        let last = last.unwrap();
+        // A miner that has not run yet: archive returns without mining.
+        let (tx, rx) = std::sync::mpsc::channel();
+        *k.hub.miner.lock().unwrap() = Some(tx);
+        k.hub.archive(&last.id).unwrap();
+        assert!(k.payloads("skill.mined").is_empty(), "mined on the request path");
+        assert_eq!(rx.try_recv().unwrap(), last.id);
+        // The real miner thread mines it.
+        let _miner = k.hub.spawn_miner();
+        let t = create_in(&k, &Caller::Person, "c9", CLIPPY[0]);
+        k.hub.archive(&t.id).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while k.payloads("skill.mined").is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(k.payloads("skill.mined").len(), 1);
     }
 

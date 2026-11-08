@@ -320,6 +320,9 @@ pub struct Hub {
     pub(crate) skill_conf: Mutex<skills::SkillConf>,
     /// Skills: signatures that verified (see `hub::skills`).
     pub(crate) skill_sigs: Mutex<HashSet<String>>,
+    /// The miner thread's queue of archived tasks (see [`Hub::spawn_miner`]); without one
+    /// (tests), archiving mines inline.
+    pub(crate) miner: Mutex<Option<mpsc::Sender<String>>>,
 }
 
 /// Highest event seq in the store (0 when empty).
@@ -489,6 +492,7 @@ impl Hub {
             dna_gates: Mutex::default(),
             skill_conf: Mutex::default(),
             skill_sigs: Mutex::default(),
+            miner: Mutex::default(),
         };
         Ok((hub, rx))
     }
@@ -688,7 +692,7 @@ impl Hub {
         let v = st.view(t)?;
         st.publish();
         drop(st);
-        self.mine_after_archive(&task.id);
+        self.mine_later(&task.id);
         Ok(v)
     }
 
