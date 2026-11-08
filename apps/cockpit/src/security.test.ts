@@ -31,6 +31,12 @@ describe("Tauri security baseline", () => {
     expect(conf.build.devUrl).toBe("http://127.0.0.1:1420");
   });
 
+  it("the main window is built in Rust (src-tauri/src/lib.rs), where new windows are denied", () => {
+    // `create: false`: Tauri does not build it from config, so `window.open` and
+    // target=_blank never get a webview of their own; links go through the opener plugin.
+    expect(conf.app.windows.map((w) => [w.label, w.create])).toEqual([["main", false]]);
+  });
+
   it("grants only notifications and opening github.com URLs", () => {
     const ids = capabilities.permissions.map((p) => (typeof p === "string" ? p : p.identifier));
     expect(ids).toEqual(["notification:default", "opener:allow-open-url"]);

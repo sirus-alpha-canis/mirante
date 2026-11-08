@@ -1,7 +1,8 @@
 //! Tauri shell of the cockpit: six commands that forward to `mirante-bridge`. No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
-//! plugin (github.com only, see `capabilities/default.json`), never in the window itself.
+//! plugin (github.com only, see `capabilities/default.json`), never in the window itself,
+//! and never in a window of their own: `window.open` / `target=_blank` are denied.
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -13,7 +14,8 @@ use mirante_ipc::Paths;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager, State, Url, WindowEvent};
+use tauri::webview::NewWindowResponse;
+use tauri::{AppHandle, Manager, State, Url, WebviewWindowBuilder, WindowEvent};
 
 /// Vite's dev server (`build.devUrl` in `tauri.conf.json`), loaded only by `tauri dev`.
 const DEV_ORIGIN: (&str, u16) = ("127.0.0.1", 1420);
@@ -132,6 +134,22 @@ pub fn run() {
                 .on_navigation(|_, url| is_app_url(url, cfg!(debug_assertions)))
                 .build(),
         )
+        .setup(|app| {
+            // `create: false` in tauri.conf.json: the main window is built here so it can
+            // refuse every new-window request (Tauri would otherwise let the platform decide).
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .cloned()
+                .ok_or("tauri.conf.json has no \"main\" window")?;
+            WebviewWindowBuilder::from_config(app.handle(), &config)?
+                .on_new_window(|_, _| NewWindowResponse::Deny)
+                .build()?;
+            Ok(())
+        })
         .manage(Cockpit { paths, socket, stream: Mutex::new(None), attachments: Attachments::default() })
         .invoke_handler(tauri::generate_handler![rpc, subscribe, attach_open, attach_write, attach_close, daemon_start])
         .on_window_event(|window, event| {
