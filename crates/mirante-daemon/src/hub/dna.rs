@@ -4,10 +4,12 @@
 //! read checks HEAD and the directory's stat signature first ([`index::needs_refresh`]).
 //! git and file reads run without the hub lock; only the store writes take it.
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use mirante_core::dna::anchor::check_path;
+use mirante_core::dna::anchor::Anchor;
 use mirante_core::dna::check::{check_all, cite, is_dirty, rev_parse, AnchorState};
-use mirante_core::dna::index::{self, IndexedAnchor, NewProposal, NoteRow, RefreshReport};
+use mirante_core::dna::index::{self, IndexedAnchor, NewProposal, NoteRow, ProposalCaps, ProposalQuery, RefreshReport};
 use mirante_core::dna::note::{Kind, Note, Status};
 use mirante_core::dna::untrusted::field;
 use mirante_core::dna::{fsio, note, sha256_hex, DnaError, MAX_ANCHORS, MAX_BODY_BYTES, MAX_TITLE_CHARS};
@@ -33,8 +35,12 @@ pub enum Caller {
 }
 
 /// Pending proposals one task, and one repo, may have at once.
-const MAX_PENDING_PER_TASK: usize = 20;
-const MAX_PENDING_PER_REPO: usize = 200;
+const CAPS: ProposalCaps = ProposalCaps { per_task: 20, per_repo: 200 };
+
+/// Proposals per `dna.proposals` page by default and at most; a task context lists at most
+/// the default.
+const PAGE_DEFAULT: usize = 50;
+const PAGE_MAX: usize = 200;
 
 /// Most notes `dna.task_context` lists as relevant.
 const RELEVANT_MAX: usize = 10;
@@ -120,6 +126,40 @@ fn key_of(repo: &Path) -> String {
     repo.to_string_lossy().into_owned()
 }
 
+/// The checkout `path` is in: git's top level, canonical (a task may have been created from
+/// a subdirectory).
+fn toplevel(path: &str) -> Result<PathBuf> {
+    let p = std::fs::canonicalize(path).map_err(|e| HubError::Invalid(format!("repo {path}: {e}")))?;
+    let out = Git::new(&p).args(["rev-parse", "--show-toplevel"]).output();
+    let top = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return Err(HubError::Invalid(format!("{path} is not inside a git work tree"))),
+    };
+    std::fs::canonicalize(&top).map_err(|e| HubError::Invalid(format!("repo {top}: {e}")))
+}
+
+/// Each anchor re-cited at the checkout's HEAD when its code is there (fresh or relocated):
+/// an accepted note then cites a commit of the checkout, not one only a task branch has
+/// (which a squash merge and gc would make unverifiable). Anchors whose code is not in the
+/// checkout yet keep the task-branch citation (stale or unverifiable until the merge, then
+/// a Confirm away from fresh).
+fn recite_at_checkout(repo: &Path, anchors: &[Anchor]) -> Vec<Anchor> {
+    let Ok(head) = rev_parse(repo, "HEAD") else { return anchors.to_vec() };
+    let Ok(checked) = check_all(repo, &head, anchors) else { return anchors.to_vec() };
+    anchors
+        .iter()
+        .zip(checked)
+        .map(|(a, c)| {
+            let (start, end) = match c.state {
+                AnchorState::Fresh => (a.start, a.end),
+                AnchorState::Relocated { start, end } => (start, end),
+                _ => return a.clone(),
+            };
+            cite(repo, &head, &a.path, a.symbol.as_deref(), start, end).unwrap_or_else(|_| a.clone())
+        })
+        .collect()
+}
+
 /// Today (UTC) as `YYYY-MM-DD`.
 fn today() -> String {
     // Howard Hinnant's civil_from_days.
@@ -176,20 +216,17 @@ impl Hub {
     /// The repo checkout `at` names, canonical: a task's repo, or a path inside a git work
     /// tree (its top level). Agent worktrees are refused: they are never indexed.
     pub(crate) fn dna_repo_of(&self, at: &DnaRef) -> Result<PathBuf> {
-        if let Some(task) = &at.task {
-            let t = self.lock().resolve(task)?;
-            return Ok(PathBuf::from(t.repo_path));
-        }
-        let Some(repo) = &at.repo else {
-            return Err(HubError::Invalid("name a repo or a task".into()));
+        let path = match (&at.task, &at.repo) {
+            (Some(task), _) => self.lock().resolve(task)?.repo_path,
+            (None, Some(repo)) => repo.clone(),
+            (None, None) => return Err(HubError::Invalid("name a repo or a task".into())),
         };
-        let p = std::fs::canonicalize(repo).map_err(|e| HubError::Invalid(format!("repo {repo}: {e}")))?;
-        let out = Git::new(&p).args(["rev-parse", "--show-toplevel"]).output();
-        let top = match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            _ => return Err(HubError::Invalid(format!("{repo} is not inside a git work tree"))),
-        };
-        let top = std::fs::canonicalize(&top).map_err(|e| HubError::Invalid(format!("repo {top}: {e}")))?;
+        self.checkout(&path)
+    }
+
+    /// [`toplevel`], refusing an agent worktree.
+    pub(crate) fn checkout(&self, path: &str) -> Result<PathBuf> {
+        let top = toplevel(path)?;
         let worktrees = self.paths.worktrees();
         let worktrees = std::fs::canonicalize(&worktrees).unwrap_or(worktrees);
         if top.starts_with(&worktrees) {
@@ -201,25 +238,46 @@ impl Hub {
         Ok(top)
     }
 
-    /// Reindexes `repo` (git and file reads unlocked), then emits `dna.indexed`.
+    /// The repo's refresh gate: one refresh (or freshness check) at a time per repo.
+    fn dna_gate(&self, repo: &Path) -> Arc<Mutex<()>> {
+        let mut gates = self.dna_gates.lock().unwrap_or_else(|p| p.into_inner());
+        gates.entry(key_of(repo)).or_default().clone()
+    }
+
+    /// Reindexes `repo` (git and file reads without the hub lock), one refresh at a time.
     pub(crate) fn dna_refresh(&self, repo: &Path) -> Result<RefreshReport> {
+        let gate = self.dna_gate(repo);
+        let _one = gate.lock().unwrap_or_else(|p| p.into_inner());
+        self.dna_refresh_gated(repo)
+    }
+
+    /// The refresh itself (the caller holds the repo's gate). Emits `dna.indexed` only when
+    /// the head or a count changed since the last one.
+    fn dna_refresh_gated(&self, repo: &Path) -> Result<RefreshReport> {
         let scan = index::scan(repo).map_err(dna_err)?;
         let checks = index::check_scan(repo, &scan).map_err(dna_err)?;
         let key = key_of(repo);
         let mut st = self.lock();
         let rep = index::apply(&mut st.store, &key, &scan, &checks)?;
         st.dna_sigs.insert(key.clone(), scan.signature);
-        st.event(
-            None,
-            "dna.indexed",
-            json!({ "repo": key, "notes": rep.notes, "stale": rep.stale, "unreviewed": rep.unreviewed }),
-        )?;
-        st.publish();
+        let payload = json!({
+            "repo": key, "head": rep.head, "notes": rep.notes, "stale": rep.stale,
+            "unreviewed": rep.unreviewed, "invalid": rep.invalid.len(),
+        });
+        if st.dna_indexed.get(&key) != Some(&payload) {
+            st.event(None, "dna.indexed", payload.clone())?;
+            st.dna_indexed.insert(key, payload);
+            st.publish();
+        }
         Ok(rep)
     }
 
-    /// Reindexes `repo` when HEAD or the memory directory changed since the last time.
+    /// Reindexes `repo` when HEAD or the memory directory changed since the last time. The
+    /// check runs under the repo's gate, so concurrent readers wait for one refresh instead
+    /// of each running their own.
     pub(crate) fn dna_ensure_fresh(&self, repo: &Path) -> Result<()> {
+        let gate = self.dna_gate(repo);
+        let _one = gate.lock().unwrap_or_else(|p| p.into_inner());
         let probe = index::probe(repo).map_err(dna_err)?;
         let key = key_of(repo);
         let stale = {
@@ -227,9 +285,18 @@ impl Hub {
             index::needs_refresh(&st.store, &key, &probe, st.dna_sigs.get(&key).map(String::as_str))?
         };
         if stale {
-            self.dna_refresh(repo)?;
+            self.dna_refresh_gated(repo)?;
         }
         Ok(())
+    }
+
+    /// `Conflict` unless memory is enabled for the repo `key`.
+    fn require_enabled(&self, key: &str) -> Result<()> {
+        if self.lock().store.dna_repo(key)?.is_some_and(|r| r.enabled) {
+            Ok(())
+        } else {
+            Err(HubError::Conflict("memory is not enabled for this repo".into()))
+        }
     }
 
     fn dna_status_of(&self, repo: &Path) -> Result<DnaStatus> {
@@ -378,24 +445,9 @@ impl Hub {
         if task.lifecycle == Lifecycle::Archived {
             return Err(HubError::Conflict(format!("task {} is archived", task.branch)));
         }
-        let repo = PathBuf::from(&task.repo_path);
+        let repo = self.checkout(&task.repo_path)?;
         let key = key_of(&repo);
-        {
-            let st = self.lock();
-            if !st.store.dna_repo(&key)?.is_some_and(|r| r.enabled) {
-                return Err(HubError::Conflict("memory is not enabled for this repo".into()));
-            }
-            if st.store.dna_pending_count(&task.id)? >= MAX_PENDING_PER_TASK {
-                return Err(HubError::Conflict(format!(
-                    "this task already has {MAX_PENDING_PER_TASK} proposals waiting for review"
-                )));
-            }
-            if st.store.dna_status(&key)?.pending >= MAX_PENDING_PER_REPO {
-                return Err(HubError::Conflict(format!(
-                    "this repo already has {MAX_PENDING_PER_REPO} proposals waiting for review"
-                )));
-            }
-        }
+        self.require_enabled(&key)?;
         let kind = Kind::parse(&p.kind)
             .ok_or_else(|| HubError::Invalid(format!("kind {:?}: use fact, decision, pattern or gotcha", p.kind)))?;
         let (title, body, mut redactions) = clean_text(&p.title, &p.body)?;
@@ -434,8 +486,7 @@ impl Hub {
             body: body.clone(),
         };
         note::render(&probe).map_err(invalid)?;
-        let mut st = self.lock();
-        let proposal = st.store.dna_insert_proposal(&NewProposal {
+        let new = NewProposal {
             repo: key,
             task_id: Some(task.id.clone()),
             origin: if agent_task.is_some() { "agent" } else { "cli" }.into(),
@@ -444,24 +495,46 @@ impl Hub {
             body,
             anchors,
             redactions,
+        };
+        let mut st = self.lock();
+        // The caps are counted inside the insert's transaction (with its `dna.proposed`).
+        let proposal = st.store.dna_insert_proposal(&new, CAPS).map_err(|e| match e {
+            CoreError::Limit(m) => HubError::Conflict(m),
+            e => e.into(),
         })?;
-        st.event(Some(&task.id), "dna.proposed", json!({ "id": proposal.id, "title": proposal.title }))?;
         st.publish();
         Ok(proposal)
     }
 
-    /// The review queue: proposals, oldest first, optionally of one repo and status.
+    /// The review queue: proposals, oldest first, a page at a time (pending by default; see
+    /// [`DnaProposals`]).
     pub fn dna_proposals(&self, q: DnaProposals) -> Result<Vec<ProposalView>> {
-        if let Some(s) = q.status.as_deref() {
-            if !matches!(s, "pending" | "accepted" | "rejected") {
-                return Err(HubError::Invalid(format!("status {s:?}: use pending, accepted or rejected")));
-            }
-        }
-        let key = match &q.repo {
+        let status = match q.status.as_deref().unwrap_or("pending") {
+            "all" => None,
+            s @ ("pending" | "accepted" | "rejected") => Some(s.to_string()),
+            s => return Err(HubError::Invalid(format!("status {s:?}: use pending, accepted, rejected or all"))),
+        };
+        let repo = match &q.repo {
             Some(r) => Some(key_of(&self.dna_repo_of(&DnaRef { repo: Some(r.clone()), task: None })?)),
             None => None,
         };
-        Ok(self.lock().store.dna_proposals(key.as_deref(), q.status.as_deref())?)
+        let st = self.lock();
+        let task_id = match &q.task {
+            Some(t) => Some(st.resolve(t)?.id),
+            None => None,
+        };
+        let query = ProposalQuery {
+            repo,
+            task_id,
+            status,
+            id: q.id,
+            after: q.after,
+            limit: q.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX),
+        };
+        st.store.dna_proposals(&query).map_err(|e| match e {
+            CoreError::NotFound { id, .. } => HubError::NotFound(format!("no proposal {id}")),
+            e => e.into(),
+        })
     }
 
     /// A person's decision. Accept writes `.mirante/memory/<slug>.md` (never overwriting;
@@ -477,25 +550,19 @@ impl Hub {
             return Err(HubError::Conflict(format!("proposal {} was already {}", p.id, p.status)));
         }
         let why = r.note.unwrap_or_default();
-        let decided = |st: &mut super::State, d: &ProposalView| -> Result<()> {
-            st.event(
-                d.task_id.as_deref(),
-                "dna.decided",
-                json!({ "id": d.id, "accepted": d.status == "accepted", "slug": d.slug }),
-            )?;
-            st.publish();
-            Ok(())
-        };
         let as_conflict = |e: CoreError| match e {
             CoreError::InvalidTransition { .. } => HubError::Conflict(format!("proposal {} was already decided", r.id)),
             e => e.into(),
         };
         if !r.accept {
+            // Rejecting writes nothing, so it stays possible in a disabled repo.
             let mut st = self.lock();
             let d = st.store.dna_decide(&p.id, false, None, &why).map_err(as_conflict)?;
-            decided(&mut st, &d)?;
+            st.publish();
             return Ok(d);
         }
+        self.require_enabled(&p.repo)?;
+        let repo = PathBuf::from(&p.repo);
         let (title, body, _) =
             clean_text(r.title.as_deref().unwrap_or(&p.title), r.body.as_deref().unwrap_or(&p.body))?;
         let kind = Kind::parse(&p.kind).ok_or_else(|| HubError::Invalid(format!("kind {:?}", p.kind)))?;
@@ -506,26 +573,26 @@ impl Hub {
             status: Status::Active,
             created: today(),
             source: p.task_id.as_ref().map_or_else(|| "cli".to_string(), |t| format!("task:{t}")),
-            anchors: p.anchors.clone(),
+            anchors: recite_at_checkout(&repo, &p.anchors),
             body,
         };
         let text = note::render(&n).map_err(|e| HubError::Invalid(e.to_string()))?;
-        let repo = PathBuf::from(&p.repo);
         fsio::init(&repo).map_err(dna_err)?;
         let slug = create_unique(&repo, &note::slugify(&n.title), &text).map_err(dna_err)?;
         let hash = sha256_hex(text.as_bytes());
+        // The decision, the ledger entry and `dna.decided` commit together or not at all.
         let accepted = {
             let mut st = self.lock();
-            st.store.dna_accept(&p.id, &slug, &why, &hash).map_err(as_conflict).and_then(|d| {
-                decided(&mut st, &d)?;
-                Ok(d)
-            })
+            let d = st.store.dna_accept(&p.id, &slug, &why, &hash).map_err(as_conflict);
+            st.publish();
+            d
         };
         let d = match accepted {
             Ok(d) => d,
             Err(e) => {
-                // Decided by someone else meanwhile: take back the file this call wrote.
-                // Through the directory descriptor, and only if it is still our text.
+                // Not accepted (decided by someone else meanwhile, or the store failed): take
+                // back the file this call wrote, through the directory descriptor, and only
+                // if it is still our text.
                 let _ = fsio::remove_note(&repo, &slug, &hash);
                 return Err(e);
             }
@@ -540,11 +607,17 @@ impl Hub {
 impl Hub {
     /// The task's memory: notes citing the files its branch changed (most cited first),
     /// then full-text hits on its title and goal (deduped, at most 10); the notes whose
-    /// cited lines the branch changed (checked at the branch tip: the per-task "Memory
-    /// CI"); and its proposals. git runs without the hub lock.
+    /// cited lines the branch changed (the per-task "Memory CI"); and its proposals (oldest
+    /// first, at most 50). git runs without the hub lock.
+    ///
+    /// At risk means: an anchor that is fresh or relocated at the checkout's HEAD, in a file
+    /// the branch changed, and stale at the branch tip. Only committed work counts:
+    /// uncommitted edits in the worktree are not checked (an agent commits before it cites,
+    /// and the tip is what would merge). An anchor already stale at the checkout is not the
+    /// task's doing and is not listed.
     pub fn dna_task_context(&self, task_ref: &str) -> Result<DnaTaskContext> {
         let task = self.lock().resolve(task_ref)?;
-        let repo = PathBuf::from(&task.repo_path);
+        let repo = self.checkout(&task.repo_path)?;
         let key = key_of(&repo);
         let enabled = self.lock().store.dna_repo(&key)?.is_some_and(|r| r.enabled);
         if !enabled {
@@ -570,11 +643,16 @@ impl Hub {
                 Some(q) => st.store.dna_search(&key, &q, RELEVANT_MAX)?,
                 None => Vec::new(),
             };
+            let query = ProposalQuery {
+                repo: Some(key.clone()),
+                task_id: Some(task.id.clone()),
+                limit: PAGE_DEFAULT,
+                ..Default::default()
+            };
             let proposals: Vec<ProposalView> = st
                 .store
-                .dna_proposals(Some(&key), None)?
+                .dna_proposals(&query)?
                 .into_iter()
-                .filter(|p| p.task_id.as_deref() == Some(task.id.as_str()))
                 .map(|p| ProposalView { title: field(&p.title, MAX_TITLE_CHARS * 4), ..p })
                 .collect();
             (citing, hits, proposals)
@@ -585,11 +663,13 @@ impl Hub {
                 relevant.push(n.clone());
             }
         }
-        // At risk: the anchors in changed files, checked at the branch tip.
+        // At risk: the anchors in changed files that hold at the checkout, checked at the
+        // branch tip.
         let mut at_risk = Vec::new();
+        let holds = |a: &IndexedAnchor| matches!(a.state, AnchorState::Fresh | AnchorState::Relocated { .. });
         let cited: Vec<(&NoteRow, &IndexedAnchor)> = citing
             .iter()
-            .flat_map(|n| n.anchors.iter().filter(|a| files.contains(&a.anchor.path)).map(move |a| (n, a)))
+            .flat_map(|n| n.anchors.iter().filter(|a| files.contains(&a.anchor.path) && holds(a)).map(move |a| (n, a)))
             .collect();
         if live && !cited.is_empty() {
             let tip = rev_parse(worktree, "HEAD").map_err(dna_err)?;
@@ -623,6 +703,7 @@ impl Hub {
     pub fn dna_note_action(&self, caller: &Caller, a: DnaNoteAction) -> Result<NoteView> {
         self.require_person(caller)?;
         let repo = self.dna_repo_of(&DnaRef { repo: Some(a.repo.clone()), task: None })?;
+        self.require_enabled(&key_of(&repo))?;
         let text = fsio::read_note(&repo, &a.slug).map_err(dna_err)?;
         if sha256_hex(text.as_bytes()) != a.expect_hash {
             return Err(dna_err(DnaError::Changed));
@@ -656,9 +737,9 @@ impl Hub {
         fsio::update_note(&repo, &a.slug, &a.expect_hash, &updated).map_err(dna_err)?;
         let key = key_of(&repo);
         {
+            // The ledger entry and its `dna.changed` event commit together.
             let mut st = self.lock();
             st.store.dna_record_review(&key, &a.slug, &sha256_hex(updated.as_bytes()), "confirmed")?;
-            st.event(None, "dna.changed", json!({ "repo": key, "slug": a.slug }))?;
             st.publish();
         }
         self.dna_refresh(&repo)?;
@@ -809,8 +890,10 @@ pub(crate) mod tests {
         assert_eq!((p.anchors[0].start, p.anchors[0].end, p.anchors[0].symbol.as_deref()), (2, 4, Some("spool")));
         assert_eq!(p.task_id.as_deref(), Some(t.id.as_str()));
         assert!(k.kinds(&t.id).contains(&"dna.proposed".to_string()));
-        let queue =
-            k.hub.dna_proposals(DnaProposals { repo: Some(k.repo.to_string_lossy().into()), status: None }).unwrap();
+        let queue = k
+            .hub
+            .dna_proposals(DnaProposals { repo: Some(k.repo.to_string_lossy().into()), ..Default::default() })
+            .unwrap();
         assert_eq!(queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), [p.id.as_str()]);
         assert_eq!(k.hub.dna_status(&k.repo_ref()).unwrap().pending, 1);
     }
@@ -873,7 +956,7 @@ pub(crate) mod tests {
         assert_eq!(n.body, "Falls back.\n");
         let key = k.repo.canonicalize().unwrap().to_string_lossy().into_owned();
         assert!(k.hub.lock().store.dna_is_reviewed(&key, "hook-spool-fallback", &sha256_hex(text.as_bytes())).unwrap());
-        assert!(k.kinds(&t.id).contains(&"dna.decided".to_string()));
+        assert_eq!(k.kinds(&t.id).iter().filter(|e| *e == "dna.decided").count(), 1);
         let v = k.hub.dna_get(DnaGet { at: k.repo_ref(), slug: "hook-spool-fallback".into() }).unwrap();
         assert!(v.summary.reviewed);
         let again = k.hub.dna_review(&Caller::Person, review_accept(&p.id));
@@ -881,6 +964,41 @@ pub(crate) mod tests {
         // Never committed for the user.
         let log = Command::new("git").arg("-C").arg(&k.repo).args(["status", "--porcelain"]).output().unwrap();
         assert!(String::from_utf8_lossy(&log.stdout).contains(".mirante/"));
+    }
+
+    #[test]
+    fn accept_recites_anchors_whose_code_is_already_in_the_checkout() {
+        let k = Kit::new();
+        commit_in(&k.repo, "src/a.rs", CODE);
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        let t = k.create(AgentKind::Claude, "recite").task;
+        commit_in(&t.worktree_path, "src/z.rs", "z\n");
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Spool", "b", "src/a.rs", 2, 4)).unwrap();
+        assert_eq!(p.anchors[0].commit, head_of(&t.worktree_path));
+        let d = k.hub.dna_review(&Caller::Person, review_accept(&p.id)).unwrap();
+        let text = std::fs::read_to_string(k.repo.join(format!(".mirante/memory/{}.md", d.slug.unwrap()))).unwrap();
+        let n = mirante_core::dna::note::parse(&text).unwrap();
+        assert_eq!((n.anchors[0].commit.clone(), n.anchors[0].start), (head_of(&k.repo), 2));
+        assert_eq!(n.anchors[0].fingerprint, p.anchors[0].fingerprint);
+    }
+
+    #[test]
+    fn accept_and_note_actions_need_memory_enabled() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        let t = k.create(AgentKind::Claude, "mem").task;
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "Late", "b", "src/a.rs", 1, 1)).unwrap();
+        let b = view(&k, "b");
+        k.hub.dna_disable(&k.repo_ref(), &Caller::Person).unwrap();
+        let acc = k.hub.dna_review(&Caller::Person, review_accept(&p.id));
+        assert!(matches!(&acc, Err(HubError::Conflict(m)) if m.contains("not enabled")), "{acc:?}");
+        assert_eq!(k.hub.lock().store.dna_proposal(&p.id).unwrap().status, "pending");
+        assert!(!k.repo.join(".mirante/memory/late.md").exists());
+        let act = k.hub.dna_note_action(&Caller::Person, action(&k, "b", NoteAction::Retire, &b.content_hash));
+        assert!(matches!(&act, Err(HubError::Conflict(m)) if m.contains("not enabled")), "{act:?}");
+        // Rejecting writes nothing, so it stays possible.
+        let r = DnaReview { id: p.id.clone(), accept: false, ..Default::default() };
+        assert_eq!(k.hub.dna_review(&Caller::Person, r).unwrap().status, "rejected");
     }
 
     #[test]
@@ -1052,6 +1170,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn at_risk_skips_anchors_already_stale_at_the_checkout() {
+        let k = Kit::new();
+        with_a_and_b(&k);
+        commit_in(&k.repo, "src/b.rs", &CODE.replace("write()", "flush()"));
+        assert_eq!(view(&k, "b").summary.state, "stale");
+        let t = k.create(AgentKind::Claude, "late").task;
+        commit_in(&t.worktree_path, "src/b.rs", &CODE.replace("write()", "sync()"));
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        assert!(c.at_risk.is_empty(), "stale before the task touched it: {:?}", c.at_risk);
+    }
+
+    #[test]
+    fn a_task_created_from_a_subdirectory_uses_the_checkout() {
+        let k = Kit::new();
+        commit_in(&k.repo, "sub/keep.txt", "k\n");
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        let t = k
+            .hub
+            .create_task(mirante_ipc::types::CreateTask {
+                repo: k.repo.join("sub").to_string_lossy().into_owned(),
+                agent: AgentKind::Claude,
+                branch: "from-sub".into(),
+                base: None,
+                goal: "g".into(),
+                title: None,
+            })
+            .unwrap()
+            .task;
+        commit_in(&t.worktree_path, "src/a.rs", CODE);
+        let by_task = DnaRef { repo: None, task: Some(t.id.clone()) };
+        assert_eq!(k.hub.dna_status(&by_task).unwrap().repo, key(&k));
+        let p = k.hub.dna_propose(&Caller::Person, propose(&t.id, "T", "b", "src/a.rs", 1, 1)).unwrap();
+        assert_eq!(p.repo, key(&k));
+        let c = k.hub.dna_task_context(&t.id).unwrap();
+        assert!(c.enabled && c.proposals.len() == 1);
+    }
+
+    #[test]
+    fn the_queue_defaults_to_pending_filters_by_task_and_pages() {
+        let k = Kit::new();
+        let t = proposing(&k, "mem");
+        let u = k.create(AgentKind::Claude, "other").task;
+        commit_in(&u.worktree_path, "src/a.rs", CODE);
+        let a = k.hub.dna_propose(&Caller::Person, propose(&t.id, "A", "b", "src/a.rs", 1, 1)).unwrap().id;
+        let b = k.hub.dna_propose(&Caller::Person, propose(&u.id, "B", "b", "src/a.rs", 1, 1)).unwrap().id;
+        let c = k.hub.dna_propose(&Caller::Person, propose(&t.id, "C", "b", "src/a.rs", 1, 1)).unwrap().id;
+        k.hub.dna_review(&Caller::Person, DnaReview { id: a.clone(), accept: false, ..Default::default() }).unwrap();
+        let ids = |q: DnaProposals| k.hub.dna_proposals(q).unwrap().into_iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(DnaProposals::default()), [b.clone(), c.clone()]);
+        assert_eq!(
+            ids(DnaProposals { status: Some("all".into()), ..Default::default() }),
+            [a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(ids(DnaProposals { task: Some("mem".into()), ..Default::default() }), [c.as_str()]);
+        assert_eq!(ids(DnaProposals { limit: Some(1), ..Default::default() }), [b.as_str()]);
+        assert_eq!(ids(DnaProposals { after: Some(b.clone()), ..Default::default() }), [c.as_str()]);
+        assert_eq!(ids(DnaProposals { id: Some(a.clone()), status: Some("all".into()), ..Default::default() }), [a]);
+        let bad = k.hub.dna_proposals(DnaProposals { status: Some("bogus".into()), ..Default::default() });
+        assert!(matches!(bad, Err(HubError::Invalid(_))), "{bad:?}");
+        let gone = k.hub.dna_proposals(DnaProposals { after: Some("nope".into()), ..Default::default() });
+        assert!(matches!(gone, Err(HubError::NotFound(_))), "{gone:?}");
+    }
+
+    #[test]
     fn context_of_a_repo_without_memory_says_disabled() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "off").task;
@@ -1190,6 +1372,21 @@ pub(crate) mod tests {
         assert_eq!(last["repo"].as_str(), Some(k.repo.canonicalize().unwrap().to_str().unwrap()));
         let st = k.hub.dna_status(&k.repo_ref()).unwrap();
         assert_eq!((st.notes, st.invalid, st.unreviewed, st.pending), (2, 1, 2, 0));
+    }
+
+    #[test]
+    fn dna_indexed_is_emitted_only_when_something_changed() {
+        let k = Kit::new();
+        with_two_notes(&k);
+        k.hub.dna_check(&k.repo_ref()).unwrap();
+        let n = k.payloads("dna.indexed").len();
+        k.hub.dna_check(&k.repo_ref()).unwrap();
+        k.hub.dna_status(&k.repo_ref()).unwrap();
+        k.hub.dna_search(DnaSearch { at: k.repo_ref(), query: "spool".into(), limit: None }).unwrap();
+        assert_eq!(k.payloads("dna.indexed").len(), n);
+        write_note(&k.repo, "late", &note_text(&k.repo, "Late", "x", "src/a.rs", 1, 1));
+        k.hub.dna_status(&k.repo_ref()).unwrap();
+        assert_eq!(k.payloads("dna.indexed").len(), n + 1);
     }
 
     #[test]

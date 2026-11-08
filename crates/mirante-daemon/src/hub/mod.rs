@@ -98,6 +98,7 @@ impl From<HubError> for RpcError {
                 | CoreError::DirtyWorktree { .. }
                 | CoreError::OutsideRoot { .. },
             )
+            | HubError::Core(CoreError::Limit(_))
             | HubError::Conflict(_)
             | HubError::Driver(DriverError::NoDialog(_) | DriverError::NotNow(_) | DriverError::NativeGone(_)) => {
                 code::CONFLICT
@@ -297,6 +298,8 @@ pub(crate) struct State {
     pub(crate) paths: Paths,
     /// DNA: each indexed repo's `.mirante/memory` stat signature at its last refresh.
     pub(crate) dna_sigs: HashMap<String, String>,
+    /// DNA: the last `dna.indexed` payload per repo (a refresh that changes nothing is silent).
+    pub(crate) dna_indexed: HashMap<String, Value>,
 }
 
 pub struct Hub {
@@ -309,6 +312,8 @@ pub struct Hub {
     /// Mirante types Claude permission answers (off by default; see
     /// [`Hub::set_claude_inline_answers`]).
     pub(crate) claude_inline: AtomicBool,
+    /// DNA: one refresh at a time per repo (taken before, never while holding, the hub lock).
+    pub(crate) dna_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// Highest event seq in the store (0 when empty).
@@ -466,6 +471,7 @@ impl Hub {
                 mem: memory::MemShared::default(),
                 paths: paths.clone(),
                 dna_sigs: HashMap::new(),
+                dna_indexed: HashMap::new(),
             }),
             worktrees: WorktreeManager::new(&paths.worktrees()),
             paths,
@@ -473,6 +479,7 @@ impl Hub {
             events: tx,
             boot_timeout: Duration::from_secs(45),
             claude_inline: AtomicBool::new(false),
+            dna_gates: Mutex::default(),
         };
         Ok((hub, rx))
     }

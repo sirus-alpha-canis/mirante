@@ -650,13 +650,26 @@ pub struct DnaPropose {
     pub anchors: Vec<ProposeAnchor>,
 }
 
+/// The review queue, oldest first, a page at a time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnaProposals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// `pending`, `accepted` or `rejected`; all when absent.
+    /// `pending` (the default), `accepted`, `rejected` or `all`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Only this task's proposals (a task reference: id, branch or id suffix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Only the proposal with this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The next page: proposals after this id (the last one of the previous page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Default 50, at most 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,8 +1,9 @@
 //! The daemon's regenerable index of `.mirante/memory` (notes, anchors, links, FTS5), plus
 //! the two tables that are not regenerable: the proposal queue and the trust ledger of
 //! content hashes a person accepted or confirmed.
-use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use std::path::Path;
 
@@ -12,7 +13,7 @@ use super::fsio::MemoryDir;
 use super::{note, sha256_hex, DnaError, MAX_NOTES};
 use crate::error::{CoreError, Result};
 use crate::model::{new_id, now_ms};
-use crate::store::Store;
+use crate::store::{insert_event, Store};
 
 /// Most terms a search uses, and most chars per term.
 const MAX_QUERY_TERMS: usize = 12;
@@ -105,6 +106,27 @@ pub struct NewProposal {
     pub redactions: usize,
 }
 
+/// Most pending proposals one task, and one repo, may have at once
+/// ([`Store::dna_insert_proposal`] counts them inside its own transaction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalCaps {
+    pub per_task: usize,
+    pub per_repo: usize,
+}
+
+/// Which proposals [`Store::dna_proposals`] returns: oldest first, filtered, at most
+/// `limit`, starting after the proposal `after` (a cursor: the last id of the previous page).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProposalQuery {
+    pub repo: Option<String>,
+    pub task_id: Option<String>,
+    /// `pending`, `accepted` or `rejected`; every status when `None`.
+    pub status: Option<String>,
+    pub id: Option<String>,
+    pub after: Option<String>,
+    pub limit: usize,
+}
+
 /// A proposed note waiting for (or past) a person's review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
@@ -195,8 +217,16 @@ fn load_proposal(tx: &rusqlite::Connection, id: &str) -> Result<Proposal> {
 }
 
 /// Marks a pending proposal decided (the trigger refuses a second decision even if this
-/// check is bypassed).
-fn decide(tx: &Transaction<'_>, id: &str, accepted: bool, slug: Option<&str>, note: &str) -> Result<Proposal> {
+/// check is bypassed) and appends `dna.decided` to the audit trail, in the caller's
+/// transaction.
+fn decide(
+    tx: &Transaction<'_>,
+    boot_id: &str,
+    id: &str,
+    accepted: bool,
+    slug: Option<&str>,
+    note: &str,
+) -> Result<Proposal> {
     let p = load_proposal(tx, id)?;
     let to = if accepted { "accepted" } else { "rejected" };
     if p.status != "pending" {
@@ -206,14 +236,88 @@ fn decide(tx: &Transaction<'_>, id: &str, accepted: bool, slug: Option<&str>, no
         "UPDATE dna_proposals SET status = ?2, slug = ?3, decision_note = ?4, decided_at = ?5 WHERE id = ?1",
         params![id, to, slug, note, now_ms()],
     )?;
-    load_proposal(tx, id)
+    let p = load_proposal(tx, id)?;
+    let payload = json!({ "id": p.id, "accepted": accepted, "slug": p.slug });
+    insert_event(tx, boot_id, p.task_id.as_deref(), "dna.decided", &payload)?;
+    Ok(p)
 }
 
-fn record_review(tx: &rusqlite::Connection, repo: &str, slug: &str, hash: &str, how: &str) -> Result<()> {
+/// Records `hash` as the slug's current reviewed content; every other review of the slug
+/// is superseded (kept as history, no longer counted).
+fn record_review(tx: &Connection, repo: &str, slug: &str, hash: &str, how: &str) -> Result<()> {
+    let now = now_ms();
+    tx.execute(
+        "UPDATE dna_reviews SET superseded_at = ?4
+         WHERE repo = ?1 AND slug = ?2 AND content_hash != ?3 AND superseded_at IS NULL",
+        params![repo, slug, hash, now],
+    )?;
     tx.execute(
         "INSERT INTO dna_reviews (repo, slug, content_hash, how, reviewed_at) VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT (repo, slug, content_hash) DO NOTHING",
-        params![repo, slug, hash, how, now_ms()],
+         ON CONFLICT (repo, slug, content_hash) DO UPDATE SET superseded_at = NULL",
+        params![repo, slug, hash, how, now],
+    )?;
+    Ok(())
+}
+
+fn count(tx: &Connection, sql: &str, arg: &str) -> Result<usize> {
+    Ok(tx.query_row(sql, [arg], |r| r.get::<_, i64>(0))? as usize)
+}
+
+fn replace_index(tx: &Connection, repo: &str, notes: &[IndexedNote]) -> Result<()> {
+    for table in ["dna_notes", "dna_anchors", "dna_links", "dna_fts"] {
+        tx.execute(&format!("DELETE FROM {table} WHERE repo = ?1"), [repo])?;
+    }
+    for n in notes {
+        tx.execute(
+            &format!("INSERT INTO dna_notes (repo, {NOTE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            params![repo, n.slug, n.id, n.title, n.kind, n.status, n.body, n.content_hash, n.source, n.parse_error],
+        )?;
+        for (idx, a) in n.anchors.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO dna_anchors (repo, slug, idx, path, symbol, line_start, line_end, commit_sha,
+                     fingerprint, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unchecked')",
+                params![repo, n.slug, idx as i64, a.path, a.symbol, a.start, a.end, a.commit, a.fingerprint],
+            )?;
+        }
+        for dst in &n.links {
+            tx.execute(
+                "INSERT OR IGNORE INTO dna_links (repo, src, dst) VALUES (?1, ?2, ?3)",
+                params![repo, n.slug, dst],
+            )?;
+        }
+        if n.parse_error.is_none() {
+            tx.execute(
+                "INSERT INTO dna_fts (repo, slug, title, body) VALUES (?1, ?2, ?3, ?4)",
+                params![repo, n.slug, n.title, n.body],
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO dna_repos (repo, enabled, indexed_at, updated_at) VALUES (?1, 0, ?2, ?2)
+         ON CONFLICT (repo) DO UPDATE SET indexed_at = ?2, updated_at = ?2",
+        params![repo, now_ms()],
+    )?;
+    Ok(())
+}
+
+fn set_anchor_states(
+    tx: &Connection,
+    repo: &str,
+    head: Option<&str>,
+    states: &[(String, u32, AnchorState)],
+) -> Result<()> {
+    for (slug, idx, state) in states {
+        let (s, reason, now_start, now_end) = state_columns(state);
+        tx.execute(
+            "UPDATE dna_anchors SET state = ?4, reason = ?5, now_start = ?6, now_end = ?7
+             WHERE repo = ?1 AND slug = ?2 AND idx = ?3",
+            params![repo, slug, idx, s, reason, now_start, now_end],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO dna_repos (repo, enabled, checked_head, updated_at) VALUES (?1, 0, ?2, ?3)
+         ON CONFLICT (repo) DO UPDATE SET checked_head = ?2, updated_at = ?3",
+        params![repo, head, now_ms()],
     )?;
     Ok(())
 }
@@ -242,41 +346,7 @@ impl Store {
     /// Replaces the repo's whole index (notes, anchors as `unchecked`, links, FTS rows).
     pub fn dna_replace_index(&mut self, repo: &str, notes: &[IndexedNote]) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for table in ["dna_notes", "dna_anchors", "dna_links", "dna_fts"] {
-            tx.execute(&format!("DELETE FROM {table} WHERE repo = ?1"), [repo])?;
-        }
-        for n in notes {
-            tx.execute(
-                &format!(
-                    "INSERT INTO dna_notes (repo, {NOTE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
-                ),
-                params![repo, n.slug, n.id, n.title, n.kind, n.status, n.body, n.content_hash, n.source, n.parse_error],
-            )?;
-            for (idx, a) in n.anchors.iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO dna_anchors (repo, slug, idx, path, symbol, line_start, line_end, commit_sha,
-                         fingerprint, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unchecked')",
-                    params![repo, n.slug, idx as i64, a.path, a.symbol, a.start, a.end, a.commit, a.fingerprint],
-                )?;
-            }
-            for dst in &n.links {
-                tx.execute(
-                    "INSERT OR IGNORE INTO dna_links (repo, src, dst) VALUES (?1, ?2, ?3)",
-                    params![repo, n.slug, dst],
-                )?;
-            }
-            if n.parse_error.is_none() {
-                tx.execute(
-                    "INSERT INTO dna_fts (repo, slug, title, body) VALUES (?1, ?2, ?3, ?4)",
-                    params![repo, n.slug, n.title, n.body],
-                )?;
-            }
-        }
-        tx.execute(
-            "INSERT INTO dna_repos (repo, enabled, indexed_at, updated_at) VALUES (?1, 0, ?2, ?2)
-             ON CONFLICT (repo) DO UPDATE SET indexed_at = ?2, updated_at = ?2",
-            params![repo, now_ms()],
-        )?;
+        replace_index(&tx, repo, notes)?;
         tx.commit()?;
         Ok(())
     }
@@ -289,19 +359,23 @@ impl Store {
         states: &[(String, u32, AnchorState)],
     ) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (slug, idx, state) in states {
-            let (s, reason, now_start, now_end) = state_columns(state);
-            tx.execute(
-                "UPDATE dna_anchors SET state = ?4, reason = ?5, now_start = ?6, now_end = ?7
-                 WHERE repo = ?1 AND slug = ?2 AND idx = ?3",
-                params![repo, slug, idx, s, reason, now_start, now_end],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO dna_repos (repo, enabled, checked_head, updated_at) VALUES (?1, 0, ?2, ?3)
-             ON CONFLICT (repo) DO UPDATE SET checked_head = ?2, updated_at = ?3",
-            params![repo, head, now_ms()],
-        )?;
+        set_anchor_states(&tx, repo, head, states)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// [`Store::dna_replace_index`] then [`Store::dna_set_anchor_states`] in one transaction:
+    /// a reader never sees the new notes with every anchor `unchecked`.
+    pub fn dna_apply_index(
+        &mut self,
+        repo: &str,
+        notes: &[IndexedNote],
+        head: Option<&str>,
+        states: &[(String, u32, AnchorState)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        replace_index(&tx, repo, notes)?;
+        set_anchor_states(&tx, repo, head, states)?;
         tx.commit()?;
         Ok(())
     }
@@ -401,15 +475,30 @@ impl Store {
             unreviewed: count(
                 "SELECT COUNT(*) FROM dna_notes n WHERE n.repo = ?1 AND n.parse_error IS NULL AND NOT EXISTS (
                      SELECT 1 FROM dna_reviews r WHERE r.repo = n.repo AND r.slug = n.slug
-                     AND r.content_hash = n.content_hash)",
+                     AND r.content_hash = n.content_hash AND r.superseded_at IS NULL)",
             )?,
             pending: count("SELECT COUNT(*) FROM dna_proposals WHERE repo = ?1 AND status = 'pending'")?,
             invalid: count("SELECT COUNT(*) FROM dna_notes WHERE repo = ?1 AND parse_error IS NOT NULL")?,
         })
     }
 
-    pub fn dna_insert_proposal(&mut self, p: &NewProposal) -> Result<Proposal> {
+    /// Queues a proposal and appends `dna.proposed`, in one transaction that also counts the
+    /// pending proposals against `caps` (so two concurrent proposals cannot both pass).
+    pub fn dna_insert_proposal(&mut self, p: &NewProposal, caps: ProposalCaps) -> Result<Proposal> {
+        let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(task) = &p.task_id {
+            let n = count(&tx, "SELECT COUNT(*) FROM dna_proposals WHERE task_id = ?1 AND status = 'pending'", task)?;
+            if n >= caps.per_task {
+                let max = caps.per_task;
+                return Err(CoreError::Limit(format!("this task already has {max} proposals waiting for review")));
+            }
+        }
+        let n = count(&tx, "SELECT COUNT(*) FROM dna_proposals WHERE repo = ?1 AND status = 'pending'", &p.repo)?;
+        if n >= caps.per_repo {
+            let max = caps.per_repo;
+            return Err(CoreError::Limit(format!("this repo already has {max} proposals waiting for review")));
+        }
         let id = new_id();
         tx.execute(
             "INSERT INTO dna_proposals (id, repo, task_id, origin, title, kind, body, anchors, redactions, status,
@@ -428,6 +517,7 @@ impl Store {
             ],
         )?;
         let out = load_proposal(&tx, &id)?;
+        insert_event(&tx, &boot, p.task_id.as_deref(), "dna.proposed", &json!({ "id": out.id, "title": out.title }))?;
         tx.commit()?;
         Ok(out)
     }
@@ -436,50 +526,70 @@ impl Store {
         load_proposal(&self.conn, id)
     }
 
-    /// Proposals, oldest first, optionally of one repo and/or one status.
-    pub fn dna_proposals(&self, repo: Option<&str>, status: Option<&str>) -> Result<Vec<Proposal>> {
+    /// Proposals, oldest first (see [`ProposalQuery`]). An unknown `after` is `NotFound`.
+    pub fn dna_proposals(&self, q: &ProposalQuery) -> Result<Vec<Proposal>> {
+        let cursor: Option<(i64, String)> = match &q.after {
+            Some(id) => Some(
+                self.conn
+                    .query_row("SELECT created_at, id FROM dna_proposals WHERE id = ?1", [id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .optional()?
+                    .ok_or_else(|| CoreError::NotFound { kind: "proposal", id: id.clone() })?,
+            ),
+            None => None,
+        };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PROPOSAL_COLUMNS} FROM dna_proposals
-             WHERE (?1 IS NULL OR repo = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY created_at, id"
+             WHERE (?1 IS NULL OR repo = ?1) AND (?2 IS NULL OR task_id = ?2) AND (?3 IS NULL OR status = ?3)
+               AND (?4 IS NULL OR id = ?4)
+               AND (?5 IS NULL OR created_at > ?5 OR (created_at = ?5 AND id > ?6))
+             ORDER BY created_at, id LIMIT ?7"
         ))?;
-        let rows = stmt.query_map(params![repo, status], proposal_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Pending proposals of one task.
-    pub fn dna_pending_count(&self, task_id: &str) -> Result<usize> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM dna_proposals WHERE task_id = ?1 AND status = 'pending'",
-            [task_id],
-            |r| r.get(0),
+        let rows = stmt.query_map(
+            params![
+                q.repo,
+                q.task_id,
+                q.status,
+                q.id,
+                cursor.as_ref().map(|c| c.0),
+                cursor.as_ref().map(|c| c.1.as_str()),
+                q.limit as i64
+            ],
+            proposal_from_row,
         )?;
-        Ok(n as usize)
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Accepts (with the note's `slug`) or rejects a pending proposal. A decided one is
     /// `InvalidTransition`.
     pub fn dna_decide(&mut self, id: &str, accepted: bool, slug: Option<&str>, note: &str) -> Result<Proposal> {
+        let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let p = decide(&tx, id, accepted, slug, note)?;
+        let p = decide(&tx, &boot, id, accepted, slug, note)?;
         tx.commit()?;
         Ok(p)
     }
 
     /// Accepts a pending proposal as the note `slug` and records its exact content as
-    /// reviewed, in one transaction.
+    /// reviewed, with its `dna.decided` event, in one transaction.
     pub fn dna_accept(&mut self, id: &str, slug: &str, note: &str, content_hash: &str) -> Result<Proposal> {
+        let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let p = decide(&tx, id, true, Some(slug), note)?;
+        let p = decide(&tx, &boot, id, true, Some(slug), note)?;
         record_review(&tx, &p.repo, slug, content_hash, "accepted")?;
         tx.commit()?;
         Ok(p)
     }
 
     /// Records that a person accepted or confirmed this exact content (`how`: `accepted` or
-    /// `confirmed`). Idempotent.
+    /// `confirmed`), superseding the slug's earlier reviews, and appends `dna.changed`, in one
+    /// transaction.
     pub fn dna_record_review(&mut self, repo: &str, slug: &str, content_hash: &str, how: &str) -> Result<()> {
+        let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         record_review(&tx, repo, slug, content_hash, how)?;
+        insert_event(&tx, &boot, None, "dna.changed", &json!({ "repo": repo, "slug": slug }))?;
         tx.commit()?;
         Ok(())
     }
@@ -488,7 +598,8 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT 1 FROM dna_reviews WHERE repo = ?1 AND slug = ?2 AND content_hash = ?3",
+                "SELECT 1 FROM dna_reviews
+                 WHERE repo = ?1 AND slug = ?2 AND content_hash = ?3 AND superseded_at IS NULL",
                 params![repo, slug, content_hash],
                 |_| Ok(()),
             )
@@ -675,8 +786,7 @@ pub fn check_scan(repo: &Path, scan: &Scan) -> std::result::Result<Checks, DnaEr
 /// Writes a scan and its checks to the index and reports the counts.
 pub fn apply(store: &mut Store, key: &str, scan: &Scan, checks: &Checks) -> Result<RefreshReport> {
     let (head, states) = checks;
-    store.dna_replace_index(key, &scan.notes)?;
-    store.dna_set_anchor_states(key, head.as_deref(), states)?;
+    store.dna_apply_index(key, &scan.notes, head.as_deref(), states)?;
     let notes_with = |want: fn(&AnchorState) -> bool| {
         let mut slugs: Vec<&str> = states.iter().filter(|(_, _, s)| want(s)).map(|(s, _, _)| s.as_str()).collect();
         slugs.dedup();
@@ -782,11 +892,17 @@ mod store_tests {
         }
     }
 
+    const CAPS: ProposalCaps = ProposalCaps { per_task: 20, per_repo: 200 };
+
+    fn kinds(s: &Store) -> Vec<(Option<String>, String)> {
+        s.events_since(0, 1000).unwrap().into_iter().map(|e| (e.task_id, e.kind)).collect()
+    }
+
     #[test]
     fn migration_5_creates_fts_and_the_decided_once_trigger() {
         let mut s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 5);
-        let p = s.dna_insert_proposal(&new_proposal("r", None)).unwrap();
+        assert!(s.schema_version().unwrap() >= 5);
+        let p = s.dna_insert_proposal(&new_proposal("r", None), CAPS).unwrap();
         assert_eq!((p.status.as_str(), p.anchors.len()), ("pending", 1));
         let d = s.dna_decide(&p.id, true, Some("slug-a"), "").unwrap();
         assert_eq!((d.status.as_str(), d.slug.as_deref()), ("accepted", Some("slug-a")));
@@ -858,13 +974,134 @@ mod store_tests {
         assert!(s.dna_repo("r").unwrap().unwrap().enabled);
         s.dna_set_enabled("r", false).unwrap();
         assert!(!s.dna_repo("r").unwrap().unwrap().enabled);
-        let a = s.dna_insert_proposal(&new_proposal("r", None)).unwrap();
-        s.dna_insert_proposal(&new_proposal("r2", None)).unwrap();
+        let a = s.dna_insert_proposal(&new_proposal("r", None), CAPS).unwrap();
+        s.dna_insert_proposal(&new_proposal("r2", None), CAPS).unwrap();
         s.dna_decide(&a.id, false, None, "no").unwrap();
-        assert_eq!(s.dna_proposals(Some("r"), None).unwrap().len(), 1);
-        assert_eq!(s.dna_proposals(None, Some("pending")).unwrap().len(), 1);
+        let q = |repo: Option<&str>, status: Option<&str>| ProposalQuery {
+            repo: repo.map(str::to_string),
+            status: status.map(str::to_string),
+            limit: 100,
+            ..Default::default()
+        };
+        assert_eq!(s.dna_proposals(&q(Some("r"), None)).unwrap().len(), 1);
+        assert_eq!(s.dna_proposals(&q(None, Some("pending"))).unwrap().len(), 1);
         assert_eq!(s.dna_status("r2").unwrap().pending, 1);
         assert_eq!(s.dna_proposal(&a.id).unwrap().decision_note, "no");
+    }
+
+    #[test]
+    fn migration_6_supersedes_older_reviews_of_a_slug() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(s.schema_version().unwrap(), 6);
+        s.dna_record_review("r", "a", "h1", "accepted").unwrap();
+        s.dna_record_review("r", "a", "h2", "confirmed").unwrap();
+        // Retired (h2): restoring the old accepted text (h1) is not reviewed any more.
+        assert!(!s.dna_is_reviewed("r", "a", "h1").unwrap());
+        assert!(s.dna_is_reviewed("r", "a", "h2").unwrap());
+        // Another slug's ledger is untouched; a person confirming h1 again makes it current.
+        s.dna_record_review("r", "b", "h1", "accepted").unwrap();
+        assert!(s.dna_is_reviewed("r", "b", "h1").unwrap());
+        s.dna_record_review("r", "a", "h1", "confirmed").unwrap();
+        assert!(s.dna_is_reviewed("r", "a", "h1").unwrap() && !s.dna_is_reviewed("r", "a", "h2").unwrap());
+        let mut a = row("a", "A", "x");
+        a.content_hash = "h2".into();
+        s.dna_replace_index("r", &[a]).unwrap();
+        assert_eq!(s.dna_status("r").unwrap().unreviewed, 1);
+    }
+
+    #[test]
+    fn every_dna_state_change_writes_its_event_in_the_same_transaction() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO tasks (id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status,
+                     created_at, updated_at) VALUES ('t1', 't', '/r', '/w', 'b', 'claude', 'g', '', 'active', 'idle', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let p = s.dna_insert_proposal(&new_proposal("r", Some("t1")), CAPS).unwrap();
+        let q = s.dna_insert_proposal(&new_proposal("r", None), CAPS).unwrap();
+        s.dna_accept(&p.id, "slug-a", "ok", "h").unwrap();
+        s.dna_decide(&q.id, false, None, "no").unwrap();
+        s.dna_record_review("r", "slug-a", "h2", "confirmed").unwrap();
+        let t1 = Some("t1".to_string());
+        assert_eq!(
+            kinds(&s),
+            [
+                (t1.clone(), "dna.proposed".to_string()),
+                (None, "dna.proposed".to_string()),
+                (t1, "dna.decided".to_string()),
+                (None, "dna.decided".to_string()),
+                (None, "dna.changed".to_string()),
+            ]
+        );
+        let ev = s.events_since(0, 1000).unwrap();
+        assert_eq!(ev[2].payload, serde_json::json!({ "id": p.id, "accepted": true, "slug": "slug-a" }));
+        assert_eq!(ev[4].payload, serde_json::json!({ "repo": "r", "slug": "slug-a" }));
+        // A refused decision writes neither the state nor an event.
+        assert!(s.dna_decide(&p.id, false, None, "").is_err());
+        assert_eq!(s.events_since(0, 1000).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn pending_caps_are_counted_inside_the_insert() {
+        let mut s = Store::open_in_memory().unwrap();
+        let caps = ProposalCaps { per_task: 2, per_repo: 3 };
+        s.conn
+            .execute(
+                "INSERT INTO tasks (id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status,
+                     created_at, updated_at) VALUES ('t1', 't', '/r', '/w', 'b', 'claude', 'g', '', 'active', 'idle', 0, 0)",
+                [],
+            )
+            .unwrap();
+        s.dna_insert_proposal(&new_proposal("r", Some("t1")), caps).unwrap();
+        s.dna_insert_proposal(&new_proposal("r", Some("t1")), caps).unwrap();
+        let task = s.dna_insert_proposal(&new_proposal("r", Some("t1")), caps);
+        assert!(matches!(&task, Err(CoreError::Limit(m)) if m.contains("this task already has 2")), "{task:?}");
+        s.dna_insert_proposal(&new_proposal("r", None), caps).unwrap();
+        let repo = s.dna_insert_proposal(&new_proposal("r", None), caps);
+        assert!(matches!(&repo, Err(CoreError::Limit(m)) if m.contains("this repo already has 3")), "{repo:?}");
+        // Another repo has its own budget; nothing refused was stored.
+        s.dna_insert_proposal(&new_proposal("r2", None), caps).unwrap();
+        assert_eq!(s.dna_status("r").unwrap().pending, 3);
+    }
+
+    #[test]
+    fn proposals_page_by_task_status_and_cursor() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO tasks (id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status,
+                     created_at, updated_at) VALUES ('t1', 't', '/r', '/w', 'b', 'claude', 'g', '', 'active', 'idle', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let ids: Vec<String> = (0..5)
+            .map(|i| {
+                let task = if i % 2 == 0 { Some("t1") } else { None };
+                s.dna_insert_proposal(&new_proposal("r", task), CAPS).unwrap().id
+            })
+            .collect();
+        let page = |q: ProposalQuery| s.dna_proposals(&q).unwrap().into_iter().map(|p| p.id).collect::<Vec<_>>();
+        let all = ProposalQuery { limit: 100, ..Default::default() };
+        assert_eq!(page(all.clone()), ids);
+        let first = page(ProposalQuery { limit: 2, ..all.clone() });
+        assert_eq!(first, ids[..2]);
+        assert_eq!(page(ProposalQuery { limit: 2, after: Some(first[1].clone()), ..all.clone() }), ids[2..4]);
+        let t1 = page(ProposalQuery { task_id: Some("t1".into()), ..all.clone() });
+        assert_eq!(t1, [ids[0].clone(), ids[2].clone(), ids[4].clone()]);
+        assert_eq!(page(ProposalQuery { id: Some(ids[3].clone()), ..all.clone() }), [ids[3].clone()]);
+        let unknown = s.dna_proposals(&ProposalQuery { after: Some("nope".into()), ..all });
+        assert!(matches!(unknown, Err(CoreError::NotFound { .. })), "{unknown:?}");
+        let plan: String = s
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM dna_proposals WHERE task_id = 't1' AND status = 'pending'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("dna_proposals_task"), "{plan}");
     }
 
     #[test]

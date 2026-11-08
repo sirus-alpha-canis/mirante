@@ -32,6 +32,9 @@ pub enum CoreError {
     DirtyWorktree { path: String, changes: Vec<String>, more: usize },
     #[error("claude binary not found: {0}")]
     ClaudeNotFound(String),
+    /// A bounded queue is full (e.g. pending memory proposals).
+    #[error("{0}")]
+    Limit(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

@@ -21,6 +21,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("migrations/0003_lifecycle_archiving.sql")),
     (4, include_str!("migrations/0004_permission_allowed_session.sql")),
     (5, include_str!("migrations/0005_dna.sql")),
+    (6, include_str!("migrations/0006_dna_ledger_and_queue.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -171,10 +172,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 5);
+        assert_eq!(s.schema_version().unwrap(), 6);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 5);
+        assert_eq!(s.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -214,7 +215,13 @@ mod tests {
     }
 }
 
-fn insert_event(conn: &Connection, boot_id: &str, task_id: Option<&str>, kind: &str, payload: &Value) -> Result<Event> {
+pub(crate) fn insert_event(
+    conn: &Connection,
+    boot_id: &str,
+    task_id: Option<&str>,
+    kind: &str,
+    payload: &Value,
+) -> Result<Event> {
     let ts_ms = now_ms();
     conn.execute(
         "INSERT INTO events (boot_id, task_id, kind, payload, ts_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1202,6 +1209,31 @@ mod hardening_tests {
         assert!(s.conn.execute("UPDATE tasks SET lifecycle = 'bogus'", []).is_err());
     }
 
+    /// A v5 database whose ledger reviewed two contents of one slug keeps only the latest
+    /// as reviewed after 0006.
+    #[test]
+    fn v5_ledger_keeps_only_the_latest_review_of_each_slug() {
+        let dir = crate::test_support::TempDir::new("store-v5");
+        let path = dir.path().join("m.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (_, sql) in &MIGRATIONS[..5] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.execute_batch(
+                "INSERT INTO dna_reviews VALUES ('r', 'a', 'old', 'accepted', 1);
+                 INSERT INTO dna_reviews VALUES ('r', 'a', 'new', 'confirmed', 2);
+                 INSERT INTO dna_reviews VALUES ('r', 'b', 'only', 'accepted', 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert!(!s.dna_is_reviewed("r", "a", "old").unwrap());
+        assert!(s.dna_is_reviewed("r", "a", "new").unwrap());
+        assert!(s.dna_is_reviewed("r", "b", "only").unwrap());
+    }
+
     /// A v3 database (permission status CHECK without 'allowed_session') is rebuilt by
     /// 0004: rows survive, the answered-once trigger and the index are back, and a
     /// session-wide grant can be recorded.
@@ -1228,7 +1260,7 @@ mod hardening_tests {
                 .is_err());
         }
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 5);
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
         let old = s.permissions_matching("old").unwrap();
         assert_eq!((old[0].status, old[0].created_at, old[0].answered_at), (PermissionStatus::Denied, 5, Some(6)));
         assert_eq!(
