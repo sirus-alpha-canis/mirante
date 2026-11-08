@@ -8,7 +8,8 @@
 //!   to the git processes it spawns itself, e.g. the `status` inside `worktree remove`);
 //! - neutralizes every filter driver the repository's config names (`filter.<x>.clean`,
 //!   `.smudge`, `.process` set to empty, `.required=false`), read with `git config`, which
-//!   executes nothing. [`Git::checkout`] skips this step (see below);
+//!   executes nothing, within a time limit: when they cannot be read the invocation refuses
+//!   to run (fail closed). [`Git::checkout`] skips this step (see below);
 //! - clears the `GIT_*` variables that redirect git or name programs, and sets
 //!   [`ENV`] (no optional locks, no prompt, no pager, no system config, `LC_ALL=C`, and
 //!   no replace refs or grafts: an agent can plant `refs/replace/*` or `info/grafts` in the
@@ -98,7 +99,13 @@ pub struct Git {
     /// Extra `-c` overrides (the neutralized filters).
     overrides: Vec<String>,
     args: Vec<OsString>,
+    /// Why this invocation must not run: the repository's filters could not be listed (in
+    /// time), so they could not be neutralized.
+    refused: Option<String>,
 }
+
+/// Longest the filter listing (`git config`, which executes nothing) may take.
+const FILTER_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Git {
     /// git in `dir`, with the filters `dir`'s config names neutralized.
@@ -108,22 +115,33 @@ impl Git {
 
     /// git in `dir` with the generic hardening only: filters stay (`git worktree add`).
     pub fn checkout(dir: &Path) -> Git {
-        Git { dir: Some(dir.to_path_buf()), overrides: Vec::new(), args: Vec::new() }
+        Git { dir: Some(dir.to_path_buf()), overrides: Vec::new(), args: Vec::new(), refused: None }
     }
 
     /// git outside any repository (e.g. `check-ref-format`).
     pub fn global() -> Git {
-        Git { dir: None, overrides: Vec::new(), args: Vec::new() }
+        Git { dir: None, overrides: Vec::new(), args: Vec::new(), refused: None }
     }
 
     /// Also neutralizes the filters named by `other`'s config (a worktree with its own
     /// `config.worktree`).
-    pub fn neutralize_filters_of(mut self, other: &Path) -> Git {
-        for name in filter_names(other) {
-            for key in ["clean", "smudge", "process"] {
-                self.overrides.push(format!("filter.{name}.{key}="));
+    pub fn neutralize_filters_of(self, other: &Path) -> Git {
+        self.neutralize_within(other, FILTER_LIMIT)
+    }
+
+    /// [`Git::neutralize_filters_of`] with the listing limited to `limit`. A listing that
+    /// times out leaves the filters unknown: this invocation then refuses to run.
+    pub fn neutralize_within(mut self, other: &Path, limit: std::time::Duration) -> Git {
+        match filter_names_within(other, limit) {
+            Ok(names) => {
+                for name in names {
+                    for key in ["clean", "smudge", "process"] {
+                        self.overrides.push(format!("filter.{name}.{key}="));
+                    }
+                    self.overrides.push(format!("filter.{name}.required=false"));
+                }
             }
-            self.overrides.push(format!("filter.{name}.required=false"));
+            Err(e) => self.refused = Some(format!("the repository's filter config could not be read: {e}")),
         }
         self
     }
@@ -142,9 +160,14 @@ impl Git {
         self
     }
 
-    /// The hardened [`Command`], stdin closed.
+    /// The hardened [`Command`], stdin closed. Refused (see [`Git::neutralize_within`]):
+    /// a git that only rejects an unknown option and exits, reading no config.
     pub fn command(&self) -> Command {
         let mut cmd = Command::new("git");
+        if self.refused.is_some() {
+            cmd.envs(ENV.iter().copied()).arg("--mirante-refused-unknown-filters").stdin(Stdio::null());
+            return cmd;
+        }
         for var in ENV_CLEARED {
             cmd.env_remove(var);
         }
@@ -162,7 +185,15 @@ impl Git {
         cmd
     }
 
+    fn check_refused(&self) -> io::Result<()> {
+        match &self.refused {
+            Some(why) => Err(io::Error::other(why.clone())),
+            None => Ok(()),
+        }
+    }
+
     pub fn output(&self) -> io::Result<Output> {
+        self.check_refused()?;
         self.command().output()
     }
 
@@ -170,6 +201,7 @@ impl Git {
     /// waits on (a huge or hung repository must not hold the caller forever).
     pub fn output_timeout(&self, limit: std::time::Duration) -> io::Result<Output> {
         use std::io::Read;
+        self.check_refused()?;
         let mut child = self.command().stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let drain = |r: Option<Box<dyn Read + Send>>| {
             std::thread::spawn(move || {
@@ -183,6 +215,8 @@ impl Git {
         let out = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
         let err = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
         let deadline = std::time::Instant::now() + limit;
+        // Short polls first: most git reads end within a few milliseconds.
+        let mut pause = std::time::Duration::from_micros(250);
         let status = loop {
             if let Some(s) = child.try_wait()? {
                 break s;
@@ -192,18 +226,18 @@ impl Git {
                 let _ = child.wait();
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("git took longer than {limit:?}")));
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(5));
         };
         Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
     }
 }
 
-/// Names of the filter drivers `dir`'s config defines (any scope git reads there).
-fn filter_names(dir: &Path) -> Vec<String> {
-    let out = Git::checkout(dir).args(["config", "-z", "--name-only", "--get-regexp", r"^filter\."]).output();
-    let Ok(out) = out else {
-        return Vec::new();
-    };
+/// Names of the filter drivers `dir`'s config defines (any scope git reads there), read
+/// within `limit`: `Err` when git could not be run or took longer.
+fn filter_names_within(dir: &Path, limit: std::time::Duration) -> io::Result<Vec<String>> {
+    let out =
+        Git::checkout(dir).args(["config", "-z", "--name-only", "--get-regexp", r"^filter\."]).output_timeout(limit)?;
     let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter_map(|key| {
@@ -214,7 +248,7 @@ fn filter_names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names.dedup();
-    names
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -225,6 +259,25 @@ mod tests {
     fn plain(dir: &Path, args: &[&str]) {
         let ok = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(ok.status.success(), "git {args:?}");
+    }
+
+    /// The filter listing is time-limited; when it cannot be read, the repository's filters
+    /// are unknown, so nothing is run there (fail closed).
+    #[test]
+    fn a_filter_listing_that_times_out_refuses_to_run_git() {
+        let d = TempDir::new("git-filters");
+        plain(d.path(), &["init", "-q"]);
+        assert!(filter_names_within(d.path(), std::time::Duration::ZERO).is_err());
+        let g = Git::checkout(d.path()).neutralize_within(d.path(), std::time::Duration::ZERO).args(["status"]);
+        let e = g.output().unwrap_err();
+        assert!(e.to_string().contains("filter"), "{e}");
+        assert!(g.output_timeout(std::time::Duration::from_secs(5)).is_err());
+        // A direct command runs nothing either (git refuses an unknown option).
+        let out = g.command().output().unwrap();
+        assert!(!out.status.success());
+        // In time: it runs.
+        let ok = Git::new(d.path()).args(["status"]).output().unwrap();
+        assert!(ok.status.success());
     }
 
     #[test]
@@ -250,8 +303,8 @@ mod tests {
         plain(dir.path(), &["init", "-q"]);
         plain(dir.path(), &["config", "filter.evil.clean", "touch PWNED"]);
         plain(dir.path(), &["config", "filter.a.b.smudge", "touch PWNED"]);
-        assert!(filter_names(dir.path()).iter().any(|n| n == "evil"));
-        assert!(filter_names(dir.path()).iter().any(|n| n == "a.b"));
+        assert!(filter_names_within(dir.path(), FILTER_LIMIT).unwrap().iter().any(|n| n == "evil"));
+        assert!(filter_names_within(dir.path(), FILTER_LIMIT).unwrap().iter().any(|n| n == "a.b"));
         let out = Git::new(dir.path()).args(["config", "--get", "filter.evil.clean"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
         let out = Git::new(dir.path()).args(["config", "--get", "filter.a.b.required"]).output().unwrap();

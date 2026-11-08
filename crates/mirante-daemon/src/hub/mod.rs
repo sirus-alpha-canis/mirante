@@ -340,6 +340,8 @@ pub struct Hub {
     /// The miner thread's queue of archived tasks (see [`Hub::spawn_miner`]); without one
     /// (tests), archiving mines inline.
     pub(crate) miner: Mutex<Option<mpsc::Sender<String>>>,
+    /// Longest a git read a person waits on may take (`repo.files`; tests shorten it).
+    pub(crate) git_read_limit: Duration,
     /// `daemon.settings` changes, one at a time (read, write, apply).
     pub(crate) settings_gate: Mutex<()>,
     /// The daemon is going down ([`Hub::shutdown`]): set under the hub lock; launches are
@@ -535,6 +537,7 @@ impl Hub {
             auto_resume: AtomicBool::new(true),
             auto_resume_env_off: AtomicBool::new(false),
             settings_gate: Mutex::new(()),
+            git_read_limit: files::GIT_LIMIT,
             shutting_down: AtomicBool::new(false),
             spawning: std::sync::atomic::AtomicUsize::new(0),
             resume_gap: resume::RESUME_GAP,
@@ -549,6 +552,11 @@ impl Hub {
     /// How long `session.start` / `session.trust` wait for the agent to leave `Booting`.
     pub fn set_boot_timeout(&mut self, timeout: Duration) {
         self.boot_timeout = timeout;
+    }
+
+    /// The limit on git reads a person waits on (`repo.files`).
+    pub fn set_git_read_limit(&mut self, limit: Duration) {
+        self.git_read_limit = limit;
     }
 
     /// Claude inline answers: when on, `permission.answer` on a Claude card types the

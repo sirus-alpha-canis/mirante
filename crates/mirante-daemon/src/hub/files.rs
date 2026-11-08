@@ -7,7 +7,7 @@
 //! so an untracked or merely staged file would not be there for the agent to read. Only a
 //! project's checkout root is listed (never a folder inside it, nor an agent's worktree).
 //! Files that usually hold secrets (`.env`, `*.pem`, `*.key`, `id_*` keys) rank last; the
-//! cockpit also flags them.
+//! cockpit also flags them. Committed symlinks and submodules are not offered.
 use std::path::Path;
 use std::time::Duration;
 
@@ -21,8 +21,17 @@ pub const FILES_DEFAULT: usize = 30;
 pub const FILES_MAX: usize = 200;
 /// Paths read from git at most (a monorepo lists the first ones only).
 const SCAN_MAX: usize = 200_000;
-/// Longest a listing may take.
-const GIT_LIMIT: Duration = Duration::from_secs(5);
+/// Longest a listing may take (the hub's default `git_read_limit`).
+pub const GIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// The path of one `git ls-tree -r` entry (`<mode> <type> <object>\t<path>`) when it is a
+/// regular file: a symlink (mode 120000) can point anywhere on the machine and a
+/// submodule (160000) is not a file, so neither is offered.
+fn regular_file(entry: &str) -> Option<String> {
+    let (meta, path) = entry.split_once('\t')?;
+    let mode = meta.split(' ').next()?;
+    matches!(mode, "100644" | "100755").then(|| path.to_string())
+}
 
 /// A path whose file usually holds a secret: `.env` (and `.env.*`), `*.pem`, `*.key`, or an
 /// ssh key (`id_rsa`, `id_ed25519`, their `.pub`).
@@ -71,10 +80,13 @@ impl Hub {
     /// Committed files of the checkout at `p.repo` matching `p.query` (see the module doc).
     pub fn repo_files(&self, p: &RepoFiles) -> Result<Vec<String>> {
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
-        let top = Git::new(&repo)
-            .args(["rev-parse", "--show-toplevel"])
-            .output_timeout(GIT_LIMIT)
-            .ok()
+        let limit = self.git_read_limit;
+        let timed_out = |e: std::io::Error| HubError::Conflict(format!("git: {e}"));
+        let top = match Git::new(&repo).args(["rev-parse", "--show-toplevel"]).output_timeout(limit) {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(timed_out(e)),
+            r => r.ok(),
+        };
+        let top = top
             .filter(|o| o.status.success())
             .and_then(|o| std::fs::canonicalize(String::from_utf8_lossy(&o.stdout).trim()).ok());
         let Some(top) = top else {
@@ -90,9 +102,9 @@ impl Hub {
         // An agent's worktree is refused (`checkout` says so).
         self.checkout(&repo.to_string_lossy())?;
         let out = Git::new(Path::new(&repo))
-            .args(["ls-tree", "-r", "-z", "--name-only", "HEAD"])
-            .output_timeout(GIT_LIMIT)
-            .map_err(|e| HubError::Conflict(format!("git: {e}")))?;
+            .args(["ls-tree", "-r", "-z", "HEAD"])
+            .output_timeout(limit)
+            .map_err(timed_out)?;
         if !out.status.success() {
             // No commit yet: nothing an agent's worktree would have.
             return Ok(Vec::new());
@@ -102,7 +114,8 @@ impl Hub {
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
             .take(SCAN_MAX)
-            .filter_map(|s| std::str::from_utf8(s).ok().map(str::to_string));
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .filter_map(regular_file);
         Ok(best(paths, &p.query, p.limit.unwrap_or(FILES_DEFAULT).clamp(1, FILES_MAX)))
     }
 }
@@ -172,6 +185,37 @@ mod tests {
         let wt = RepoFiles { repo: t.worktree_path.clone(), query: String::new(), limit: None };
         let r = k.hub.repo_files(&wt);
         assert!(matches!(r, Err(HubError::Invalid(ref m)) if m.contains("worktree")), "{r:?}");
+    }
+
+    /// A committed symlink is not a file to read (it can point anywhere on the machine),
+    /// and a submodule is not a file at all: neither is offered.
+    #[test]
+    fn committed_symlinks_are_not_offered() {
+        let k = Kit::new();
+        std::os::unix::fs::symlink("/etc/hosts", k.repo.join("hosts_link")).unwrap();
+        std::fs::write(k.repo.join("hosts_notes.md"), "x").unwrap();
+        git(&k.repo, &["add", "hosts_link", "hosts_notes.md"]);
+        git(&k.repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "links"]);
+        let r = k.hub.repo_files(&RepoFiles {
+            repo: k.repo.to_string_lossy().into_owned(),
+            query: "hosts".into(),
+            limit: None,
+        });
+        assert_eq!(r.unwrap(), ["hosts_notes.md"]);
+    }
+
+    /// A listing that takes too long is an error, through the hub (the cockpit's picker
+    /// says so instead of waiting).
+    #[test]
+    fn a_slow_listing_times_out_through_the_hub() {
+        let mut k = Kit::new();
+        std::sync::Arc::get_mut(&mut k.hub).unwrap().set_git_read_limit(Duration::ZERO);
+        let r = k.hub.repo_files(&RepoFiles {
+            repo: k.repo.to_string_lossy().into_owned(),
+            query: String::new(),
+            limit: None,
+        });
+        assert!(matches!(r, Err(HubError::Conflict(ref m)) if m.contains("longer")), "{r:?}");
     }
 
     /// Review (minor): tracked files that usually hold secrets come last.

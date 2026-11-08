@@ -209,13 +209,18 @@ fn key_of(repo: &Path) -> String {
     repo.to_string_lossy().into_owned()
 }
 
+/// Longest `git rev-parse --show-toplevel` may take (a hung filesystem must not hold a
+/// caller, nor the hub lock some callers hold).
+const TOPLEVEL_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The checkout `path` is in: git's top level, canonical (a task may have been created from
 /// a subdirectory).
 fn toplevel(path: &str) -> Result<PathBuf> {
     let p = std::fs::canonicalize(path).map_err(|e| HubError::Invalid(format!("repo {path}: {e}")))?;
-    let out = Git::new(&p).args(["rev-parse", "--show-toplevel"]).output();
+    let out = Git::new(&p).args(["rev-parse", "--show-toplevel"]).output_timeout(TOPLEVEL_LIMIT);
     let top = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(HubError::Conflict(format!("git: {e}"))),
         _ => return Err(HubError::Invalid(format!("{path} is not inside a git work tree"))),
     };
     std::fs::canonicalize(&top).map_err(|e| HubError::Invalid(format!("repo {top}: {e}")))
