@@ -121,7 +121,8 @@ fn split(text: &str) -> Result<(Vec<&str>, &str), DnaError> {
     Err(note_err("frontmatter is not closed with ---"))
 }
 
-/// A plain value (trimmed) or a double-quoted one with `\"` and `\\` escapes.
+/// A plain value (trimmed) or a double-quoted one with `\"`, `\\`, `\n`, `\r` and `\t`
+/// escapes.
 fn scalar(v: &str) -> Result<String, DnaError> {
     let v = v.trim();
     let Some(inner) = v.strip_prefix('"') else {
@@ -133,6 +134,9 @@ fn scalar(v: &str) -> Result<String, DnaError> {
         match c {
             '\\' => match chars.next() {
                 Some(e @ ('"' | '\\')) => out.push(e),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
                 _ => return Err(note_err(format!("unsupported escape in {v}"))),
             },
             '"' => {
@@ -148,8 +152,23 @@ fn scalar(v: &str) -> Result<String, DnaError> {
     Err(note_err(format!("unterminated quote in {v}")))
 }
 
+/// `v` double-quoted, escaping `\\`, `"` and line breaks and tabs (so a value never spans
+/// two lines).
 fn quote(v: &str) -> String {
-    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `v` plain when it is unambiguous YAML, else quoted.
@@ -261,8 +280,9 @@ fn render_anchors(out: &mut String, anchors: &[Anchor]) {
     }
 }
 
-/// The file text of `n`, keys in the documented order.
-pub fn render(n: &Note) -> String {
+/// The file text of `n`, keys in the documented order. Fails unless the text parses back
+/// into exactly `n` (a value [`parse`] would refuse, e.g. a title with a line break).
+pub fn render(n: &Note) -> Result<String, DnaError> {
     let mut out = String::from("---\n");
     out.push_str(&format!("id: {}\n", plain_or_quoted(&n.id)));
     out.push_str(&format!("title: {}\n", quote(&n.title)));
@@ -273,11 +293,15 @@ pub fn render(n: &Note) -> String {
     render_anchors(&mut out, &n.anchors);
     out.push_str("---\n");
     out.push_str(&n.body);
-    out
+    if parse(&out)? != *n {
+        return Err(note_err("the note does not render to the same note"));
+    }
+    Ok(out)
 }
 
 /// `text` with only its `status:` line and/or its `anchors:` block rewritten; every other
-/// byte (unknown keys, comments, the body) is copied verbatim. The result must parse.
+/// byte (unknown keys, comments, the body) is copied verbatim. Lines are read exactly as
+/// [`parse`] reads them, and the result must parse with the requested status and anchors.
 pub fn update(text: &str, status: Option<Status>, anchors: Option<&[Anchor]>) -> Result<String, DnaError> {
     parse(text)?;
     if anchors.is_some_and(|a| a.is_empty() || a.len() > MAX_ANCHORS) {
@@ -288,7 +312,8 @@ pub fn update(text: &str, status: Option<Status>, anchors: Option<&[Anchor]>) ->
     out.push_str(lines.next().unwrap_or_default()); // the opening ---
     let mut in_anchors = false;
     for raw in lines.by_ref() {
-        let line = raw.trim_end_matches(['\n', '\r']);
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line); // exactly as `split` reads it
         if line == "---" {
             out.push_str(raw);
             break;
@@ -318,7 +343,10 @@ pub fn update(text: &str, status: Option<Status>, anchors: Option<&[Anchor]>) ->
         }
     }
     out.extend(lines);
-    parse(&out)?;
+    let n = parse(&out)?;
+    if status.is_some_and(|st| st != n.status) || anchors.is_some_and(|a| a != n.anchors.as_slice()) {
+        return Err(note_err("the update did not take effect (unusual frontmatter layout)"));
+    }
     Ok(out)
 }
 
@@ -423,7 +451,7 @@ mod tests {
         assert_eq!(n.title, "Spool: the \"fallback\"");
         assert_eq!((n.kind, n.status), (Kind::Gotcha, Status::Active));
         assert_eq!(n.anchors.len(), 1);
-        assert_eq!(parse(&render(&n)).unwrap(), n);
+        assert_eq!(parse(&render(&n).unwrap()).unwrap(), n);
     }
 
     #[test]
@@ -458,6 +486,25 @@ mod tests {
         assert_eq!((n.anchors, n.status), (vec![a], Status::Active));
         assert!(n2.contains("tags: [hooks]\n") && !n2.contains("src/a.rs"));
         assert!(update(SAMPLE, None, Some(&[])).is_err());
+    }
+
+    #[test]
+    fn update_and_parse_agree_on_the_closing_line() {
+        // `---\r\r` is not a closing line for parse; update must not treat it as one.
+        let text = SAMPLE.replace("kind: gotcha\n", "kind: gotcha\n---\r\r\n");
+        assert_eq!(parse(&text).unwrap().status, Status::Active);
+        let out = update(&text, Some(Status::Retired), None).unwrap();
+        assert_eq!(parse(&out).unwrap().status, Status::Retired);
+    }
+
+    #[test]
+    fn render_round_trips_or_fails() {
+        let n = parse(SAMPLE).unwrap();
+        assert_eq!(parse(&render(&n).unwrap()).unwrap(), n);
+        let bad = Note { title: "two\nlines".into(), ..n.clone() };
+        assert!(render(&bad).is_err());
+        assert_eq!(scalar(&quote("a\nb\r\"c\\")).unwrap(), "a\nb\r\"c\\");
+        assert!(!quote("a\nb").contains('\n'));
     }
 
     #[test]

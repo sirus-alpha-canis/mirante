@@ -431,7 +431,7 @@ impl Hub {
             anchors: anchors.clone(),
             body: body.clone(),
         };
-        note::parse(&note::render(&probe)).map_err(invalid)?;
+        note::render(&probe).map_err(invalid)?;
         let mut st = self.lock();
         let proposal = st.store.dna_insert_proposal(&NewProposal {
             repo: key,
@@ -507,8 +507,7 @@ impl Hub {
             anchors: p.anchors.clone(),
             body,
         };
-        let text = note::render(&n);
-        note::parse(&text).map_err(|e| HubError::Invalid(e.to_string()))?;
+        let text = note::render(&n).map_err(|e| HubError::Invalid(e.to_string()))?;
         let repo = PathBuf::from(&p.repo);
         fsio::init(&repo).map_err(dna_err)?;
         let slug = create_unique(&repo, &note::slugify(&n.title), &text).map_err(dna_err)?;
@@ -741,6 +740,7 @@ pub(crate) mod tests {
             anchors: vec![a],
             body: format!("{body}\n"),
         })
+        .unwrap()
     }
 
     pub fn write_note(repo: &Path, slug: &str, text: &str) {

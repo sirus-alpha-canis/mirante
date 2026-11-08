@@ -920,6 +920,7 @@ mod refresh_tests {
             anchors: vec![a],
             body: format!("{title} body, see [[other]].\n"),
         })
+        .unwrap()
     }
 
     fn repo_with_memory(notes: &[(&str, &str)]) -> TempDir {
