@@ -372,6 +372,7 @@ mod tests {
             resume: resume.map(String::from),
             paths: Paths::new(Path::new("/h")),
             mcp: None,
+            skills: None,
         }
     }
 

@@ -501,12 +501,14 @@ impl Hub {
             (task, session.id, native, sink)
         };
         let mcp = self.memory_server_for(&task);
+        let skills = self.skills_for(&task, &session_id);
         let req = SpawnRequest {
             task: task.clone(),
             session_id: session_id.clone(),
             resume: native.clone(),
             paths: self.paths.clone(),
             mcp,
+            skills,
         };
         match self.factory.spawn(req, sink) {
             Ok(driver) => {
@@ -785,6 +787,9 @@ impl State {
         st.feed_claude(&p.task, &Input::Hook(ev.clone()))?;
         if tool_ran {
             st.settle_tool_ran(&p.task, &session_id, &ev)?;
+        }
+        if ev.hook_event_name == "PreToolUse" {
+            st.skill_hook(&p.task, &session_id, &ev);
         }
         if let Some(step) = tool_step(&ev) {
             // A feed step is cosmetic: failing to record it must not fail the hook.

@@ -435,14 +435,14 @@ docs/dogfood/skills.md                           (new)
 
 **Files:** Create `migrations/0007_skills.sql` and `skills/index.rs`. Modify `store.rs`.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `migration_7_and_decided_once`
   - `ledger_counts_only_the_latest_review_of_a_name`
   - `history_query_reads_goals_messages_and_denials_of_learning_tenants_only`
   - `usage_counts_by_skill_and_window`
   - `task_origin_is_written_once` (a trigger refuses an update)
-- [ ] **Step 2: Run** `cargo test -p mirante-core skills::index`. Expected: FAIL (`schema_version` is 6).
-- [ ] **Step 3: Write the SQL.**
+- [x] **Step 2: Run** `cargo test -p mirante-core skills::index`. Expected: FAIL (`schema_version` is 6).
+- [x] **Step 3: Write the SQL.**
 
 ```sql
 CREATE TABLE task_origins (task_id TEXT PRIMARY KEY REFERENCES tasks(id), origin TEXT NOT NULL, tenant TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -471,7 +471,7 @@ CREATE TABLE skill_usage (session_id TEXT NOT NULL, task_id TEXT NOT NULL, name 
 CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
 ```
 
-- [ ] **Step 4: Implement the store methods** (`impl Store`, one transaction each):
+- [x] **Step 4: Implement the store methods** (`impl Store`, one transaction each):
   - `skill_set_origin`, `skill_origin_of`;
   - `skill_tenants`, `skill_set_learning`;
   - `skill_upsert_current`, `skill_record_review`, `skill_is_reviewed(name, hash)`;
@@ -480,33 +480,33 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
   - `skill_history(tenant, since)` (joins `task_origins` with `tasks.goal`, `events` and `permission_requests`);
   - `skill_record_usage`, `skill_usage_counts`.
   - Bump the asserted `user_version` in the `store.rs` tests to 7.
-- [ ] **Step 5: Run** `cargo test -p mirante-core`. Expected: PASS.
-- [ ] **Step 6: Commit** `feat(core): skills index, ledger, proposal queue, tenant learning and usage (migration 7)`.
+- [x] **Step 5: Run** `cargo test -p mirante-core`. Expected: PASS.
+- [x] **Step 6: Commit** `feat(core): skills index, ledger, proposal queue, tenant learning and usage (migration 7)`.
 
 ### Task 8: Hub read side; the tenant fixed at task creation; learning toggle
 
 **Files:** Create `hub/skills.rs`. Modify `hub/mod.rs` (`create_task` records the origin after the row exists), `ipc/types.rs`, `ipc/paths.rs`, `server.rs`.
 
-- [ ] **Step 1: Failing tests (Kit):**
+- [x] **Step 1: Failing tests (Kit):**
   - `create_task_records_origin_before_any_session` (set `remote.origin.url` in the Kit repo, then check `task_origins`);
   - `rewriting_origin_later_does_not_move_the_task`;
   - `learn_is_person_only_and_listed_in_tenants` (`Caller::Peer(agent root)` gets `Forbidden`);
   - `list_get_report_verification_state` (a file modified on disk shows `verified:false, reason`);
   - server: `skill_methods_are_served_and_validate_params`.
-- [ ] **Step 2: Run** `cargo test -p mirante-daemon skill`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p mirante-daemon skill`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - Wire types: `TenantView`, `SkillSummary {name, version, scope, activation, status, verified, reason?, injected_30d, used_30d}`, `SkillView`, `SkillProposalView`, `Finding`, `TaskSkills`.
   - `Paths::{skills,keys,tmp}`.
   - `Hub::skill_tenants`, `skill_learn(caller,…)` (`require_person`), `skill_list`, `skill_get`.
   - Verification runs git-free and file-only without the hub lock. A verifier cache keyed by `(manifest_hash, sig sha)` is held in `Hub`.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(daemon): skill.* read side; each task's tenant is fixed from its origin at creation`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(daemon): skill.* read side; each task's tenant is fixed from its origin at creation`.
 
 ### Task 9: Proposals, review, actions (person-only)
 
 **Files:** `hub/skills.rs`, `server.rs`.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
 
 ```rust
 #[test] fn agent_propose_is_bound_to_its_task_redacted_linted_and_scoped_to_its_repo() {}
@@ -521,31 +521,31 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
 #[test] fn widening_to_personal_carries_the_leak_warning_in_the_view() {}
 ```
 
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement** per Decision 10. `skill.add` reads a person-given directory through `SafeDir`, caps sizes, and refuses symlinks and executables. `skill.lint` is pure. `skill.may_review` mirrors `dna.may_review`.
-- [ ] **Step 4: Run** `cargo test -p mirante-daemon`. Expected: PASS.
-- [ ] **Step 5: Commit** `feat(daemon): skill proposals and person-only review; accepted versions are linted, signed and ledgered`.
+- [x] **Step 2: Run.** Expected: FAIL.
+- [x] **Step 3: Implement** per Decision 10. `skill.add` reads a person-given directory through `SafeDir`, caps sizes, and refuses symlinks and executables. `skill.lint` is pure. `skill.may_review` mirrors `dna.may_review`.
+- [x] **Step 4: Run** `cargo test -p mirante-daemon`. Expected: PASS.
+- [x] **Step 5: Commit** `feat(daemon): skill proposals and person-only review; accepted versions are linted, signed and ledgered`.
 
 ### Task 10: Mining in the hub
 
 **Files:** `hub/skills.rs`, `hub/mod.rs` (archive hook).
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `mine_proposes_once_and_updates_evidence_on_rerun`
   - `mine_never_crosses_tenants_and_skips_non_learning_ones`
   - `rejected_fingerprints_are_not_reproposed`
   - `archive_triggers_a_mine_of_that_tenant`
   - `skill_mined_event_reports_counts`
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement** `skill_mine(caller, tenant)`: read history under the lock, then cluster and draft unlocked, then insert under the lock. Archive calls it with `Caller::Person` after the archive commits; errors are logged, not raised.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(daemon): mine repeated instructions per learning tenant into skill proposals`.
+- [x] **Step 2: Run.** Expected: FAIL.
+- [x] **Step 3: Implement** `skill_mine(caller, tenant)`: read history under the lock, then cluster and draft unlocked, then insert under the lock. Archive calls it with `Caller::Person` after the archive commits; errors are logged, not raised.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(daemon): mine repeated instructions per learning tenant into skill proposals`.
 
 ### Task 11: Resolving skills for a session, plus usage
 
 **Files:** `hub/skills.rs`, `hub/session.rs` (where `SpawnRequest` is built; `Skill` hook), `driver/mod.rs`.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
 
 ```rust
 #[test] fn session_gets_only_scope_matching_verified_skills() { /* client A org skill injected in A repo, absent in B repo */ }
@@ -555,15 +555,26 @@ CREATE INDEX skill_usage_name ON skill_usage(name, ts_ms);
 #[test] fn claude_skill_hook_records_used() { /* PreToolUse tool_name "Skill" input {"skill":"mirante-skills:a"} → skill.used */ }
 ```
 
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run.** Expected: FAIL.
+- [x] **Step 3: Implement.**
   - `SpawnRequest.skills: Option<InjectedSkills { always: Vec<VerifiedSkill>, on_demand: Vec<VerifiedSkill> }>`.
   - `Hub::skills_for(task, agent)` reads `task_origins`, matches, verifies, applies the budget, and records `injected`/`refused` usage plus events.
   - The hook path matches `tool_name == "Skill"` and a `mirante-skills:` prefix (field name confirmed live in Task 12).
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(daemon): each session gets the verified skills of its tenant; refused skills are reported`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(daemon): each session gets the verified skills of its tenant; refused skills are reported`.
 
 ---
+
+> **As built (2026-11-08), Batch B.** Tasks 7–11 landed one commit each, TDD (each test seen failing first). Differences from the text above:
+> - **Origin pinning (review of Batch A).** `remote.origin.url` lives in the shared `.git/config`, which an earlier task's agent can rewrite, so the next `task.create` would read client B's URL. Migration 7 adds `repo_origins` (the origin a person pinned per checkout, keyed by its canonical git common dir) and `task_origins.{repo, observed}`. Only a **person's** `task.create` pins an unpinned checkout (`Hub::create_task_from(caller, …)`; the socket passes the peer). A task whose live origin differs from the pin keeps the pinned origin and tenant with `observed` set; so does an agent's task in an unpinned checkout. Such a task gets no skills (`skill.unavailable`: "confirm it in the cockpit"), cannot `skill.propose`, and is left out of mining until a person runs **`skill.confirm_origin {task, origin}`** (new, person-only): confirming the pinned origin clears the tasks fixed to it; confirming the live one re-pins the checkout for new tasks (tasks fixed to the old origin stay without skills). Triggers refuse any update of `task_origins` except clearing `observed`. Events: `skill.origin_confirmed` (the first pin is audited by the person's `task_created`).
+> - **Injection bytes (review of Batch A).** `SpawnRequest.skills` carries `VerifiedSkill`s from `read_verified`; Tasks 12–13 must write only those in-memory bytes, never re-read or copy the version folder (TOCTOU).
+> - **Not done here (review of Batch A).** `git.rs` does not clear `GIT_CONFIG_GLOBAL`; a separate fix handles it.
+> - **Task 7.** Store API: `skill_create_origin` / `skill_origin_of` / `skill_repo_origin` / `skill_confirm_origin` instead of `skill_set_origin`; composite one-transaction methods `skill_accept` (decision + ledger + index + `skill.decided`, writing the accepted, edited content back into the proposal row), `skill_change` (expect-hash check + optional ledger + index + `skill.changed`), `skill_record_session` (usage + `skill.injected` / `skill.refused`) and `skill_record_used` (only for a skill injected into that session). `skill_set_learning` writes `skill.learning`. Extra indexes on `task_origins(tenant, repo)`, `skill_proposals(task_id, status)`, `skill_usage(session_id, name)`. `dna::index`'s schema assertion became `>= 6`.
+> - **Task 8.** `skill.tenants` also lists tenants that only hold skills. The ssh alias home and the `ssh-keygen` path are `Hub` settings (`set_ssh_home`, `set_ssh_keygen`; tests use none / a missing binary). The library reads (`skill.tenants`, `.list`, `.get`, `.proposals`, `.task_skills`) refuse Mirante-launched agents and unverified callers too: a session gets its own skills at start, and another client's skill text must not be readable from a tool call.
+> - **Task 9.** `skill.propose { base }` names the skill to edit (its current manifest hash becomes `base_hash`); a new proposal's name must be free. Activation defaults to `always`. `skill.add` takes `dir` or `inline {name, description, body}`; its tenant is the scope's (or `personal`). Rescope and rollback keep the source version's provenance, so the "learned in <tenant>" warning survives a widening. `library::remove_version` (new, in `skills/library.rs`) takes back a version the store refused; `hub::dna::today` became `pub(crate)`.
+> - **Task 10.** `skill.mine` on a tenant without learning is `CONFLICT`; the archive hook mines only a learning tenant of a confirmed task and stays silent otherwise. Mined drafts carry their lint findings.
+> - **Task 11.** Candidates are filtered on the index (`active`, the task's agent, scope), then verified; `ssh-keygen` missing (checked before verifying) gives `skill.unavailable`. Usage is recorded when the session's skills are resolved, before the spawn. `skill.task_skills` also reports `confirmed` and `unavailable`, and records nothing. The `Skill` hook counts `mirante-skills:<name>` only.
+> - **For Batch D:** the bridge allowlist decision now also covers `skill.confirm_origin` (person-only, like `skill.learn`) and `skill.task_skills`.
 
 ## Batch C: Agents and CLI
 

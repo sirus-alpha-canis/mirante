@@ -77,6 +77,9 @@ pub mod method {
     /// A person finds repeated instructions in a learning tenant's tasks
     /// ([`super::SkillMine`] → [`super::SkillMined`]).
     pub const SKILL_MINE: &str = "skill.mine";
+    /// What a task's next session gets: its tenant, the matching verified skills and the
+    /// refused ones ([`super::SkillTaskParams`] → [`super::TaskSkills`]).
+    pub const SKILL_TASK_SKILLS: &str = "skill.task_skills";
     /// `{}` when the caller may review skills, else `FORBIDDEN`.
     pub const SKILL_MAY_REVIEW: &str = "skill.may_review";
     /// Notification carrying one `mirante_core::model::Event`.
@@ -1046,4 +1049,40 @@ pub struct SkillMined {
     pub proposed: usize,
     pub updated: usize,
     pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillTaskParams {
+    pub task: String,
+}
+
+/// A skill a task's session gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSkill {
+    pub name: String,
+    pub version: u32,
+    pub activation: String,
+    pub scope: String,
+}
+
+/// A skill a task's session does not get, and why (modified on disk, over budget, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedSkill {
+    pub name: String,
+    pub reason: String,
+}
+
+/// What the task's next session would get, resolved now (nothing is recorded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSkills {
+    pub tenant: String,
+    pub origin: String,
+    pub learning: bool,
+    /// False while the task's origin waits for a person's confirmation (no skills).
+    pub confirmed: bool,
+    pub active: Vec<TaskSkill>,
+    pub refused: Vec<RefusedSkill>,
+    /// Why no skill applies at all (no origin, unconfirmed origin, no ssh-keygen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
 }

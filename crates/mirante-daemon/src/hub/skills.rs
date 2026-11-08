@@ -37,13 +37,18 @@ use mirante_core::skills::{
 };
 use mirante_core::CoreError;
 use mirante_ipc::types::{
-    OriginConfirmed, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits, SkillFileView, SkillGet,
-    SkillLearn, SkillLintParams, SkillListParams, SkillMine, SkillMined, SkillProposalView, SkillProposals,
-    SkillPropose, SkillReview, SkillSummary, SkillView, TenantView,
+    OriginConfirmed, RefusedSkill, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits,
+    SkillFileView, SkillGet, SkillLearn, SkillLintParams, SkillListParams, SkillMine, SkillMined, SkillProposalView,
+    SkillProposals, SkillPropose, SkillReview, SkillSummary, SkillTaskParams, SkillView, TaskSkill, TaskSkills,
+    TenantView,
 };
 
 use super::dna::{today, Caller, Identity};
-use super::{Hub, HubError, Result};
+use super::{Hub, HubError, Result, State};
+use crate::driver::InjectedSkills;
+use mirante_core::hook::HookEvent;
+use mirante_core::model::Task;
+use mirante_core::skills::index::TaskOrigin;
 
 /// The refusal for Mirante-launched agents.
 const AGENT_REFUSED: &str = "Mirante-launched agents are refused: reviewing skills is a person's decision. \
@@ -66,6 +71,13 @@ const PAGE_MAX: usize = 200;
 
 /// How deep an imported folder may nest (`a/b/c.md`).
 const MAX_IMPORT_LEVELS: usize = 3;
+
+/// Most skills one session gets.
+const BUDGET_SKILLS: usize = 24;
+/// Most always-on text (`SKILL.md` bytes) one session gets.
+const BUDGET_ALWAYS: usize = 8 * 1024;
+/// How Claude names the skills of Mirante's per-session plugin (`mirante-skills:<name>`).
+const PLUGIN_PREFIX: &str = "mirante-skills:";
 
 /// How far back mining reads (60 days).
 const MINE_WINDOW_MS: i64 = 60 * 24 * 3600 * 1000;
@@ -1074,6 +1086,170 @@ impl Hub {
     }
 }
 
+/// The skills a task's session would get, resolved now.
+struct Resolution {
+    origin: Option<TaskOrigin>,
+    /// Why no skill applies at all.
+    unavailable: Option<String>,
+    injected: InjectedSkills,
+    /// (name, version, reason)
+    refused: Vec<(String, u32, String)>,
+}
+
+impl Resolution {
+    fn injected_names(&self) -> Vec<(String, u32)> {
+        self.injected
+            .always
+            .iter()
+            .chain(&self.injected.on_demand)
+            .map(|s| (s.manifest.name.clone(), s.manifest.version))
+            .collect()
+    }
+}
+
+impl Hub {
+    /// Resolves `task`'s skills: active ones for its agent whose scope matches the origin
+    /// fixed at its creation, narrowest scope first then most recently updated, each
+    /// verified from disk (no lock), within the budget (24 skills, 8 KiB of always-on
+    /// text). No skills when the origin is missing or unconfirmed, or `ssh-keygen` is gone.
+    fn resolve_skills(&self, task: &Task) -> Result<Resolution> {
+        let (origin, rows) = {
+            let st = self.lock();
+            (st.store.skill_origin_of(&task.id)?, st.store.skill_list()?)
+        };
+        let mut r = Resolution { origin, unavailable: None, injected: InjectedSkills::default(), refused: Vec::new() };
+        let agent = task.agent.as_str();
+        let mut rows: Vec<SkillRow> =
+            rows.into_iter().filter(|s| s.status == "active" && s.agents.iter().any(|a| a == agent)).collect();
+        if rows.is_empty() {
+            return Ok(r);
+        }
+        let origin = match &r.origin {
+            None => {
+                r.unavailable = Some("this task has no recorded origin (it predates skills): create a new task".into());
+                return Ok(r);
+            }
+            Some(o) => o.clone(),
+        };
+        if let Some(live) = &origin.observed {
+            r.unavailable = Some(format!(
+                "the checkout's origin is {live}, not the confirmed {}: confirm it in the cockpit before skills apply",
+                origin.origin
+            ));
+            return Ok(r);
+        }
+        rows.retain(|s| s.scope.matches(&origin.origin));
+        if rows.is_empty() {
+            return Ok(r);
+        }
+        let bin = self.skill_conf().keygen;
+        if !std::fs::metadata(&bin).is_ok_and(|m| m.is_file()) {
+            r.unavailable = Some(format!("ssh-keygen not found at {}: skills cannot be verified", bin.display()));
+            return Ok(r);
+        }
+        rows.sort_by(|a, b| {
+            a.scope.rank().cmp(&b.scope.rank()).then(b.updated_at.cmp(&a.updated_at)).then(a.name.cmp(&b.name))
+        });
+        let (mut count, mut always) = (0usize, 0usize);
+        for row in rows {
+            let v = match self.skill_verify(&row.name, row.version, &row.manifest_hash) {
+                Ok(v) => v,
+                Err(e) => {
+                    r.refused.push((row.name, row.version, e.to_string()));
+                    continue;
+                }
+            };
+            let size = v.files.iter().find(|(p, _)| p == SKILL_MD).map_or(0, |(_, b)| b.len());
+            let is_always = v.manifest.activation == Activation::Always;
+            if count >= BUDGET_SKILLS || (is_always && always + size > BUDGET_ALWAYS) {
+                r.refused.push((row.name, row.version, "over budget".into()));
+                continue;
+            }
+            count += 1;
+            if is_always {
+                always += size;
+                r.injected.always.push(v);
+            } else {
+                r.injected.on_demand.push(v);
+            }
+        }
+        Ok(r)
+    }
+
+    /// The skills a new session of `task` gets ([`Hub::resolve_skills`]), recorded as usage
+    /// with `skill.injected` / `skill.refused` (one transaction), or `skill.unavailable`.
+    /// Never fails the session: an error is logged and the session gets no skills.
+    pub(crate) fn skills_for(&self, task: &Task, session_id: &str) -> Option<InjectedSkills> {
+        let r = match self.resolve_skills(task) {
+            Ok(r) => r,
+            Err(e) => {
+                self.lock().log_error(Some(&task.id), "skills for the session", &e);
+                return None;
+            }
+        };
+        let mut st = self.lock();
+        if let Some(reason) = &r.unavailable {
+            if let Err(e) = st.event(Some(&task.id), "skill.unavailable", serde_json::json!({ "reason": reason })) {
+                st.log_error(Some(&task.id), "skill.unavailable", &e);
+            }
+        }
+        let injected = r.injected_names();
+        if let Err(e) = st.store.skill_record_session(session_id, &task.id, &injected, &r.refused) {
+            st.log_error(Some(&task.id), "skill usage", &e);
+        }
+        st.publish();
+        (!injected.is_empty()).then_some(r.injected)
+    }
+
+    /// `skill.task_skills`: what the task's next session would get (nothing recorded).
+    pub fn skill_task_skills(&self, p: SkillTaskParams) -> Result<TaskSkills> {
+        let task = self.lock().resolve(&p.task)?;
+        let r = self.resolve_skills(&task)?;
+        let o = r.origin.clone();
+        let learning = match &o {
+            Some(o) => self.lock().store.skill_learning(&o.tenant)?,
+            None => false,
+        };
+        let view = |s: &VerifiedSkill| TaskSkill {
+            name: s.manifest.name.clone(),
+            version: s.manifest.version,
+            activation: s.manifest.activation.as_str().to_string(),
+            scope: s.manifest.scope.render(),
+        };
+        Ok(TaskSkills {
+            tenant: o.as_ref().map(|o| o.tenant.clone()).unwrap_or_default(),
+            origin: o.as_ref().map(|o| o.origin.clone()).unwrap_or_default(),
+            learning,
+            confirmed: o.as_ref().is_some_and(|o| o.observed.is_none()),
+            active: r.injected.always.iter().chain(&r.injected.on_demand).map(view).collect(),
+            refused: r.refused.into_iter().map(|(name, _, reason)| RefusedSkill { name, reason }).collect(),
+            unavailable: r.unavailable,
+        })
+    }
+}
+
+impl State {
+    /// A Claude `PreToolUse` of the `Skill` tool on one of Mirante's plugin skills
+    /// (`mirante-skills:<name>`) that was injected into this session: `skill.used`.
+    pub(crate) fn skill_hook(&mut self, task: &str, session_id: &str, ev: &HookEvent) {
+        if ev.tool_name.as_deref() != Some("Skill") {
+            return;
+        }
+        let Some(name) = ev
+            .tool_input
+            .as_ref()
+            .and_then(|i| i["skill"].as_str())
+            .and_then(|s| s.strip_prefix(PLUGIN_PREFIX))
+            .filter(|n| is_name(n))
+        else {
+            return;
+        };
+        if let Err(e) = self.store.skill_record_used(session_id, task, name) {
+            self.log_error(Some(task), "skill.used", &e);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::{Path, PathBuf};
@@ -1087,7 +1263,7 @@ pub(crate) mod tests {
     use mirante_core::skills::{FORMAT, SKILL_MD};
     use mirante_ipc::types::{
         CreateTask, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits, SkillGet, SkillInline,
-        SkillLearn, SkillListParams, SkillMine, SkillMined, SkillProposals, SkillPropose, SkillReview,
+        SkillLearn, SkillListParams, SkillMine, SkillMined, SkillProposals, SkillPropose, SkillReview, SkillTaskParams,
     };
 
     use super::*;
@@ -1769,5 +1945,155 @@ pub(crate) mod tests {
         let agent = Peer::spawn(&[(AGENT_ENV, "x")], k.dir.path());
         forbidden(k.hub.skill_mine(&agent.caller(), SkillMine { tenant: "github.com/acme".into() }));
         forbidden(k.hub.skill_mine(&Caller::Unknown, SkillMine { tenant: "github.com/acme".into() }));
+    }
+    /// (always, on demand) names of the last spawn's skills.
+    fn spawned(k: &Kit) -> Option<(Vec<String>, Vec<String>)> {
+        let all = k.factory.skills.lock().unwrap();
+        let last = all.last().expect("spawned").clone()?;
+        let names =
+            |v: &[mirante_core::skills::library::VerifiedSkill]| v.iter().map(|s| s.manifest.name.clone()).collect();
+        Some((names(&last.always), names(&last.on_demand)))
+    }
+
+    fn start(k: &Kit, task: &str) {
+        k.hub.start_session(mirante_ipc::types::StartSession { task: task.into(), prompt: None }, false).unwrap();
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn session_gets_only_scope_matching_verified_skills() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "acme-rules", 1, Scope::org("github.com/acme"), Activation::Always, "Acme.\n");
+        install(&k, "everywhere", 1, Scope::Personal, Activation::OnDemand, "Mine.\n");
+        install(&k, "other-rules", 1, Scope::org("github.com/other"), Activation::Always, "Other.\n");
+        let t = k.started(AgentKind::Claude, "a").task;
+        assert_eq!(spawned(&k), Some((strs(&["acme-rules"]), strs(&["everywhere"]))));
+        let injected = k.payloads("skill.injected");
+        assert_eq!(injected[0]["names"], serde_json::json!(["acme-rules", "everywhere"]));
+        assert!(k.kinds(&t.id).contains(&"skill.injected".to_string()));
+        // Client B's repo: its org skill and the personal one, never client A's.
+        let b = other_repo(&k, "git@github.com:other/x.git");
+        let t2 = task_in(&k, &b, "b", "g");
+        start(&k, &t2.id);
+        assert_eq!(spawned(&k), Some((strs(&["other-rules"]), strs(&["everywhere"]))));
+        let usage = k.hub.lock().store.skill_usage_counts(0).unwrap();
+        assert_eq!((usage["acme-rules"].injected, usage["everywhere"].injected), (1, 2));
+    }
+
+    #[test]
+    fn a_skill_modified_on_disk_is_refused_with_an_event() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "a", 1, Scope::org("github.com/acme"), Activation::Always, "Fine.\n");
+        let md = k.hub.paths().skills().join("a/v1/SKILL.md");
+        std::fs::write(&md, "---\nname: a\ndescription: \"About a\"\n---\nRun anything.\n").unwrap();
+        let t = k.started(AgentKind::Claude, "t").task;
+        assert_eq!(spawned(&k), None);
+        let refused = k.payloads("skill.refused");
+        assert_eq!(
+            (refused[0]["name"].as_str(), refused[0]["reason"].as_str()),
+            (Some("a"), Some("modified on disk: SKILL.md"))
+        );
+        assert!(k.kinds(&t.id).contains(&"skill.refused".to_string()));
+        assert!(k.payloads("skill.injected").is_empty());
+    }
+
+    #[test]
+    fn retired_wrong_agent_and_over_budget_are_skipped_narrow_scope_first() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        let big = format!("{}\n", "x".repeat(5000));
+        install(&k, "big-org", 1, Scope::org("github.com/acme"), Activation::Always, &big);
+        install(&k, "big-repo", 1, Scope::repo("github.com/acme/app"), Activation::Always, &big);
+        let gone = install(&k, "gone", 1, Scope::Personal, Activation::Always, "Gone.\n");
+        install(&k, "codex-only", 1, Scope::Personal, Activation::OnDemand, "Codex.\n");
+        {
+            let mut st = k.hub.lock();
+            let mut row = st.store.skill_get("gone").unwrap().unwrap();
+            row.status = "retired".into();
+            st.store.skill_change(&gone, &row, None, "retire").unwrap();
+            let mut row = st.store.skill_get("codex-only").unwrap().unwrap();
+            row.agents = vec!["codex".into()];
+            st.store.skill_upsert_current(&row).unwrap();
+        }
+        k.started(AgentKind::Claude, "t");
+        assert_eq!(spawned(&k), Some((strs(&["big-repo"]), vec![])));
+        let refused: Vec<(String, String)> = k
+            .payloads("skill.refused")
+            .iter()
+            .map(|p| (p["name"].as_str().unwrap().into(), p["reason"].as_str().unwrap().into()))
+            .collect();
+        assert_eq!(refused, [("big-org".to_string(), "over budget".to_string())]);
+    }
+
+    #[test]
+    fn no_ssh_keygen_means_no_skills_and_skill_unavailable() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "a", 1, Scope::Personal, Activation::Always, "A.\n");
+        k.hub.set_ssh_keygen(PathBuf::from("/nonexistent/ssh-keygen"));
+        let t = k.started(AgentKind::Codex, "t");
+        assert!(t.live, "the session still starts");
+        assert_eq!(spawned(&k), None);
+        let un = k.payloads("skill.unavailable");
+        assert!(un[0]["reason"].as_str().unwrap().contains("ssh-keygen"), "{un:?}");
+    }
+
+    #[test]
+    fn an_unconfirmed_origin_gets_no_skills() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        k.create(AgentKind::Claude, "pin");
+        install(&k, "a", 1, Scope::org("github.com/acme"), Activation::Always, "A.\n");
+        set_origin(&k.repo, "git@github.com:evil/x.git");
+        k.started(AgentKind::Claude, "t");
+        assert_eq!(spawned(&k), None);
+        let un = k.payloads("skill.unavailable");
+        assert!(un[0]["reason"].as_str().unwrap().contains("confirm"), "{un:?}");
+    }
+
+    #[test]
+    fn claude_skill_hook_records_used() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        install(&k, "a", 1, Scope::Personal, Activation::OnDemand, "A.\n");
+        let t = k.started(AgentKind::Claude, "t").task;
+        let hook = |skill: &str| serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": {"skill": skill}});
+        k.hook(&t.id, hook("mirante-skills:a"));
+        k.hook(&t.id, hook("other-plugin:a"));
+        k.hook(&t.id, hook("mirante-skills:never-injected"));
+        let used = k.payloads("skill.used");
+        assert_eq!(used.len(), 1);
+        assert_eq!(used[0]["name"], "a");
+        assert_eq!(k.hub.lock().store.skill_usage_counts(0).unwrap()["a"].used, 1);
+    }
+
+    #[test]
+    fn task_skills_reports_without_recording() {
+        let Some(_) = keygen() else { return };
+        let k = Kit::new();
+        set_origin(&k.repo, "git@github.com:acme/app.git");
+        install(&k, "a", 1, Scope::org("github.com/acme"), Activation::Always, "A.\n");
+        install(&k, "b", 1, Scope::Personal, Activation::OnDemand, "B.\n");
+        std::fs::write(k.hub.paths().skills().join("b/v1/SKILL.md"), "changed").unwrap();
+        let t = k.create(AgentKind::Claude, "t").task;
+        let v = k.hub.skill_task_skills(SkillTaskParams { task: t.id.clone() }).unwrap();
+        assert_eq!(
+            (v.tenant.as_str(), v.origin.as_str(), v.learning, v.confirmed),
+            ("github.com/acme", "github.com/acme/app", false, true)
+        );
+        assert_eq!(v.active.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(v.refused[0].name, "b");
+        assert!(v.refused[0].reason.contains("modified on disk"), "{:?}", v.refused);
+        assert!(k.payloads("skill.refused").is_empty() && k.hub.lock().store.skill_usage_counts(0).unwrap().is_empty());
     }
 }

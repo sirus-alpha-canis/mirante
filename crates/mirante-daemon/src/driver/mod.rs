@@ -314,6 +314,15 @@ pub trait Driver: Send + Sync {
     }
 }
 
+/// The skills a new session gets, verified: their bytes come from
+/// `mirante_core::skills::library::read_verified` and are the only copy a driver may write
+/// out (never the version folder itself, which could change after the check).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InjectedSkills {
+    pub always: Vec<mirante_core::skills::library::VerifiedSkill>,
+    pub on_demand: Vec<mirante_core::skills::library::VerifiedSkill>,
+}
+
 pub struct SpawnRequest {
     pub task: Task,
     pub session_id: String,
@@ -324,6 +333,9 @@ pub struct SpawnRequest {
     /// `--mcp-config`, Codex: `-c mcp_servers.mirante-memory.*`). Set only for repos whose memory
     /// was explicitly enabled; `None` launches the agent exactly as before.
     pub mcp: Option<std::path::PathBuf>,
+    /// The verified skills whose scope matches the task's origin (see
+    /// `Hub::skills_for`); `None` when there are none.
+    pub skills: Option<InjectedSkills>,
 }
 
 pub trait DriverFactory: Send + Sync {
