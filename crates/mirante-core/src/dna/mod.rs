@@ -2,6 +2,7 @@
 //! against the code they cite. Pure library: no daemon, no network. Every git call goes
 //! through [`crate::git::Git`].
 pub mod anchor;
+pub mod note;
 
 use sha2::{Digest, Sha256};
 
