@@ -91,7 +91,8 @@ experiments, `export MIRANTE_HOME=/tmp/mh` (short: the socket path has a length 
       "relocated now L…"; **Confirm** re-anchors it and it turns fresh.
 - [ ] Timing on a real memory: after a pull that moves HEAD, the first memory read (Brain,
       `mirante memory ls`, an agent's `memory_search`) pays the refresh. See the timings
-      below: the cost follows the number of **distinct cited commits**, about 15 ms each.
+      below: it used to follow the number of **distinct cited commits** (about 15 ms each);
+      since the fix it is one diff from the previous HEAD plus the anchors on changed paths.
       Note how long the first read takes on your repo and how many distinct commits its
       notes cite (`grep -ho '@[0-9a-f]\{40\}' .mirante/memory/*.md | sort -u | wc -l`).
 
@@ -118,8 +119,8 @@ experiments, `export MIRANTE_HOME=/tmp/mh` (short: the socket path has a length 
       anchor is fresh, **1** on findings (a stale or unverifiable anchor, or a note that does
       not parse), **3** when it could not run (not a git checkout, unknown `--rev`).
 - [ ] The clone needs full history (`actions/checkout` with `fetch-depth: 0`): in a
-      shallow clone every cited commit is missing, so every anchor is unverifiable and the
-      job fails (exit 1, "the cited commit … no longer exists").
+      shallow clone it exits **3** with "shallow clone: … fetch full history (e.g.
+      actions/checkout with fetch-depth: 0 …)", not a list of unverifiable anchors.
 - [ ] `--rev <base>` checks the notes as committed at that revision, at that revision.
 
 ## Run on 2026-11-08 (no interactive session)
@@ -135,7 +136,7 @@ fingerprints).
 | `--rev HEAD~1` (before the change) | exit 0 |
 | a note without closing `---` | listed as `invalid`, exit 1 |
 | outside a git checkout / `--rev nosuchrev` | exit 3 / exit 3, with the reason |
-| full clone / shallow clone (`--depth 1`) | exit 0 / exit 1, all 20 unverifiable |
+| full clone / shallow clone (`--depth 1`) | exit 0 / exit 1, all 20 unverifiable (since fixed: a shallow clone exits 3 and says to fetch full history; see below) |
 | `memory enable` on a scratch repo | only `?? .mirante/memory/README.md` in `git status` |
 | no global config | `~/.codex/config.toml` and `~/.claude.json` mention Mirante only as trusted spike folders; `codex mcp get mirante-memory` (no overrides): not found |
 | Codex per-launch override: `codex mcp get mirante-memory --json` with the daemon's three `-c` (command, `args=[]`, env) | stdio server, our binary, `args: []`, env `MIRANTE_TASK_ID`, `MIRANTE_HOME`, `MIRANTE_TASK`; exit 0 |
@@ -157,9 +158,37 @@ changed), "warm" is any read with nothing new:
 The refresh costs about 15 ms per distinct cited commit (its git calls), and little per
 note. Accepted notes are cited at the checkout's HEAD of the day they were accepted, so a
 long-lived memory tends toward one commit per note: 300 such notes add 4.6 s to the first
-read after every HEAD move, which an agent's `memory_search` waits for. The plan's
-mitigation stands (cache per (commit, HEAD), or batch the per-commit git calls); not done
-here.
+read after every HEAD move, which an agent's `memory_search` waits for.
+
+**Fixed the same day** (batched checks, reuse across HEAD moves). A check now runs a fixed
+number of git processes whatever the notes cite: one `cat-file --batch-check` for which
+cited commits exist and one `diff-tree --stdin` for the paths changed since each (instead of
+a `rev-parse` and a `diff` per commit), then the two blob batches. A lazy refresh after a
+HEAD move also starts from the states stored at the previous HEAD: one `diff-tree` (old HEAD
+→ new HEAD) says which paths changed, and only anchors on those paths (or unchecked,
+unverifiable, or citing a commit that is gone) are checked again. An explicit `memory check`
+still rechecks everything. Before/after, same generator (notes with real fingerprints, 40-line
+files, N notes citing C distinct commits), release build, isolated daemon, same machine, two
+runs each (the first table's machine was faster: its 300/300 row read 4.6 s, here 6.4 s).
+Times in ms and include about 90 ms of harness and CLI round trip (the warm read is that
+floor); "unrelated move" is a commit touching no cited path, "cited move" one that changes
+two cited lines:
+
+| Notes / distinct commits | Build | Enable | Warm read | Unrelated move | Cited move | `memory check` | `check --offline` |
+|---|---|---|---|---|---|---|---|
+| 300 / 300 | before | 6463, 6402 | 92, 93 | 6358, 6436 | 6375, 6335 | 6373, 6427 | 6463, 6407 |
+| 300 / 300 | after | 378, 326 | 112, 93 | 180, 155 | 187, 184 | 338, 329 | 309, 310 |
+| 1000 / 100 | before | 2316, 2339 | 107, 104 | 2301, 2346 | 2285, 2290 | 2322, 2311 | 2283, 2271 |
+| 1000 / 100 | after | 295, 291 | 106, 106 | 193, 192 | 218, 219 | 300, 297 | 244, 245 |
+| 400 / 40 | before | 1025, 987 | 94, 94 | 991, 981 | 980, 977 | 989, 993 | 954, 995 |
+| 400 / 40 | after | 206, 202 | 95, 95 | 153, 153 | 185, 184 | 209, 209 | 178, 178 |
+
+The first read after a HEAD move went from 6.4 s to under 0.2 s at 300 distinct commits,
+and no longer grows with the number of distinct commits. Correctness is pinned by tests: a
+path changed between the stored HEAD and the new one is rechecked (stale), a switch to an
+unrelated history rechecks every changed path, a stored HEAD or cited commit that is gone is
+never trusted, and a planted replace ref cannot hide a change (the hardened runner ignores
+it, also for the HEAD → HEAD' diff).
 
 Not run (need an interactive session, a model call or a person): B, C, D's cockpit and
 agent-terminal refusals, the signed-build question, E–H in the app. Those are below.
