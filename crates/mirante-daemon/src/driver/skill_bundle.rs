@@ -617,7 +617,7 @@ pub(crate) mod tests {
         assert_eq!(mirante_core::skills::lint::lint(&draft), vec![], "{item}");
         // Nothing valid to withdraw: no item, nothing touched.
         assert_eq!(withdraw_skills(&paths, "t1", &[]).unwrap(), None);
-        assert_eq!(withdraw_skills(&paths, "t-none", &["x".into()]).unwrap().is_some(), true);
+        assert!(withdraw_skills(&paths, "t-none", &["x".into()]).unwrap().is_some());
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {

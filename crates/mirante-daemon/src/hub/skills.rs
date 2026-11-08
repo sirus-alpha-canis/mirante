@@ -770,7 +770,7 @@ impl Hub {
                         }
                         n.clone()
                     }
-                    None => self.fresh_name(&description, &visible)?,
+                    None => self.fresh_name(&description, visible)?,
                 };
                 let name = self.fresh_from(&wanted, |_| true)?;
                 if name != wanted {
