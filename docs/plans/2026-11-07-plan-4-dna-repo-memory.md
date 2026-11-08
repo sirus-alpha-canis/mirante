@@ -1434,6 +1434,8 @@ it("nodes are keyboard reachable and have accessible names", async () => { /* ro
 
 - [ ] **Step 6: Commit** `docs(dogfood): repo memory checklist and real-agent results`.
 
+> **As built (2026-11-08):** `docs/dogfood/memory.md` holds sections A–I (B, C, D, E, I sharpened: hyphenated permission names, Codex approval per MCP call, cockpit vs agent-terminal review, signed vs unsigned app, `check --offline` exit codes 0/1/3 and full-history clones, refresh timing) and the results of what ran without an interactive session: offline check exit codes, enable, no global config, Codex `-c` override resolution, `mirante-mcp` `tools/list`, and lazy-refresh timings (about 15 ms per distinct cited commit: 4.6 s for 300 notes citing 300 commits). Steps 2–4 passed. Step 5's agent sections are listed for the founder in that file.
+
 ---
 
 ## Self-review: requirements → tasks
