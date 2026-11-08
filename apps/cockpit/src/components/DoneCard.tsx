@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useEnv } from "../env";
 import type { ReactNode } from "react";
 import type { TaskDiff } from "../lib/protocol";
+import { ErrorRetry } from "./ErrorRetry";
 import { diffTotals, plural, useDiff } from "./useDiff";
 
 /** "1 file changed, +10 −2 vs main · 2 new untracked files". `against` names the base;
@@ -33,7 +34,12 @@ export function DoneCard({ taskId, version, onOpen }: { taskId: string; version:
   const d = useDiff(taskId, version);
   const [openError, setOpenError] = useState(false);
   if (d.state === "loading") return <div className="done muted">Reading the diff…</div>;
-  if (d.state === "error") return <div className="done error">Diff unavailable: {d.error}</div>;
+  if (d.state === "error")
+    return (
+      <div className="done">
+        <ErrorRetry text={`Diff unavailable: ${d.error}`} onRetry={d.retry} />
+      </div>
+    );
   const url = d.diff.compare_url;
   return (
     <div className="done" role="group" aria-label="Turn finished">

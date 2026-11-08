@@ -48,3 +48,11 @@ export function shallow<T>(a: T, b: T): boolean {
 export function useSelect<T>(select: (s: State) => T, equal: (a: T, b: T) => boolean = Object.is): T {
   return useCockpitSelect(useEnv().cockpit, select, equal);
 }
+
+const selectBoot = (s: State) => s.bootId;
+
+/** The daemon's boot id (null before the first snapshot): views that fetch on their own
+ * fetch again when it changes (a restarted daemon may answer differently). */
+export function useBoot(): string | null {
+  return useSelect(selectBoot);
+}

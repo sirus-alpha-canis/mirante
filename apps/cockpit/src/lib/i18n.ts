@@ -10,6 +10,8 @@ export const LANGS: Lang[] = ["en", "pt"];
 export const LANG_KEY = "mirante.lang";
 
 const en = {
+  // Common
+  "common.retry": "Retry",
   // Terminal
   "term.region": "Terminal of {branch}",
   "term.noLive": "No live session. Resume the task to see its terminal.",
@@ -30,6 +32,7 @@ export type Key = keyof typeof en;
 export type Params = Record<string, string | number>;
 
 const pt: Partial<Record<Key, string>> = {
+  "common.retry": "Tentar de novo",
   "term.region": "Terminal de {branch}",
   "term.noLive": "Nenhuma sessão ativa. Retome a tarefa para ver o terminal.",
   "term.ended": "stream encerrado",

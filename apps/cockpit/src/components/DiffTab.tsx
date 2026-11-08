@@ -1,6 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { useEnv } from "../env";
 import { DiffCounts } from "./DoneCard";
+import { ErrorRetry } from "./ErrorRetry";
 import { useDiff } from "./useDiff";
 
 function lineClass(l: string): string {
@@ -31,10 +32,10 @@ const Patch = memo(function Patch({ patch }: { patch: string }) {
 
 export function DiffTab({ taskId, version }: { taskId: string; version: number }) {
   const { openUrl } = useEnv();
-  const d = useDiff(taskId, version);
+  const d = useDiff(taskId, version, true);
   const [openError, setOpenError] = useState(false);
   if (d.state === "loading") return <p className="muted">Reading the diff…</p>;
-  if (d.state === "error") return <p className="error">Diff unavailable: {d.error}</p>;
+  if (d.state === "error") return <ErrorRetry text={`Diff unavailable: ${d.error}`} onRetry={d.retry} />;
   const { diff } = d;
   const openPr = (url: string) => {
     setOpenError(false);
