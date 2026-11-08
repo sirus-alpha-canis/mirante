@@ -4438,9 +4438,9 @@ Expected: exit 0; output contains `Tests  11 passed (11)`
 
 The props above are threaded through the later tasks; apply these when writing them:
 - **Task 13 (Home):** `Home` passes `inlineAnswers={props.status?.claude_inline_answers ?? false}` to each `AgentCard`, and its `onOpen` prop becomes `onOpen(taskId: string, tab?: "Terminal"): void` (passed through unchanged).
-- **Task 15 (Detail):** `Detail` takes `initialTab?: Tab` (`useState<Tab>(initialTab ?? "Steps")`, and `key={taskId + (initialTab ?? "")}` at the call site so a new request re-focuses), and its pending-permission cards get the same `agent` / `inlineAnswers` / `onAnswerInTerminal={() => setTab("Terminal")}` props; add a test: a Claude card with inline answers off shows **Answer in terminal**, and clicking it selects the Terminal tab (`aria-selected="true"`) with `Terminal of feat/a` visible.
+- **Task 15 (Detail):** `Detail` takes `initialTab?: Tab` (`useState<Tab>(initialTab ?? "Steps")`, the tab it opens on) and `focusTerminalNonce?: number` (each new value after mount selects the Terminal tab again, so a second **Answer in terminal** for the task already on screen re-focuses it without remounting; the value it mounts with is not a request), and its pending-permission cards get the same `agent` / `inlineAnswers` / `onAnswerInTerminal={() => setTab("Terminal")}` props; add a test: a Claude card with inline answers off shows **Answer in terminal**, and clicking it selects the Terminal tab (`aria-selected="true"`) with `Terminal of feat/a` visible.
 - **Task 16 (Grid):** `Tile` renders `<PermissionCard perm={perm} agent={t.agent} inlineAnswers={inline} onAnswerInTerminal={() => onOpen(t.id, "Terminal")} compact />` (`inline` from the polled status via a `status` prop on `Grid`); the grid test's inline **Allow once** runs with `claude_inline_answers: true`, plus one assertion that the same Claude tile with it false shows **Answer in terminal** and calls `onOpen("…", "Terminal")`.
-- **Task 18 (App):** `open` becomes `(id: string, tab?: "Terminal") => { setTaskId(id); setDetailTab(tab); setMode("detail"); }`, `Detail` gets `initialTab={detailTab}`, `Grid` gets `status`; the ⌘K command for a task needing the user on a Claude card with inline answers off reads "Answer in terminal" and opens the Terminal tab.
+- **Task 18 (App):** `open` becomes `(id: string, tab?: "Terminal") => { setTaskId(id); setDetailTab(tab); if (tab === "Terminal") setTerminalNonce((n) => n + 1); setMode("detail"); }`, `Detail` gets `initialTab={detailTab}`, `focusTerminalNonce={terminalNonce}` and `inlineAnswers={status?.claude_inline_answers ?? false}`, `Grid` gets `status`; the ⌘K command for a task needing the user on a Claude card with inline answers off reads "Answer in terminal" and opens the Terminal tab.
 - **Task 21 (dogfood):** see the two checklist lines on Claude cards.
 
 - [ ] **Step 14: Commit**
@@ -5838,7 +5838,7 @@ The three modes of one screen, the connection banner (with **Start daemon**), `d
 - Create: `apps/cockpit/src/lib/notify.test.ts`
 - Create: `apps/cockpit/src/App.tsx`
 - Create: `apps/cockpit/src/App.test.tsx`
-- Create: `apps/cockpit/src/styles.css`
+- Modify: `apps/cockpit/src/styles.css` (already exists: committed ahead of this task and extended since)
 - Modify: `apps/cockpit/src/main.tsx` (replace)
 
 - [ ] **Step 1: Create `apps/cockpit/src/lib/notify.test.ts`**
@@ -6024,6 +6024,9 @@ export function App({ env }: { env: Env }) {
   const [mode, setMode] = useState<Mode>("home");
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
   const [taskId, setTaskId] = useState<string | null>(null);
+  const [detailTab, setDetailTab] = useState<"Terminal" | undefined>(undefined);
+  // Bumped by every "Answer in terminal": Detail re-selects its Terminal tab on each new value.
+  const [terminalNonce, setTerminalNonce] = useState(0);
   const [repos, setRepos] = useState(() => loadRepos(env.storage));
   const [project, setProject] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -6067,8 +6070,10 @@ export function App({ env }: { env: Env }) {
     env.storage.setItem(THEME_KEY, theme);
   }, [env, theme]);
 
-  const open = useCallback((id: string) => {
+  const open = useCallback((id: string, tab?: "Terminal") => {
     setTaskId(id);
+    setDetailTab(tab);
+    if (tab === "Terminal") setTerminalNonce((n) => n + 1);
     setMode("detail");
   }, []);
   const toggleGrid = useCallback(() => {
@@ -6146,8 +6151,16 @@ export function App({ env }: { env: Env }) {
             onDraft={setDraft}
           />
         )}
-        {mode === "detail" && taskId && <Detail taskId={taskId} onSelect={setTaskId} />}
-        {mode === "grid" && <Grid onOpen={open} />}
+        {mode === "detail" && taskId && (
+          <Detail
+            taskId={taskId}
+            onSelect={setTaskId}
+            initialTab={detailTab}
+            focusTerminalNonce={terminalNonce}
+            inlineAnswers={status?.claude_inline_answers ?? false}
+          />
+        )}
+        {mode === "grid" && <Grid onOpen={open} status={status} />}
         {palette && (
           <CommandBar
             commands={commands}
@@ -6164,7 +6177,9 @@ export function App({ env }: { env: Env }) {
 }
 ```
 
-- [ ] **Step 6: Create `apps/cockpit/src/styles.css`**
+- [ ] **Step 6: `apps/cockpit/src/styles.css` (already exists)**
+
+The stylesheet was committed ahead of this task (92c62fc) and later tasks added rules to it (queue list, terminal link hint). Do not recreate it: compare it with the block below and add only what is missing.
 
 ```css
 /* Mirante cockpit. Tokens first; light is the base, dark overrides (OS or data-theme). */
@@ -6382,6 +6397,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 - [ ] **Step 7: Create `apps/cockpit/src/main.tsx`**
 
 ```tsx
+// xterm's own stylesheet (the Terminal tab renders unstyled without it), then ours.
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 import { openUrl } from "@tauri-apps/plugin-opener";
