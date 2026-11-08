@@ -1,13 +1,27 @@
-import { type KeyboardEvent, type Ref, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  type Ref,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useEnv, useStore } from "../env";
 import {
+  applySuggestion,
   branchFromGoal,
   branchProblem,
   GOAL_HELP,
   isPowerSyntax,
+  matchProjects,
   nextFreeBranch,
   parseDispatch,
   resolveRepo,
+  suggest,
+  type SuggestionItem,
 } from "../lib/dispatch";
 import { type AgentKind, type CreatedOrigin, M, type StartResult, type TaskView } from "../lib/protocol";
 import type { Project } from "../store/select";
@@ -85,10 +99,11 @@ export function DispatchComposer(props: {
   // The branch: named after the goal, past the names this repo's tasks already use, unless edited.
   const [edited, setEdited] = useState<string | null>(null);
   const power = isPowerSyntax(props.value);
-  const taken = useMemo(
-    () => new Set(Object.values(s.tasks).filter((t) => t.repo_path === repo).map((t) => t.branch)),
-    [s.tasks, repo],
+  const takenIn = useCallback(
+    (path: string | null) => new Set(Object.values(s.tasks).filter((t) => t.repo_path === path).map((t) => t.branch)),
+    [s.tasks],
   );
+  const taken = useMemo(() => takenIn(repo), [takenIn, repo]);
   const auto = nextFreeBranch(branchFromGoal(props.value), taken);
   const branch = edited ?? auto;
 
@@ -97,7 +112,7 @@ export function DispatchComposer(props: {
   /** task.create; an auto-named branch git already has moves on to -2, -3… */
   const create = async (target: { repo: string; agent: AgentKind; branch: string; goal: string }, renames: boolean) => {
     if (!renames) return { v: await rpc<TaskView>(M.taskCreate, target), branch: target.branch };
-    const tried = new Set(taken);
+    const tried = takenIn(target.repo);
     let b = target.branch;
     for (let n = 0; ; n++) {
       try {
@@ -121,7 +136,10 @@ export function DispatchComposer(props: {
       if (!p.ok) return setError(p.error);
       const r = resolveRepo(p.value.repo, props.projects);
       if (!r.ok) return setError(r.error);
-      target = { repo: r.path, agent: p.value.agent, branch: p.value.branch, goal: p.value.goal };
+      // "shop/" with no branch: named from the goal, like the form's.
+      renames = p.value.branch === "";
+      const b = renames ? nextFreeBranch(branchFromGoal(p.value.goal), takenIn(r.path)) : p.value.branch;
+      target = { repo: r.path, agent: p.value.agent, branch: b, goal: p.value.goal };
     } else {
       const goal = sent.trim();
       if (!goal) return setError("say what the agent should do");
@@ -157,9 +175,65 @@ export function DispatchComposer(props: {
     }
   };
 
+  // Suggestions for the @ line: agents, then projects; never inside the goal.
+  const box = useRef<HTMLTextAreaElement | null>(null);
+  const setBox = useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      box.current = el;
+      const r = props.inputRef;
+      if (typeof r === "function") r(el);
+      else if (r) (r as { current: HTMLTextAreaElement | null }).current = el;
+    },
+    [props.inputRef],
+  );
+  const [caret, setCaret] = useState(0);
+  const [focused, setFocused] = useState(false);
+  // The text Escape closed the list on: it stays closed until the text changes.
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const sugg = focused && dismissed !== props.value ? suggest(props.value, caret, props.projects) : null;
+  const suggKey = sugg ? `${sugg.kind}:${sugg.from}:${sugg.items.map((i) => i.label).join(",")}` : "";
+  const [activeAt, setActiveAt] = useState({ key: "", i: 0 });
+  const active = sugg && activeAt.key === suggKey ? Math.min(activeAt.i, sugg.items.length - 1) : 0;
+  const listId = useId();
+  const optionId = (i: number) => `${listId}-opt-${i}`;
+  // Where the caret goes once a picked suggestion is in the text.
+  const placeCaret = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const at = placeCaret.current;
+    if (at === null || !box.current) return;
+    placeCaret.current = null;
+    box.current.setSelectionRange(at, at);
+  });
+  const pick = (i: number) => {
+    if (!sugg) return;
+    const next = applySuggestion(props.value, sugg, sugg.items[i]);
+    placeCaret.current = next.caret;
+    setCaret(next.caret);
+    props.onChange(next.text);
+    box.current?.focus();
+  };
+
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.
+    // Enter that confirms an IME composition (Japanese, Chinese…) is not a send nor a pick.
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (sugg && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const n = sugg.items.length;
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveAt({ key: suggKey, i: (active + (e.key === "ArrowDown" ? 1 : n - 1)) % n });
+        return;
+      }
+      if ((e.key === "Enter" && !e.shiftKey) || (e.key === "Tab" && !e.shiftKey)) {
+        e.preventDefault();
+        pick(active);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setDismissed(props.value);
+        return;
+      }
+    }
     // ⌘↵ / Ctrl↵ sends; a plain Enter is a new line of the goal.
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
@@ -191,36 +265,40 @@ export function DispatchComposer(props: {
             </button>
           ))}
         </div>
-        <label htmlFor="dispatch-repo" className="small muted">
-          Repository
-        </label>
-        <select
-          id="dispatch-repo"
-          value={repo ?? ""}
-          disabled={power || props.projects.length === 0}
-          onChange={(e) => setPicked(e.target.value)}
-        >
-          {props.projects.length === 0 && <option value="">No projects yet</option>}
-          {props.projects.map((p) => (
-            <option key={p.path} value={p.path} title={p.path}>
-              {p.name}
-            </option>
-          ))}
-        </select>
+        <RepoBox projects={props.projects} value={repo} disabled={power} onPick={setPicked} />
       </div>
       <label htmlFor="dispatch" className="sr-only">
         Goal
       </label>
       <textarea
         id="dispatch"
-        ref={props.inputRef}
+        ref={setBox}
         rows={3}
         placeholder={GOAL_HELP}
         value={props.value}
-        onChange={(e) => props.onChange(e.target.value)}
+        onChange={(e) => {
+          setCaret(e.target.selectionStart ?? e.target.value.length);
+          props.onChange(e.target.value);
+        }}
+        onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
         onKeyDown={onKey}
         aria-describedby={error ? "dispatch-error" : "dispatch-branch"}
+        aria-autocomplete="list"
+        aria-controls={sugg ? listId : undefined}
+        aria-activedescendant={sugg ? optionId(active) : undefined}
       />
+      {sugg && (
+        <OptionList
+          id={listId}
+          label="Suggestions"
+          items={sugg.items}
+          active={active}
+          optionId={optionId}
+          onPick={pick}
+        />
+      )}
       <button className="btn btn-primary" type="submit" disabled={busy || !props.value.trim()}>
         Dispatch
       </button>
@@ -255,5 +333,103 @@ export function DispatchComposer(props: {
         </p>
       )}
     </form>
+  );
+}
+
+/** A listbox under a field that keeps the keyboard (`aria-activedescendant` on the field).
+ * Options are picked with a click; mousedown keeps the field's focus. */
+function OptionList(props: {
+  id: string;
+  label: string;
+  items: SuggestionItem[];
+  active: number;
+  optionId(i: number): string;
+  onPick(i: number): void;
+}) {
+  return (
+    <ul className="suggest" id={props.id} role="listbox" aria-label={props.label}>
+      {props.items.map((it, i) => (
+        <li
+          key={it.label + i}
+          id={props.optionId(i)}
+          role="option"
+          aria-selected={i === props.active}
+          className={i === props.active ? "active" : undefined}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => props.onPick(i)}
+        >
+          <span>{it.label}</span>
+          {it.detail && <span className="muted small">{it.detail}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** The form's repository: a combobox over the Projects, filtered by folder name as typed. */
+function RepoBox(props: { projects: Project[]; value: string | null; disabled: boolean; onPick(path: string): void }) {
+  // null: not searching (the box shows the chosen project's name).
+  const [query, setQuery] = useState<string | null>(null);
+  const [active, setActive] = useState(0);
+  const id = useId();
+  const listId = `${id}-list`;
+  const optionId = (i: number) => `${id}-opt-${i}`;
+  const chosen = props.projects.find((p) => p.path === props.value);
+  const items = query === null ? [] : matchProjects(query, props.projects);
+  const open = items.length > 0;
+  const at = Math.min(active, Math.max(items.length - 1, 0));
+  const pick = (i: number) => {
+    props.onPick(items[i].path);
+    setQuery(null);
+  };
+  const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (query === null) {
+        setQuery("");
+        setActive(0);
+        return;
+      }
+      const n = items.length || 1;
+      setActive((at + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
+    } else if (e.key === "Enter") {
+      // Never submits the form from here.
+      e.preventDefault();
+      if (open) pick(at);
+    } else if (e.key === "Tab" && open && !e.shiftKey) {
+      pick(at);
+    } else if (e.key === "Escape" && query !== null) {
+      e.preventDefault();
+      setQuery(null);
+    }
+  };
+  return (
+    <span className="repo-box">
+      <label htmlFor={id} className="small muted">
+        Repository
+      </label>
+      <input
+        id={id}
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-autocomplete="list"
+        aria-activedescendant={open ? optionId(at) : undefined}
+        title={chosen?.path}
+        placeholder={props.projects.length === 0 ? "No projects yet" : "Search projects"}
+        disabled={props.disabled || props.projects.length === 0}
+        value={query ?? chosen?.name ?? ""}
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setActive(0);
+        }}
+        onKeyDown={onKey}
+        onBlur={() => setQuery(null)}
+      />
+      {open && <OptionList id={listId} label="Projects" items={items.map((p) => ({ label: p.name, detail: p.path, insert: p.path }))} active={at} optionId={optionId} onPick={pick} />}
+    </span>
   );
 }

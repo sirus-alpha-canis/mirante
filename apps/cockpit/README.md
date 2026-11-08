@@ -93,7 +93,10 @@ of your Projects; it starts on the one selected on the left), and write the goal
 is named after the goal (`mirante/<words-of-the-goal>`, accents dropped, about 40 characters);
 a name another task of the repo uses, or one git already has, moves on to `-2`, `-3`… Use
 **edit** to type your own (an existing branch is then checked out as it is). Text starting
-with `@claude` or `@codex` is the one-line form, `@claude shop/feat/login add a login page`.
+with `@claude` or `@codex` is the one-line form, `@claude shop/feat/login add a login page`:
+typing `@` suggests the agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab
+picks, Esc closes); `shop/` with no branch gets one named from the goal. The Repository box
+filters the Projects the same way.
 
 ## Keys
 

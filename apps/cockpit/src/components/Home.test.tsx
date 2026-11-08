@@ -136,13 +136,99 @@ describe("Home (V3 group chat)", () => {
     expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("the repo select lists the projects, starts on the selected one, and is what is sent", async () => {
-    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [], [], null, ["/repos/shop", "/repos/api"]);
-    const repo = screen.getByLabelText("Repository");
-    expect(repo).toHaveValue("/repos/shop");
-    await userEvent.selectOptions(repo, "/repos/api");
+  it("the repo box starts on the selected project; typing filters the projects, Enter picks", async () => {
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [], [], null, ["/repos/shop", "/repos/api", "/repos/apex"]);
+    const repo = screen.getByRole("combobox", { name: "Repository" });
+    expect(repo).toHaveValue("shop");
+    await userEvent.clear(repo);
+    await userEvent.type(repo, "ap");
+    const list = screen.getByRole("listbox", { name: "Projects" });
+    expect(within(list).getAllByRole("option").map((o) => o.textContent)).toEqual(["apex/repos/apex", "api/repos/api"]);
+    expect(repo).toHaveAttribute("aria-expanded", "true");
+    await userEvent.keyboard("{ArrowDown}");
+    expect(repo).toHaveAttribute("aria-activedescendant", within(list).getAllByRole("option")[1].id);
+    await userEvent.keyboard("{Enter}");
+    expect(repo).toHaveValue("api");
+    expect(screen.queryByRole("listbox", { name: "Projects" })).toBeNull();
     await userEvent.type(screen.getByLabelText("Goal"), "fix it{Meta>}{Enter}{/Meta}");
     await waitFor(() => expect(sent(h)[0]?.[1]).toMatchObject({ repo: "/repos/api", branch: "mirante/fix-it" }));
+  });
+
+  it("the repo box: a click picks; Escape puts the chosen project back", async () => {
+    setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
+    const repo = screen.getByRole("combobox", { name: "Repository" });
+    await userEvent.clear(repo);
+    await userEvent.type(repo, "a");
+    await userEvent.keyboard("{Escape}");
+    expect(repo).toHaveValue("shop");
+    await userEvent.clear(repo);
+    await userEvent.type(repo, "a");
+    await userEvent.click(screen.getByRole("option", { name: /^api/ }));
+    expect(repo).toHaveValue("api");
+  });
+
+  describe("the @ shortcut's suggestions", () => {
+    const goal = () => screen.getByLabelText("Goal");
+    const options = () => within(screen.getByRole("listbox", { name: "Suggestions" })).getAllByRole("option").map((o) => o.textContent);
+
+    it("@ suggests the agents; arrows move, Enter picks", async () => {
+      setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
+      await userEvent.type(goal(), "@");
+      expect(options()).toEqual(["@claude", "@codex"]);
+      expect(goal()).toHaveAttribute("aria-autocomplete", "list");
+      await userEvent.keyboard("{ArrowDown}");
+      expect(goal()).toHaveAttribute("aria-activedescendant", screen.getByRole("option", { name: "@codex" }).id);
+      expect(screen.getByRole("option", { name: "@codex" })).toHaveAttribute("aria-selected", "true");
+      await userEvent.keyboard("{Enter}");
+      expect(goal()).toHaveValue("@codex ");
+    });
+
+    it("after the agent, the projects filtered as typed; Tab inserts repo/", async () => {
+      setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
+      await userEvent.type(goal(), "@claude ");
+      expect(options()).toEqual(["api/repos/api", "shop/repos/shop"]);
+      await userEvent.type(goal(), "a");
+      expect(options()).toEqual(["api/repos/api"]);
+      await userEvent.keyboard("{Tab}");
+      expect(goal()).toHaveValue("@claude api/");
+      expect(goal()).toHaveFocus();
+      expect(screen.queryByRole("listbox", { name: "Suggestions" })).toBeNull();
+    });
+
+    it("a click picks; Escape closes without changing the text", async () => {
+      setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
+      await userEvent.type(goal(), "@claude s");
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("listbox", { name: "Suggestions" })).toBeNull();
+      expect(goal()).toHaveValue("@claude s");
+      await userEvent.type(goal(), "h");
+      await userEvent.click(screen.getByRole("option", { name: /^shop/ }));
+      expect(goal()).toHaveValue("@claude shop/");
+    });
+
+    it("never inside the goal text", async () => {
+      setup({}, [], [], null, ["/repos/shop"]);
+      await userEvent.type(goal(), "@claude shop/feat/x fix @co");
+      expect(screen.queryByRole("listbox", { name: "Suggestions" })).toBeNull();
+    });
+
+    it("Enter that confirms an IME composition does not pick", () => {
+      setup({}, [], [], null, ["/repos/shop"]);
+      act(() => goal().focus());
+      fireEvent.change(goal(), { target: { value: "@", selectionStart: 1 } });
+      expect(screen.getByRole("listbox", { name: "Suggestions" })).toBeInTheDocument();
+      fireEvent.keyDown(goal(), { key: "Enter", isComposing: true });
+      fireEvent.keyDown(goal(), { key: "Enter", keyCode: 229 });
+      expect(goal()).toHaveValue("@");
+    });
+
+    it("repo/ with no branch gets one named from the goal", async () => {
+      const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [task("a", { branch: "mirante/fix-the-login" })]);
+      await userEvent.type(goal(), "@codex shop/ fix the login{Meta>}{Enter}{/Meta}");
+      await waitFor(() =>
+        expect(sent(h)[0]?.[1]).toEqual({ repo: "/repos/shop", agent: "codex", branch: "mirante/fix-the-login-2", goal: "fix the login", base: "HEAD" }),
+      );
+    });
   });
 
   it("a branch another task of the repo has gets -2, -3…", async () => {

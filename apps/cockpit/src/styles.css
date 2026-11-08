@@ -166,6 +166,14 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .seg .btn:first-child { border-radius: 6px 0 0 6px; }
 .seg .btn:last-child { border-radius: 0 6px 6px 0; margin-left: -1px; }
 .seg .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.composer.dispatch { position: relative; }
+.repo-box { position: relative; display: inline-flex; gap: 6px; align-items: center; }
+.repo-box input { border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; background: var(--bg); width: 200px; }
+/* Suggestion lists open upward: the dispatch form sits at the bottom of the feed. */
+.suggest { position: absolute; bottom: 100%; left: 0; z-index: 10; min-width: 240px; max-height: 240px; overflow: auto; list-style: none; margin: 0 0 4px; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15); }
+.composer.dispatch > .suggest { left: 20px; }
+.suggest li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 8px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+.suggest li.active, .suggest li:hover { background: var(--panel-2); }
 .dispatch-branch { flex-basis: 100%; margin: 0; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
 .dispatch-branch input { border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; background: var(--bg); font-family: var(--mono, ui-monospace, monospace); min-width: 220px; }
 
