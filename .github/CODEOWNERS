@@ -1,0 +1,3 @@
+# Default owner for everything in the repository.
+# Reviews from code owners are required only when branch protection enables it.
+* @pedrincandido
