@@ -491,6 +491,8 @@ export const M = {
   permissionList: "permission.list",
   permissionAnswer: "permission.answer",
   daemonStatus: "daemon.status",
+  daemonSettings: "daemon.settings",
+  repoFiles: "repo.files",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
   dnaStatus: "dna.status",

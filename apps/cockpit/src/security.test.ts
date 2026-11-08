@@ -106,6 +106,7 @@ describe("Tauri security baseline", () => {
       "PERMISSION_LIST",
       "PERMISSION_ANSWER",
       "DAEMON_STATUS",
+      "DAEMON_SETTINGS",
       "SESSION_HIBERNATE",
       "SESSION_WAKE",
       "DNA_STATUS",
@@ -131,6 +132,7 @@ describe("Tauri security baseline", () => {
       "SKILL_PROPOSALS",
       "SKILL_REVIEW",
       "SKILL_ACTION",
+      "REPO_FILES",
     ]);
     // Never DNA_PROPOSE: agents propose through MCP; people write notes in their editor.
     expect(block).not.toContain("DNA_PROPOSE");

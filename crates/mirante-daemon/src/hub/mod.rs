@@ -25,6 +25,7 @@ use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
 pub mod dna;
 pub(crate) mod evidence;
+pub mod files;
 pub mod memory;
 pub mod messages;
 pub mod queue;

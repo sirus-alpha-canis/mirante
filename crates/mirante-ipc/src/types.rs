@@ -44,6 +44,9 @@ pub mod method {
     pub const DAEMON_DOCTOR: &str = "daemon.doctor";
     /// Kills one orphan the user picked from `daemon.doctor` ([`super::KillOrphan`]).
     pub const DAEMON_KILL_ORPHAN: &str = "daemon.kill_orphan";
+    /// A repository's files whose path matches a query, for attaching them to a goal
+    /// ([`super::RepoFiles`] → `Vec<String>`, relative paths). A person only.
+    pub const REPO_FILES: &str = "repo.files";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -536,6 +539,17 @@ pub struct DaemonStatus {
     /// (`daemon.settings`). Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_resume: Option<bool>,
+}
+
+/// `repo.files` parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoFiles {
+    pub repo: String,
+    #[serde(default)]
+    pub query: String,
+    /// Default 30, at most 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 /// `daemon.settings` parameters: each one given is changed (and persisted).

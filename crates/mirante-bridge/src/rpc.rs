@@ -33,6 +33,8 @@ pub const ALLOWED: &[&str] = &[
     method::PERMISSION_LIST,
     method::PERMISSION_ANSWER,
     method::DAEMON_STATUS,
+    // The person's auto-resume setting (the daemon allows a person only).
+    method::DAEMON_SETTINGS,
     method::SESSION_HIBERNATE,
     method::SESSION_WAKE,
     // Repo memory (DNA). Never `dna.propose`: agents propose through their MCP server and
@@ -64,6 +66,8 @@ pub const ALLOWED: &[&str] = &[
     method::SKILL_PROPOSALS,
     method::SKILL_REVIEW,
     method::SKILL_ACTION,
+    // "+ context" in the dispatch form: a repo's file paths matching a query (never contents).
+    method::REPO_FILES,
 ];
 
 /// `session.start` waits for the agent to boot (up to 45 s in the daemon).
@@ -171,6 +175,7 @@ mod tests {
             "permission.list",
             "permission.answer",
             "daemon.status",
+            "daemon.settings",
             "session.hibernate",
             "session.wake",
             "dna.status",
@@ -196,6 +201,7 @@ mod tests {
             "skill.proposals",
             "skill.review",
             "skill.action",
+            "repo.files",
         ];
         assert_eq!(ALLOWED, expected);
     }

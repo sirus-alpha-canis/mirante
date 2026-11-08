@@ -69,6 +69,7 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::DAEMON_DOCTOR, Access::Person),
     (method::DAEMON_KILL_ORPHAN, Access::Person),
     (method::DAEMON_SETTINGS, Access::Person),
+    (method::REPO_FILES, Access::Person),
     (method::DNA_STATUS, Access::Person),
     (method::DNA_ENABLE, Access::Person),
     (method::DNA_DISABLE, Access::Person),
