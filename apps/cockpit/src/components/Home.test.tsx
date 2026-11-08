@@ -201,4 +201,12 @@ describe("Home (V3 group chat)", () => {
     act(() => h.env.cockpit.dispatch({ type: "event", event: ev(5, "a", "status", { to: "needs_you" }) }));
     expect(region).toHaveTextContent("goal of a: Needs you");
   });
+
+  it("the rail ends with the memory guard panel, fed by daemon.status", () => {
+    const sys = { level: "critical", total: 16 * 2 ** 30, free: 256 * 2 ** 20, swap_used: 0, swap_total: 0, paused: true };
+    setup({}, [task("a", { status: "working" })], [], { ...daemonStatus(false), memory: sys });
+    const rail = screen.getByRole("navigation", { name: "Projects and agents" });
+    const panel = within(rail).getByRole("region", { name: "Memory guard" });
+    expect(panel).toHaveTextContent("System pressure critical · 256 MB free · new sessions paused");
+  });
 });

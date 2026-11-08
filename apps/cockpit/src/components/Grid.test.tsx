@@ -64,4 +64,12 @@ describe("Grid (V2)", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
     expect(onOpen).toHaveBeenCalledWith("w", "Terminal");
   });
+
+  it("each live tile can be hibernated", async () => {
+    const h = makeEnv({ "session.hibernate": {} });
+    h.load([task("a", { status: "working" })]);
+    renderWith(h.env, <Grid onOpen={() => {}} status={null} />);
+    await userEvent.click(within(screen.getByRole("article")).getByRole("button", { name: "Hibernate" }));
+    expect(h.calls).toContainEqual(["session.hibernate", { task: "a" }]);
+  });
 });

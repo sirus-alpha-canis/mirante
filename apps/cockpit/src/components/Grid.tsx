@@ -5,6 +5,7 @@ import { type DaemonStatus, M, RpcCode, type SendMode, type SendResult, type Tas
 import { columnOf, gridTasks, lastLines, pendingPerms } from "../store/select";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
+import { HibernateButton } from "./MemoryPanel";
 import { PermissionCard } from "./PermissionCard";
 import { TrustCard } from "./TrustCard";
 
@@ -91,6 +92,7 @@ function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onOpen(id: string, ta
             {note}
           </span>
         )}
+        <HibernateButton t={t} />
       </footer>
     </article>
   );

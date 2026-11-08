@@ -3,6 +3,7 @@ import { useEnv, useStore } from "../env";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { addRepo, loadRepos, removeRepo } from "../lib/repos";
 import type { Project } from "../store/select";
+import { MemoryPanel } from "./MemoryPanel";
 
 export function LeftRail(props: {
   projects: Project[];
@@ -101,6 +102,7 @@ export function LeftRail(props: {
           </li>
         ))}
       </ul>
+      <MemoryPanel status={props.status} />
     </nav>
   );
 }

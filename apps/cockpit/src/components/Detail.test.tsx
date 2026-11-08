@@ -230,4 +230,14 @@ describe("Detail (V1 classic)", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Open PR" }));
     expect(await screen.findByText(/could not open the browser/)).toBeInTheDocument();
   });
+
+  it("a live task can be hibernated from the header; a hibernated one offers Wake, not Resume", async () => {
+    const h = setup({ "session.hibernate": {}, "session.wake": {} }, [task("a", { status: "working" })], []);
+    await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
+    expect(h.calls).toContainEqual(["session.hibernate", { task: "a" }]);
+    act(() => h.load([task("a", { live: false, boot: null, status: "ended", hibernated: true })]));
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Wake" }));
+    expect(h.calls).toContainEqual(["session.wake", { task: "a" }]);
+  });
 });

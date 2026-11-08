@@ -1,10 +1,12 @@
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useEnv, useStore } from "../env";
+import { isHibernated } from "../lib/memguard";
 import { M, type TaskView } from "../lib/protocol";
 import { columnOf, COLUMN_LABEL, type Column, pendingPerms, turnsEnded } from "../store/select";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
+import { HibernateButton } from "./MemoryPanel";
 import { MessageComposer } from "./MessageComposer";
 import { PermissionCard } from "./PermissionCard";
 import { QueueList } from "./QueueList";
@@ -79,9 +81,12 @@ function Actions({ t }: { t: TaskView }) {
   return (
     <span className="actions">
       {!t.live ? (
-        <button className="btn btn-small" disabled={busy} onClick={() => run(M.sessionResume)}>
-          Resume
-        </button>
+        // A hibernated session is resumed by Wake (below), which keeps the memory guard's mark.
+        !isHibernated(t) && (
+          <button className="btn btn-small" disabled={busy} onClick={() => run(M.sessionResume)}>
+            Resume
+          </button>
+        )
       ) : confirmStop ? (
         <span role="group" aria-label="Confirm stop">
           <span className="small">Stop the agent? The task stays; resume it later.</span>{" "}
@@ -102,6 +107,7 @@ function Actions({ t }: { t: TaskView }) {
           </button>
         </>
       )}
+      <HibernateButton t={t} />
       {error && (
         <span className="error" role="alert">
           {error}
