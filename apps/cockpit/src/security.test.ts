@@ -42,8 +42,16 @@ describe("Tauri security baseline", () => {
   });
 
   it("grants only notifications and opening github.com URLs", () => {
+    // Notifications: exactly the three commands the plugin's \`window.Notification\` shim
+    // calls (is_permission_granted, request_permission, notify); not the plugin's default
+    // set (channels, pending/active lists, cancel, listeners…).
     const ids = capabilities.permissions.map((p) => (typeof p === "string" ? p : p.identifier));
-    expect(ids).toEqual(["notification:default", "opener:allow-open-url"]);
+    expect(ids).toEqual([
+      "notification:allow-is-permission-granted",
+      "notification:allow-request-permission",
+      "notification:allow-notify",
+      "opener:allow-open-url",
+    ]);
     const opener = capabilities.permissions.find((p) => typeof p !== "string");
     expect(opener).toEqual({ identifier: "opener:allow-open-url", allow: [{ url: "https://github.com/*" }] });
     expect(capabilities.windows).toEqual(["main"]);
