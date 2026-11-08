@@ -506,9 +506,10 @@ impl Hub {
         let repo = PathBuf::from(&p.repo);
         fsio::init(&repo).map_err(dna_err)?;
         let slug = create_unique(&repo, &note::slugify(&n.title), &text).map_err(dna_err)?;
+        let hash = sha256_hex(text.as_bytes());
         let accepted = {
             let mut st = self.lock();
-            st.store.dna_accept(&p.id, &slug, &why, &sha256_hex(text.as_bytes())).map_err(as_conflict).and_then(|d| {
+            st.store.dna_accept(&p.id, &slug, &why, &hash).map_err(as_conflict).and_then(|d| {
                 decided(&mut st, &d)?;
                 Ok(d)
             })
@@ -517,7 +518,8 @@ impl Hub {
             Ok(d) => d,
             Err(e) => {
                 // Decided by someone else meanwhile: take back the file this call wrote.
-                let _ = std::fs::remove_file(fsio::note_path(&repo, &slug));
+                // Through the directory descriptor, and only if it is still our text.
+                let _ = fsio::remove_note(&repo, &slug, &hash);
                 return Err(e);
             }
         };

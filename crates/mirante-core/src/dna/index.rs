@@ -4,13 +4,12 @@
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use super::anchor::Anchor;
 use super::check::{check_all, rev_parse, AnchorState};
-use super::{fsio, note, sha256_hex, DnaError, MAX_NOTES, MEMORY_DIR};
+use super::fsio::MemoryDir;
+use super::{note, sha256_hex, DnaError, MAX_NOTES};
 use crate::error::{CoreError, Result};
 use crate::model::{new_id, now_ms};
 use crate::store::Store;
@@ -559,61 +558,38 @@ pub fn repo_key(repo: &Path) -> std::result::Result<String, DnaError> {
     Ok(repo.canonicalize()?.to_string_lossy().into_owned())
 }
 
-/// `Ok(None)` when `.mirante/memory` does not exist at all; the checked directory when it
-/// does; `Err(Unsafe)` when either level is a symlink or not a directory.
-fn existing_memory_dir(repo: &Path) -> std::result::Result<Option<std::path::PathBuf>, DnaError> {
-    let mut p = repo.to_path_buf();
-    for seg in MEMORY_DIR.split('/') {
-        p.push(seg);
-        match std::fs::symlink_metadata(&p) {
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
-                return Err(DnaError::Unsafe(format!("{}: is a symlink or not a directory", p.display())))
-            }
-            Ok(_) => {}
-        }
-    }
-    fsio::memory_dir(repo).map(Some)
-}
-
 /// A stat signature of `.mirante/memory`: every entry's name, type, size and mtime,
 /// hashed. `"absent"` when the directory does not exist.
 pub fn signature(repo: &Path) -> std::result::Result<String, DnaError> {
-    let Some(dir) = existing_memory_dir(repo)? else {
-        return Ok("absent".into());
-    };
-    let mut lines = Vec::new();
-    for (i, entry) in std::fs::read_dir(&dir)?.enumerate() {
-        if i > MAX_NOTES {
-            break;
-        }
-        let entry = entry?;
-        let m = entry.metadata()?; // does not follow a symlink
-        lines.push(format!(
-            "{}\0{:o}\0{}\0{}.{}",
-            entry.file_name().to_string_lossy(),
-            m.mode(),
-            m.len(),
-            m.mtime(),
-            m.mtime_nsec()
-        ));
+    match MemoryDir::open(repo)? {
+        Some(dir) => signature_of(&dir),
+        None => Ok("absent".into()),
     }
+}
+
+fn signature_of(dir: &MemoryDir) -> std::result::Result<String, DnaError> {
+    let mut lines: Vec<String> = dir
+        .entries(MAX_NOTES)?
+        .iter()
+        .map(|e| format!("{}\0{:o}\0{}\0{}.{}", e.name, e.mode, e.size, e.mtime, e.mtime_nsec))
+        .collect();
     lines.sort();
     Ok(sha256_hex(lines.join("\n").as_bytes()))
 }
 
-/// Reads `.mirante/memory`: at most [`MAX_NOTES`] entries; regular `*.md` files only
-/// (symlinks, directories, dotfiles, other extensions and `README.md` are skipped); each
-/// read without following symlinks and size-capped. A file whose name is not a slug is
-/// listed as invalid; one that does not parse is indexed with its `parse_error`.
+/// Reads `.mirante/memory` through one [`MemoryDir`] descriptor: at most [`MAX_NOTES`]
+/// entries; regular `*.md` files only (symlinks, directories, dotfiles such as the
+/// `.<name>.tmp-*` files of a write in progress, other extensions and `README.md` are
+/// skipped); each read without following symlinks, single-link and size-capped. A file
+/// whose name is not a slug is listed as invalid; one that does not parse is indexed with
+/// its `parse_error`.
 pub fn scan(repo: &Path) -> std::result::Result<Scan, DnaError> {
-    let signature = signature(repo)?;
-    let Some(dir) = existing_memory_dir(repo)? else {
-        return Ok(Scan { notes: Vec::new(), invalid: Vec::new(), signature });
+    let Some(dir) = MemoryDir::open(repo)? else {
+        return Ok(Scan { notes: Vec::new(), invalid: Vec::new(), signature: "absent".into() });
     };
+    let signature = signature_of(&dir)?;
     let (mut notes, mut invalid) = (Vec::new(), Vec::new());
-    for (i, entry) in std::fs::read_dir(&dir)?.enumerate() {
+    for (i, entry) in dir.entries(MAX_NOTES)?.into_iter().enumerate() {
         if i >= MAX_NOTES {
             invalid.push(InvalidNote {
                 file: String::new(),
@@ -621,17 +597,16 @@ pub fn scan(repo: &Path) -> std::result::Result<Scan, DnaError> {
             });
             break;
         }
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(stem) = name.strip_suffix(".md").map(str::to_string) else { continue };
-        if name.starts_with('.') || name.eq_ignore_ascii_case("README.md") || !entry.file_type()?.is_file() {
+        let name = entry.name.clone();
+        if name.starts_with('.') || name.eq_ignore_ascii_case("README.md") || !entry.is_file() {
             continue;
         }
+        let Some(stem) = name.strip_suffix(".md").map(str::to_string) else { continue };
         if !note::is_slug(&stem) {
             invalid.push(InvalidNote { file: name, error: "the file name is not a note name (a-z, 0-9 and -)".into() });
             continue;
         }
-        let text = match fsio::read_note(repo, &stem) {
+        let text = match dir.read_file(&name) {
             Ok(t) => t,
             Err(e) => {
                 invalid.push(InvalidNote { file: name, error: e.to_string() });
@@ -984,10 +959,16 @@ mod refresh_tests {
         std::fs::create_dir(dir.join("y.md")).unwrap();
         std::fs::write(dir.join("z.txt"), "text").unwrap();
         std::fs::write(dir.join("Not A Slug.md"), "x").unwrap();
+        // A write in progress (temp file) and other dotfiles are not notes.
+        std::fs::write(dir.join(".good.md.tmp-0193"), "partial").unwrap();
+        std::fs::write(dir.join(".hidden.md"), "x").unwrap();
+        // A hard link planted in place of a note is refused, never indexed.
+        std::fs::write(r.path().join("secret.txt"), "secret").unwrap();
+        std::fs::hard_link(r.path().join("secret.txt"), dir.join("linked.md")).unwrap();
         let mut s = Store::open_in_memory().unwrap();
         let rep = refresh(&mut s, r.path()).unwrap();
         assert_eq!(rep.notes, 1);
-        assert_eq!(rep.invalid.iter().map(|i| i.file.as_str()).collect::<Vec<_>>(), ["Not A Slug.md"]);
+        assert_eq!(rep.invalid.iter().map(|i| i.file.as_str()).collect::<Vec<_>>(), ["Not A Slug.md", "linked.md"]);
         let key = repo_key(r.path()).unwrap();
         assert!(s.dna_note(&key, "x").unwrap().is_none() && s.dna_note(&key, "readme").unwrap().is_none());
     }
