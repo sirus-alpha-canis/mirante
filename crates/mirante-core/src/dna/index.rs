@@ -1067,7 +1067,7 @@ mod store_tests {
     #[test]
     fn migration_6_supersedes_older_reviews_of_a_slug() {
         let mut s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 6);
+        assert!(s.schema_version().unwrap() >= 6);
         s.dna_record_review("r", "a", "h1", "accepted").unwrap();
         s.dna_record_review("r", "a", "h2", "confirmed").unwrap();
         // Retired (h2): restoring the old accepted text (h1) is not reviewed any more.

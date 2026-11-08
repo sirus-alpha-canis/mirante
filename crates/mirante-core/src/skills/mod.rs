@@ -2,6 +2,7 @@
 //! the task repo's normalized origin. Pure library: origin normalization, the format,
 //! lint, signing, the versioned library and the miner. No daemon, no network.
 pub mod format;
+pub mod index;
 pub mod library;
 pub mod lint;
 pub mod mine;
