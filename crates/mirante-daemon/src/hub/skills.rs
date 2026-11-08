@@ -1395,7 +1395,10 @@ impl Hub {
                     .collect(),
                 fingerprint: Some(m.fingerprint.clone()),
                 lint: lint(&m.lint_draft()),
-                redactions: 0,
+                // Mined text is redacted sentence by sentence before it is clustered: what
+                // it shows masked is what was redacted.
+                redactions: mirante_core::redact::masked_count(&m.body)
+                    + m.evidence.iter().map(|e| mirante_core::redact::masked_count(&e.text)).sum::<usize>(),
             };
             match self.lock().store.skill_insert_proposal(&new, CAPS) {
                 Ok(i) if i.new => out.proposed += 1,
@@ -2809,6 +2812,25 @@ pub(crate) mod tests {
         assert_eq!((r.proposed, r.updated), (0, 1));
         let q = k.hub.skill_proposals(SkillProposals::default()).unwrap();
         assert_eq!((q.len(), q[0].proposal.evidence.len()), (1, 4));
+    }
+
+    /// A mined proposal says how many secrets its text had masked (like any other).
+    #[test]
+    fn a_mined_proposal_counts_its_redactions() {
+        let k = Kit::new();
+        learning(&k, "unrelated");
+        let token = format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        for (i, g) in CLIPPY[..3].iter().enumerate() {
+            create_in(&k, &Caller::Person, &format!("c{i}"), &format!("{g} Use TOKEN={token} to push."));
+        }
+        assert_eq!(mine(&k, "github.com/acme").unwrap().proposed, 1);
+        let q = k.hub.skill_proposals(SkillProposals::default()).unwrap();
+        let p = &q[0].proposal;
+        let shown = p.body.matches("«redacted»").count()
+            + p.evidence.iter().map(|e| e.text.matches("«redacted»").count()).sum::<usize>();
+        assert!(shown > 0, "{p:?}");
+        assert!(!format!("{p:?}").contains(&token));
+        assert_eq!(p.redactions, shown);
     }
 
     #[test]

@@ -421,10 +421,16 @@ fn description_text(s: &str) -> String {
 /// description or body) before the line is proposed as an edit of it: a third.
 pub const MIN_RELEVANCE: f64 = 1.0 / 3.0;
 
-/// Two words name the same thing: equal, or one starts the other and both have at least
-/// four letters (`commit` / `commitar`, `test` / `tests`): a crude stem across PT and EN.
+/// Two words name the same thing: equal; or one starts the other and the shorter, the
+/// stem, has at least five letters (`commit` / `commitar`); or a stem of four letters
+/// with at most two more (`test` / `tests`, never `test` / `testament`): a crude stem
+/// across PT and EN.
 fn same_word(a: &str, b: &str) -> bool {
-    a == b || (a.len().min(b.len()) >= 4 && (a.starts_with(b) || b.starts_with(a)))
+    if a == b {
+        return true;
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    long.starts_with(short) && (short.len() >= 5 || (short.len() == 4 && long.len() - short.len() <= 2))
 }
 
 /// The share of `line` (its tokens) that `skill` also says, in its name, description or
@@ -498,13 +504,10 @@ pub fn draft(
         Scope::Repo(k) | Scope::Org(k) => super::origin::tenant(k) == c.tenant,
         Scope::Personal => false,
     };
-    // What the line is about: a denial's tool and command, else the line's own words.
+    // What the line is about: a denial's command (not its tool: every shell rule names
+    // bash), else the line's own words.
     let topic = match &c.denial {
-        Some((tool, head)) => {
-            let mut t = vec![tool.to_lowercase()];
-            t.extend(tokens(head));
-            t
-        }
+        Some((_, head)) => tokens(head),
         None => tokens(&line),
     };
     let ran_with = |s: &ActiveSkill| {
@@ -768,6 +771,29 @@ mod tests {
         assert_eq!(d.body.trim_end(), "Do not run `git push`; ask the operator first (denied in 3 tasks).");
         assert_eq!(d.kind, Kind::New);
         assert!(!has_errors(&lint(&d.lint_draft())), "{:?}", lint(&d.lint_draft()));
+    }
+
+    /// Relevance: the denial's tool name says nothing about the command (every shell rule
+    /// mentions bash), and a short stem is not a word (`test` is not `testament`).
+    #[test]
+    fn relevance_ignores_the_tool_and_needs_a_real_stem() {
+        assert!(same_word("test", "tests") && same_word("commit", "commitar") && same_word("cargo", "cargo"));
+        assert!(!same_word("test", "testament") && !same_word("run", "running") && !same_word("push", "pushover"));
+        let denied = |task: &str, ts: i64| Utterance {
+            source: Source::Denied { tool: "Bash".into() },
+            ..utt_in(A, "api", task, "git push origin main", ts)
+        };
+        let c = cluster(&units(&[denied("t1", 1), denied("t2", 2), denied("t3", 3)]), &Params::default());
+        let all: HashMap<String, Vec<String>> =
+            ["t1", "t2", "t3"].iter().map(|t| (t.to_string(), vec!["shell".to_string()])).collect();
+        // Says "bash" but nothing of the command: the tool name does not make it related.
+        let shell = ActiveSkill {
+            description: "Bash habits".into(),
+            ..active("shell", Scope::org(A), "Prefer bash over sh. Quote every variable.\n")
+        };
+        assert_eq!(draft(&c[0], std::slice::from_ref(&shell), &all, &[]).unwrap().kind, Kind::New);
+        let pushing = ActiveSkill { description: "How we push with git".into(), ..shell };
+        assert!(matches!(draft(&c[0], &[pushing], &all, &[]).unwrap().kind, Kind::Edit { .. }));
     }
 
     #[test]

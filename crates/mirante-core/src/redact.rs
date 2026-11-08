@@ -4,6 +4,12 @@
 /// What a masked credential reads as.
 const REDACTED: &str = "«redacted»";
 
+/// How many masked values `text` shows (text that went through [`redact`] earlier, e.g. a
+/// mined proposal built from redacted sentences).
+pub fn masked_count(text: &str) -> usize {
+    text.matches(REDACTED).count()
+}
+
 /// `text` with the credentials a command, URL or note commonly carries masked: an
 /// `Authorization:` header value, a `Bearer` token, the `user:password@` of a URL,
 /// assignments whose name says secret (`*_KEY=`, `*TOKEN*=`, `*SECRET*=`, `*PASSWORD*=`,
