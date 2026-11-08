@@ -670,10 +670,27 @@ impl Store {
 
     /// Accepts a pending proposal as `row` (the version just written): the decision (with
     /// what the proposal became), the ledger entry, the index row and `skill.decided`
-    /// commit together or not at all.
-    pub fn skill_accept(&mut self, id: &str, fin: &Final, row: &SkillRow, note: &str) -> Result<SkillProposal> {
+    /// commit together or not at all. `base` is the manifest hash the version was made
+    /// against (`None`: a new skill), rechecked here: a skill that appeared or moved on
+    /// since is `InvalidTransition`.
+    pub fn skill_accept(
+        &mut self,
+        id: &str,
+        fin: &Final,
+        row: &SkillRow,
+        base: Option<&str>,
+        note: &str,
+    ) -> Result<SkillProposal> {
         let boot = self.boot_id().to_string();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_skill(&tx, &row.name)?;
+        if current.as_ref().map(|c| c.manifest_hash.as_str()) != base {
+            return Err(CoreError::InvalidTransition {
+                kind: "skill",
+                from: current.map_or_else(|| format!("{} (none)", row.name), |c| format!("{} v{}", c.name, c.version)),
+                to: "accept (it changed since this proposal)".into(),
+            });
+        }
         let p = decide(&tx, &boot, id, true, Some((fin, row.version)), note)?;
         record_review(&tx, &row.name, row.version, &row.manifest_hash, "accepted")?;
         upsert(&tx, row)?;
@@ -932,7 +949,7 @@ mod tests {
             scope: Scope::Personal,
             activation: Activation::OnDemand,
         };
-        let d = s.skill_accept(&p.id, &fin, &row("run-tests", 1, "h1"), "ok").unwrap();
+        let d = s.skill_accept(&p.id, &fin, &row("run-tests", 1, "h1"), None, "ok").unwrap();
         assert_eq!((d.status.as_str(), d.version, d.scope.as_str()), ("accepted", Some(1), "personal"));
         assert_eq!((d.description.as_str(), d.activation.as_str()), ("Edited", "on_demand"));
         assert!(s.skill_is_reviewed("run-tests", "h1").unwrap());
@@ -942,8 +959,36 @@ mod tests {
         assert_eq!(decided.payload["version"], 1);
         assert_eq!(decided.payload["name"], "run-tests");
         // A second accept of the same proposal changes nothing.
-        assert!(s.skill_accept(&p.id, &fin, &row("run-tests", 2, "h2"), "").is_err());
+        assert!(s.skill_accept(&p.id, &fin, &row("run-tests", 2, "h2"), Some("h1"), "").is_err());
         assert_eq!(s.skill_get("run-tests").unwrap().unwrap().version, 1);
+    }
+
+    /// The base an accept was decided against is rechecked inside its transaction: a skill
+    /// that appeared (for a new one) or moved on (for an edit) meanwhile refuses it, and
+    /// nothing is written.
+    #[test]
+    fn accept_rechecks_its_base_in_the_transaction() {
+        let mut s = Store::open_in_memory().unwrap();
+        let fin = |name: &str| Final {
+            name: name.into(),
+            description: "d".into(),
+            body: "b\n".into(),
+            scope: Scope::Personal,
+            activation: Activation::Always,
+        };
+        let p1 = s.skill_insert_proposal(&proposal("github.com/acme", None, None), CAPS).unwrap().proposal;
+        let p2 = s.skill_insert_proposal(&proposal("github.com/acme", None, None), CAPS).unwrap().proposal;
+        s.skill_upsert_current(&row("run-tests", 1, "h1")).unwrap();
+        // A new skill: none may exist.
+        let e = s.skill_accept(&p1.id, &fin("run-tests"), &row("run-tests", 2, "h2"), None, "");
+        assert!(matches!(e, Err(CoreError::InvalidTransition { .. })), "{e:?}");
+        // An edit: the current version must be the base.
+        let e = s.skill_accept(&p2.id, &fin("run-tests"), &row("run-tests", 2, "h2"), Some("h0"), "");
+        assert!(matches!(e, Err(CoreError::InvalidTransition { .. })), "{e:?}");
+        assert_eq!(s.skill_proposal(&p2.id).unwrap().status, "pending");
+        assert_eq!(s.skill_get("run-tests").unwrap().unwrap().manifest_hash, "h1");
+        s.skill_accept(&p2.id, &fin("run-tests"), &row("run-tests", 2, "h2"), Some("h1"), "").unwrap();
+        assert_eq!(s.skill_get("run-tests").unwrap().unwrap().manifest_hash, "h2");
     }
 
     #[test]

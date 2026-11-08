@@ -839,6 +839,9 @@ impl Hub {
         }
         let note = r.note.unwrap_or_default();
         let as_conflict = |e: CoreError| match e {
+            CoreError::InvalidTransition { kind: "skill", from, .. } => {
+                HubError::Conflict(format!("skill {from} changed since this proposal; look at the new diff"))
+            }
             CoreError::InvalidTransition { .. } => HubError::Conflict(format!("proposal {} was already decided", r.id)),
             e => e.into(),
         };
@@ -900,6 +903,7 @@ impl Hub {
         let version = self.next_version(&name, current.as_ref().map(|r| r.version))?;
         let mut all = vec![(SKILL_MD.to_string(), render_skill_md(&name, &description, &body).into_bytes())];
         all.extend(files);
+        let base = parent.clone();
         let bundle = Bundle {
             manifest: Manifest {
                 format: FORMAT.into(),
@@ -937,7 +941,7 @@ impl Hub {
                 updated_at: now_ms(),
             };
             let mut st = self.lock();
-            let d = st.store.skill_accept(&p.id, &fin, &row, &note).map_err(as_conflict);
+            let d = st.store.skill_accept(&p.id, &fin, &row, base.as_deref(), &note).map_err(as_conflict);
             st.publish();
             d
         })?;
