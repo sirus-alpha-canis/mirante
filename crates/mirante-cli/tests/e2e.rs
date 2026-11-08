@@ -524,6 +524,36 @@ fn memory_check_offline_exits_1_on_stale_and_names_the_note() {
     assert!(!env.home.join("daemon.sock").exists(), "offline never starts the daemon");
 }
 
+/// `memory check` exits 1 only for what it found (stale, unverifiable, invalid) and 3 when
+/// it could not check at all, so a CI job tells a broken note from a broken setup.
+#[test]
+fn memory_check_exits_3_when_it_could_not_run() {
+    let env = Env::new();
+    let repo = env.repo_with_note_citing("src/a.rs", 1, 2);
+    let code = |dir: &Path, args: &[&str]| {
+        let out = env.mirante_in(dir, args);
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (c, err) = code(env.dir.path(), &["memory", "check", "--offline"]);
+    assert_eq!(c, Some(3), "not a checkout: {err}");
+    let (c, err) = code(&repo, &["memory", "check", "--offline", "--rev", "no-such-rev"]);
+    assert_eq!(c, Some(3), "a bad --rev: {err}");
+    // The daemon cannot start.
+    let out = env
+        .cmd(&bin("mirante"))
+        .args(["memory", "check"])
+        .env("MIRANTE_DAEMON_BIN", env.dir.path().join("missing"))
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    // A finding is still 1, online and offline.
+    env.commit(&repo, "src/a.rs", "changed\n");
+    assert_eq!(code(&repo, &["memory", "check", "--offline"]).0, Some(1));
+    assert_eq!(code(&repo, &["memory", "check"]).0, Some(1));
+}
+
 #[test]
 fn memory_enable_ls_accept_round_trip_through_the_daemon() {
     use mirante_core::model::AgentKind;

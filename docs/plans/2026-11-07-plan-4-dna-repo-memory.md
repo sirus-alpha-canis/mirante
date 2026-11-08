@@ -1217,7 +1217,7 @@ cargo build -p mirante-mcp
 
 - [ ] **Step 5: Commit** `feat(cli): mirante memory (enable, search, review queue, confirm/retire, offline check for CI)`.
 
-  > **As built (Batch C).** `check` choices: a note that does not parse fails the check (exit 1, printed as `invalid`); retired notes are skipped; `--rev` requires `--offline` (the daemon always checks at the checkout HEAD); `check` without `--offline` asks the daemon (`dna.check`, then `dna.graph`) and fails exactly like the offline check. `propose` requires `--task <id>`, because `dna.propose` cites the task worktree's HEAD.
+  > **As built (Batch C).** `check` choices: a note that does not parse fails the check (exit 1, printed as `invalid`); retired notes are skipped; `--rev` requires `--offline` (the daemon always checks at the checkout HEAD); `check` without `--offline` asks the daemon (`dna.check`, then `dna.graph`) and fails exactly like the offline check. Exit codes (Batch C review): 0 all fresh, **1** a finding (a stale or unverifiable anchor, a note that does not parse), **3** the check could not run (not a checkout, a bad `--rev`, the daemon unreachable, a git failure), so CI tells a broken note from a broken setup; 2 stays a usage error. Pinned in e2e `memory_check_exits_3_when_it_could_not_run`. `propose` requires `--task <id>`, because `dna.propose` cites the task worktree's HEAD.
 
 ---
 

@@ -45,8 +45,10 @@ usage: mirante <command>
                          Mirante-launched agents, also on an agent's terminal). Confirm
                          re-anchors at HEAD; retire keeps the file with status retired
   memory check [<repo>] [--offline [--rev <rev>]]
-                         recheck every anchor; exits 1 when one is stale or unverifiable.
-                         --offline reads the files and git directly (no daemon; for CI)
+                         recheck every anchor; exits 1 when one is stale or unverifiable or
+                         a note does not parse, 3 when it could not check (not a checkout,
+                         a bad --rev, no daemon, a git failure). --offline reads the files
+                         and git directly (no daemon; for CI)
   memory propose --task <task> --title <t> --kind fact|decision|pattern|gotcha
                  --cite <path:start-end[#symbol]>... <body...>
                          propose a note yourself, citing committed code in the task worktree

@@ -25,6 +25,23 @@ use mirante_cli::{confirm, daemon_ctl, memcheck, render, term};
 
 type Res = Result<(), Box<dyn Error>>;
 
+/// What `memory check` found wrong (a stale or unverifiable anchor, a note that does not
+/// parse): exit 1. Any other `memory check` error means it could not check: exit 3.
+#[derive(Debug)]
+struct Findings(String);
+
+impl std::fmt::Display for Findings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for Findings {}
+
+/// `memory check` could not run (not a checkout, a bad `--rev`, the daemon unreachable, a
+/// git failure).
+const EXIT_CHECK_FAILED_TO_RUN: u8 = 3;
+
 /// Ctrl-] detaches from `attach`.
 const DETACH: u8 = 0x1d;
 
@@ -353,7 +370,8 @@ fn memory_note_action(paths: &Paths, slug: String, repo: Option<String>, confirm
 }
 
 /// `mirante memory check`: one line per anchor; a stale or unverifiable anchor (or a note
-/// that does not parse) is an error, so the exit status fails a CI job.
+/// that does not parse) is a [`Findings`] error (exit 1), so the exit status fails a CI
+/// job; failing to check at all exits 3.
 fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offline: bool) -> Res {
     if offline {
         let dir = match repo {
@@ -367,7 +385,7 @@ fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offlin
         }
         let summary = r.summary(&sha[..sha.len().min(12)]);
         if r.failed() {
-            return Err(format!("memory check failed: {summary}").into());
+            return Err(Box::new(Findings(format!("memory check failed: {summary}"))));
         }
         println!("{summary}");
         return Ok(());
@@ -402,7 +420,7 @@ fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offlin
         report.invalid.len()
     );
     if stale + unverifiable + report.invalid.len() > 0 {
-        return Err(format!("memory check failed: {summary}").into());
+        return Err(Box::new(Findings(format!("memory check failed: {summary}"))));
     }
     println!("{summary}");
     Ok(())
@@ -668,12 +686,19 @@ fn main() -> ExitCode {
             eprintln!("mirante: {e}\n\n{USAGE}");
             ExitCode::from(2)
         }
-        Ok(cmd) => match run(cmd) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("mirante: {e}");
-                ExitCode::FAILURE
+        Ok(cmd) => {
+            let check = matches!(cmd, Cmd::Memory(MemoryCmd::Check { .. }));
+            match run(cmd) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("mirante: {e}");
+                    if check && !e.is::<Findings>() {
+                        ExitCode::from(EXIT_CHECK_FAILED_TO_RUN)
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
             }
-        },
+        }
     }
 }
