@@ -218,6 +218,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .terminal { position: absolute; inset: 0; background: #0b0d10; border-radius: 6px; padding: 6px; }
 .terminal-overlay { position: absolute; z-index: 2; margin: 0; padding: 3px 8px; max-width: calc(100% - 24px); overflow-wrap: anywhere; border-radius: 6px; background: rgba(32, 36, 44, 0.92); color: #d8dee9; pointer-events: none; }
 .terminal-note { top: 8px; right: 12px; }
+.terminal-note-action { pointer-events: auto; }
 .terminal-link { bottom: 8px; left: 12px; }
 /* Requests and the queue over the Terminal tab (beside it they would resize it). */
 .term-overlay { position: absolute; top: 20px; right: 14px; z-index: 3; width: min(440px, 60%); max-height: 60%; overflow: auto; display: flex; flex-direction: column; gap: 6px; }

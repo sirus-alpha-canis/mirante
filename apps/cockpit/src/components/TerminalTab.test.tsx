@@ -1,5 +1,5 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type LinkHandler = {
   activate(e: { metaKey?: boolean; ctrlKey?: boolean }, uri: string): void;
@@ -70,6 +70,9 @@ vi.mock("@xterm/xterm", () => ({
       h.onResize = fn;
       return { dispose() {} };
     }
+    reset() {
+      h.log.push("reset");
+    }
     dispose() {
       h.disposed = true;
     }
@@ -111,7 +114,7 @@ import { EnvContext } from "../env";
 import { DaemonError } from "../lib/daemon";
 import type { TaskView } from "../lib/protocol";
 import { makeEnv } from "../test/env";
-import { task } from "../test/fixtures";
+import { snapshot, task } from "../test/fixtures";
 import { TerminalTab } from "./TerminalTab";
 import css from "../styles.css?raw";
 
@@ -337,19 +340,55 @@ describe("TerminalTab", () => {
     expect(h.attachAck.mock.calls.length).toBeLessThanOrEqual(3);
   });
 
-  it("terminal links leave only through the opener: http(s), on a modifier click", async () => {
+  it("terminal links leave only through the opener: github.com and localhost ports, on a modifier click", async () => {
     h.attachOpen.mockResolvedValue({ id: 6, input: true });
     const { env } = mount(task("a"));
     await waitFor(() => expect(h.onData).not.toBeNull());
     const link = h.options!.linkHandler as LinkHandler;
     expect(link.allowNonHttpProtocols).toBe(false);
-    link.activate({}, "https://example.com/x");
+    link.activate({}, "https://github.com/o/r/pull/1");
     expect(env.openUrl).not.toHaveBeenCalled();
     link.activate({ metaKey: true }, "javascript:alert(1)");
     link.activate({ metaKey: true }, "file:///etc/passwd");
     expect(env.openUrl).not.toHaveBeenCalled();
-    link.activate({ metaKey: true }, "https://example.com/x");
-    expect(env.openUrl).toHaveBeenCalledWith("https://example.com/x");
+    link.activate({ metaKey: true }, "https://github.com/o/r/pull/1");
+    link.activate({ ctrlKey: true }, "http://localhost:5173/app");
+    link.activate({ metaKey: true }, "http://127.0.0.1:8080/");
+    expect(vi.mocked(env.openUrl).mock.calls).toEqual([["https://github.com/o/r/pull/1"], ["http://localhost:5173/app"], ["http://127.0.0.1:8080/"]]);
+  });
+
+  it("a link the app may not open says to copy it (not a silent no-op)", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const { env } = mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    const link = h.options!.linkHandler as LinkHandler;
+    for (const u of ["https://example.com/x", "http://localhost/", "http://localhost:3000@evil.example/", "https://localhost:3000/", "http://github.com/x"]) {
+      act(() => link.activate({ metaKey: true }, u));
+    }
+    expect(env.openUrl).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("Mirante opens only github.com and localhost links — copy it instead");
+  });
+
+  it("a link the opener refuses says it could not be opened", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const { env } = mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    vi.mocked(env.openUrl).mockRejectedValueOnce(new Error("forbidden"));
+    const link = h.options!.linkHandler as LinkHandler;
+    await act(async () => link.activate({ metaKey: true }, "https://github.com/o/r"));
+    expect(screen.getByRole("status")).toHaveTextContent("could not open the link");
+  });
+
+  it("a lost GPU context is tried again when the window is shown", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    h.contextLoss!();
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(h.log.filter((l) => l === "addon:webgl")).toHaveLength(2);
+    // Not again while it holds.
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(h.log.filter((l) => l === "addon:webgl")).toHaveLength(2);
   });
 
   it("renders on the GPU when it can (loaded after open), and falls back to the DOM renderer", async () => {
@@ -457,5 +496,92 @@ describe("TerminalTab", () => {
     expect(screen.getByText(/https:\/\/evil\.example\/login/)).toBeInTheDocument();
     act(() => link.leave!({}, "https://evil.example/login"));
     expect(screen.queryByText(/evil\.example/)).toBeNull();
+  });
+  describe("re-attach", () => {
+    afterEach(() => vi.useRealTimers());
+    const advance = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+
+    it("a stream that ends while the task is live re-attaches after a short wait, on a reset terminal", async () => {
+      vi.useFakeTimers();
+      const ends: (() => void)[] = [];
+      h.attachOpen.mockImplementation(async (_t: string, _r: number, _c: number, _d: unknown, onEnd: () => void) => {
+        ends.push(onEnd);
+        return { id: ends.length, input: true };
+      });
+      mount(task("a"));
+      await advance(0);
+      expect(h.attachOpen).toHaveBeenCalledTimes(1);
+      act(() => ends[0]());
+      expect(screen.getByRole("status")).toHaveTextContent("stream ended");
+      await advance(400);
+      expect(h.attachOpen).toHaveBeenCalledTimes(1);
+      await advance(200);
+      expect(h.attachOpen).toHaveBeenCalledTimes(2);
+      // The daemon replays the screen on attach: the old one is cleared first, same terminal.
+      expect(h.log.filter((l) => l === "reset")).toHaveLength(1);
+      expect(h.terms).toBe(1);
+      expect(screen.queryByRole("status")).toBeNull();
+      // Keys go to the new stream.
+      h.onData!("x");
+      expect(sent()).toEqual([[2, "x"]]);
+    });
+
+    it("a failed re-attach backs off (0.5, 1, 2, 5 s), then offers Reconnect", async () => {
+      vi.useFakeTimers();
+      let end!: () => void;
+      h.attachOpen.mockImplementationOnce(async (_t: string, _r: number, _c: number, _d: unknown, onEnd: () => void) => {
+        end = onEnd;
+        return { id: 1, input: true };
+      });
+      h.attachOpen.mockRejectedValue(new DaemonError({ kind: "disconnected", message: "gone" }));
+      mount(task("a"));
+      await advance(0);
+      act(() => end());
+      for (const [ms, calls] of [
+        [500, 2],
+        [1000, 3],
+        [2000, 4],
+        [5000, 5],
+      ] as const) {
+        await advance(ms - 1);
+        expect(h.attachOpen).toHaveBeenCalledTimes(calls - 1);
+        await advance(1);
+        expect(h.attachOpen).toHaveBeenCalledTimes(calls);
+      }
+      await advance(60_000);
+      expect(h.attachOpen).toHaveBeenCalledTimes(5);
+      h.attachOpen.mockResolvedValue({ id: 9, input: true });
+      act(() => screen.getByRole("button", { name: "Reconnect" }).click());
+      await advance(0);
+      expect(h.attachOpen).toHaveBeenCalledTimes(6);
+      expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+    });
+
+    it("a new daemon boot re-attaches at once on a reset terminal", async () => {
+      h.attachOpen.mockImplementation(async () => ({ id: h.attachOpen.mock.calls.length, input: true }));
+      const r = mount(task("a"));
+      act(() => r.env.cockpit.dispatch({ type: "connected", snapshot: snapshot([task("a")], 0, { boot_id: "b1" }) }));
+      await waitFor(() => expect(h.attachOpen).toHaveBeenCalledTimes(1));
+      act(() => r.env.cockpit.dispatch({ type: "connected", snapshot: snapshot([task("a")], 0, { boot_id: "b2" }) }));
+      await waitFor(() => expect(h.attachOpen).toHaveBeenCalledTimes(2));
+      expect(h.attachClose).toHaveBeenCalledWith(1);
+      expect(h.log).toContain("reset");
+      expect(h.terms).toBe(1);
+    });
+
+    it("an ended stream is not re-attached once the task is no longer live", async () => {
+      vi.useFakeTimers();
+      let end!: () => void;
+      h.attachOpen.mockImplementation(async (_t: string, _r: number, _c: number, _d: unknown, onEnd: () => void) => {
+        end = onEnd;
+        return { id: 1, input: true };
+      });
+      const r = mount(task("a"));
+      await advance(0);
+      act(() => end());
+      r.rerender(task("a", { live: false }));
+      await advance(10_000);
+      expect(h.attachOpen).toHaveBeenCalledTimes(1);
+    });
   });
 });
