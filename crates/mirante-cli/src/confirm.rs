@@ -1,9 +1,12 @@
 //! Typed confirmation of a person's decision on the controlling terminal (`/dev/tty`),
-//! never on stdin: a pipe or a script cannot answer it, and a process without a terminal
-//! (an agent's tool call, a cron job, `setsid`) is refused before anything is asked.
+//! never on stdin: a plain pipe cannot answer it, and a process without a terminal (a
+//! cron job, `setsid`) is refused before anything is asked.
 //!
-//! Defense in depth for the daemon's guard (Mirante-launched agents are refused there): the
-//! CLI is a person's tool, so it insists on a person at a terminal.
+//! An intent check, not a security boundary: anything that can allocate a pseudo-terminal
+//! (`script`, `expect`, Python's `pty.spawn`) can type the word, and an agent's tool calls
+//! may run on the agent's own terminal. The boundary is the daemon's `require_person`: it
+//! refuses Mirante-launched agents, including a process whose controlling terminal is a live
+//! agent session's, and the CLI asks it (`dna.may_review`) before showing or asking anything.
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 
@@ -48,7 +51,8 @@ impl Tty for DevTty {
 pub fn no_tty(e: io::Error) -> String {
     format!(
         "a memory review needs you at a terminal: it asks on /dev/tty, and this process has none ({e}). \
-Mirante-launched agents are refused; review in the cockpit, or run this in a terminal you opened yourself"
+Review in the cockpit, or run this in a terminal you opened yourself (Mirante-launched agents are refused \
+either way)"
     )
 }
 

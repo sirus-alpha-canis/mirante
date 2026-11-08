@@ -306,6 +306,12 @@ pub trait Driver: Send + Sync {
     fn root(&self) -> Option<proctree::Proc> {
         None
     }
+    /// The device of the agent's terminal ([`proctree::controlling_tty`]), when it runs on
+    /// a PTY: a process whose controlling terminal it is was started from the agent's
+    /// session.
+    fn tty(&self) -> Option<u64> {
+        None
+    }
 }
 
 pub struct SpawnRequest {

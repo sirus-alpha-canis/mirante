@@ -301,12 +301,21 @@ fn repo_or_cwd(repo: Option<String>) -> Result<String, Box<dyn Error>> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// Asks the daemon whether this process may make a person's memory decision, before
+/// anything is shown or asked: the daemon is the boundary (it refuses Mirante-launched
+/// agents, including a process on an agent's terminal), the typed word only an intent check.
+fn may_review(c: &mut Client) -> Res {
+    c.call::<Value>(method::DNA_MAY_REVIEW, json!({}))?;
+    Ok(())
+}
+
 /// `mirante memory accept|reject`: the typed confirmation happens on the controlling
 /// terminal, which is checked before the daemon is contacted; the daemon refuses
 /// Mirante-launched agents on its side.
 fn memory_review(paths: &Paths, id: String, accept: bool, title: Option<String>, note: Option<String>) -> Res {
     let mut tty = confirm::DevTty::open()?;
     let mut c = client(paths)?;
+    may_review(&mut c)?;
     let query = DnaProposals { id: Some(id.clone()), status: Some("all".into()), ..Default::default() };
     let found: Vec<ProposalView> = c.call(method::DNA_PROPOSALS, query)?;
     let p = found.into_iter().next().ok_or_else(|| format!("no proposal {id}"))?;
@@ -328,6 +337,7 @@ fn memory_note_action(paths: &Paths, slug: String, repo: Option<String>, confirm
     let mut tty = confirm::DevTty::open()?;
     let repo = repo_or_cwd(repo)?;
     let mut c = client(paths)?;
+    may_review(&mut c)?;
     let n: NoteView = c.call(method::DNA_GET, DnaGet { at: DnaRef { repo: Some(repo.clone()), task: None }, slug })?;
     let (word, action) = if confirm { ("confirm", NoteAction::Confirm) } else { ("retire", NoteAction::Retire) };
     confirm::typed(&mut tty, &render::note_view(&n), word)?;

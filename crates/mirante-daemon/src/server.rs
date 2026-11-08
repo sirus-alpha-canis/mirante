@@ -327,6 +327,7 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
             out(hub.dna_task_context_in(hub.view_for(caller, q.for_agent), &q.task))
         }
         method::DNA_NOTE_ACTION => out(hub.dna_note_action(caller, params(p)?)),
+        method::DNA_MAY_REVIEW => out(hub.require_person(caller).map(|()| json!({}))),
         other => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {other}"))),
     }
 }
@@ -573,11 +574,15 @@ mod tests {
         let in_agent = ["MIRANTE_TASK", "MIRANTE_TASK_ID"].iter().any(|k| std::env::var_os(k).is_some());
         if !in_agent {
             assert_eq!(code_of(c.call(method::DNA_REVIEW, review.clone())), code::NOT_FOUND);
+            let may: Result<Value, ClientError> = c.call(method::DNA_MAY_REVIEW, json!({}));
+            assert_eq!(may.unwrap(), json!({}));
         }
         *k.factory.driver.root.lock().unwrap() = crate::driver::proctree::proc_of(std::process::id() as i32);
         k.started(AgentKind::Claude, "agent");
         let mut c = Client::connect(&sock).unwrap();
         assert_eq!(code_of(c.call(method::DNA_REVIEW, review)), code::FORBIDDEN);
+        // The CLI asks first, so it never prompts on a terminal it cannot decide from.
+        assert_eq!(code_of(c.call(method::DNA_MAY_REVIEW, Value::Null)), code::FORBIDDEN);
         assert_eq!(code_of(c.call(method::DNA_ENABLE, json!({"repo": k.repo}))), code::FORBIDDEN);
         // Reads stay open to agents.
         let status: Result<Value, ClientError> = c.call(method::DNA_STATUS, json!({"repo": k.repo}));

@@ -80,6 +80,8 @@ pub struct PtyProcess {
     writer: Writer,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     root: Option<Proc>,
+    /// The PTY's terminal device, read from the root's controlling terminal at spawn.
+    tty: Option<u64>,
     /// Every process seen below the root while it ran (still-running ones only).
     snapshot: Arc<Mutex<Vec<Proc>>>,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -160,8 +162,10 @@ impl PtyProcess {
         }
         let child = pair.slave.spawn_command(cmd).map_err(other)?;
         drop(pair.slave);
-        // Captured now, while the pid surely names our child.
+        // Captured now, while the pid surely names our child. `spawn_command` returns after
+        // the exec, so the child already made this PTY its controlling terminal.
         let root = child.process_id().and_then(|pid| proctree::proc_of(pid as i32));
+        let tty = root.and_then(|r| proctree::controlling_tty(r.pid));
         let mut reader = pair.master.try_clone_reader().map_err(other)?;
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(other)?));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(nz(spec.rows), nz(spec.cols), 0)));
@@ -171,6 +175,7 @@ impl PtyProcess {
             writer: writer.clone(),
             child: Mutex::new(child),
             root,
+            tty,
             snapshot: Arc::default(),
             parser: parser.clone(),
             fanout: fanout.clone(),
@@ -305,6 +310,12 @@ impl PtyProcess {
         self.root
     }
 
+    /// The device of this PTY's terminal (as [`proctree::controlling_tty`] reads it): the
+    /// controlling terminal of the agent and of every process it starts that keeps it.
+    pub fn tty(&self) -> Option<u64> {
+        self.tty
+    }
+
     /// Ends the agent and every process below it: SIGTERM, `grace`, SIGKILL, verify. Also
     /// after the agent exited: whatever of the descendant snapshot is still the same process
     /// (and its group, while the unreaped root still pins the group id).
@@ -426,6 +437,21 @@ mod tests {
         let (_, initial, _rx) = p.attach();
         let text = String::from_utf8_lossy(&initial);
         assert!(text.contains("hello") && text.contains("\x1b[?2004h"), "{text:?}");
+    }
+
+    #[test]
+    fn the_pty_is_the_controlling_tty_of_the_agent_and_its_children() {
+        let p = PtyProcess::spawn(&sh("sleep 30 & sleep 30"), |_| {}).unwrap();
+        let tty = p.tty().expect("the agent's terminal device");
+        let root = p.root().expect("root process");
+        assert_eq!(proctree::controlling_tty(root.pid), Some(tty));
+        wait_for("the background child", || !proctree::descendants(root).is_empty());
+        for kid in proctree::descendants(root) {
+            assert_eq!(proctree::controlling_tty(kid.pid), Some(tty), "{kid:?}");
+        }
+        assert_ne!(proctree::controlling_tty(std::process::id() as i32), Some(tty));
+        let other = PtyProcess::spawn(&sh("sleep 30"), |_| {}).unwrap();
+        assert_ne!(other.tty(), Some(tty), "each session has its own terminal");
     }
 
     #[test]

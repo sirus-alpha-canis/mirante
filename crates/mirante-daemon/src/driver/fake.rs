@@ -15,6 +15,8 @@ pub struct FakeDriver {
     pub attached: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// What `root()` reports (memory sampling tests set it).
     pub root: Mutex<Option<Proc>>,
+    /// What `tty()` reports (identity tests set it).
+    pub tty: Mutex<Option<u64>>,
     /// When set, `send` fails with this error (after recording the call).
     pub send_error: Mutex<Option<DriverError>>,
     /// When set, the next `answer_permission` signals the first channel, then waits on the
@@ -127,6 +129,9 @@ impl Driver for FakeDriver {
     }
     fn root(&self) -> Option<Proc> {
         *self.root.lock().unwrap()
+    }
+    fn tty(&self) -> Option<u64> {
+        *self.tty.lock().unwrap()
     }
 }
 

@@ -461,14 +461,15 @@ impl Hub {
             return gone();
         }
         let by_tree = self.task_of_tree(p);
+        let by_tty = self.task_of_tty(p);
         let env = proctree::environ(p.pid);
         let cwd = crate::memguard::orphans::process_cwd(p.pid);
         if !proctree::alive(p) {
             return gone();
         }
         let by_env = env.as_deref().and_then(marker_task);
-        if by_tree.is_some() || by_env.is_some() {
-            let signs: Vec<Option<String>> = by_tree.map(Some).into_iter().chain(by_env).collect();
+        if by_tree.is_some() || by_tty.is_some() || by_env.is_some() {
+            let signs: Vec<Option<String>> = by_tree.into_iter().chain(by_tty).map(Some).chain(by_env).collect();
             let task = match signs.split_first() {
                 Some((first, rest)) if rest.iter().all(|t| t == first) => first.clone(),
                 _ => None,
@@ -487,6 +488,14 @@ impl Hub {
             return Identity::Agent { task: None };
         }
         Identity::Person
+    }
+
+    /// The task whose live session's terminal is `p`'s controlling terminal: started from
+    /// the agent's session, even if it left the process tree and scrubbed its environment.
+    fn task_of_tty(&self, p: Proc) -> Option<String> {
+        let tty = proctree::controlling_tty(p.pid)?;
+        let st = self.lock();
+        st.live.iter().find(|(_, l)| l.driver.as_ref().and_then(|d| d.tty()) == Some(tty)).map(|(t, _)| t.clone())
     }
 
     /// The task whose live session's process tree holds `p` (its root or a descendant).
@@ -1358,6 +1367,40 @@ pub(crate) mod tests {
         let mixed = Peer::spawn(&[(TASK_ENV, &mine.id), (AGENT_ENV, &other.id)], k.dir.path());
         assert_eq!(k.hub.identify(&mixed.caller()), Identity::Agent { task: None });
         forbidden_with(k.hub.dna_propose(&mixed.caller(), propose(&mine.id, "T", "b", "src/a.rs", 1, 1)), "task");
+    }
+
+    /// The test binary sleeping on a fresh PTY (its controlling terminal), with no agent
+    /// env marker, outside every worktree.
+    fn on_a_pty(cwd: &Path) -> Arc<crate::driver::pty::PtyProcess> {
+        let spec = crate::driver::pty::PtySpec {
+            program: std::env::current_exe().unwrap(),
+            args: ["--exact", "driver::proctree::tests::sleeper_child", "--ignored", "--test-threads=1", "-q"]
+                .map(String::from)
+                .to_vec(),
+            cwd: cwd.to_path_buf(),
+            env_remove: vec![AGENT_ENV.into(), TASK_ENV.into()],
+            env_set: vec![("MIRANTE_SLEEPER".into(), "1".into())],
+            rows: 24,
+            cols: 80,
+        };
+        crate::driver::pty::PtyProcess::spawn(&spec, |_| {}).unwrap()
+    }
+
+    #[test]
+    fn a_process_on_a_live_agents_terminal_counts_as_that_agent() {
+        let k = Kit::new();
+        let pty = on_a_pty(k.dir.path());
+        let caller = Caller::Peer(pty.root().unwrap());
+        // No live session has that terminal yet: a person.
+        assert_eq!(k.hub.identify(&caller), Identity::Person);
+        assert!(k.hub.require_person(&caller).is_ok());
+        // An agent session on it (a scrubbed env, outside its tree and its worktree: e.g. a
+        // tool call that ran `env -i setsid …` but kept the terminal).
+        *k.factory.driver.tty.lock().unwrap() = pty.tty();
+        let t = k.started(AgentKind::Claude, "tty").task;
+        assert_eq!(k.hub.identify(&caller), Identity::Agent { task: Some(t.id.clone()) });
+        forbidden_with(k.hub.dna_review(&caller, review_accept("x")), "Mirante-launched agents are refused");
+        forbidden_with(k.hub.require_person(&caller), "Mirante-launched agents are refused");
     }
 
     #[test]

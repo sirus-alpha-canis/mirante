@@ -269,7 +269,9 @@ fn type_trust(pty: &PtyProcess, sink: &Sink, deadline: Instant, tick: Duration) 
     let mut last_down: Option<Instant> = None;
     let r = loop {
         if Instant::now() >= deadline {
-            break Err(DriverError::Failed("the trust answer waited too long to be typed; nothing more was typed".into()));
+            break Err(DriverError::Failed(
+                "the trust answer waited too long to be typed; nothing more was typed".into(),
+            ));
         }
         match trust_key(&pty.grid()) {
             Err(e) => break Err(e),
@@ -290,7 +292,9 @@ fn type_trust(pty: &PtyProcess, sink: &Sink, deadline: Instant, tick: Duration) 
         std::thread::sleep(tick);
     };
     if let Err(e) = &r {
-        sink.emit(DriverEvent::Step(json!({ "type": "answer_aborted", "what": "trust answer", "error": e.to_string() })));
+        sink.emit(DriverEvent::Step(
+            json!({ "type": "answer_aborted", "what": "trust answer", "error": e.to_string() }),
+        ));
     }
     r
 }
@@ -655,6 +659,10 @@ impl Driver for ClaudeDriver {
 
     fn root(&self) -> Option<Proc> {
         self.pty.root()
+    }
+
+    fn tty(&self) -> Option<u64> {
+        self.pty.tty()
     }
 }
 

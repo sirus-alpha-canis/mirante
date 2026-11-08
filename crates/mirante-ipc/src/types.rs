@@ -76,6 +76,9 @@ pub mod method {
     /// A person confirms (re-anchors at HEAD) or retires a note ([`super::DnaNoteAction`] →
     /// [`super::NoteView`]). Mirante-launched agents are refused.
     pub const DNA_NOTE_ACTION: &str = "dna.note_action";
+    /// `{}` when this caller may make a person's memory decision, else `FORBIDDEN` with
+    /// why (the CLI asks before it prompts). The decision itself checks again.
+    pub const DNA_MAY_REVIEW: &str = "dna.may_review";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

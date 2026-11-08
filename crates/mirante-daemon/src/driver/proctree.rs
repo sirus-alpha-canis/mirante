@@ -45,6 +45,11 @@ mod sys {
         bsdinfo(pid).map(|i| i.pbi_pgid as i32)
     }
 
+    /// `e_tdev`: the controlling terminal's device, `NODEV` (all ones) when there is none.
+    pub fn tty(pid: i32) -> Option<u64> {
+        bsdinfo(pid).map(|i| i.e_tdev).filter(|d| *d != u32::MAX && *d != 0).map(u64::from)
+    }
+
     pub fn children(pid: i32) -> Vec<i32> {
         list(pid, |pid, buf, bytes| {
             // SAFETY: the buffer holds `bytes` bytes.
@@ -134,6 +139,18 @@ mod sys {
         stat(pid).map(|s| s.2)
     }
 
+    /// `tty_nr` (field 7 of `/proc/<pid>/stat`): the controlling terminal's device, 0 when
+    /// there is none.
+    pub fn tty(pid: i32) -> Option<u64> {
+        if pid <= 0 {
+            return None;
+        }
+        let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &s[s.rfind(')')? + 2..];
+        let nr: i64 = rest.split_whitespace().nth(4)?.parse().ok()?;
+        (nr > 0).then_some(nr as u64)
+    }
+
     fn all_where(keep: impl Fn((char, i32, i32, u64)) -> bool) -> Vec<i32> {
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Vec::new();
@@ -207,6 +224,13 @@ pub fn alive(p: Proc) -> bool {
 
 pub fn pgid(pid: i32) -> Option<i32> {
     sys::pgid(pid)
+}
+
+/// The device of `pid`'s controlling terminal (macOS: `e_tdev` of `PROC_PIDTBSDINFO`;
+/// Linux: `tty_nr` of `/proc/<pid>/stat`), `None` when it has none or is gone. Compare only
+/// values read through this function: the encoding is the kernel's.
+pub fn controlling_tty(pid: i32) -> Option<u64> {
+    sys::tty(pid)
 }
 
 /// Processes whose process group is `pgid` (unverified pids).
@@ -492,6 +516,25 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_process_without_a_terminal_has_no_controlling_tty() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        // SAFETY: setsid is async-signal-safe; the child leaves any terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        assert_eq!(controlling_tty(child.id() as i32), None);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(controlling_tty(-1), None);
     }
 
     #[test]

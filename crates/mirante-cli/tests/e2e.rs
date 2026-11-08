@@ -446,10 +446,16 @@ impl Env {
     /// `mirante <args>` on a pseudo-terminal (`script`), typing `answer` once it asks.
     /// Returns everything it printed.
     fn on_tty(&self, dir: &Path, args: &[&str], answer: &str) -> String {
+        self.on_tty_with(dir, args, Some(answer), &[])
+    }
+
+    /// [`Env::on_tty`] with `envs` added; `answer: None` types nothing and waits for exit.
+    fn on_tty_with(&self, dir: &Path, args: &[&str], answer: Option<&str>, envs: &[(&str, &str)]) -> String {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};
         let mirante = bin("mirante");
         let mut cmd = self.cmd(Path::new("script"));
+        cmd.envs(envs.iter().copied());
         if cfg!(target_os = "macos") {
             cmd.args(["-q", "/dev/null"]).arg(&mirante).args(args);
         } else {
@@ -473,10 +479,21 @@ impl Env {
                 sink.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
             }
         });
-        wait_until("the confirmation prompt", || seen.lock().unwrap().contains("to confirm"));
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(format!("{answer}\n").as_bytes()).unwrap();
-        child.wait().unwrap();
+        if let Some(answer) = answer {
+            wait_until("the confirmation prompt", || seen.lock().unwrap().contains("to confirm"));
+            stdin.write_all(format!("{answer}\n").as_bytes()).unwrap();
+        }
+        // Bounded: a prompt nobody answers must fail the test, not hang it.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
         drop(stdin);
         reader.join().unwrap();
         let out = seen.lock().unwrap().clone();
@@ -590,6 +607,36 @@ fn memory_enable_ls_accept_round_trip_through_the_daemon() {
 
     assert!(env.ok_in(&repo, &["memory", "disable"]).contains("disabled"));
     assert!(repo.join(".mirante/memory/spool-falls-back.md").exists());
+}
+
+/// On a terminal, a Mirante-launched agent's process (here: its env marker) is refused
+/// before it is shown or asked anything; the daemon is the boundary, the prompt only UX.
+#[test]
+fn memory_review_from_an_agent_is_refused_before_the_prompt() {
+    use mirante_core::model::AgentKind;
+    use mirante_ipc::types::{CreateTask, DnaProposals, ProposalView};
+    let env = Env::new();
+    let repo = env.repo.clone();
+    env.ok_in(&repo, &["memory", "enable"]);
+    let create = CreateTask {
+        repo: repo.to_string_lossy().into_owned(),
+        agent: AgentKind::Claude,
+        branch: "mem".into(),
+        base: None,
+        goal: "g".into(),
+        title: None,
+    };
+    let t: TaskView = env.client().call(method::TASK_CREATE, create).unwrap();
+    env.commit(Path::new(&t.task.worktree_path), "src/a.rs", "fn spool() {}\n");
+    let propose =
+        ["memory", "propose", "--task", "mem", "--title", "T", "--kind", "fact", "--cite", "src/a.rs:1-1", "b"];
+    env.ok_in(&repo, &propose);
+    let pending: Vec<ProposalView> = env.client().call(method::DNA_PROPOSALS, DnaProposals::default()).unwrap();
+    let id = pending[0].id.clone();
+    let out = env.on_tty_with(&repo, &["memory", "accept", &id], None, &[("MIRANTE_TASK", &t.task.id)]);
+    assert!(out.contains("Mirante-launched agents are refused") && !out.contains("to confirm"), "{out}");
+    let still: Vec<ProposalView> = env.client().call(method::DNA_PROPOSALS, DnaProposals::default()).unwrap();
+    assert_eq!(still.len(), 1, "nothing was decided");
 }
 
 /// `confirm` and `retire` are person decisions like `accept`: no terminal, no decision.

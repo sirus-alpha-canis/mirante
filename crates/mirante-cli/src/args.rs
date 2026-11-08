@@ -41,8 +41,9 @@ usage: mirante <command>
   memory accept <proposal> [--title <t>] [--note <why>] | memory reject <proposal> [--note <why>]
   memory confirm <slug> [--repo <r>] | memory retire <slug> [--repo <r>]
                          a person's decision: you type the verb on this terminal to confirm
-                         (Mirante-launched agents are refused). Confirm re-anchors at HEAD;
-                         retire keeps the file with status retired
+                         (an intent check, not a security boundary: the daemon refuses
+                         Mirante-launched agents, also on an agent's terminal). Confirm
+                         re-anchors at HEAD; retire keeps the file with status retired
   memory check [<repo>] [--offline [--rev <rev>]]
                          recheck every anchor; exits 1 when one is stale or unverifiable.
                          --offline reads the files and git directly (no daemon; for CI)
