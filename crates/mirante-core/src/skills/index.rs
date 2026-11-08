@@ -363,6 +363,14 @@ fn insert_usage(
     Ok(())
 }
 
+/// `skill.injected` / `skill.withdrawn` of conversation `?1`'s sessions, in order.
+/// Through the conversation's task (`events_task`): never a scan of every event.
+const CONVERSATION_SKILLS_SQL: &str = "SELECT kind, payload FROM events
+     WHERE task_id = (SELECT task_id FROM conversations WHERE id = ?1)
+       AND kind IN ('skill.injected', 'skill.withdrawn')
+       AND json_extract(payload, '$.session_id') IN (SELECT id FROM sessions WHERE conversation_id = ?1)
+     ORDER BY seq";
+
 impl Store {
     /// Fixes `task`'s origin at its creation, against the origin pinned for its checkout
     /// (`repo`: the canonical git common dir), in one transaction:
@@ -854,12 +862,7 @@ impl Store {
     /// `skill.withdrawn` took back since, in injection order. A version is `None` when the
     /// event predates recorded versions. Read from events (never pruned), not usage.
     pub fn skill_conversation_skills(&self, conversation: &str) -> Result<Vec<(String, Option<u32>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT kind, payload FROM events
-             WHERE kind IN ('skill.injected', 'skill.withdrawn')
-               AND json_extract(payload, '$.session_id') IN (SELECT id FROM sessions WHERE conversation_id = ?1)
-             ORDER BY seq",
-        )?;
+        let mut stmt = self.conn.prepare(CONVERSATION_SKILLS_SQL)?;
         let rows = stmt.query_map([conversation], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut held: Vec<(String, Option<u32>)> = Vec::new();
         for row in rows {
@@ -975,6 +978,22 @@ mod tests {
     use crate::skills::mine::Source;
     use crate::skills::origin::Scope;
     use crate::store::Store;
+
+    #[test]
+    fn a_conversation_s_skills_are_read_through_the_task_s_events_only() {
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {CONVERSATION_SKILLS_SQL}"))
+            .unwrap()
+            .query_map(["c"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        // Not a scan of every event in the store (it runs under the hub lock).
+        assert!(plan.iter().any(|l| l.contains("events_task")), "{plan:?}");
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN events")), "{plan:?}");
+    }
 
     fn task(s: &mut Store, goal: &str) -> String {
         s.create_task(NewTask {
