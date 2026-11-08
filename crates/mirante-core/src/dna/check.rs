@@ -293,8 +293,12 @@ fn existing_commits(repo: &Path, commits: &[&str]) -> Result<HashSet<String>, Dn
 
 /// The paths changed between each of `commits` (full shas of existing commits) and `head`:
 /// one `diff-tree --stdin` for all of them. With `--name-status -z` every path follows a
-/// one-letter status, so a header (the commit, echoed before a non-empty diff) cannot be
-/// confused with a path, even one named like a commit.
+/// one-letter status, so a header (the commit) cannot be confused with a path, even one
+/// named like a commit. `--no-renames` is required for that: a rename or copy status
+/// (`R100`, `C75`) is several letters and is followed by two paths. `--always` prints a
+/// header for every input, even one with no change: git skips an input line it cannot
+/// parse (a corrupt commit object) with a message on stderr and exits 0, so exactly one
+/// header per input, in input order, is required, or this is an error (never "unchanged").
 fn changed_since(repo: &Path, commits: &[&str], head: &str) -> Result<HashMap<String, HashSet<String>>, DnaError> {
     let mut changed: HashMap<String, HashSet<String>> =
         commits.iter().map(|c| (c.to_string(), HashSet::new())).collect();
@@ -311,11 +315,22 @@ fn changed_since(repo: &Path, commits: &[&str], head: &str) -> Result<HashMap<St
         }
         input.extend_from_slice(format!("{c} {head}\n").as_bytes());
     }
-    let args = ["diff-tree", "--stdin", "-r", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z"];
+    let args = [
+        "diff-tree",
+        "--stdin",
+        "--always",
+        "-r",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames", // one-letter statuses: see the doc comment
+        "--name-status",
+        "-z",
+    ];
+    debug_assert!(args.contains(&"--no-renames") && args.contains(&"--always"));
     let out = git_with_input(repo, &args, input)?;
-    let bad = || DnaError::Git("unexpected diff-tree output".into());
+    let bad = || DnaError::Git("unexpected diff-tree output (a commit it could not read?)".into());
     let mut tokens = out.split(|b| *b == 0).filter(|t| !t.is_empty());
-    // Headers come in input order (a commit with no change prints none).
+    // One header per input, in input order (`--always`); a skipped input is an error.
     let mut expected = commits.iter();
     let mut current_key: Option<&str> = None;
     while let Some(tok) = tokens.next() {
@@ -325,9 +340,12 @@ fn changed_since(repo: &Path, commits: &[&str], head: &str) -> Result<HashMap<St
             changed.get_mut(key).ok_or_else(bad)?.insert(String::from_utf8_lossy(path).into_owned());
         } else {
             let header = std::str::from_utf8(tok).map_err(|_| bad())?;
-            let next = expected.by_ref().find(|c| **c == header).ok_or_else(bad)?;
+            let next = expected.next().filter(|c| **c == header).ok_or_else(bad)?;
             current_key = Some(next);
         }
+    }
+    if expected.next().is_some() {
+        return Err(bad());
     }
     Ok(changed)
 }
@@ -356,7 +374,8 @@ pub struct Previous {
 /// two (same blob, same lines, same answer), and its commit still exists. So a HEAD move
 /// costs one `diff-tree` (old HEAD → new HEAD) plus the checks of anchors on changed paths.
 /// Everything else (unchecked or unverifiable before, a path that changed, an old HEAD that
-/// no longer exists, as after a switch to an unrelated history and a gc) is checked anew.
+/// no longer exists, as after a switch to an unrelated history and a gc, or one git cannot
+/// read) is checked anew.
 pub fn check_since(
     repo: &Path,
     rev: &str,
@@ -373,10 +392,13 @@ pub fn check_since(
     }
     let prev_head = prev.map(|p| p.head.as_str()).filter(|h| is_full_sha(h) && *h != head);
     let exists = existing_commits(repo, &[&commits[..], prev_head.as_slice()].concat())?;
-    // Paths changed since the previous HEAD; None: nothing can be reused.
+    // Paths changed since the previous HEAD; None: nothing can be reused. A previous HEAD
+    // git cannot diff (a corrupt object) means a full recheck, not a failed refresh.
     let moved: Option<HashSet<String>> = match prev {
         Some(p) if p.head == head => Some(HashSet::new()),
-        Some(p) if exists.contains(&p.head) => changed_since(repo, &[&p.head], &head)?.remove(&p.head),
+        Some(p) if exists.contains(&p.head) => {
+            changed_since(repo, &[&p.head], &head).ok().and_then(|mut m| m.remove(&p.head))
+        }
         _ => None,
     };
     let reused = |a: &Anchor| -> Option<AnchorState> {
@@ -708,6 +730,52 @@ mod tests {
         let prev = Previous { head: head(&r), states: [(ghost.clone(), AnchorState::Fresh)].into() };
         let rep = check_since(&r, "HEAD", &[ghost], Some(&prev)).unwrap();
         assert!(matches!(rep[0].state, AnchorState::Unverifiable { .. }), "{:?}", rep[0]);
+    }
+
+    /// A commit object that exists (`cat-file` says commit) but does not parse.
+    fn plant_corrupt_commit(r: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(r)
+            .args(["hash-object", "-t", "commit", "--literally", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.take().unwrap().write_all(b"garbage\n")?;
+                c.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn diff_tree_never_skips_an_input_it_cannot_parse() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let c1 = head(&r);
+        commit_file(&r, "a.rs", "two\n");
+        let bad = plant_corrupt_commit(&r);
+        assert!(existing_commits(&r, &[&bad]).unwrap().contains(&bad), "cat-file sees a commit");
+        // git prints nothing for the bad line and exits 0: it must not read as "no change".
+        assert!(changed_since(&r, &[&bad, &c1], &head(&r)).is_err());
+        assert!(changed_since(&r, &[&c1, &bad], &head(&r)).is_err());
+        // Unchanged inputs still get their (empty) entry.
+        let h = head(&r);
+        let ok = changed_since(&r, &[&h, &c1], &h).unwrap();
+        assert!(ok[&h].is_empty() && ok[&c1].contains("a.rs"), "{ok:?}");
+    }
+
+    #[test]
+    fn since_rechecks_everything_when_the_previous_head_is_corrupt() {
+        let r = repo_with(&[("a.rs", "one\n")]);
+        let a = cite(&r, "HEAD", "a.rs", None, 1, 1).unwrap();
+        commit_file(&r, "a.rs", "two\n");
+        let bad = plant_corrupt_commit(&r);
+        let prev = Previous { head: bad, states: [(a.clone(), AnchorState::Fresh)].into() };
+        let rep = check_since(&r, "HEAD", std::slice::from_ref(&a), Some(&prev)).unwrap();
+        assert!(matches!(rep[0].state, AnchorState::Stale { .. }), "false fresh: {:?}", rep[0]);
+        assert_eq!(rep, check_all(&r, "HEAD", &[a]).unwrap());
     }
 
     #[test]
