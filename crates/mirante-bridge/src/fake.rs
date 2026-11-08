@@ -158,7 +158,9 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
             .cloned()
             .ok_or_else(|| RpcError::new(code::NOT_FOUND, format!("no task {}", p["task"]))),
         method::PERMISSION_LIST | method::TASK_EVENTS => Ok(json!([])),
-        method::DAEMON_SETTINGS => Ok(json!({"auto_resume": p["auto_resume"].as_bool().unwrap_or(true)})),
+        method::DAEMON_SETTINGS => {
+            Ok(json!({"auto_resume": p["auto_resume"].as_bool().unwrap_or(true), "forced_by_env": false}))
+        }
         method::REPO_FILES => {
             let q = p["query"].as_str().unwrap_or("").to_lowercase();
             let demo = ["README.md", "src/lib.rs", "src/login.rs", "src/session.rs", "docs/design.md", "Cargo.toml"];

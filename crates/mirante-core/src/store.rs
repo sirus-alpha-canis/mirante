@@ -119,6 +119,20 @@ impl Store {
         &self.boot_id
     }
 
+    /// The run before this one: the boot id of the newest event another run wrote.
+    pub fn previous_boot_id(&self) -> Result<Option<String>> {
+        let r = self.conn.query_row(
+            "SELECT boot_id FROM events WHERE boot_id != ?1 ORDER BY seq DESC LIMIT 1",
+            params![self.boot_id],
+            |r| r.get(0),
+        );
+        match r {
+            Ok(b) => Ok(Some(b)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn schema_version(&self) -> Result<i64> {
         Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
@@ -208,6 +222,21 @@ mod tests {
         assert_eq!(s.journal_mode().unwrap(), "wal");
         let fk: i64 = s.conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
         assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn the_previous_boot_is_the_newest_other_run() {
+        let dir = TempDir::new("store-boots");
+        let path = dir.path().join("db.sqlite");
+        let mut a = Store::open(&path).unwrap();
+        assert_eq!(a.previous_boot_id().unwrap(), None);
+        a.append_event(None, "x", &json!({})).unwrap();
+        let mut b = Store::open(&path).unwrap();
+        assert_eq!(b.previous_boot_id().unwrap().as_deref(), Some(a.boot_id()));
+        b.append_event(None, "y", &json!({})).unwrap();
+        assert_eq!(b.previous_boot_id().unwrap().as_deref(), Some(a.boot_id()));
+        let c = Store::open(&path).unwrap();
+        assert_eq!(c.previous_boot_id().unwrap().as_deref(), Some(b.boot_id()));
     }
 
     #[test]

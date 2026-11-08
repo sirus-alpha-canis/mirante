@@ -67,6 +67,10 @@ impl Hub {
     pub fn recover(&self) -> Result<Recovery> {
         let mut report = Recovery::default();
         let mut st = self.lock();
+        let current = st.store.boot_id().to_string();
+        let previous = st.store.previous_boot_id()?;
+        let now = mirante_core::model::now_ms();
+        let auto_resume = self.auto_resume_enabled();
         for task in st.store.list_tasks(false)? {
             if let Err(e) = end_stale_session(&mut st, &task.id, &mut report) {
                 st.log_error(Some(&task.id), "recovery", &e);
@@ -79,12 +83,12 @@ impl Hub {
                 Err(e) => st.log_error(Some(&task.id), "recovery: hibernation mark", &e),
             }
             let active = matches!(task.lifecycle, Lifecycle::Active | Lifecycle::Created);
-            match st.store.task_events(&task.id) {
-                Ok(events) if active && crate::hub::resume::ended_by_daemon(&events) => {
-                    report.resume.push(task.id.clone())
+            if active {
+                if let Err(e) = resume_candidate(&mut st, &task.id, (&current, previous.as_deref(), now), auto_resume)
+                    .map(|yes| yes.then(|| report.resume.push(task.id.clone())))
+                {
+                    st.log_error(Some(&task.id), "recovery: auto-resume", &e);
                 }
-                Ok(_) => {}
-                Err(e) => st.log_error(Some(&task.id), "recovery: auto-resume", &e),
             }
             if task.lifecycle == Lifecycle::Archiving {
                 if let Err(e) = self.finish_archive(&mut st, &task, &mut report) {
@@ -280,6 +284,22 @@ fn was_hibernated(st: &State, task_id: &str) -> Result<bool> {
         .rev()
         .find(|e| matches!(e.kind.as_str(), "session_launch" | "memory.hibernated" | "memory.auto_hibernated"));
     Ok(last.is_some_and(|e| e.kind != "session_launch"))
+}
+
+/// Whether `task_id` is brought back by auto-resume (see `hub::resume::verdict`). A
+/// candidate that is not (too old, a crash loop, auto-resume off) is said once, with a
+/// `session.auto_resume_skipped` that also keeps later starts from trying it.
+fn resume_candidate(st: &mut State, task_id: &str, run: (&str, Option<&str>, i64), auto_resume: bool) -> Result<bool> {
+    use crate::hub::resume::{verdict, Verdict};
+    let (current, previous, now) = run;
+    let why = match verdict(&st.store.task_events(task_id)?, current, previous, now) {
+        Verdict::No => return Ok(false),
+        Verdict::Resume if auto_resume => return Ok(true),
+        Verdict::Resume => "auto-resume is off",
+        Verdict::Skip(why) => why,
+    };
+    st.event(Some(task_id), "session.auto_resume_skipped", json!({ "reason": why }))?;
+    Ok(false)
 }
 
 fn end_stale_session(st: &mut State, task_id: &str, report: &mut Recovery) -> Result<()> {

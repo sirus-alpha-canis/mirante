@@ -324,6 +324,10 @@ pub struct Hub {
     pub(crate) claude_inline: AtomicBool,
     /// Resume the sessions the daemon itself ended when it starts again (see [`resume`]).
     pub(crate) auto_resume: AtomicBool,
+    /// `MIRANTE_AUTO_RESUME=off`: auto-resume is off for this daemon whatever the setting.
+    pub(crate) auto_resume_env_off: AtomicBool,
+    /// The pause between two automatic resumes (see [`resume::RESUME_GAP`]).
+    pub(crate) resume_gap: Duration,
     /// DNA: one refresh at a time per repo (taken before, never while holding, the hub lock).
     pub(crate) dna_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Skills: where `ssh-keygen` and the ssh host aliases are.
@@ -501,6 +505,8 @@ impl Hub {
             boot_timeout: Duration::from_secs(45),
             claude_inline: AtomicBool::new(false),
             auto_resume: AtomicBool::new(true),
+            auto_resume_env_off: AtomicBool::new(false),
+            resume_gap: resume::RESUME_GAP,
             dna_gates: Mutex::default(),
             skill_conf: Mutex::default(),
             skill_sigs: Mutex::default(),
@@ -755,6 +761,7 @@ impl Hub {
             memory: st.mem.system.clone(),
             claude_inline_answers: self.claude_inline_answers(),
             auto_resume: Some(self.auto_resume_enabled()),
+            auto_resume_forced_off: self.auto_resume_forced_off().then_some(true),
         }
     }
 }

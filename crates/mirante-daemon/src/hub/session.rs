@@ -509,13 +509,40 @@ impl State {
     }
 }
 
+/// What [`Hub::launch`] did.
+#[derive(Debug)]
+pub(crate) enum Launch {
+    Started(StartResult),
+    /// An automatic resume that may not happen (now): why.
+    Refused(&'static str),
+}
+
 impl Hub {
     /// Starts (or, with `resume`, resumes) the task's agent. Fails with a conflict while a
     /// session is live (the per-task lock). Waits until the agent leaves `Booting`.
     pub fn start_session(&self, req: StartSession, resume: bool) -> Result<StartResult> {
+        match self.launch(req, resume, false)? {
+            Launch::Started(r) => Ok(r),
+            Launch::Refused(why) => Err(HubError::Conflict(why.to_string())),
+        }
+    }
+
+    /// [`Hub::start_session`]; `auto`: an automatic resume after a restart, so under the
+    /// same lock as the launch the task must still be one to resume (see
+    /// `resume::resume_refusal`) and memory must not be tight (`Refused(MEMORY_TIGHT)`: the
+    /// caller waits and retries). Its `session_launch` says `auto_resume`.
+    pub(crate) fn launch(&self, req: StartSession, resume: bool, auto: bool) -> Result<Launch> {
         let (task, session_id, native, sink, conversation_id) = {
             let mut st = self.lock();
             let task = st.resolve(&req.task)?;
+            if auto {
+                if st.mem.paused {
+                    return Ok(Launch::Refused(super::resume::MEMORY_TIGHT));
+                }
+                if let Some(why) = st.resume_refusal(&task.id)? {
+                    return Ok(Launch::Refused(why));
+                }
+            }
             if task.lifecycle == Lifecycle::Archived {
                 return Err(HubError::Conflict(format!("task {} is archived", task.branch)));
             }
@@ -543,11 +570,11 @@ impl Hub {
             let native = if resume { conversation.native_session_id.clone() } else { None };
             let session = st.store.start_session(&task.id, &conversation.id)?;
             let launched = st.set_status(&task.id, Status::Idle, "mirante:session_started").and_then(|()| {
-                st.event(
-                    Some(&task.id),
-                    "session_launch",
-                    json!({ "session_id": session.id, "resume": native, "resume_requested": resume }),
-                )
+                let mut payload = json!({ "session_id": session.id, "resume": native, "resume_requested": resume });
+                if auto {
+                    payload["auto_resume"] = json!(true);
+                }
+                st.event(Some(&task.id), "session_launch", payload)
             });
             if let Err(e) = launched {
                 // Nothing is live yet: release the per-task lock and fail.
@@ -624,7 +651,7 @@ impl Hub {
                 return Err(e.into());
             }
         }
-        self.wait_boot(&task.id, &session_id, native.is_some())
+        self.wait_boot(&task.id, &session_id, native.is_some()).map(Launch::Started)
     }
 
     /// Polls (without holding the lock) until the session leaves `Booting`, ends, or the

@@ -101,7 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // daemon (tests that restart a daemon and check what stays ended).
     hub.load_settings();
     if mirante_daemon::hub::resume::env_says_off(std::env::var("MIRANTE_AUTO_RESUME").ok().as_deref()) {
-        hub.set_auto_resume(false);
+        hub.force_auto_resume_off();
     }
     eprintln!("mirante-daemon: auto-resume {}", if hub.auto_resume_enabled() { "on" } else { "off" });
     let hub = Arc::new(hub);

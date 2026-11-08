@@ -546,6 +546,10 @@ pub struct DaemonStatus {
     /// (`daemon.settings`). Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_resume: Option<bool>,
+    /// `MIRANTE_AUTO_RESUME=off` turned auto-resume off for this daemon (the person's
+    /// setting then does not apply until it restarts without it). Absent when not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume_forced_off: Option<bool>,
 }
 
 /// `repo.files` parameters.
@@ -569,8 +573,13 @@ pub struct SettingsParams {
 /// The daemon's settings (`<home>/settings.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonSettings {
-    /// Resume the sessions the daemon itself ended (shutdown, crash) when it starts again.
+    /// Resume the sessions the daemon itself ended (shutdown, crash) when it starts again
+    /// (what this daemon does: off while `forced_by_env`).
     pub auto_resume: bool,
+    /// `MIRANTE_AUTO_RESUME=off` keeps it off for this daemon; the person's choice is saved
+    /// for the next start.
+    #[serde(default)]
+    pub forced_by_env: bool,
 }
 #[cfg(test)]
 mod tests {
