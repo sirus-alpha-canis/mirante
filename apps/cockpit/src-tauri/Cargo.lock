@@ -2083,6 +2083,7 @@ dependencies = [
 name = "mirante-bridge"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mirante-cli",
  "mirante-core",
  "mirante-ipc",

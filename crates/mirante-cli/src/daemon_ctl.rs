@@ -28,9 +28,22 @@ pub fn daemon_bin() -> io::Result<PathBuf> {
 /// `TERM_PROGRAM*`. Credentials (`ANTHROPIC_*`, `OPENAI_*`, `CODEX_*`, Claude OAuth,
 /// `CLAUDE_CONFIG_DIR`) are never removed. `present` is this process's variable names.
 pub fn daemon_command(bin: &Path, paths: &Paths, present: Vec<String>) -> Command {
+    daemon_command_with_env(bin, paths, present, &[])
+}
+
+/// [`daemon_command`] plus `extra` variables (the desktop app passes PATH and `MIRANTE_*`
+/// from the user's login shell). An extra never re-adds a scrubbed variable and never moves
+/// the daemon to another `MIRANTE_HOME` than `paths`.
+pub fn daemon_command_with_env(bin: &Path, paths: &Paths, present: Vec<String>, extra: &[(String, String)]) -> Command {
     let mut cmd = Command::new(bin);
-    for k in daemon_env_to_scrub(present) {
+    let scrubbed = daemon_env_to_scrub(present);
+    for k in &scrubbed {
         cmd.env_remove(k);
+    }
+    for (k, v) in extra {
+        if !scrubbed.contains(k) && k != mirante_ipc::paths::HOME_ENV {
+            cmd.env(k, v);
+        }
     }
     cmd.env(mirante_ipc::paths::HOME_ENV, paths.home());
     cmd
@@ -50,10 +63,15 @@ pub fn start_daemon(paths: &Paths) -> io::Result<Client> {
 /// [`start_daemon`] with an explicit daemon binary (the desktop app is not installed next to
 /// `mirante-daemon`, so it finds the binary itself).
 pub fn start_daemon_with(paths: &Paths, bin: &Path) -> io::Result<Client> {
+    start_daemon_with_env(paths, bin, &[])
+}
+
+/// [`start_daemon_with`] with extra variables for the daemon (see [`daemon_command_with_env`]).
+pub fn start_daemon_with_env(paths: &Paths, bin: &Path, extra: &[(String, String)]) -> io::Result<Client> {
     paths.ensure_home()?;
     let _ = logfile::rotate_if_over(&paths.log(), logfile::LOG_CAP);
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(paths.log())?;
-    let mut cmd = daemon_command(bin, paths, env_names());
+    let mut cmd = daemon_command_with_env(bin, paths, env_names(), extra);
     cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: setsid is async-signal-safe and touches no Rust state.
     unsafe {
@@ -137,6 +155,28 @@ mod tests {
     /// `cmd` will not pass `key` on.
     fn removes(cmd: &Command, key: &str) -> bool {
         cmd.get_envs().any(|(k, v)| k == OsStr::new(key) && v.is_none())
+    }
+
+    fn sets<'a>(cmd: &'a Command, key: &str) -> Option<&'a OsStr> {
+        cmd.get_envs().find(|(k, _)| *k == OsStr::new(key)).and_then(|(_, v)| v)
+    }
+
+    #[test]
+    fn extra_env_is_set_but_never_overrides_the_home_or_a_scrubbed_variable() {
+        let d = TestDir::new();
+        let paths = Paths::new(d.path());
+        let extra = [
+            ("PATH", "/Users/me/.local/bin:/usr/bin"),
+            ("MIRANTE_CODEX_BIN", "/x/codex"),
+            ("MIRANTE_HOME", "/somewhere/else"),
+            ("CLAUDECODE", "1"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let cmd = daemon_command_with_env(Path::new("/bin/true"), &paths, vec!["CLAUDECODE".into()], &extra);
+        assert_eq!(sets(&cmd, "PATH"), Some(OsStr::new("/Users/me/.local/bin:/usr/bin")));
+        assert_eq!(sets(&cmd, "MIRANTE_CODEX_BIN"), Some(OsStr::new("/x/codex")));
+        assert_eq!(sets(&cmd, "MIRANTE_HOME"), Some(paths.home().as_os_str()));
+        assert!(removes(&cmd, "CLAUDECODE"));
     }
 
     #[test]
