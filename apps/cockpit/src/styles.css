@@ -15,6 +15,7 @@
   --review: #15803d;
   --review-bg: #e7f6ec;
   --danger: #b91c1c;
+  --on-danger: #fff;
   --add: #15803d;
   --del: #b91c1c;
   --focus: #2563eb;
@@ -40,6 +41,7 @@
     --review: #4ade80;
     --review-bg: #12291b;
     --danger: #f87171;
+    --on-danger: #1f0a0a;
     --add: #4ade80;
     --del: #f87171;
     --focus: #93b4ff;
@@ -63,6 +65,7 @@
   --review: #4ade80;
   --review-bg: #12291b;
   --danger: #f87171;
+  --on-danger: #1f0a0a;
   --add: #4ade80;
   --del: #f87171;
   --focus: #93b4ff;
@@ -97,7 +100,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .btn-warn { border-color: var(--needs); color: var(--needs); }
 .btn-small { padding: 2px 8px; font-size: 12px; }
-.link { background: none; border: none; padding: 0; color: var(--text); font-weight: 600; cursor: pointer; text-align: left; }
+.link { background: none; border: none; padding: 0; color: var(--text); font-weight: 600; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
 .link:hover { text-decoration: underline; }
 
 .home { display: grid; grid-template-columns: 240px 1fr; flex: 1; min-height: 0; }
@@ -130,7 +133,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .agent { font-weight: 600; }
 .agent-claude { color: #c2410c; }
 .agent-codex { color: var(--work); }
-.branch { background: var(--panel-2); border-radius: 4px; padding: 0 4px; }
+.branch { background: var(--panel-2); border-radius: 4px; padding: 0 4px; overflow-wrap: anywhere; }
 .tag { border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; font-size: 11px; }
 .tag-muted { color: var(--muted); }
 .tag-warn { border-color: var(--needs); color: var(--needs); }
@@ -219,6 +222,7 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .terminal-overlay { position: absolute; z-index: 2; margin: 0; padding: 3px 8px; max-width: calc(100% - 24px); overflow-wrap: anywhere; border-radius: 6px; background: rgba(32, 36, 44, 0.92); color: #d8dee9; pointer-events: none; }
 .terminal-note { top: 8px; right: 12px; }
 .terminal-note-action { pointer-events: auto; }
+.lang { font: inherit; font-size: 12px; padding: 2px 4px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
 .terminal-link { bottom: 8px; left: 12px; }
 /* Requests and the queue over the Terminal tab (beside it they would resize it). */
 .term-overlay { position: absolute; top: 20px; right: 14px; z-index: 3; width: min(440px, 60%); max-height: 60%; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
@@ -376,7 +380,7 @@ button.skill-chip { cursor: pointer; }
 .answer { margin-top: 6px; display: flex; gap: 6px; align-items: flex-start; }
 .answer-text { margin: 0; white-space: pre-wrap; word-break: break-word; flex: 1; }
 .answer-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.tag-danger { border-color: var(--danger); background: var(--danger); color: #fff; font-weight: 600; }
+.tag-danger { border-color: var(--danger); background: var(--danger); color: var(--on-danger); font-weight: 600; }
 .line-warn .text { color: var(--danger); font-weight: 600; }
 .repeat { margin-left: 6px; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 5px; }
 .line-run > .btn { padding: 0; font-family: var(--mono); font-size: 12px; color: var(--muted); }
