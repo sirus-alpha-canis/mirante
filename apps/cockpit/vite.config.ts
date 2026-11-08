@@ -21,6 +21,7 @@ export default defineConfig(({ mode }) => ({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./src/test-setup.ts"],
-    css: false,
+    // Not processed; styles.css only as text (`?raw`), for the layout rules tests pin.
+    css: { include: [/styles\.css/] },
   },
 }));

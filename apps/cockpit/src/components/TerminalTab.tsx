@@ -1,6 +1,8 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { type ILinkHandler, Terminal } from "@xterm/xterm";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useEnv } from "../env";
 import { attachAck, attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
 import { M, type TaskView } from "../lib/protocol";
@@ -13,6 +15,7 @@ const MAX_PENDING_INPUT = 64 * 1024;
 const ACK_BATCH = 64 * 1024;
 /** …or after this long, whichever comes first. */
 const ACK_DELAY_MS = 50;
+const FONT = '"SF Mono", Menlo, monospace';
 
 /**
  * Terminal output is untrusted. Only the features below are on:
@@ -59,31 +62,67 @@ function concat(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** The task's live PTY over `attach`; keystrokes go back unless the stream is read-only. */
-export function TerminalTab({ t }: { t: TaskView }) {
+const nextFrame = (fn: () => void) => {
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(fn);
+  else setTimeout(fn, 16);
+};
+
+/** Laid out with a size (not hidden): only then can xterm measure its cells. */
+const sized = (el: HTMLElement) => el.isConnected && el.clientWidth > 0 && el.clientHeight > 0;
+
+/**
+ * The task's live PTY over `attach`; keystrokes go back unless the stream is read-only.
+ * `active`: its tab is the one shown. It stays mounted and attached while another tab is
+ * shown (coming back costs nothing), and first attaches when first shown, at the size it
+ * is shown at. The note and the link hint float over the terminal: nothing in it changes
+ * its size (each size change is a `session.resize`, and the agent redraws its screen).
+ */
+function TerminalView({ t, active = true }: { t: TaskView; active?: boolean }) {
   const { rpc, openUrl } = useEnv();
   const host = useRef<HTMLDivElement>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const [shown, setShown] = useState(active);
   const [note, setNote] = useState<string | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
 
   useEffect(() => {
+    if (active) setShown(true);
+  }, [active]);
+
+  useEffect(() => {
     setNote(null);
     setHovered(null);
-    if (!t.live || !host.current) return;
+    if (!t.live || !shown || !host.current) return;
+    const el = host.current;
     let closed = false;
     const term = new Terminal({
       convertEol: false,
       cursorBlink: true,
       fontSize: 13,
+      fontFamily: FONT,
       scrollback: 5000,
+      // For the Unicode 11 width tables (emoji and CJK take two cells, as agents' TUIs assume).
+      allowProposedApi: true,
       linkHandler: linkHandler(openUrl, (uri) => {
         if (!closed) setHovered(uri);
       }),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.open(host.current);
-    fit.fit();
+    term.loadAddon(new Unicode11Addon());
+    term.unicode.activeVersion = "11";
+    term.open(el);
+    // The GPU renderer when the webview gives it a context; else (or once the context is
+    // lost) xterm's DOM renderer.
+    try {
+      const gl = new WebglAddon();
+      gl.onContextLoss(() => gl.dispose());
+      term.loadAddon(gl);
+    } catch {
+      // No WebGL2 here: the DOM renderer stays.
+    }
+    if (sized(el)) fit.fit();
     let id: number | null = null;
 
     // Size: the PTY learns the last size once resizing settles, and only when it changed.
@@ -100,8 +139,18 @@ export function TerminalTab({ t }: { t: TaskView }) {
       if (resizeTimer !== null) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(tellSize, RESIZE_DEBOUNCE_MS);
     });
-    const ro = new ResizeObserver(() => fit.fit());
-    ro.observe(host.current);
+    // At most one fit a frame, none while hidden (it measures 0×0 then); a fit resizes the
+    // terminal only when its grid of cells changed.
+    let fitQueued = false;
+    const ro = new ResizeObserver(() => {
+      if (fitQueued) return;
+      fitQueued = true;
+      nextFrame(() => {
+        fitQueued = false;
+        if (!closed && sized(el)) fit.fit();
+      });
+    });
+    ro.observe(el);
 
     // Input: one write in flight at a time, so keys arrive in the order typed; whatever is
     // typed meanwhile goes out as one write after it. A failed write drops what queued behind it.
@@ -182,6 +231,7 @@ export function TerminalTab({ t }: { t: TaskView }) {
         }
         id = a.id;
         flushAck();
+        if (activeRef.current) term.focus();
         if (!a.input) {
           setNote("read-only stream (this agent takes messages from the composer)");
           return;
@@ -204,22 +254,29 @@ export function TerminalTab({ t }: { t: TaskView }) {
       if (id !== null) void attachClose(id).catch(() => {});
       term.dispose();
     };
-  }, [rpc, openUrl, t.id, t.live]);
+  }, [rpc, openUrl, t.id, t.live, shown]);
 
   if (!t.live) return <p className="muted">No live session. Resume the task to see its terminal.</p>;
   return (
     <div className="terminal-wrap">
+      <div className="terminal" ref={host} role="region" aria-label={`Terminal of ${t.branch}`} />
       {note && (
-        <p className="small muted" role="status">
+        <p className="small terminal-overlay terminal-note" role="status">
           {note}
         </p>
       )}
-      <div className="terminal" ref={host} role="region" aria-label={`Terminal of ${t.branch}`} />
       {hovered && (
-        <p className="small muted terminal-link">
+        <p className="small terminal-overlay terminal-link">
           Link to <code>{hovered}</code> (⌘/Ctrl-click to open)
         </p>
       )}
     </div>
   );
 }
+
+/** Renders again only for what it uses: a task refresh with the same id, liveness and
+ * branch leaves the terminal alone. */
+export const TerminalTab = memo(
+  TerminalView,
+  (a, b) => a.t.id === b.t.id && a.t.live === b.t.live && a.t.branch === b.t.branch && (a.active ?? true) === (b.active ?? true),
+);

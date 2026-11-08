@@ -22,18 +22,37 @@ const h = vi.hoisted(() => ({
   attachAck: vi.fn(async (_id: number, _bytes: number) => {}),
   /** Write callbacks xterm has not called yet (it calls them once it parsed the chunk). */
   parsed: [] as (() => void)[],
+  /** What happened to the terminal, in order (addons by name). */
+  log: [] as string[],
+  terms: 0,
+  fits: 0,
+  focused: 0,
+  unicode: { activeVersion: "6" },
+  webglThrows: false,
+  contextLoss: null as (() => void) | null,
+  webglDisposed: false,
+  ro: null as (() => void) | null,
 }));
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     rows = 30;
     cols = 100;
+    unicode = h.unicode;
     constructor(options: Record<string, unknown>) {
       h.options = options;
       h.term = this;
+      h.terms++;
     }
-    loadAddon() {}
-    open() {}
+    loadAddon(a: { name?: string }) {
+      h.log.push(`addon:${a.name ?? "?"}`);
+    }
+    open() {
+      h.log.push("open");
+    }
+    focus() {
+      h.focused++;
+    }
     write(b: Uint8Array, cb?: () => void) {
       if (h.disposed) throw new Error("write after dispose");
       h.written.push(b);
@@ -56,7 +75,30 @@ vi.mock("@xterm/xterm", () => ({
     }
   },
 }));
-vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
+vi.mock("@xterm/addon-fit", () => ({
+  FitAddon: class {
+    name = "fit";
+    fit() {
+      h.fits++;
+    }
+  },
+}));
+vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class { name = "unicode11"; } }));
+vi.mock("@xterm/addon-webgl", () => ({
+  WebglAddon: class {
+    name = "webgl";
+    constructor() {
+      if (h.webglThrows) throw new Error("no WebGL2");
+    }
+    onContextLoss(fn: () => void) {
+      h.contextLoss = fn;
+      return { dispose() {} };
+    }
+    dispose() {
+      h.webglDisposed = true;
+    }
+  },
+}));
 vi.mock("../lib/daemon", async (actual) => ({
   ...(await actual<typeof import("../lib/daemon")>()),
   attachOpen: h.attachOpen,
@@ -71,8 +113,19 @@ import type { TaskView } from "../lib/protocol";
 import { makeEnv } from "../test/env";
 import { task } from "../test/fixtures";
 import { TerminalTab } from "./TerminalTab";
+import css from "../styles.css?raw";
+
+/** The declarations of `selector`'s one-line rule in styles.css. */
+const rule = (selector: string) =>
+  css
+    .split("\n")
+    .find((l: string) => l.startsWith(`${selector} {`))
+    ?.slice(selector.length + 2) ?? "";
 
 globalThis.ResizeObserver = class {
+  constructor(fn: () => void) {
+    h.ro = fn;
+  }
   observe() {}
   disconnect() {}
 } as unknown as typeof ResizeObserver;
@@ -90,17 +143,17 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function mount(t: TaskView) {
+function mount(t: TaskView, active?: boolean) {
   const { env, calls } = makeEnv();
   const r = render(
     <EnvContext.Provider value={env}>
-      <TerminalTab t={t} />
+      <TerminalTab t={t} active={active} />
     </EnvContext.Provider>,
   );
-  const rerender = (next: TaskView) =>
+  const rerender = (next: TaskView, nextActive?: boolean) =>
     r.rerender(
       <EnvContext.Provider value={env}>
-        <TerminalTab t={next} />
+        <TerminalTab t={next} active={nextActive} />
       </EnvContext.Provider>,
     );
   return { ...r, env, calls, rerender };
@@ -121,6 +174,15 @@ describe("TerminalTab", () => {
     h.attachClose.mockClear();
     h.attachAck.mockClear();
     h.parsed = [];
+    h.log = [];
+    h.terms = 0;
+    h.fits = 0;
+    h.focused = 0;
+    h.unicode = { activeVersion: "6" };
+    h.webglThrows = false;
+    h.contextLoss = null;
+    h.webglDisposed = false;
+    h.ro = null;
   });
 
   it("attaches at the terminal's size, writes output, sends keys, detaches on unmount", async () => {
@@ -288,6 +350,102 @@ describe("TerminalTab", () => {
     expect(env.openUrl).not.toHaveBeenCalled();
     link.activate({ metaKey: true }, "https://example.com/x");
     expect(env.openUrl).toHaveBeenCalledWith("https://example.com/x");
+  });
+
+  it("renders on the GPU when it can (loaded after open), and falls back to the DOM renderer", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const r = mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    expect(h.log.indexOf("addon:webgl")).toBeGreaterThan(h.log.indexOf("open"));
+    // A lost context drops the GPU renderer; xterm goes back to the DOM one.
+    h.contextLoss!();
+    expect(h.webglDisposed).toBe(true);
+    r.unmount();
+    h.webglThrows = true;
+    h.onData = null;
+    mount(task("b"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    expect(h.log.filter((l) => l === "addon:webgl")).toHaveLength(1);
+  });
+
+  it("uses the system monospace font and Unicode 11 widths, and takes focus when it opens", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    expect(h.options!.fontFamily).toBe('"SF Mono", Menlo, monospace');
+    expect(h.options!.allowProposedApi).toBe(true);
+    expect(h.log).toContain("addon:unicode11");
+    expect(h.unicode.activeVersion).toBe("11");
+    expect(h.focused).toBe(1);
+  });
+
+  it("stays attached while hidden: a tab switch is no new terminal and no new attach", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const r = mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    r.rerender(task("a"), false);
+    r.rerender(task("a", { status: "working" }), false);
+    r.rerender(task("a"), true);
+    expect([h.terms, h.attachOpen.mock.calls.length, h.attachClose.mock.calls.length, h.disposed]).toEqual([1, 1, 0, false]);
+  });
+
+  it("is not attached before it is first shown (a hidden view has no size to give the PTY)", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const r = mount(task("a"), false);
+    await new Promise((res) => setTimeout(res, 20));
+    expect([h.terms, h.attachOpen.mock.calls.length]).toEqual([0, 0]);
+    r.rerender(task("a"), true);
+    await waitFor(() => expect(h.attachOpen).toHaveBeenCalledTimes(1));
+    expect(h.focused).toBe(1);
+  });
+
+  it("opened while hidden it does not take focus", async () => {
+    h.attachOpen.mockImplementation(() => new Promise((res) => setTimeout(() => res({ id: 6, input: true }), 10)));
+    const r = mount(task("a"));
+    r.rerender(task("a"), false);
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    expect(h.focused).toBe(0);
+  });
+
+  it("fits at most once per frame, and never while hidden", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
+    try {
+      mount(task("a"));
+      await waitFor(() => expect(h.onData).not.toBeNull());
+      const before = h.fits;
+      for (let i = 0; i < 5; i++) h.ro!();
+      await new Promise((res) => setTimeout(res, 40));
+      expect(h.fits - before).toBe(1);
+      width.mockReturnValue(0);
+      h.ro!();
+      await new Promise((res) => setTimeout(res, 40));
+      expect(h.fits - before).toBe(1);
+    } finally {
+      width.mockRestore();
+      height.mockRestore();
+    }
+  });
+
+  it("hovering a link sends no session.resize: the hint floats over the terminal", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    const r = mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    const link = h.options!.linkHandler as LinkHandler;
+    act(() => link.hover!({}, "https://example.com/x"));
+    expect(screen.getByText(/example\.com/).closest(".terminal-overlay")).not.toBeNull();
+    act(() => link.leave!({}, "https://example.com/x"));
+    await new Promise((res) => setTimeout(res, 150));
+    expect(r.calls.filter(([m]) => m === "session.resize")).toEqual([]);
+  });
+
+  it("its size depends on its pane only: the terminal fills it, notes and hints float over it", () => {
+    expect(rule(".terminal")).toMatch(/position: absolute; inset: 0/);
+    expect(rule(".terminal-overlay")).toMatch(/position: absolute/);
+    expect(rule(".terminal-overlay")).toMatch(/pointer-events: none/);
+    expect(rule(".term-overlay")).toMatch(/position: absolute/);
+    expect(rule(".detail-head")).toMatch(/flex-wrap: nowrap/);
   });
 
   it("hovering a link shows where it really goes, whatever its text says", async () => {

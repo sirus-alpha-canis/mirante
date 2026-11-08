@@ -126,7 +126,9 @@ function Actions({ t }: { t: TaskView }) {
  * selects the Terminal tab again ("Answer in terminal" pressed twice, or from another view);
  * the value it mounts with is not a request (`initialTab` covers that). `inlineAnswers` is
  * `daemon.status.claude_inline_answers` (false when unknown). Per-task state (draft, terminal,
- * diff, queue, session actions) is keyed by task, so nothing follows a task switch.
+ * diff, queue, session actions) is keyed by task, so nothing follows a task switch. The
+ * terminal stays mounted (and attached) on the other tabs; on its own tab, requests and the
+ * queue float over it, so their coming and going does not resize the agent's PTY.
  */
 export function Detail({
   taskId,
@@ -179,6 +181,23 @@ export function Detail({
     e.preventDefault();
     selectTab(next);
   };
+  const onTerminal = tab === "Terminal";
+  const notices = t && (
+    <>
+      {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
+      {perms.map((p) => (
+        <PermissionCard
+          key={p.id}
+          perm={p}
+          agent={t.agent}
+          inlineAnswers={inlineAnswers}
+          onAnswerInTerminal={() => setTab("Terminal")}
+        />
+      ))}
+    </>
+  );
+  // Its own key: it moves between the overlay and the column, beside the composer's `t.id`.
+  const queue = t?.live && <QueueList key={`queue-${t.id}`} t={t} />;
   return (
     <div className="detail">
       <TaskList selected={taskId} onSelect={onSelect} />
@@ -195,16 +214,7 @@ export function Detail({
             <SkillsChip key={`skills-${t.id}`} task={t.id} />
             <Actions key={t.id} t={t} />
           </header>
-          {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
-          {perms.map((p) => (
-            <PermissionCard
-              key={p.id}
-              perm={p}
-              agent={t.agent}
-              inlineAnswers={inlineAnswers}
-              onAnswerInTerminal={() => setTab("Terminal")}
-            />
-          ))}
+          {!onTerminal && notices}
           <div role="tablist" aria-label="Task views" className="tabs" onKeyDown={onTabKey}>
             {TABS.map((name) => (
               <button
@@ -224,22 +234,36 @@ export function Detail({
               </button>
             ))}
           </div>
-          <section role="tabpanel" id="task-panel" aria-labelledby={`tab-${tab}`} className="panel">
-            {tab === "Steps" &&
-              (feed.length === 0 ? (
-                <p className="muted">No steps yet.</p>
-              ) : (
-                <ol className="lines lines-full">
-                  {feed.map((i) => (
-                    <FeedLine key={i.seq} item={i} />
-                  ))}
-                </ol>
-              ))}
-            {tab === "Terminal" && <TerminalTab key={t.id} t={t} />}
-            {tab === "Diff" && <DiffTab key={t.id} taskId={t.id} version={turnsEnded(feed)} />}
-            {tab === "Memory" && <MemoryTab key={t.id} t={t} mem={memory.mem} reload={memory.reload} version={dnaVersion} />}
-          </section>
-          {t.live && <QueueList key={t.id} t={t} />}
+          <div className="panel-wrap">
+            <section role="tabpanel" id="task-panel" aria-labelledby={`tab-${tab}`} className="panel">
+              {tab === "Steps" &&
+                (feed.length === 0 ? (
+                  <p className="muted">No steps yet.</p>
+                ) : (
+                  <ol className="lines lines-full">
+                    {feed.map((i) => (
+                      <FeedLine key={i.seq} item={i} />
+                    ))}
+                  </ol>
+                ))}
+              {/* Mounted on every tab (hidden off its own): coming back to it is no new
+                  terminal, attach or repaint. */}
+              <div className="terminal-slot" hidden={!onTerminal}>
+                <TerminalTab key={t.id} t={t} active={onTerminal} />
+              </div>
+              {tab === "Diff" && <DiffTab key={t.id} taskId={t.id} version={turnsEnded(feed)} />}
+              {tab === "Memory" && <MemoryTab key={t.id} t={t} mem={memory.mem} reload={memory.reload} version={dnaVersion} />}
+            </section>
+            {/* Over the terminal, not above or below it: a card or the queue coming and
+                going must not resize the terminal (each resize makes the agent redraw). */}
+            {onTerminal && (
+              <div className="term-overlay">
+                {notices}
+                {queue}
+              </div>
+            )}
+          </div>
+          {!onTerminal && queue}
           <MessageComposer key={t.id} t={t} />
         </main>
       )}

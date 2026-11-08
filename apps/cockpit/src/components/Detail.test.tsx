@@ -4,9 +4,25 @@ import type { ReactElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { TaskView } from "../lib/protocol";
 
-vi.mock("./TerminalTab", () => ({
-  TerminalTab: ({ t }: { t: TaskView }) => <div aria-label={`Terminal of ${t.branch}`}>terminal here</div>,
-}));
+const term = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }));
+vi.mock("./TerminalTab", async () => {
+  const { useEffect } = await import("react");
+  return {
+    TerminalTab: ({ t, active }: { t: TaskView; active?: boolean }) => {
+      useEffect(() => {
+        term.mounts++;
+        return () => {
+          term.unmounts++;
+        };
+      }, []);
+      return (
+        <div aria-label={`Terminal of ${t.branch}`} data-active={String(active ?? true)}>
+          terminal here
+        </div>
+      );
+    },
+  };
+});
 
 import { RpcCode, type TaskDiff } from "../lib/protocol";
 import { ev, task } from "../test/fixtures";
@@ -89,6 +105,35 @@ describe("Detail (V1 classic)", () => {
     renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
     const queue = screen.getByRole("region", { name: "Queued messages" });
     expect(within(queue).getByText("then update docs")).toBeInTheDocument();
+  });
+
+  it("keeps one terminal per task across tab switches, hidden off its tab", async () => {
+    const h = makeEnv();
+    h.load([task("a", { status: "working" })]);
+    term.mounts = term.unmounts = 0;
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} initialTab="Terminal" />);
+    const view = screen.getByLabelText("Terminal of feat/a");
+    expect(view.closest("[hidden]")).toBeNull();
+    await userEvent.click(screen.getByRole("tab", { name: "Steps" }));
+    expect(screen.getByLabelText("Terminal of feat/a")).toHaveAttribute("data-active", "false");
+    expect(screen.getByLabelText("Terminal of feat/a").closest("[hidden]")).not.toBeNull();
+    await userEvent.click(screen.getByRole("tab", { name: "Terminal" }));
+    expect(screen.getByLabelText("Terminal of feat/a")).toBe(view);
+    expect([term.mounts, term.unmounts]).toEqual([1, 0]);
+  });
+
+  it("on the Terminal tab, requests and the queue float over the terminal instead of resizing it", async () => {
+    const h = makeEnv();
+    h.load([task("a", { status: "needs_you", agent: "codex", queued: 1 })], [ev(1, "a", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "ls" })]);
+    h.env.cockpit.dispatch({ type: "queue", taskId: "a", list: [{ id: "q1", text: "then update docs" }] });
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    const card = () => screen.getByRole("button", { name: "Allow once" });
+    const queue = () => screen.getByRole("region", { name: "Queued messages" });
+    expect(card().closest(".term-overlay")).toBeNull();
+    expect(queue().closest(".term-overlay")).toBeNull();
+    await userEvent.click(screen.getByRole("tab", { name: "Terminal" }));
+    expect(card().closest(".term-overlay")).not.toBeNull();
+    expect(queue().closest(".term-overlay")).not.toBeNull();
   });
 
   it("opens on the requested tab", () => {
