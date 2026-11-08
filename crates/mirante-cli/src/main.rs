@@ -379,7 +379,7 @@ fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offlin
             None => std::env::current_dir()?,
         };
         let top = memcheck::toplevel(&dir)?;
-        let (r, sha) = memcheck::check(&top, rev.as_deref().unwrap_or("HEAD"))?;
+        let (r, sha) = memcheck::check(&top, rev.as_deref())?;
         for l in &r.lines {
             println!("{l}");
         }

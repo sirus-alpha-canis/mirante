@@ -8,7 +8,7 @@ use serde_json::json;
 use std::path::Path;
 
 use super::anchor::Anchor;
-use super::check::{check_all, rev_parse, AnchorState};
+use super::check::{check_all, memory_files_at, rev_parse, AnchorState};
 use super::fsio::MemoryDir;
 use super::{note, sha256_hex, DnaError, MAX_NOTES};
 use crate::error::{CoreError, Result};
@@ -714,54 +714,93 @@ pub fn scan(repo: &Path) -> std::result::Result<Scan, DnaError> {
         if name.starts_with('.') || name.eq_ignore_ascii_case("README.md") || !entry.is_file() {
             continue;
         }
-        let Some(stem) = name.strip_suffix(".md").map(str::to_string) else { continue };
-        if !note::is_slug(&stem) {
-            invalid.push(InvalidNote { file: name, error: "the file name is not a note name (a-z, 0-9 and -)".into() });
-            continue;
-        }
-        let text = match dir.read_file(&name) {
-            Ok(t) => t,
-            Err(e) => {
-                invalid.push(InvalidNote { file: name, error: e.to_string() });
-                continue;
-            }
-        };
-        let content_hash = sha256_hex(text.as_bytes());
-        match note::parse(&text) {
-            Ok(n) => notes.push(IndexedNote {
-                slug: stem.clone(),
-                id: n.id,
-                title: n.title,
-                kind: n.kind.as_str().to_string(),
-                status: n.status.as_str().to_string(),
-                links: note::links(&n.body),
-                body: n.body,
-                content_hash,
-                source: n.source,
-                parse_error: None,
-                anchors: n.anchors,
-            }),
-            Err(e) => {
-                invalid.push(InvalidNote { file: name, error: e.to_string() });
-                notes.push(IndexedNote {
-                    slug: stem.clone(),
-                    id: String::new(),
-                    title: stem.clone(),
-                    kind: String::new(),
-                    status: "active".into(),
-                    body: String::new(),
-                    content_hash,
-                    source: String::new(),
-                    parse_error: Some(e.to_string()),
-                    anchors: Vec::new(),
-                    links: Vec::new(),
-                });
-            }
-        }
+        add_file(&name, || dir.read_file(&name), &mut notes, &mut invalid);
     }
     notes.sort_by(|a, b| a.slug.cmp(&b.slug));
     invalid.sort_by(|a, b| a.file.cmp(&b.file));
     Ok(Scan { notes, invalid, signature })
+}
+
+/// [`scan`] of `.mirante/memory` as committed at `commit` (a full sha), read through the
+/// hardened git (`ls-tree`, `cat-file`), never the working tree: what a CI job checks at a
+/// revision. The same rules: at most [`MAX_NOTES`] entries, regular `*.md` files only
+/// (symlinks, subdirectories, dotfiles and `README.md` skipped), size-capped. No signature
+/// (`rev:<commit>`).
+pub fn scan_at(repo: &Path, commit: &str) -> std::result::Result<Scan, DnaError> {
+    let files = memory_files_at(repo, commit, MAX_NOTES + 1)?;
+    let (mut notes, mut invalid) = (Vec::new(), Vec::new());
+    for (i, (name, text)) in files.into_iter().enumerate() {
+        if i >= MAX_NOTES {
+            invalid.push(InvalidNote {
+                file: String::new(),
+                error: format!("more than {MAX_NOTES} entries; rest skipped"),
+            });
+            break;
+        }
+        if name.starts_with('.') || name.eq_ignore_ascii_case("README.md") {
+            continue;
+        }
+        add_file(&name, || text, &mut notes, &mut invalid);
+    }
+    notes.sort_by(|a, b| a.slug.cmp(&b.slug));
+    invalid.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(Scan { notes, invalid, signature: format!("rev:{commit}") })
+}
+
+/// One file of the memory directory: a note (indexed, with its `parse_error` when it does
+/// not parse) or an invalid entry. Files that are not `*.md` are skipped; `read` runs only
+/// for a file whose name is a slug.
+fn add_file(
+    name: &str,
+    read: impl FnOnce() -> std::result::Result<String, DnaError>,
+    notes: &mut Vec<IndexedNote>,
+    invalid: &mut Vec<InvalidNote>,
+) {
+    let file = name.to_string();
+    let Some(stem) = name.strip_suffix(".md").map(str::to_string) else { return };
+    if !note::is_slug(&stem) {
+        invalid.push(InvalidNote { file, error: "the file name is not a note name (a-z, 0-9 and -)".into() });
+        return;
+    }
+    let text = match read() {
+        Ok(t) => t,
+        Err(e) => {
+            invalid.push(InvalidNote { file, error: e.to_string() });
+            return;
+        }
+    };
+    let content_hash = sha256_hex(text.as_bytes());
+    match note::parse(&text) {
+        Ok(n) => notes.push(IndexedNote {
+            slug: stem,
+            id: n.id,
+            title: n.title,
+            kind: n.kind.as_str().to_string(),
+            status: n.status.as_str().to_string(),
+            links: note::links(&n.body),
+            body: n.body,
+            content_hash,
+            source: n.source,
+            parse_error: None,
+            anchors: n.anchors,
+        }),
+        Err(e) => {
+            invalid.push(InvalidNote { file, error: e.to_string() });
+            notes.push(IndexedNote {
+                slug: stem.clone(),
+                id: String::new(),
+                title: stem,
+                kind: String::new(),
+                status: "active".into(),
+                body: String::new(),
+                content_hash,
+                source: String::new(),
+                parse_error: Some(e.to_string()),
+                anchors: Vec::new(),
+                links: Vec::new(),
+            });
+        }
+    }
 }
 
 /// The HEAD a scan was checked at and each anchor's state (slug, idx, state).

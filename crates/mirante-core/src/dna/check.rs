@@ -80,12 +80,23 @@ fn is_full_sha(s: &str) -> bool {
 /// than [`MAX_CITED_FILE`], not a regular file, or not UTF-8. Two git processes in all:
 /// `cat-file --batch-check` for every name, then `cat-file --batch` for the blobs to read.
 fn read_blobs(repo: &Path, names: &[(String, String)]) -> Result<Vec<Result<Option<String>, DnaError>>, DnaError> {
+    for (_, path) in names {
+        check_path(path)?; // no control characters (one name per line), nothing sensitive
+    }
+    read_objects(repo, names)
+}
+
+/// [`read_blobs`] without the citable-path check: for Mirante's own files (`.mirante/…`).
+/// Every path must be free of control characters.
+fn read_objects(repo: &Path, names: &[(String, String)]) -> Result<Vec<Result<Option<String>, DnaError>>, DnaError> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
     let mut input = Vec::new();
     for (commit, path) in names {
-        check_path(path)?; // no control characters: one name per line
+        if path.chars().any(char::is_control) {
+            return Err(DnaError::Git(format!("{path:?} has a control character")));
+        }
         if !is_full_sha(commit) {
             return Err(DnaError::Git(format!("{commit:?} is not a full sha")));
         }
@@ -134,6 +145,49 @@ fn read_blobs(repo: &Path, names: &[(String, String)]) -> Result<Vec<Result<Opti
             String::from_utf8(body.to_vec()).map(Some).map_err(|_| DnaError::Git(format!("{path} is a binary file")));
     }
     Ok(results)
+}
+
+/// A file of `.mirante/memory` at a commit: its name, and its text or why it was not read.
+pub type MemoryFile = (String, Result<String, DnaError>);
+
+/// The note files of `.mirante/memory` as committed at `commit` (a full sha): each regular
+/// file directly in that directory (symlinks, submodules and subdirectories skipped), by
+/// name, with its text or why it could not be read. At most `limit` entries are listed.
+/// Two or three git processes: one `ls-tree`, then [`read_blobs`].
+pub fn memory_files_at(repo: &Path, commit: &str, limit: usize) -> Result<Vec<MemoryFile>, DnaError> {
+    if !is_full_sha(commit) {
+        return Err(DnaError::Git(format!("{commit:?} is not a full sha")));
+    }
+    let dir = format!("{}/", super::MEMORY_DIR);
+    let out = git(repo, &["ls-tree", "-z", "--full-tree", "--end-of-options", commit, "--", &dir])?;
+    let mut names = Vec::new();
+    for entry in out.split(|b| *b == 0).filter(|e| !e.is_empty()).take(limit) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, path)) = entry.split_once('\t') else { continue };
+        let regular = matches!(meta.split(' ').collect::<Vec<_>>()[..], ["100644" | "100755", "blob", _]);
+        match path.strip_prefix(&dir) {
+            Some(name) if regular && !name.is_empty() && !name.contains('/') => names.push(name.to_string()),
+            _ => {}
+        }
+    }
+    // A name with a control character is never read (one name per line on cat-file's stdin).
+    let readable = |n: &String| !n.chars().any(char::is_control);
+    let wanted: Vec<(String, String)> =
+        names.iter().filter(|n| readable(n)).map(|n| (commit.to_string(), format!("{dir}{n}"))).collect();
+    let mut read = read_objects(repo, &wanted)?.into_iter();
+    Ok(names
+        .into_iter()
+        .map(|n| {
+            let text = if readable(&n) {
+                read.next()
+                    .unwrap_or(Ok(None))
+                    .and_then(|t| t.ok_or_else(|| DnaError::Git(format!("{n} is missing at {commit}"))))
+            } else {
+                Err(DnaError::Note("the file name has a control character".into()))
+            };
+            (n, text)
+        })
+        .collect())
 }
 
 #[cfg(test)]

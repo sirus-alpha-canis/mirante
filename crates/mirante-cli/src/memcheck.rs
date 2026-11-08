@@ -1,11 +1,12 @@
-//! `mirante memory check --offline`: every active note's anchors checked against a
-//! revision straight from the files and git, with no daemon (the "Memory CI" seed). Uses
+//! `mirante memory check --offline`: every active note's anchors checked straight from the
+//! files and git, with no daemon (the "Memory CI" seed): the working tree's notes at HEAD,
+//! or, with `--rev`, the notes committed at that revision, at that revision. Uses
 //! the same core as the daemon: `dna::index::scan` (safe reads of `.mirante/memory`) and
 //! `dna::check::check_all` (hardened git).
 use std::path::{Path, PathBuf};
 
 use mirante_core::dna::check::{check_all, rev_parse, AnchorState};
-use mirante_core::dna::index::scan;
+use mirante_core::dna::index::{scan, scan_at};
 use mirante_core::git::Git;
 
 use crate::render::{self, check_line};
@@ -46,11 +47,17 @@ pub fn toplevel(dir: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(&top).map_err(|e| format!("{top}: {e}"))
 }
 
-/// Checks the active notes of the checkout `repo` against `rev`. Returns the report and
-/// the full sha `rev` names.
-pub fn check(repo: &Path, rev: &str) -> Result<(Report, String), String> {
-    let sha = rev_parse(repo, rev).map_err(|e| e.to_string())?;
-    let found = scan(repo).map_err(|e| e.to_string())?;
+/// Checks the active notes of the checkout `repo`. Without `rev`: the notes as they are in
+/// the working tree (uncommitted ones too, like the daemon), against HEAD. With `rev`: the
+/// notes as committed at `rev` (read through git, never the working tree), against `rev`.
+/// Returns the report and the full sha it checked against.
+pub fn check(repo: &Path, rev: Option<&str>) -> Result<(Report, String), String> {
+    let sha = rev_parse(repo, rev.unwrap_or("HEAD")).map_err(|e| e.to_string())?;
+    let found = match rev {
+        None => scan(repo),
+        Some(_) => scan_at(repo, &sha),
+    }
+    .map_err(|e| e.to_string())?;
     let mut r = Report::default();
     for bad in &found.invalid {
         r.invalid += 1;
@@ -140,23 +147,55 @@ mod tests {
         note(&repo, "b-note", Status::Retired, "b.rs");
         assert_eq!(toplevel(&repo.join(".mirante")).unwrap(), repo.canonicalize().unwrap());
 
-        let (r, _) = check(&repo, "HEAD").unwrap();
+        let (r, _) = check(&repo, None).unwrap();
         assert_eq!((r.notes, r.anchors, r.failed()), (1, 1, false), "{r:?}");
         assert_eq!(r.lines, ["fresh  a-note  a.rs:1-1"]);
 
         commit(&repo, "a.rs", "uno\n");
         commit(&repo, "b.rs", "dos\n");
-        let (r, sha) = check(&repo, "HEAD").unwrap();
+        let (r, sha) = check(&repo, None).unwrap();
         assert_eq!((r.stale, r.failed()), (1, true), "{r:?}");
         assert!(r.lines[0].starts_with("stale  a-note  a.rs:1-1"), "{:?}", r.lines);
         assert!(r.summary(&sha[..7]).contains("1 stale"));
 
+        // Without --rev: the files as they are now (an uncommitted note too), at HEAD.
         std::fs::write(repo.join(".mirante/memory/c-note.md"), "no frontmatter").unwrap();
-        let (r, _) = check(&repo, "HEAD~2").unwrap();
-        assert_eq!((r.stale, r.invalid, r.failed()), (0, 1, true), "{r:?}");
+        let (r, _) = check(&repo, None).unwrap();
+        assert_eq!((r.stale, r.invalid, r.failed()), (1, 1, true), "{r:?}");
         assert!(r.lines.iter().any(|l| l.starts_with("invalid  c-note.md")), "{:?}", r.lines);
-        assert!(check(&repo, "no-such-rev").is_err());
+        // With --rev: the notes as committed at that revision, checked there.
+        let (r, sha) = check(&repo, Some("HEAD~2")).unwrap();
+        assert_eq!((r.notes, r.stale, r.invalid, r.failed()), (1, 0, 0, false), "{r:?}");
+        assert_eq!(sha.len(), 40);
+        assert!(check(&repo, Some("no-such-rev")).is_err());
         assert!(toplevel(d.path()).is_err());
+    }
+
+    #[test]
+    fn rev_reads_the_notes_committed_at_that_revision() {
+        let d = TestDir::new();
+        let repo = d.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "trunk"]);
+        commit(&repo, "a.rs", "one\n");
+        note(&repo, "a-note", Status::Active, "a.rs");
+        let base = rev_parse(&repo, "HEAD").unwrap();
+        // Later: the note is retired in the working tree only, and another note is added
+        // and committed; a symlink and a nested file in the directory are not notes.
+        commit(&repo, "b.rs", "two\n");
+        note(&repo, "b-note", Status::Active, "b.rs");
+        std::os::unix::fs::symlink("a-note.md", repo.join(".mirante/memory/link.md")).unwrap();
+        commit(&repo, ".mirante/memory/sub/x.md", "not a note\n");
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "link"]);
+        std::fs::remove_file(repo.join(".mirante/memory/a-note.md")).unwrap();
+        let (r, _) = check(&repo, Some(&base)).unwrap();
+        assert_eq!((r.notes, r.anchors, r.invalid), (1, 1, 0), "{r:?}");
+        assert_eq!(r.lines, ["fresh  a-note  a.rs:1-1"]);
+        let (r, _) = check(&repo, Some("HEAD")).unwrap();
+        assert_eq!((r.notes, r.invalid), (2, 0), "committed at HEAD, whatever the working tree says: {r:?}");
+        let (r, _) = check(&repo, None).unwrap();
+        assert_eq!(r.notes, 1, "the working tree: {r:?}");
     }
 
     #[test]
@@ -168,7 +207,7 @@ mod tests {
         commit(&repo, "a.rs", "one\n");
         let evil = "---\ntitle: \"\u{1b}]0;owned\u{7}\u{1b}[2J\n---\nbody\n";
         commit(&repo, ".mirante/memory/evil.md", evil);
-        let (r, _) = check(&repo, "HEAD").unwrap();
+        let (r, _) = check(&repo, None).unwrap();
         assert_eq!(r.invalid, 1, "{r:?}");
         let line = r.lines.iter().find(|l| l.starts_with("invalid  evil.md")).expect("the invalid line");
         assert!(!line.contains(['\u{1b}', '\u{7}', '\n']), "{line:?}");
