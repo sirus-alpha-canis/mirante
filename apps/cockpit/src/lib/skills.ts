@@ -121,6 +121,27 @@ export function skillBody(skillMd: string): string {
   return m ? skillMd.slice(m[0].length) : skillMd;
 }
 
+/** The tenant a rendered scope belongs to (`host/owner`), or null for personal. */
+export function scopeTenant(scope: string): string | null {
+  if (scopeKind(scope) === "personal") return null;
+  const key = scope.slice(scope.indexOf(":") + 1);
+  return key.split("/").slice(0, 2).join("/");
+}
+
+/** The cross-client warnings for putting text learned in `learnedIn` under `scope`. */
+export function wideningWarnings(scope: string, learnedIn: string | null | undefined): string[] {
+  const kind = scopeKind(scope);
+  if (kind === "personal") {
+    return [
+      learnedIn
+        ? `Learned in ${learnedIn}; personal skills reach every repo, including other clients'.`
+        : "Personal skills reach every repo, including other clients'.",
+    ];
+  }
+  const t = scopeTenant(scope);
+  return learnedIn && t && t !== learnedIn ? [`Learned in ${learnedIn}; scoped to ${t}, another client's.`] : [];
+}
+
 export const hasLintErrors = (f: readonly Finding[]) => f.some((x) => x.severity === "error");
 
 /** `rule (error, SKILL.md line 3): message`. */

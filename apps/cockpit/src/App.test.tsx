@@ -311,6 +311,9 @@ describe("App", () => {
     await userEvent.type(screen.getByRole("combobox"), "Go to Skills{Enter}");
     expect(nav()).toHaveAttribute("aria-pressed", "true");
     expect(await screen.findByRole("main", { name: "Skills" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "k", ...mod });
+    await userEvent.type(screen.getByRole("combobox"), "Review skills{Enter}");
+    expect(await screen.findByRole("region", { name: "Skill review queue" })).toBeInTheDocument();
   });
 
   it("⌘B toggles the brain and back; the command bar opens it and the review queue", async () => {

@@ -76,6 +76,8 @@ export function App({ env }: { env: Env }) {
   const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
   // Bumped by every "Review memory": the brain (open or not) switches to its review queue.
   const [reviewNonce, setReviewNonce] = useState(0);
+  // Bumped by every "Review skills": the Skills view shows its review queue.
+  const [skillsReviewNonce, setSkillsReviewNonce] = useState(0);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [detailTab, setDetailTab] = useState<"Terminal" | undefined>(undefined);
   // Bumped by every "Answer in terminal": Detail re-selects its Terminal tab on each new value.
@@ -235,6 +237,14 @@ export function App({ env }: { env: Env }) {
       },
       { id: "review", label: "Review memory", run: () => openReview() },
       { id: "skills", label: "Go to Skills", run: () => setMode("skills") },
+      {
+        id: "skills-review",
+        label: "Review skills",
+        run: () => {
+          setSkillsReviewNonce((n) => n + 1);
+          setMode("skills");
+        },
+      },
       { id: "theme", label: `Theme: ${nextTheme(theme)}`, hint: hints.theme, run: () => setTheme(nextTheme) },
       ...projs.map((p) => ({
         id: `p-${p.path}`,
@@ -295,7 +305,10 @@ export function App({ env }: { env: Env }) {
             onReposChanged={setRepos}
             onOpen={open}
             onReview={openReview}
-            onSkills={() => setMode("skills")}
+            onSkills={() => {
+              setSkillsReviewNonce((n) => n + 1);
+              setMode("skills");
+            }}
             status={status}
             draft={draft}
             onDraft={setDraft}
@@ -312,7 +325,7 @@ export function App({ env }: { env: Env }) {
         )}
         {mode === "grid" && <Grid onOpen={open} status={status} />}
         {mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
-        {mode === "skills" && <Skills />}
+        {mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
         {palette && (
           <CommandBar
             commands={commands}

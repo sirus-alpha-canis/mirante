@@ -19,9 +19,13 @@ import {
   skillLearn,
   skillList,
   skillMine,
+  skillProposals,
   skillTenants,
+  scopeTenant,
+  wideningWarnings,
 } from "../lib/skills";
 import { useSkillsVersion } from "../lib/useSkills";
+import { SkillProposals } from "./SkillProposals";
 
 const KIND_ORDER = { personal: 0, org: 1, repo: 2 } as const;
 
@@ -35,27 +39,6 @@ export function groupByScope(list: SkillSummary[]): { scope: string; skills: Ski
 }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
-
-/** The tenant a rendered scope belongs to (`host/owner`), or null for personal. */
-export function scopeTenant(scope: string): string | null {
-  if (scopeKind(scope) === "personal") return null;
-  const key = scope.slice(scope.indexOf(":") + 1);
-  return key.split("/").slice(0, 2).join("/");
-}
-
-/** The cross-client warnings for putting text learned in `learnedIn` under `scope`. */
-export function wideningWarnings(scope: string, learnedIn: string | null | undefined): string[] {
-  const kind = scopeKind(scope);
-  if (kind === "personal") {
-    return [
-      learnedIn
-        ? `Learned in ${learnedIn}; personal skills reach every repo, including other clients'.`
-        : "Personal skills reach every repo, including other clients'.",
-    ];
-  }
-  const t = scopeTenant(scope);
-  return learnedIn && t && t !== learnedIn ? [`Learned in ${learnedIn}; scoped to ${t}, another client's.`] : [];
-}
 
 function TenantRow({ t, onChanged }: { t: TenantView; onChanged(): void }) {
   const { rpc } = useEnv();
@@ -324,12 +307,29 @@ type Library =
   | { state: "ready"; tenants: TenantView[]; skills: SkillSummary[] };
 
 /** The skills view. `reviewNonce`: each new value opens the review queue. */
-export function Skills({ reviewNonce: _reviewNonce = 0 }: { reviewNonce?: number }) {
+export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
   const { rpc } = useEnv();
   const version = useSkillsVersion();
   const [nonce, setNonce] = useState(0);
   const [lib, setLib] = useState<Library>({ state: "loading" });
+  // The panel: the review queue (null) or a selected skill.
   const [selected, setSelected] = useState<string | null>(null);
+  const [pending, setPending] = useState(0);
+  const seenReview = useRef(reviewNonce);
+  useEffect(() => {
+    if (reviewNonce === seenReview.current) return;
+    seenReview.current = reviewNonce;
+    setSelected(null);
+  }, [reviewNonce]);
+  useEffect(() => {
+    let live = true;
+    skillProposals(rpc, { status: "pending", limit: 200 })
+      .then((l) => live && setPending((l ?? []).length))
+      .catch(() => live && setPending(0));
+    return () => {
+      live = false;
+    };
+  }, [rpc, version, nonce]);
   useEffect(() => {
     let live = true;
     (async () => {
@@ -390,6 +390,9 @@ export function Skills({ reviewNonce: _reviewNonce = 0 }: { reviewNonce?: number
         <header className="feed-head">
           <h1>Skills</h1>
           <span className="muted small">Reviewed instructions Mirante gives each matching session</span>
+          <button className="btn btn-small" aria-pressed={selected === null} onClick={() => setSelected(null)}>
+            Review ({pending})
+          </button>
         </header>
         {body}
       </section>
@@ -397,7 +400,7 @@ export function Skills({ reviewNonce: _reviewNonce = 0 }: { reviewNonce?: number
         {selected ? (
           <SkillPanel key={selected} name={selected} version={version} onChanged={reload} />
         ) : (
-          <p className="muted">Select a skill to read it.</p>
+          <SkillProposals onDecided={reload} />
         )}
       </aside>
     </main>

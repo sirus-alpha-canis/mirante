@@ -174,3 +174,15 @@ describe("Skills view", () => {
     expect(await screen.findByText(/This daemon predates skills/)).toBeInTheDocument();
   });
 });
+
+describe("Skills view review panel", () => {
+  it("opens on the review queue; a selected skill replaces it until Review is pressed", async () => {
+    setup();
+    expect(await screen.findByRole("region", { name: "Skill review queue" })).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: /cargo-tests-first/ }));
+    expect(await screen.findByRole("region", { name: "Skill cargo-tests-first" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Skill review queue" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Review (0)" }));
+    expect(await screen.findByRole("region", { name: "Skill review queue" })).toBeInTheDocument();
+  });
+});
