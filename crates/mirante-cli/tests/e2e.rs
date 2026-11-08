@@ -548,6 +548,24 @@ fn memory_check_exits_3_when_it_could_not_run() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    // A shallow clone: no cited commit is in it. Exit 3 with how to fix it, not a list of
+    // "no longer exists"; online too, before any daemon is started.
+    env.commit(&repo, "src/b.rs", "b\n");
+    let clone = env.dir.path().join("shallow");
+    let url = format!("file://{}", repo.display());
+    let ok = std::process::Command::new("git")
+        .args(["clone", "-q", "--depth", "1", &url])
+        .arg(&clone)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git clone --depth 1");
+    for args in [&["memory", "check", "--offline"][..], &["memory", "check"][..]] {
+        let (c, err) = code(&clone, args);
+        assert_eq!(c, Some(3), "{args:?}: {err}");
+        assert!(err.contains("shallow clone") && err.contains("fetch-depth: 0"), "{err}");
+    }
+    assert!(!env.home.join("daemon.sock").exists(), "a shallow clone never starts the daemon");
     // A finding is still 1, online and offline.
     env.commit(&repo, "src/a.rs", "changed\n");
     assert_eq!(code(&repo, &["memory", "check", "--offline"]).0, Some(1));

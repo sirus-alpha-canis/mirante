@@ -371,7 +371,7 @@ fn memory_note_action(paths: &Paths, slug: String, repo: Option<String>, confirm
 
 /// `mirante memory check`: one line per anchor; a stale or unverifiable anchor (or a note
 /// that does not parse) is a [`Findings`] error (exit 1), so the exit status fails a CI
-/// job; failing to check at all exits 3.
+/// job; failing to check at all exits 3 (so does a shallow clone: fetch full history).
 fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offline: bool) -> Res {
     if offline {
         let dir = match repo {
@@ -391,6 +391,8 @@ fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offlin
         return Ok(());
     }
     let repo = repo_or_cwd(repo)?;
+    // A shallow clone cannot be checked (every cited commit reads as gone): say so, exit 3.
+    memcheck::refuse_shallow(std::path::Path::new(&repo))?;
     let mut c = client(paths)?;
     let at = DnaRef { repo: Some(repo), task: None };
     let report: CheckReport = c.call(method::DNA_CHECK, &at)?;

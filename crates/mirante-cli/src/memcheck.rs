@@ -47,11 +47,32 @@ pub fn toplevel(dir: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(&top).map_err(|e| format!("{top}: {e}"))
 }
 
+/// The message for a shallow clone (exit 3: the check could not run).
+pub const SHALLOW: &str = "shallow clone: the commits the notes cite are not in it, so nothing can be checked; \
+     fetch full history (e.g. actions/checkout with fetch-depth: 0, or git fetch --unshallow)";
+
+/// Err with [`SHALLOW`] when `repo` is a shallow clone (`rev-parse --is-shallow-repository`
+/// through the hardened git): there every cited commit would read as gone.
+pub fn refuse_shallow(repo: &Path) -> Result<(), String> {
+    let out =
+        Git::new(repo).args(["rev-parse", "--is-shallow-repository"]).output().map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git rev-parse: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "false" => Ok(()),
+        "true" => Err(SHALLOW.into()),
+        other => Err(format!("unexpected rev-parse --is-shallow-repository output: {other:?}")),
+    }
+}
+
 /// Checks the active notes of the checkout `repo`. Without `rev`: the notes as they are in
 /// the working tree (uncommitted ones too, like the daemon), against HEAD. With `rev`: the
 /// notes as committed at `rev` (read through git, never the working tree), against `rev`.
-/// Returns the report and the full sha it checked against.
+/// Returns the report and the full sha it checked against. A shallow clone is an error
+/// ([`refuse_shallow`]), not a list of unverifiable anchors.
 pub fn check(repo: &Path, rev: Option<&str>) -> Result<(Report, String), String> {
+    refuse_shallow(repo)?;
     let sha = rev_parse(repo, rev.unwrap_or("HEAD")).map_err(|e| e.to_string())?;
     let found = match rev {
         None => scan(repo),
@@ -196,6 +217,24 @@ mod tests {
         assert_eq!((r.notes, r.invalid), (2, 0), "committed at HEAD, whatever the working tree says: {r:?}");
         let (r, _) = check(&repo, None).unwrap();
         assert_eq!(r.notes, 1, "the working tree: {r:?}");
+    }
+
+    #[test]
+    fn a_shallow_clone_cannot_be_checked_and_says_how_to_fix_it() {
+        let d = TestDir::new();
+        let repo = d.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "trunk"]);
+        commit(&repo, "a.rs", "one\n");
+        note(&repo, "a-note", Status::Active, "a.rs");
+        commit(&repo, "b.rs", "two\n");
+        assert_eq!(refuse_shallow(&repo), Ok(()));
+        let url = format!("file://{}", repo.display());
+        let clone = d.path().join("c");
+        git(d.path(), &["clone", "-q", "--depth", "1", &url, clone.to_str().unwrap()]);
+        let err = check(&clone, None).unwrap_err();
+        assert!(err.contains("shallow clone") && err.contains("fetch-depth: 0"), "{err}");
+        assert!(refuse_shallow(&clone).is_err());
     }
 
     #[test]

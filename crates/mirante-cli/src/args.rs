@@ -47,9 +47,11 @@ usage: mirante <command>
   memory check [<repo>] [--offline [--rev <rev>]]
                          recheck every anchor; exits 1 when one is stale or unverifiable or
                          a note does not parse, 3 when it could not check (not a checkout,
-                         a bad --rev, no daemon, a git failure). --offline reads the files
-                         and git directly (no daemon; for CI); with --rev <rev> it checks the
-                         notes as committed at <rev>, against <rev> (not the working tree)
+                         a bad --rev, no daemon, a git failure, a shallow clone). --offline
+                         reads the files and git directly (no daemon; for CI: check out full
+                         history, e.g. actions/checkout with fetch-depth: 0); with --rev <rev>
+                         it checks the notes as committed at <rev>, against <rev> (not the
+                         working tree)
   memory propose --task <task> --title <t> --kind fact|decision|pattern|gotcha
                  --cite <path:start-end[#symbol]>... <body...>
                          propose a note yourself, citing committed code in the task worktree
