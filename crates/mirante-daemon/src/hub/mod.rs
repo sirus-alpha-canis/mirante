@@ -458,9 +458,12 @@ impl State {
 
     /// Logs an error that must not fail the operation it happened in (the user-visible
     /// action already took effect): stderr plus a `daemon_error` event, best effort.
+    /// An error the daemon handled, on stderr (daemon.log) and as a `daemon_error` event,
+    /// credentials masked in both (an error can quote a command or a URL).
     pub(crate) fn log_error(&mut self, task_id: Option<&str>, context: &str, e: &dyn fmt::Display) {
-        eprintln!("mirante-daemon: {context}: {e}");
-        let _ = self.event(task_id, "daemon_error", json!({ "context": context, "error": e.to_string() }));
+        let error = mirante_core::redact::redact(&e.to_string());
+        eprintln!("mirante-daemon: {context}: {error}");
+        let _ = self.event(task_id, "daemon_error", json!({ "context": context, "error": error }));
     }
 
     pub(crate) fn event(&mut self, task_id: Option<&str>, kind: &str, payload: Value) -> Result<()> {
@@ -1103,6 +1106,17 @@ mod tests {
         assert!(k.hub.list_tasks(false).unwrap().is_empty());
         assert_eq!(k.hub.list_tasks(true).unwrap().len(), 1);
         assert!(matches!(k.hub.archive(&t.id), Err(HubError::Conflict(_))));
+    }
+
+    #[test]
+    fn a_logged_error_is_stored_with_credentials_masked() {
+        let k = Kit::new();
+        let token = format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        k.hub.lock().log_error(None, "push", &format!("remote said: bad token {token}"));
+        let st = k.hub.lock();
+        let ev = st.store.events_since(0, 1000).unwrap();
+        let e = ev.iter().rev().find(|e| e.kind == "daemon_error").unwrap();
+        assert!(!e.payload.to_string().contains(&token), "{e:?}");
     }
 
     #[test]
