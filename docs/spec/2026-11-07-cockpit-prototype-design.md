@@ -73,9 +73,10 @@ CLI (cockpit …) ─────┘                              │
 
   An unsupported capability is a typed result, never a silent failure.
 - **Durable model.** The minimal set of concepts is **Task → Conversation (durable) → Session (process activation) → Turn → PermissionRequest → Checkpoint**. Events carry a monotonic `seq` plus a `boot_id`. Clients reconcile from snapshots; the stream is only a hint. State is persisted on every transition, not only at shutdown.
-- **Checkpoints.** Each turn ends with a commit to a hidden git ref (`refs/cockpit/<task>/<turn>`). This gives a diff per turn and revert without polluting the user's branch.
+- **Checkpoints.** Each turn ends with a commit to a hidden git ref (`refs/cockpit/<task>/<turn>`). This gives a diff per turn and revert without polluting the user's branch. *Deferred (not built):* the Diff tab shows the worktree (committed and uncommitted) against the fork point instead; per-turn refs, the diff per turn and revert are left to a later plan (see `docs/plans/2026-11-07-plan-3-tauri-cockpit.md`, "Diff base", and the out-of-scope list of `docs/plans/2026-11-07-plan-2b-daemon-drivers-cli.md`).
 - **Hooks install.** Hooks are installed per agent, scoped by an env var (`COCKPIT_TASK_ID`), so they do nothing outside the cockpit. There is no global behavior change, and install and uninstall are explicit.
-- **Worktrees.** They live under `~/.cockpit/worktrees/<repo>/<branch>`. Optional repo scripts `setup` / `teardown` are declared in a repo-level config file. The worktree is cleaned up on task archive, with the branch preserved.
+- **Worktrees.** They live under `~/.cockpit/worktrees/<repo>/<branch>`. Optional repo scripts `setup` / `teardown` are declared in a repo-level config file. The worktree is cleaned up on task archive, with the branch preserved. *Deferred (not built):* the repo `setup` / `teardown` scripts (listed as later in `docs/plans/2026-11-07-plan-2a-mirante-core.md` and out of scope in plan 2b). Archive also removes the task's daemon-side files (`~/.mirante/sessions/<task>/`).
+- **Data growth.** The event log is append-only and never pruned: an archived task's events stay (skills mining and a conversation's skill history read them). Message text, permission details and step text are stored redacted and capped, so a task's log grows with its activity, not with pasted payloads. The WAL is bounded (`journal_size_limit` 64 MiB) and is checkpointed and truncated at shutdown and once a day. Reclaiming the space of long-archived tasks (a person-run `mirante db compact` for tasks archived more than N days ago) is a later item, not built.
 
 ## 5. Security baseline
 
@@ -107,9 +108,9 @@ That project was a cloud "autonomous engineer": a Jira webhook started a hand-wr
 - **`NEEDS_HUMAN` as a first-class exit.** Several guards can raise it: cost, protected paths, failed checks. It maps to `needs_you` plus a notification.
 - **Audit trail of transitions.** Use the `runs / run_steps / run_events (from→to) / run_artifacts` shape, adapted to SQLite as Task / Turn / Event / Artifact. Add the transition validation the old code lacked; the trail also lets us verify "0 wrong status in 50 transitions".
 - **Per-task lock.** Never run two sessions on the same task or worktree. In a local daemon this needs no Redis.
-- **In-run cost/token ceiling.** Check it while the task runs, from the usage the hooks and CLIs report. Exceeding it means `needs_you`.
+- **In-run cost/token ceiling.** Check it while the task runs, from the usage the hooks and CLIs report. Exceeding it means `needs_you`. *Deferred (not built, not yet planned):* usage is shown (Codex rate limits and tokens), but no ceiling raises `needs_you`; listed as later in plans 2a and 2b.
 - **Task artifacts as persistent context.** Keep the plan, notes and review summary per task in a local directory.
-- **Protected paths.** Turn them into suggested permission rules, never auto-decisions. Match on repo-relative paths: the old guard compared against `'/'`-prefixed paths, so it likely never blocked anything.
+- **Protected paths.** Turn them into suggested permission rules, never auto-decisions. Match on repo-relative paths: the old guard compared against `'/'`-prefixed paths, so it likely never blocked anything. *Deferred (not built, not yet planned):* listed as later in plans 2a and 2b; permission cards are always answered by the person.
 
 **Do not repeat:**
 
