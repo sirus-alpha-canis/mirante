@@ -66,6 +66,8 @@ const ENV_CLEARED: &[&str] = &[
     "GIT_NAMESPACE",
     "GIT_REPLACE_REF_BASE",
     "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
     "GIT_ATTR_SOURCE",
@@ -79,6 +81,14 @@ const ENV_CLEARED: &[&str] = &[
     "GIT_SEQUENCE_EDITOR",
     "GIT_PROXY_COMMAND",
 ];
+
+/// The inherited `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` among `names` (git ignores
+/// them once `GIT_CONFIG_COUNT` is gone; they are removed anyway).
+fn indexed_config_vars(names: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    names
+        .filter(|n| n.to_str().is_some_and(|n| n.starts_with("GIT_CONFIG_KEY_") || n.starts_with("GIT_CONFIG_VALUE_")))
+        .collect()
+}
 
 /// One git invocation. Build with [`Git::new`] (or [`Git::checkout`], [`Git::global`]),
 /// add arguments, then run.
@@ -136,6 +146,9 @@ impl Git {
     pub fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         for var in ENV_CLEARED {
+            cmd.env_remove(var);
+        }
+        for var in indexed_config_vars(std::env::vars_os().map(|(k, _)| k)) {
             cmd.env_remove(var);
         }
         cmd.envs(ENV.iter().copied());
@@ -239,5 +252,17 @@ mod tests {
         let cleared: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_owned()).collect();
         assert!(cleared.iter().any(|k| k == "GIT_DIR") && cleared.iter().any(|k| k == "GIT_EXTERNAL_DIFF"));
         assert!(cmd.get_envs().any(|(k, v)| k == "GIT_OPTIONAL_LOCKS" && v == Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn inherited_config_files_and_indexed_config_are_cleared() {
+        let cmd = Git::global().command();
+        let cleared: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_owned()).collect();
+        for var in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT"] {
+            assert!(cleared.iter().any(|k| k == var), "{var} is inherited");
+        }
+        let env = ["PATH", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_12", "GIT_CONFIG_NOSYSTEM"];
+        let indexed = indexed_config_vars(env.iter().map(OsString::from));
+        assert_eq!(indexed, ["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_12"]);
     }
 }
