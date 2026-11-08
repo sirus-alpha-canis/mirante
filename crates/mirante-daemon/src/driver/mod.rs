@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use mirante_core::model::{Status, Task};
 use mirante_ipc::types::BootState;
@@ -172,9 +173,14 @@ pub struct Attachment {
     pub input: bool,
 }
 
-/// Output chunks queued per attached client. A client that falls this far behind stops
-/// getting chunks until it is sent a repaint (memory stays bounded whatever it does).
-pub const ATTACH_QUEUE: usize = 256;
+/// Output chunks (each at most one 8 KiB read) queued per attached client: at most
+/// 256 KiB. A client that falls this far behind stops getting chunks until it is sent a
+/// repaint (memory stays bounded whatever it does); the repaint carries the whole screen,
+/// so nothing it missed is lost from view.
+pub const ATTACH_QUEUE: usize = 32;
+/// After a repaint that could not be queued (the client is still stalled), the next try
+/// waits this long: a repaint renders the whole screen.
+pub const REPAINT_RETRY: Duration = Duration::from_millis(50);
 
 struct FanoutSub {
     tx: mpsc::SyncSender<Vec<u8>>,
@@ -190,6 +196,8 @@ pub struct Fanout {
     next: u64,
     cap: usize,
     subs: HashMap<u64, FanoutSub>,
+    /// When a repaint last failed to reach a stalled client (its queue still full).
+    repaint_failed_at: Option<Instant>,
 }
 
 impl Default for Fanout {
@@ -201,7 +209,7 @@ impl Default for Fanout {
 impl Fanout {
     /// `cap` chunks queued per client (at least 1).
     pub fn with_capacity(cap: usize) -> Fanout {
-        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new() }
+        Fanout { next: 0, cap: cap.max(1), subs: HashMap::new(), repaint_failed_at: None }
     }
 
     pub fn subscribe(&mut self) -> (u64, mpsc::Receiver<Vec<u8>>) {
@@ -232,9 +240,12 @@ impl Fanout {
         });
     }
 
-    /// Some client dropped chunks and waits for a full screen.
+    /// Some client dropped chunks and waits for a full screen, and a repaint is due: never
+    /// tried, or the last one could not be queued at least [`REPAINT_RETRY`] ago (a stalled
+    /// client does not cost a screen render per chunk).
     pub fn needs_repaint(&self) -> bool {
         self.subs.values().any(|s| s.needs_repaint)
+            && self.repaint_failed_at.is_none_or(|t| t.elapsed() >= REPAINT_RETRY)
     }
 
     /// Sends `screen` (bytes that redraw the whole screen) to every client marked by
@@ -253,6 +264,8 @@ impl Fanout {
                 Err(mpsc::TrySendError::Disconnected(_)) => false,
             }
         });
+        let stalled = self.subs.values().any(|s| s.needs_repaint);
+        self.repaint_failed_at = stalled.then(Instant::now);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -397,6 +410,32 @@ mod tests {
         assert!(!f.needs_repaint());
         f.send(b"6");
         assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![b"SCREEN".to_vec(), b"6".to_vec()]);
+    }
+
+    /// A repaint costs a whole screen render: a client still stalled is not retried on
+    /// every chunk, only once [`REPAINT_RETRY`] passed.
+    #[test]
+    fn a_stalled_client_is_retried_after_a_pause_not_on_every_chunk() {
+        let mut f = Fanout::with_capacity(1);
+        let (_id, rx) = f.subscribe();
+        f.send(b"1");
+        f.send(b"2");
+        assert!(f.needs_repaint());
+        f.repaint(b"S1");
+        assert!(!f.needs_repaint(), "its queue is still full: not retried at once");
+        f.send(b"3");
+        assert!(!f.needs_repaint());
+        std::thread::sleep(REPAINT_RETRY + Duration::from_millis(20));
+        assert!(f.needs_repaint());
+        assert_eq!(rx.recv().unwrap(), b"1");
+        f.repaint(b"S2");
+        assert!(!f.needs_repaint());
+        assert_eq!(rx.recv().unwrap(), b"S2");
+    }
+
+    #[test]
+    fn the_per_client_queue_stays_small() {
+        assert!(ATTACH_QUEUE <= 32, "{ATTACH_QUEUE} chunks of up to 8 KiB per client");
     }
 
     #[test]
