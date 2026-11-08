@@ -43,14 +43,22 @@ pub enum Steer {
         code: i64,
         message: String,
     },
-    /// The first prompt ran to its end; the second ran after it.
+    /// The first prompt ran to its end; the second ran after it as its own turn.
     Queued,
+    /// The second prompt joined the running turn: both were answered back to back, with
+    /// no agent output between the two responses (a steer at the next model step).
+    Absorbed,
     /// The second prompt finished while the first was still open.
     Concurrent,
     /// The first prompt ended `cancelled` without a client `session/cancel`.
     Preempted,
     Unknown(String),
 }
+
+/// `session/update` kinds that are the agent doing something (not bookkeeping such as
+/// `usage_update` or `available_commands_update`).
+pub const AGENT_OUTPUT: [&str; 5] =
+    ["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"];
 
 /// Classifies by file order (not timestamps): the first prompt A, the first prompt B
 /// sent before A's response, and how each was answered.
@@ -83,9 +91,17 @@ pub fn classify_steer(log: &[Value]) -> Steer {
         return Steer::Preempted;
     }
     if b < a {
-        Steer::Concurrent
-    } else {
+        return Steer::Concurrent;
+    }
+    let output_between = log[a + 1..b].iter().any(|v| {
+        v["dir"] == "out"
+            && v["line"]["method"] == "session/update"
+            && AGENT_OUTPUT.contains(&v["line"]["params"]["update"]["sessionUpdate"].as_str().unwrap_or(""))
+    });
+    if output_between {
         Steer::Queued
+    } else {
+        Steer::Absorbed
     }
 }
 
@@ -243,6 +259,25 @@ pub fn mcp_echo_reply(msg: &Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
+/// Narrows an `AllowOnce` answer: allowed only when the tool call's JSON contains one of
+/// `allow_match` and never mentions a parent directory or a path outside `/tmp/acp-spike`.
+/// Anything else is rejected once. Other answers pass through.
+pub fn gate(answer: Answer, tool_call: &Value, allow_match: &[String]) -> Answer {
+    if answer != Answer::AllowOnce || allow_match.is_empty() {
+        return answer;
+    }
+    let s = tool_call.to_string();
+    let outside = s
+        .split(['"', ' ', '\'', '=', ',', '\\'])
+        .filter(|t| t.starts_with('/'))
+        .any(|t| !(t.starts_with("/tmp/acp-spike") || t.starts_with("/private/tmp/acp-spike")));
+    if allow_match.iter().any(|m| s.contains(m.as_str())) && !s.contains("..") && !outside {
+        Answer::AllowOnce
+    } else {
+        Answer::RejectOnce
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,11 +318,16 @@ mod tests {
         ];
         assert_eq!(classify_steer(&rejected), Steer::Rejected { code: -32603, message: "busy".into() });
 
-        // Queued: the second prompt is answered after the first one, which ran to its end.
+        // Queued: the second prompt runs its own turn after the first one ran to its end.
+        let chunk = out(
+            21000,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}),
+        );
         let queued = vec![
             inn(0, prompt(3, "five steps")),
             inn(6000, prompt(4, "stop, say BANANA")),
             out(20000, done(3, "end_turn")),
+            chunk,
             out(22000, done(4, "end_turn")),
         ];
         assert_eq!(classify_steer(&queued), Steer::Queued);
@@ -309,6 +349,36 @@ mod tests {
             out(9000, done(4, "end_turn")),
         ];
         assert_eq!(classify_steer(&preempted), Steer::Preempted);
+
+        // Absorbed (OpenCode 1.18.25, S1): the second prompt joins the running turn at the
+        // next model step; both prompts are answered back to back with no output between.
+        let upd = |ts| {
+            out(
+                ts,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}),
+            )
+        };
+        let absorbed = vec![
+            inn(0, prompt(3, "five steps")),
+            inn(6000, prompt(4, "stop, say BANANA")),
+            upd(20000),
+            out(21000, done(3, "end_turn")),
+            out(
+                21000,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":8264}}}),
+            ),
+            out(21000, done(4, "end_turn")),
+        ];
+        assert_eq!(classify_steer(&absorbed), Steer::Absorbed);
+        // Queued with output in between is still Queued.
+        let queued_with_output = vec![
+            inn(0, prompt(3, "five steps")),
+            inn(6000, prompt(4, "stop, say BANANA")),
+            out(20000, done(3, "end_turn")),
+            upd(21000),
+            out(22000, done(4, "end_turn")),
+        ];
+        assert_eq!(classify_steer(&queued_with_output), Steer::Queued);
 
         assert!(matches!(classify_steer(&[inn(0, prompt(3, "x"))]), Steer::Unknown(_)));
     }
@@ -400,5 +470,21 @@ mod tests {
         assert_eq!(call["result"]["content"][0]["text"], "ECHO:hi");
         let bad = mcp_echo_reply(&json!({"jsonrpc":"2.0","id":4,"method":"nope"})).unwrap();
         assert_eq!(bad["error"]["code"], -32601);
+    }
+    #[test]
+    fn gate_allows_only_matching_tool_calls_inside_the_spike_dir() {
+        let m = vec!["sleep 3".to_string(), "touch hello.txt".to_string()];
+        let ok = json!({"title":"sleep 3","rawInput":{"command":"sleep 3"}});
+        assert_eq!(gate(Answer::AllowOnce, &ok, &m), Answer::AllowOnce);
+        let other = json!({"title":"rm -rf x","rawInput":{"command":"rm -rf x"}});
+        assert_eq!(gate(Answer::AllowOnce, &other, &m), Answer::RejectOnce);
+        let up = json!({"rawInput":{"command":"touch hello.txt ../escape"}});
+        assert_eq!(gate(Answer::AllowOnce, &up, &m), Answer::RejectOnce);
+        let abs = json!({"rawInput":{"command":"touch hello.txt","filepath":"/Users/x/hello.txt"}});
+        assert_eq!(gate(Answer::AllowOnce, &abs, &m), Answer::RejectOnce);
+        let inside = json!({"rawInput":{"command":"touch hello.txt","filepath":"/tmp/acp-spike/repo/hello.txt"}});
+        assert_eq!(gate(Answer::AllowOnce, &inside, &m), Answer::AllowOnce);
+        assert_eq!(gate(Answer::AllowOnce, &other, &[]), Answer::AllowOnce);
+        assert_eq!(gate(Answer::Hold, &other, &m), Answer::Hold);
     }
 }

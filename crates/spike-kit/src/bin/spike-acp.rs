@@ -7,6 +7,11 @@
 //! usage: spike-acp --bin <path> [--arg a]... --cwd <dir> --script s.jsonl --out log.jsonl
 //!        [--answer allow_once|reject_once|cancel|hold] [--answer-after-ms 300]
 //!        [--env K=V]... [--session <id>] [--echo <path>] [--wait <secs>]
+//!        [--allow-match TEXT]...   allow_once only for tool calls containing TEXT and
+//!                                  no path outside /tmp/acp-spike; others reject_once
+//!        [--hold-match TEXT]...    leave a permission whose tool call contains TEXT pending
+//!
+//!        spike-acp --report <log.jsonl>   (re-print the summary of an earlier run)
 //!
 //! Script lines (JSONL), run in order:
 //!   {"delay_ms": N, "msg": {...}}          send one message ($CWD, $SESSION, $ECHO filled)
@@ -123,6 +128,8 @@ struct Args {
     session: Option<String>,
     echo: String,
     wait: u64,
+    allow_match: Vec<String>,
+    hold_match: Vec<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -139,6 +146,8 @@ fn parse_args() -> Result<Args> {
         session: None,
         echo: std::env::current_exe()?.with_file_name("spike-mcp-echo").display().to_string(),
         wait: 3,
+        allow_match: vec![],
+        hold_match: vec![],
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().with_context(|| format!("{flag} needs a value"));
@@ -158,6 +167,8 @@ fn parse_args() -> Result<Args> {
             "--session" => a.session = Some(val()?),
             "--echo" => a.echo = val()?,
             "--wait" => a.wait = val()?.parse()?,
+            "--allow-match" => a.allow_match.push(val()?),
+            "--hold-match" => a.hold_match.push(val()?),
             _ => bail!("unknown flag {flag}"),
         }
     }
@@ -187,6 +198,12 @@ fn is_perm_request(v: &Value) -> bool {
 }
 
 fn main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--report") {
+        let path = argv.get(2).context("usage: spike-acp --report <log.jsonl>")?;
+        report(&util::read_jsonl(std::path::Path::new(path))?);
+        return Ok(());
+    }
     let a = parse_args()?;
     let script = util::read_jsonl(&a.script)?;
     if a.out.exists() {
@@ -225,6 +242,7 @@ fn main() -> Result<()> {
     let reader = {
         let (log, stdin, pending, answer, after) =
             (log.clone(), stdin.clone(), pending.clone(), a.answer, a.answer_after);
+        let (allow_match, hold_match) = (a.allow_match.clone(), a.hold_match.clone());
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
                 let parsed: Value = serde_json::from_str(&line).unwrap_or(Value::String(line.clone()));
@@ -232,7 +250,16 @@ fn main() -> Result<()> {
                 let (Some(method), Some(id)) = (parsed["method"].as_str(), parsed.get("id").cloned()) else { continue };
                 if method == "session/request_permission" {
                     let options = parsed["params"]["options"].as_array().cloned().unwrap_or_default();
-                    match acp::choose(&options, answer) {
+                    let tool_call = &parsed["params"]["toolCall"];
+                    let gated = if hold_match.iter().any(|m| tool_call.to_string().contains(m.as_str())) {
+                        Answer::Hold
+                    } else {
+                        acp::gate(answer, tool_call, &allow_match)
+                    };
+                    if gated != answer {
+                        log.push("note", json!({"gate": format!("{answer:?} narrowed to {gated:?}")}));
+                    }
+                    match acp::choose(&options, gated) {
                         None => pending.lock().unwrap().push(id),
                         Some(reply) => {
                             pending.lock().unwrap().push(id.clone());
@@ -321,8 +348,14 @@ fn main() -> Result<()> {
     drop(guard);
     let _ = reader.join();
 
-    let log = log.snapshot();
-    println!("session id: {}", acp::capture_session(&log).unwrap_or_else(|| "-".into()));
+    report(&log.snapshot());
+    Ok(())
+}
+
+/// Prints the summary of one run: session id, errors, permissions, stop reasons, update
+/// kinds, the steer verdict and the protocol-only status timeline.
+fn report(log: &[Value]) {
+    println!("session id: {}", acp::capture_session(log).unwrap_or_else(|| "-".into()));
     for v in log.iter().filter(|v| v["dir"] == "out" && v["line"].get("error").is_some()) {
         println!("json-rpc error (id {}): {}", v["line"]["id"], v["line"]["error"]);
     }
@@ -346,11 +379,10 @@ fn main() -> Result<()> {
             .or_default() += 1;
     }
     println!("session/update kinds: {kinds:?}");
-    println!("steer: {:?}", acp::classify_steer(&log));
+    println!("steer: {:?}", acp::classify_steer(log));
     println!("ground truth:");
     let t0 = log.first().and_then(|v| v["ts"].as_u64()).unwrap_or(0);
-    for p in acp::ground_truth(&log) {
+    for p in acp::ground_truth(log) {
         println!("  +{:>6} ms  {:<40} {:?}", p.ts_ms.saturating_sub(t0), p.event, p.status);
     }
-    Ok(())
 }
