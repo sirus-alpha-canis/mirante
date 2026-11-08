@@ -222,3 +222,29 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .queue-actions { display: inline-flex; gap: 2px; flex-shrink: 0; }
 .queue-edit { display: flex; gap: 6px; align-items: flex-start; width: 100%; }
 .queue-edit textarea { flex: 1; }
+
+/* Repo memory (DNA): Memory tab, note view. Note text is plain text, never HTML. */
+.dna-section { margin-bottom: 14px; }
+.dna-section h3 { margin: 0 0 6px; font-size: 13px; }
+.dna-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.dna-row { padding: 6px 8px; border-radius: 6px; background: var(--panel-2); }
+.dna-reason { margin-top: 2px; overflow-wrap: anywhere; }
+.dna-cite { margin-right: 8px; overflow-wrap: anywhere; }
+.dna-title { font-weight: 600; }
+.dna-pill { border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: 600; border: 1px solid transparent; }
+.dna-fresh { background: var(--review-bg); color: var(--review); }
+.dna-stale { background: var(--needs-bg); color: var(--needs); }
+.dna-unverifiable { background: var(--panel); color: var(--muted); border-color: var(--line); }
+.dna-unreviewed { background: var(--panel); color: var(--accent); border-color: var(--accent); border-style: dashed; }
+.dna-retired { background: var(--panel-2); color: var(--muted); text-decoration: line-through; }
+.dna-note { margin-top: 10px; }
+.dna-note-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dna-note-head h3 { margin: 0; overflow-wrap: anywhere; }
+.dna-anchors { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 2px; font-size: 12.5px; }
+.dna-anchor { overflow-wrap: anywhere; }
+.dna-a-stale { color: var(--needs); }
+.dna-a-unverifiable { color: var(--muted); }
+.dna-body { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel-2); border-radius: 6px; padding: 8px 10px; }
+.dna-link { background: none; border: none; padding: 0 2px; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; }
+.dna-actions { display: flex; gap: 6px; margin-top: 8px; }
+.dna-off p { max-width: 70ch; }

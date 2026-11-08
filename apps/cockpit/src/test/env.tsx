@@ -10,13 +10,20 @@ import { snapshot } from "./fixtures";
 
 type Answer = unknown | ((params: Record<string, unknown>) => unknown);
 
+const ERROR_KINDS = new Set(["disconnected", "rpc", "protocol", "forbidden", "timeout"]);
+
+/** A `BridgeError` answer (notes and proposals have a `kind` too: "fact", "gotcha"…). */
+function isBridgeError(v: unknown): v is BridgeError {
+  return !!v && typeof v === "object" && "kind" in v && ERROR_KINDS.has(String((v as { kind: unknown }).kind));
+}
+
 export function makeEnv(answers: Record<string, Answer> = {}) {
   const calls: [string, Record<string, unknown>][] = [];
   const rpc = vi.fn(async (method: string, params: object = {}) => {
     calls.push([method, params as Record<string, unknown>]);
     const a = answers[method];
     const v = typeof a === "function" ? (a as (p: Record<string, unknown>) => unknown)(params as Record<string, unknown>) : a;
-    if (v && typeof v === "object" && "kind" in v) throw new DaemonError(v as BridgeError);
+    if (isBridgeError(v)) throw new DaemonError(v);
     return v as never;
   });
   const cockpit = createCockpit({ rpc, subscribe: async () => {} });

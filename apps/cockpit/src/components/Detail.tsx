@@ -3,10 +3,12 @@ import { useEnv, useStore } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { M, type TaskView } from "../lib/protocol";
 import { columnOf, COLUMN_LABEL, type Column, pendingPerms, turnsEnded } from "../store/select";
+import { dnaRev } from "../store/state";
 import { FeedLine } from "./AgentCard";
 import { StatusPill, TaskBadges } from "./Badges";
 import { DiffTab } from "./DiffTab";
 import { HibernateButton } from "./MemoryPanel";
+import { atRiskCount, MemoryTab, useTaskMemory } from "./MemoryTab";
 import { MessageComposer } from "./MessageComposer";
 import { PermissionCard } from "./PermissionCard";
 import { QueueList } from "./QueueList";
@@ -143,6 +145,11 @@ export function Detail({
   const t = s.tasks[taskId];
   const feed = s.feed[taskId] ?? [];
   const perms = useMemo(() => pendingPerms(s.perms, taskId), [s.perms, taskId]);
+  // Repo memory: refetched when the repo's memory changes or a turn ends (the branch moved).
+  const dnaVersion = t ? dnaRev(s, t.repo_path) : 0;
+  const memory = useTaskMemory(taskId, dnaVersion + turnsEnded(feed));
+  const atRisk = atRiskCount(memory.mem);
+  const tabLabel = (name: Tab) => (name === "Memory" && atRisk > 0 ? `Memory (${atRisk} at risk)` : name);
   const tabRefs = useRef(new Map<Tab, HTMLButtonElement>());
   const seenNonce = useRef(focusTerminalNonce);
   useEffect(() => {
@@ -210,7 +217,7 @@ export function Detail({
                 tabIndex={tab === name ? 0 : -1}
                 onClick={() => setTab(name)}
               >
-                {name}
+                {tabLabel(name)}
               </button>
             ))}
           </div>
@@ -227,12 +234,7 @@ export function Detail({
               ))}
             {tab === "Terminal" && <TerminalTab key={t.id} t={t} />}
             {tab === "Diff" && <DiffTab key={t.id} taskId={t.id} version={turnsEnded(feed)} />}
-            {tab === "Memory" && (
-              <p className="muted">
-                Repo memory arrives with the memory layer (a later plan). Goal: <q>{t.goal}</q>
-                {t.notes && <> · Notes: {t.notes}</>}
-              </p>
-            )}
+            {tab === "Memory" && <MemoryTab key={t.id} t={t} mem={memory.mem} reload={memory.reload} version={dnaVersion} />}
           </section>
           {t.live && <QueueList key={t.id} t={t} />}
           <MessageComposer key={t.id} t={t} />

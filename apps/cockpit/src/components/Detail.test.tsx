@@ -34,7 +34,7 @@ describe("Detail (V1 classic)", () => {
     expect(h.onSelect).toHaveBeenCalledWith("b");
   });
 
-  it("shows steps, switches tabs with arrows, and has a memory placeholder", async () => {
+  it("shows steps, switches tabs with arrows, and has a Memory tab", async () => {
     setup();
     expect(screen.getByText("$ npm test")).toBeInTheDocument();
     screen.getByRole("tab", { name: "Steps" }).focus();
@@ -42,7 +42,7 @@ describe("Detail (V1 classic)", () => {
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("terminal here")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Memory" }));
-    expect(screen.getByRole("tabpanel")).toHaveTextContent("Repo memory arrives with the memory layer");
+    expect(screen.getByRole("tabpanel")).not.toHaveTextContent("arrives with the memory layer");
   });
 
   it("Steer now and Queue send with their mode", async () => {
@@ -62,8 +62,9 @@ describe("Detail (V1 classic)", () => {
     await userEvent.type(screen.getByLabelText("Message to the agent"), "stop");
     await userEvent.click(screen.getByRole("button", { name: "Steer now" }));
     await userEvent.click(await screen.findByRole("button", { name: "Interrupt and send" }));
-    await waitFor(() => expect(h.calls.map((c) => c[0])).toEqual(["message.send", "session.interrupt", "message.send"]));
-    expect(h.calls[2][1]).toMatchObject({ mode: "queue", text: "stop" });
+    const sent = () => h.calls.filter((c) => !c[0].startsWith("dna."));
+    await waitFor(() => expect(sent().map((c) => c[0])).toEqual(["message.send", "session.interrupt", "message.send"]));
+    expect(sent()[2][1]).toMatchObject({ mode: "queue", text: "stop" });
   });
 
   it("a stopped task offers Resume instead of the composer", async () => {
