@@ -5984,7 +5984,7 @@ import { loadRepos } from "./lib/repos";
 import { SHORTCUT_HINTS, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, THEME_KEY, type Theme } from "./lib/theme";
 import { useCockpitState } from "./store/cockpit";
-import { gridTasks, newlyNeedingYou, projects } from "./store/select";
+import { gridTasks, needsYou, newlyNeedingYou, projects } from "./store/select";
 import type { State } from "./store/state";
 
 export type Mode = "home" | "detail" | "grid";
@@ -6102,6 +6102,7 @@ export function App({ env }: { env: Env }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [palette, mode, toggleGrid]);
 
+  const inlineAnswers = status?.claude_inline_answers ?? false;
   const commands: Command[] = useMemo(
     () => [
       { id: "home", label: "Go to Home", hint: SHORTCUT_HINTS.home, run: () => setMode("home") },
@@ -6110,9 +6111,15 @@ export function App({ env }: { env: Env }) {
       ...projs.map((p) => ({ id: `p-${p.path}`, label: `Project ${p.name}`, run: () => (setProject(p.path), setMode("home")) })),
       ...Object.values(s.tasks)
         .filter((t) => t.lifecycle !== "archived")
-        .map((t) => ({ id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) })),
+        .map((t) =>
+          // Step 13b: a Claude request is answered in its own TUI unless the daemon types
+          // answers (a trust prompt is not: its card answers it here).
+          needsYou(t) && t.boot !== "trust_prompt" && t.agent === "claude" && !inlineAnswers
+            ? { id: `t-${t.id}`, label: `Answer in terminal: ${t.title} (@claude ${t.branch})`, run: () => open(t.id, "Terminal") }
+            : { id: `t-${t.id}`, label: `Open ${t.title} (@${t.agent} ${t.branch})`, run: () => open(t.id) },
+        ),
     ],
-    [projs, s.tasks, theme, open, toggleGrid],
+    [projs, s.tasks, theme, open, toggleGrid, inlineAnswers],
   );
 
   return (
