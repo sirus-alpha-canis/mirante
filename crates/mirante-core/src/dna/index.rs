@@ -14,18 +14,20 @@ use crate::error::{CoreError, Result};
 use crate::model::{new_id, now_ms};
 use crate::store::Store;
 
-/// Most terms a search uses.
+/// Most terms a search uses, and most chars per term.
 const MAX_QUERY_TERMS: usize = 12;
+const MAX_TERM_CHARS: usize = 64;
 
 /// A safe FTS5 `MATCH` expression for free text: alphanumeric runs, lowercased, each a
-/// quoted prefix term (`"term"*`), joined with `OR`, at most 12. FTS5 syntax in the input
-/// (`NEAR`, `-`, `:`, quotes, `*`) is dropped. `None` when no term is left.
+/// quoted prefix term (`"term"*`, cut to 64 chars), joined with `OR`, at most 12. FTS5
+/// syntax in the input (`NEAR`, `-`, `:`, quotes, `*`) is dropped. `None` when no term is
+/// left.
 pub fn fts_query(text: &str) -> Option<String> {
     let terms: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .take(MAX_QUERY_TERMS)
-        .map(|t| format!("\"{}\"*", t.to_lowercase()))
+        .map(|t| format!("\"{}\"*", t.to_lowercase().chars().take(MAX_TERM_CHARS).collect::<String>()))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" OR "))
 }
@@ -733,6 +735,8 @@ mod fts_tests {
         );
         assert_eq!(fts_query("  ** ").as_deref(), None);
         assert_eq!(fts_query(&"w ".repeat(50)).unwrap().matches(" OR ").count(), 11);
+        // Each term is cut to 64 chars.
+        assert_eq!(fts_query(&"é".repeat(1000)).unwrap(), format!("\"{}\"*", "é".repeat(64)));
     }
 }
 
