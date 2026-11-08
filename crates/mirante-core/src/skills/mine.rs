@@ -7,7 +7,7 @@
 //! non-alphanumerics, a small English and Portuguese stopword list) and clustered greedily
 //! in time order: a unit joins a cluster of its tenant when its token set has Jaccard ≥ 0.5
 //! or containment ≥ 0.8 with the cluster's first unit. Denials cluster on (tool, the first
-//! two words of the command). A cluster qualifies with at least 3 distinct tasks; tenants
+//! two words of the command, kept to `[A-Za-z0-9._/-]`: the command is the agent's). A cluster qualifies with at least 3 distinct tasks; tenants
 //! never mix. [`draft`] turns one into a proposal: skipped when an active in-scope skill
 //! already says it, an edit of a repo or org skill of the same tenant that was active in
 //! ≥ 2/3 of its tasks (never a personal skill: that would carry one client's words to every
@@ -83,7 +83,7 @@ pub struct Params {
     pub min_tasks: usize,
     pub min_tokens: usize,
     pub max_tokens: usize,
-    /// Most units clustered (the newest are kept).
+    /// Most units clustered per tenant (the newest are kept).
     pub max_units: usize,
     /// Units older than this (ms since the epoch) are ignored.
     pub since_ms: i64,
@@ -180,11 +180,19 @@ pub fn units(utterances: &[Utterance]) -> Vec<Unit> {
         match &u.source {
             Source::Denied { tool } => {
                 let clean = untrusted::line(&redact(&u.text), 4096);
-                let head: Vec<&str> = clean.split_whitespace().take(2).collect();
+                // The command is the agent's: only plain command characters reach the draft.
+                let head: Vec<String> = clean
+                    .split_whitespace()
+                    .map(|w| {
+                        w.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')).collect()
+                    })
+                    .filter(|w: &String| !w.is_empty())
+                    .take(2)
+                    .collect();
                 if head.is_empty() {
                     continue;
                 }
-                let head = head.join(" ").replace('`', "'");
+                let head = head.join(" ");
                 out.push(unit(clean.clone(), tokens(&clean), Some((tool.clone(), head))));
             }
             _ => {
@@ -234,13 +242,23 @@ pub struct Cluster {
     pub denial: Option<(String, String)>,
 }
 
-/// The qualifying clusters of `units` (see the module docs), oldest first.
+/// The qualifying clusters of `units` (see the module docs), oldest first. The newest
+/// `max_units` are kept per tenant (the hub mines one tenant at a time; a mixed input never
+/// lets one tenant's volume push another's evidence out).
 pub fn cluster(units: &[Unit], p: &Params) -> Vec<Cluster> {
     let mut sorted: Vec<&Unit> = units.iter().filter(|u| u.ts >= p.since_ms).collect();
     sorted.sort_by_key(|u| u.ts); // stable: same-time units keep their order
-    if sorted.len() > p.max_units {
-        sorted.drain(..sorted.len() - p.max_units);
+    let mut per_tenant: HashMap<&str, usize> = HashMap::new();
+    let mut keep = vec![false; sorted.len()];
+    for (i, u) in sorted.iter().enumerate().rev() {
+        let n = per_tenant.entry(u.tenant.as_str()).or_default();
+        if *n < p.max_units {
+            *n += 1;
+            keep[i] = true;
+        }
     }
+    let mut kept = keep.into_iter();
+    sorted.retain(|_| kept.next().unwrap_or(false));
     let mut clusters: Vec<Cluster> = Vec::new();
     for u in sorted {
         let joins = |c: &Cluster| {
@@ -667,6 +685,40 @@ mod tests {
         assert_eq!(d.body.trim_end(), "Do not run `git push`; ask the operator first (denied in 3 tasks).");
         assert_eq!(d.kind, Kind::New);
         assert!(!has_errors(&lint(&d.lint_draft())), "{:?}", lint(&d.lint_draft()));
+    }
+
+    #[test]
+    fn a_denied_command_head_keeps_only_plain_command_characters() {
+        let denied = |task: &str, cmd: &str, ts: i64| Utterance {
+            source: Source::Denied { tool: "Bash".into() },
+            ..utt_in(A, "api", task, cmd, ts)
+        };
+        let u: Vec<Utterance> =
+            (1..=3).map(|i| denied(&format!("t{i}"), "git`; push<x> --force origin main", i)).collect();
+        let c = cluster(&units(&u), &Params::default());
+        assert_eq!(c[0].denial.as_ref().map(|d| d.1.as_str()), Some("git pushx"));
+        let d = draft(&c[0], &[], &HashMap::new(), &[]).unwrap();
+        assert_eq!(d.body.trim_end(), "Do not run `git pushx`; ask the operator first (denied in 3 tasks).");
+        // A head with nothing plain left is not mined.
+        assert!(units(&[denied("t1", "`;| <>", 1)]).is_empty());
+    }
+
+    #[test]
+    fn the_newest_units_are_kept_per_tenant_not_across_tenants() {
+        // Tenant A's instruction in 3 old tasks; tenant B chatty since.
+        let mut u = clippy_three();
+        for i in 0..20 {
+            u.push(utt_in(
+                B,
+                "api",
+                &format!("b{i}"),
+                &format!("deploy the staging cluster number {i} today"),
+                10_000 + i,
+            ));
+        }
+        let p = Params { max_units: 5, ..Params::default() };
+        let c = cluster(&units(&u), &p);
+        assert!(c.iter().any(|c| c.tenant == A && c.tasks.len() == 3), "A's evidence was crowded out: {c:?}");
     }
 
     #[test]
