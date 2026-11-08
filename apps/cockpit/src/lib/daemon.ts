@@ -63,18 +63,12 @@ export async function subscribe(onMsg: (m: StreamMsg) => void): Promise<void> {
   await invoke("subscribe", { onMsg: ch });
 }
 
-export type AttachMsg = { type: "data"; b64: string } | { type: "end" };
+/** Output arrives raw (an `ArrayBuffer`); the end of the stream is `{ type: "end" }`. */
+export type AttachMsg = ArrayBuffer | { type: "end" };
 
 export interface Attached {
   id: number;
   input: boolean;
-}
-
-function fromBase64(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 export async function attachOpen(
@@ -85,11 +79,26 @@ export async function attachOpen(
   onEnd: () => void,
 ): Promise<Attached> {
   const ch = new Channel<AttachMsg>();
-  ch.onmessage = (m) => (m.type === "data" ? onData(fromBase64(m.b64)) : onEnd());
+  ch.onmessage = (m) => {
+    if (m instanceof ArrayBuffer) onData(new Uint8Array(m));
+    else if (ArrayBuffer.isView(m)) onData(new Uint8Array(m.buffer, m.byteOffset, m.byteLength));
+    else if (m && m.type === "end") onEnd();
+  };
   try {
     return await invoke<Attached>("attach_open", { task, rows, cols, onMsg: ch });
   } catch (e) {
     throw toDaemonError(e);
+  }
+}
+
+/** The terminal drew `bytes` more of the attachment's output (the bridge's flow-control
+ * window: with too much unacked it stops reading). Never rejects: an ack for a stream that
+ * just ended has nothing to do. */
+export async function attachAck(id: number, bytes: number): Promise<void> {
+  try {
+    await invoke("attach_ack", { id, bytes });
+  } catch {
+    // The attachment is gone; its window with it.
   }
 }
 

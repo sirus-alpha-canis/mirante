@@ -2,13 +2,17 @@ import { FitAddon } from "@xterm/addon-fit";
 import { type ILinkHandler, Terminal } from "@xterm/xterm";
 import { useEffect, useRef, useState } from "react";
 import { useEnv } from "../env";
-import { attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
+import { attachAck, attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
 import { M, type TaskView } from "../lib/protocol";
 
 /** Window size changes settle for this long before one `session.resize` goes out. */
 const RESIZE_DEBOUNCE_MS = 100;
 /** Typed input waiting behind a write in flight; past this the daemon is not keeping up. */
 const MAX_PENDING_INPUT = 64 * 1024;
+/** Parsed output is acked to the bridge once this much has built up (its window is 256 KiB)… */
+const ACK_BATCH = 64 * 1024;
+/** …or after this long, whichever comes first. */
+const ACK_DELAY_MS = 50;
 
 /**
  * Terminal output is untrusted. Only the features below are on:
@@ -135,16 +139,34 @@ export function TerminalTab({ t }: { t: TaskView }) {
       pump();
     };
 
+    // Output flow control: what xterm has parsed is acked to the bridge, which stops reading
+    // with too much unacked (the daemon then skips the backlog and repaints).
+    let parsed = 0;
+    let ackTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushAck = () => {
+      if (ackTimer !== null) clearTimeout(ackTimer);
+      ackTimer = null;
+      if (closed || id === null || parsed === 0) return;
+      const n = parsed;
+      parsed = 0;
+      void attachAck(id, n);
+    };
+    const drew = (n: number) => {
+      parsed += n;
+      if (parsed >= ACK_BATCH) flushAck();
+      else if (ackTimer === null) ackTimer = setTimeout(flushAck, ACK_DELAY_MS);
+    };
+
     attachOpen(
       t.id,
       told.rows,
       told.cols,
-      // Output goes straight into xterm, which buffers and parses it; there is no backpressure
-      // toward the daemon (a flood is bounded by the PTY and the daemon's own buffers).
       (bytes) => {
         if (closed) return;
         try {
-          term.write(bytes);
+          term.write(bytes, () => {
+            if (!closed) drew(bytes.length);
+          });
         } catch {
           // Disposed between the check and the write: nothing to show it on.
         }
@@ -159,6 +181,7 @@ export function TerminalTab({ t }: { t: TaskView }) {
           return;
         }
         id = a.id;
+        flushAck();
         if (!a.input) {
           setNote("read-only stream (this agent takes messages from the composer)");
           return;
@@ -176,6 +199,7 @@ export function TerminalTab({ t }: { t: TaskView }) {
     return () => {
       closed = true;
       if (resizeTimer !== null) clearTimeout(resizeTimer);
+      if (ackTimer !== null) clearTimeout(ackTimer);
       ro.disconnect();
       if (id !== null) void attachClose(id).catch(() => {});
       term.dispose();

@@ -72,6 +72,8 @@ describe("Tauri security baseline", () => {
       "subscribe",
       "attach_open",
       "attach_write",
+      // Flow control: the terminal acks what it drew (an id and a byte count, nothing else).
+      "attach_ack",
       "attach_close",
       "daemon_start",
       "home_dir",

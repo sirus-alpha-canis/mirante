@@ -19,6 +19,9 @@ const h = vi.hoisted(() => ({
   attachOpen: vi.fn(),
   attachWrite: vi.fn(async (_id: number, _bytes: Uint8Array) => {}),
   attachClose: vi.fn(async (_id: number) => {}),
+  attachAck: vi.fn(async (_id: number, _bytes: number) => {}),
+  /** Write callbacks xterm has not called yet (it calls them once it parsed the chunk). */
+  parsed: [] as (() => void)[],
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -31,9 +34,10 @@ vi.mock("@xterm/xterm", () => ({
     }
     loadAddon() {}
     open() {}
-    write(b: Uint8Array) {
+    write(b: Uint8Array, cb?: () => void) {
       if (h.disposed) throw new Error("write after dispose");
       h.written.push(b);
+      if (cb) h.parsed.push(cb);
     }
     onData(fn: (d: string) => void) {
       h.onData = fn;
@@ -58,6 +62,7 @@ vi.mock("../lib/daemon", async (actual) => ({
   attachOpen: h.attachOpen,
   attachWrite: h.attachWrite,
   attachClose: h.attachClose,
+  attachAck: h.attachAck,
 }));
 
 import { EnvContext } from "../env";
@@ -114,6 +119,8 @@ describe("TerminalTab", () => {
     h.attachWrite.mockReset();
     h.attachWrite.mockImplementation(async () => {});
     h.attachClose.mockClear();
+    h.attachAck.mockClear();
+    h.parsed = [];
   });
 
   it("attaches at the terminal's size, writes output, sends keys, detaches on unmount", async () => {
@@ -247,6 +254,25 @@ describe("TerminalTab", () => {
       ["session.resize", { task: "a", rows: 40, cols: 120 }],
       ["session.resize", { task: "a", rows: 43, cols: 123 }],
     ]);
+  });
+
+  it("acks output once xterm has parsed it, in batches, so the bridge keeps reading", async () => {
+    let output!: (b: Uint8Array) => void;
+    h.attachOpen.mockImplementation(async (_t: string, _r: number, _c: number, onData: (b: Uint8Array) => void) => {
+      output = onData;
+      onData(new Uint8Array(100)); // the repaint, before the attach answers
+      return { id: 4, input: true };
+    });
+    mount(task("a"));
+    await waitFor(() => expect(h.onData).not.toBeNull());
+    for (let i = 0; i < 3; i++) output(new Uint8Array(40 * 1024));
+    expect(h.attachAck).not.toHaveBeenCalled(); // nothing parsed yet
+    act(() => h.parsed.splice(0).forEach((cb) => cb()));
+    // 100 + 3 × 40 KiB parsed: one ack past the batch size, the rest after a moment.
+    expect(h.attachAck.mock.calls.reduce((n, [, b]) => n + b, 0)).toBeGreaterThanOrEqual(64 * 1024);
+    await waitFor(() => expect(h.attachAck.mock.calls.reduce((n, [, b]) => n + b, 0)).toBe(100 + 3 * 40 * 1024));
+    expect(h.attachAck.mock.calls.every(([id]) => id === 4)).toBe(true);
+    expect(h.attachAck.mock.calls.length).toBeLessThanOrEqual(3);
   });
 
   it("terminal links leave only through the opener: http(s), on a modifier click", async () => {

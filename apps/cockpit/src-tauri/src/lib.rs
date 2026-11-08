@@ -1,4 +1,4 @@
-//! Tauri shell of the cockpit: six commands that forward to `mirante-bridge`, plus two
+//! Tauri shell of the cockpit: seven commands that forward to `mirante-bridge`, plus two
 //! small path helpers for adding a project (the home directory, and what is at a path). No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
@@ -14,7 +14,7 @@ use mirante_bridge::{rpc as bridge_rpc, BridgeError};
 use mirante_ipc::Paths;
 use serde::Serialize;
 use serde_json::Value;
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, State, Url, WebviewWindowBuilder, WindowEvent};
 
@@ -39,12 +39,14 @@ struct Cockpit {
     attachments: Attachments,
 }
 
-/// Terminal output for the frontend: base64 keeps binary-safe bytes cheap over JSON IPC.
-#[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AttachMsg {
-    Data { b64: String },
-    End,
+/// Terminal output for the frontend: raw bytes (an `ArrayBuffer` in the webview, no
+/// base64 or JSON on either side), then one JSON `{"type":"end"}` when the stream ends.
+fn output_msg(bytes: Vec<u8>) -> InvokeResponseBody {
+    InvokeResponseBody::Raw(bytes)
+}
+
+fn end_msg() -> InvokeResponseBody {
+    InvokeResponseBody::Json(r#"{"type":"end"}"#.to_string())
 }
 
 fn joined<T>(r: Result<Result<T, BridgeError>, tauri::Error>) -> Result<T, BridgeError> {
@@ -75,7 +77,7 @@ async fn attach_open(
     task: String,
     rows: u16,
     cols: u16,
-    on_msg: Channel<AttachMsg>,
+    on_msg: Channel<InvokeResponseBody>,
 ) -> Result<Opened, BridgeError> {
     joined(
         tauri::async_runtime::spawn_blocking(move || {
@@ -87,11 +89,10 @@ async fn attach_open(
                 rows,
                 cols,
                 move |bytes| {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    let _ = out.send(AttachMsg::Data { b64 });
+                    let _ = out.send(output_msg(bytes));
                 },
                 move || {
-                    let _ = on_msg.send(AttachMsg::End);
+                    let _ = on_msg.send(end_msg());
                 },
             )
         })
@@ -113,6 +114,13 @@ fn typed_bytes(b64: &str) -> Result<Vec<u8>, BridgeError> {
 async fn attach_write(app: AppHandle, id: u32, b64: String) -> Result<(), BridgeError> {
     let data = typed_bytes(&b64)?;
     joined(tauri::async_runtime::spawn_blocking(move || app.state::<Cockpit>().attachments.write(id, &data)).await)
+}
+
+/// The frontend drew `bytes` more of an attachment's output (its flow-control window; see
+/// `mirante_bridge::attach`). Never blocks.
+#[tauri::command]
+fn attach_ack(app: State<'_, Cockpit>, id: u32, bytes: usize) {
+    app.attachments.ack(id, bytes);
 }
 
 #[tauri::command]
@@ -200,6 +208,7 @@ pub fn run() {
             subscribe,
             attach_open,
             attach_write,
+            attach_ack,
             attach_close,
             daemon_start,
             home_dir,
@@ -259,6 +268,17 @@ mod tests {
         assert!(path_kind_of(std::path::Path::new("relative/x")).is_err());
         assert_eq!(serde_json::to_value(PathKind::Missing).unwrap(), "missing");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_goes_out_raw_and_the_end_as_json() {
+        assert!(matches!(output_msg(vec![0, 0xff, b'a']), InvokeResponseBody::Raw(b) if b == vec![0, 0xff, b'a']));
+        match end_msg() {
+            InvokeResponseBody::Json(j) => {
+                assert_eq!(serde_json::from_str::<Value>(&j).unwrap(), serde_json::json!({"type": "end"}))
+            }
+            InvokeResponseBody::Raw(_) => panic!("the end is JSON"),
+        }
     }
 
     #[test]

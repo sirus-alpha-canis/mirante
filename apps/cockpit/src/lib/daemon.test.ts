@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
-import { attachClose, attachOpen, attachWrite, DaemonError, daemonStart, rpc } from "./daemon";
+import { attachAck, attachClose, attachOpen, attachWrite, DaemonError, daemonStart, rpc } from "./daemon";
 import { RpcCode } from "./protocol";
 
 describe("daemon transport", () => {
@@ -32,18 +32,28 @@ describe("daemon transport", () => {
     expect([e.code, e.unsupported, e.message]).toEqual([3, true, "codex cannot resize"]);
   });
 
-  it("attach decodes base64 chunks and reports the end", async () => {
+  it("attach hands raw output (ArrayBuffer) through as bytes and reports the end", async () => {
     let channel: { onmessage: (m: unknown) => void } | undefined;
     invoke.mockImplementation(async (_cmd: string, args: { onMsg: typeof channel }) => {
       channel = args.onMsg;
       return { id: 7, input: true };
     });
-    const chunks: string[] = [];
+    const chunks: number[][] = [];
     let ended = false;
-    const a = await attachOpen("t1", 24, 80, (b) => chunks.push(new TextDecoder().decode(b)), () => (ended = true));
-    channel!.onmessage({ type: "data", b64: btoa("héllo".replace("é", "e")) });
+    const a = await attachOpen("t1", 24, 80, (b) => chunks.push([...b]), () => (ended = true));
+    channel!.onmessage(new Uint8Array([104, 0xff, 0]).buffer);
     channel!.onmessage({ type: "end" });
-    expect([a, chunks, ended]).toEqual([{ id: 7, input: true }, ["hello"], true]);
+    expect([a, chunks, ended]).toEqual([{ id: 7, input: true }, [[104, 0xff, 0]], true]);
+  });
+
+  it("acks name the attachment and the byte count; a failed ack is not thrown", async () => {
+    invoke.mockImplementation(async () => undefined);
+    await attachAck(7, 65536);
+    expect(invoke).toHaveBeenCalledWith("attach_ack", { id: 7, bytes: 65536 });
+    invoke.mockImplementation(async () => {
+      throw { kind: "protocol", message: "gone" };
+    });
+    await expect(attachAck(7, 1)).resolves.toBeUndefined();
   });
 
   it("ANSWER_IN_TERMINAL (code 8) is surfaced as such with the daemon's reason", async () => {
