@@ -376,8 +376,9 @@ pub fn links(body: &str) -> Vec<String> {
     out
 }
 
-/// Common Latin letters with diacritics, folded to ASCII.
-fn fold(c: char) -> Option<&'static str> {
+/// Common Latin letters with diacritics (lowercase), folded to ASCII. Shared with the skill
+/// miner's tokenizer.
+pub(crate) fn fold(c: char) -> Option<&'static str> {
     Some(match c {
         'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' => "a",
         'ç' | 'ć' | 'č' => "c",

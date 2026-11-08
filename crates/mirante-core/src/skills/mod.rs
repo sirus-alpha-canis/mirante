@@ -4,6 +4,7 @@
 pub mod format;
 pub mod library;
 pub mod lint;
+pub mod mine;
 pub mod origin;
 pub mod sign;
 

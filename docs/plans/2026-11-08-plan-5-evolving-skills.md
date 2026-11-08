@@ -226,7 +226,7 @@ docs/dogfood/skills.md                           (new)
 
 **Files:** Create `crates/mirante-core/src/skills/{mod.rs,origin.rs}`. Modify `lib.rs` (`pub mod skills;`).
 
-- [ ] **Step 1: Write failing tests (`skills::origin`).**
+- [x] **Step 1: Write failing tests (`skills::origin`).**
 
 ```rust
 #[test] fn normalizes_ssh_https_tokens_and_forge_aliases() {
@@ -253,21 +253,21 @@ docs/dogfood/skills.md                           (new)
 #[test] fn local_repos_get_a_path_key() { assert!(local_key(Path::new("/r")).starts_with("local/")); }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p mirante-core skills::origin`. Expected: FAIL (module missing).
-- [ ] **Step 3: Implement** per Decision 3.
+- [x] **Step 2: Run** `cargo test -p mirante-core skills::origin`. Expected: FAIL (module missing).
+- [x] **Step 3: Implement** per Decision 3.
   - `pub struct Origin { host, segments: Vec<String> }`, with `key()` = `host/seg…`.
   - `pub fn aliases(text) -> Aliases` and `pub fn read_aliases(home) -> Aliases` (reads `~/.ssh/config` with `O_NOFOLLOW`, max 256 KiB, errors give an empty map).
   - `pub fn origin_of(repo, &Aliases) -> String` (hardened `Git`; `local_key` on any failure).
   - `Scope { Personal | Org(String) | Repo(String) }` with `parse/render/matches`.
   - The userinfo is dropped before anything is stored or logged.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(core): normalize git origins into tenant keys (ssh aliases, Azure, token-stripped)`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(core): normalize git origins into tenant keys (ssh aliases, Azure, token-stripped)`.
 
 ### Task 2: The skill format (manifest, SKILL.md render and parse)
 
 **Files:** Create `skills/format.rs`.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
 
 ```rust
 #[test] fn manifest_bytes_are_canonical_and_hash_stable() {
@@ -288,22 +288,22 @@ docs/dogfood/skills.md                           (new)
 #[test] fn file_paths_are_relative_text_and_bounded() { /* "../x", "/x", "a/../b", "x.sh", ".hidden" refused; "reference/a.md" ok */ }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p mirante-core skills::format`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p mirante-core skills::format`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - `Manifest` (serde, field order as in Decision 6, `#[serde(deny_unknown_fields)]`).
   - `Activation { Always, OnDemand }`, `FileEntry`.
   - `to_bytes` / `parse` / `hash`.
   - `render_skill_md` (quoted description, one line).
   - `parse_skill_md`: the same strict line subset as `dna::note`.
   - `check_file_path`.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(core): mirante.skill/v1 manifest and SKILL.md rendering`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(core): mirante.skill/v1 manifest and SKILL.md rendering`.
 
 ### Task 3: Lint
 
 **Files:** Create `skills/lint.rs`.
 
-- [ ] **Step 1: Failing tests,** one per table row, plus:
+- [x] **Step 1: Failing tests,** one per table row, plus:
 
 ```rust
 #[test] fn clean_skill_has_no_findings() { assert!(lint(&draft("Run `cargo test -p mirante-core` before committing.")).is_empty()); }
@@ -317,16 +317,16 @@ docs/dogfood/skills.md                           (new)
 #[test] fn findings_carry_line_numbers() {}
 ```
 
-- [ ] **Step 2: Run** `cargo test -p mirante-core skills::lint`. Expected: FAIL.
-- [ ] **Step 3: Implement** `pub fn lint(d: &Draft) -> Vec<Finding>`, where `Draft { name, description, body, files: Vec<(String, Vec<u8>)>, extra_keys }`. Patterns are `const` tables over the folded text; no regex crate. `has_errors()`.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(core): deterministic skill lint (secrets, forbidden approvals, dangerous shell, injection markers, refs)`.
+- [x] **Step 2: Run** `cargo test -p mirante-core skills::lint`. Expected: FAIL.
+- [x] **Step 3: Implement** `pub fn lint(d: &Draft) -> Vec<Finding>`, where `Draft { name, description, body, files: Vec<(String, Vec<u8>)>, extra_keys }`. Patterns are `const` tables over the folded text; no regex crate. `has_errors()`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(core): deterministic skill lint (secrets, forbidden approvals, dangerous shell, injection markers, refs)`.
 
 ### Task 4: Signing through `ssh-keygen -Y`
 
 **Files:** Create `skills/sign.rs`.
 
-- [ ] **Step 1: Failing tests.** They need `/usr/bin/ssh-keygen`; they are skipped with a printed note when it is absent.
+- [x] **Step 1: Failing tests.** They need `/usr/bin/ssh-keygen`; they are skipped with a printed note when it is absent.
 
 ```rust
 #[test] fn sign_then_verify_round_trips_and_tamper_fails() {
@@ -342,16 +342,16 @@ docs/dogfood/skills.md                           (new)
 #[test] fn another_namespace_does_not_verify() {}
 ```
 
-- [ ] **Step 2: Run** `cargo test -p mirante-core skills::sign`. Expected: FAIL.
-- [ ] **Step 3: Implement** per Decision 7: the traits, `SshKeygen { bin, key, signers, tmp }`, `fingerprint()` (`ssh-keygen -l -f <pub>`), stdin and stdout through pipes with a 10 s timeout. The doc comment states the same-uid limit.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(core): sign skill manifests with ssh-keygen (SSHSIG, ed25519, namespace mirante-skill)`.
+- [x] **Step 2: Run** `cargo test -p mirante-core skills::sign`. Expected: FAIL.
+- [x] **Step 3: Implement** per Decision 7: the traits, `SshKeygen { bin, key, signers, tmp }`, `fingerprint()` (`ssh-keygen -l -f <pub>`), stdin and stdout through pipes with a 10 s timeout. The doc comment states the same-uid limit.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(core): sign skill manifests with ssh-keygen (SSHSIG, ed25519, namespace mirante-skill)`.
 
 ### Task 5: `SafeDir` and the versioned library
 
 **Files:** Create `crates/mirante-core/src/safedir.rs` and `skills/library.rs`. Modify `dna/fsio.rs`.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
 
 ```rust
 // safedir.rs: the DNA fsio tests stay green unchanged (MemoryDir now wraps SafeDir)
@@ -371,8 +371,8 @@ docs/dogfood/skills.md                           (new)
 #[test] fn prune_keeps_the_newest_twenty() {}
 ```
 
-- [ ] **Step 2: Run** `cargo test -p mirante-core safedir skills::library dna::fsio`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p mirante-core safedir skills::library dna::fsio`. Expected: FAIL.
+- [x] **Step 3: Implement.**
   - Move the descriptor machinery (open by levels, `openat`/`linkat`/`renameat`/`unlinkat`, `flock`, single-link and same-device checks) into `SafeDir::open(root, &[seg])` / `SafeDir::create(root, &[seg])`, adding `mkdirat` and `create_dir_new`.
   - `MemoryDir` keeps its API.
   - `write_version`:
@@ -386,14 +386,14 @@ docs/dogfood/skills.md                           (new)
     2. The directory listing must equal the manifest files + 2.
     3. Each file's sha256 must match.
     4. Verify the signature.
-- [ ] **Step 4: Run.** Expected: PASS (including every existing `dna::fsio` test).
-- [ ] **Step 5: Commit** `refactor(core): SafeDir from DNA fsio; feat(core): immutable, signed, verified skill versions`.
+- [x] **Step 4: Run.** Expected: PASS (including every existing `dna::fsio` test).
+- [x] **Step 5: Commit** `refactor(core): SafeDir from DNA fsio; feat(core): immutable, signed, verified skill versions`.
 
 ### Task 6: The miner
 
 **Files:** Create `skills/mine.rs`.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
 
 ```rust
 #[test] fn three_tasks_repeating_an_instruction_make_one_cluster() {
@@ -411,15 +411,23 @@ docs/dogfood/skills.md                           (new)
 #[test] fn fingerprint_ignores_word_order_and_accents() {}
 ```
 
-- [ ] **Step 2: Run** `cargo test -p mirante-core skills::mine`. Expected: FAIL.
-- [ ] **Step 3: Implement** per Decision 9.
+- [x] **Step 2: Run** `cargo test -p mirante-core skills::mine`. Expected: FAIL.
+- [x] **Step 3: Implement** per Decision 9.
   - `Utterance { task, repo_key, tenant, text, ts, source: Goal|Steer|Queue|Denied{tool} }`.
   - `units`, `tokens` (EN+PT stopwords, accent fold), `cluster` (greedy, O(n·clusters), capped at 5,000 units).
   - `draft(cluster, active_skills, active_in_tasks) -> Draft { kind: New|Edit{name, base_hash}, … , fingerprint, evidence: Vec<{task, text}> (≤5) }`.
-- [ ] **Step 4: Run.** Expected: PASS.
-- [ ] **Step 5: Commit** `feat(core): find repeated operator instructions per tenant and draft skill proposals (no LLM)`.
+- [x] **Step 4: Run.** Expected: PASS.
+- [x] **Step 5: Commit** `feat(core): find repeated operator instructions per tenant and draft skill proposals (no LLM)`.
 
 ---
+
+> **As built (2026-11-08), Batch A.** Tasks 1–6 landed as written, one commit each, TDD (each test module seen failing first). Founder questions answered with the plan's defaults: personal skills apply in every repo (with the widening warning, Task 9); mined proposals default to always-on; no team skills from `<repo>/.mirante/skills` in P5. Differences from the text above:
+> - **Task 1.** `Scope` also has `from_parts(kind, value)` (the manifest's and the index's form), `kind()`/`value()` and `rank()` (narrower first, for the budget). `ssh+git`/`git+ssh` and `http` are accepted besides the listed schemes; Azure's `DefaultCollection` segment is dropped; a segment that decodes to `/` or `\` is refused. Errors never quote the URL (it may hold a token).
+> - **Task 2.** `Manifest::parse` accepts only canonical bytes; `Manifest::validate` pins the file list (SKILL.md first, extras unique and sorted, sorted agents). Extra file paths: at most 3 levels and 128 bytes.
+> - **Task 3.** `Finding` also carries `file` (`SKILL.md`, `description`, `name`, `frontmatter` or the bundled path). Three rules beyond the table: `frontmatter` (warn: imported keys are dropped, Decision 5), `description` (error: not one line, or `<`/`>`) and `text` (error: a bundled file is not UTF-8). Backticked paths count as bundled refs only in the `./x.md` form, so a repo path like `README.md` is not an error. `dna::untrusted::hidden(c)` is the shared "would `line` strip it" predicate.
+> - **Task 4.** `Signer` also has `fingerprint()` (the manifest's `signer.key`). `SshKeygen::ensure_key(home)` takes the Mirante home (`keys/`, `tmp/` under it); `ensure_key_with(home, bin)` and `at(home, bin)` exist for tests. The child runs in its own process group so the timeout kills what it started.
+> - **Task 5.** `safedir::SafeError` maps into `DnaError` and `SkillError`. The no-replace rename is `renameatx_np(RENAME_EXCL)` on macOS and `renameat2(RENAME_NOREPLACE)` on Linux. `write_version` computes the manifest's `files` and `signer` itself and returns the final manifest; the library is opened from its parent, so a symlinked `skills/` is refused too. `prune` also clears `.stage-*` folders a crash left.
+> - **Task 6.** `draft(cluster, active, active_in_tasks, taken)` takes the names in use (for `-2`); its result type is `Mined` (`lint::Draft` already names lint's input) with `lint_draft()` and `skill_md()`. `Params::since_ms` is the window (the store's query passes 60 days). Denial drafts are named `ask-before-<cmd>`.
 
 ## Batch B: Daemon
 
