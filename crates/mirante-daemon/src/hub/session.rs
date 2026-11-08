@@ -500,11 +500,13 @@ impl Hub {
             st.publish();
             (task, session.id, native, sink)
         };
+        let mcp = self.memory_server_for(&task);
         let req = SpawnRequest {
             task: task.clone(),
             session_id: session_id.clone(),
             resume: native.clone(),
             paths: self.paths.clone(),
+            mcp,
         };
         match self.factory.spawn(req, sink) {
             Ok(driver) => {
@@ -1016,6 +1018,34 @@ mod tests {
 
     fn status(k: &Kit, task: &str) -> Status {
         k.hub.get_task(task).unwrap().task.status
+    }
+
+    #[test]
+    fn spawn_request_carries_mcp_only_for_enabled_repos() {
+        use super::super::dna::Caller;
+        let k = Kit::new();
+        let bin = k.dir.path().join("bin/mirante-mcp");
+        *k.factory.mcp_bin.lock().unwrap() = Some(bin.clone());
+        let t = k.create(AgentKind::Claude, "mem").task;
+        let cycle = || {
+            k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+            k.hub.stop(&t.id).unwrap();
+            k.factory.mcps.lock().unwrap().last().cloned().expect("spawned")
+        };
+        assert_eq!(cycle(), None, "nothing before memory is enabled");
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        assert_eq!(cycle(), Some(bin.clone()));
+        k.hub.dna_disable(&k.repo_ref(), &Caller::Person).unwrap();
+        assert_eq!(cycle(), None, "disable stops injection for the next session");
+        assert!(!k.kinds(&t.id).contains(&"dna.unavailable".to_string()));
+        // Enabled but the binary is missing: the session still starts, without memory, and
+        // says why.
+        k.hub.dna_enable(&k.repo_ref(), &Caller::Person).unwrap();
+        *k.factory.mcp_bin.lock().unwrap() = None;
+        assert_eq!(cycle(), None);
+        let events = k.hub.lock().store.task_events(&t.id).unwrap();
+        let why = events.iter().find(|e| e.kind == "dna.unavailable").expect("dna.unavailable");
+        assert!(why.payload["reason"].as_str().unwrap().contains("mirante-mcp"), "{}", why.payload);
     }
 
     #[test]

@@ -144,6 +144,10 @@ pub struct FakeFactory {
     pub spawn_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     /// When set, `spawn` emits this event through the sink, then fails.
     pub emit_then_fail: Mutex<Option<DriverEvent>>,
+    /// What `memory_server` answers (`None`: not found).
+    pub mcp_bin: Mutex<Option<std::path::PathBuf>>,
+    /// Every spawn request's `mcp`, in order.
+    pub mcps: Mutex<Vec<Option<std::path::PathBuf>>>,
 }
 
 impl FakeFactory {
@@ -163,6 +167,7 @@ impl DriverFactory for Arc<FakeFactory> {
             let _ = release.recv();
         }
         self.resumes.lock().unwrap().push(req.resume.clone());
+        self.mcps.lock().unwrap().push(req.mcp.clone());
         if self.fail.load(Ordering::SeqCst) {
             return Err(DriverError::Failed("spawn refused".into()));
         }
@@ -175,5 +180,9 @@ impl DriverFactory for Arc<FakeFactory> {
         }
         self.sinks.lock().unwrap().push(sink);
         Ok(self.driver.clone())
+    }
+
+    fn memory_server(&self) -> Result<std::path::PathBuf, String> {
+        self.mcp_bin.lock().unwrap().clone().ok_or_else(|| "mirante-mcp not found (fake)".to_string())
     }
 }

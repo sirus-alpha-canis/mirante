@@ -373,6 +373,32 @@ impl Hub {
         Ok(())
     }
 
+    /// The memory MCP server for a new session of `task`: only when its repo's memory was
+    /// explicitly enabled. When it is enabled but the binary cannot be found, the session
+    /// still starts without memory (memory is not worth blocking a task) and a
+    /// `dna.unavailable` event says why.
+    pub(crate) fn memory_server_for(&self, task: &mirante_core::model::Task) -> Option<PathBuf> {
+        let Ok(repo) = self.checkout(&task.repo_path) else {
+            return None;
+        };
+        let enabled = matches!(self.lock().store.dna_repo(&key_of(&repo)), Ok(Some(r)) if r.enabled);
+        if !enabled {
+            return None;
+        }
+        match self.factory.memory_server() {
+            Ok(bin) => Some(bin),
+            Err(reason) => {
+                let mut st = self.lock();
+                let payload = json!({ "reason": format!("repo memory is off for this session: {reason}") });
+                if let Err(e) = st.event(Some(&task.id), "dna.unavailable", payload) {
+                    st.log_error(Some(&task.id), "dna.unavailable", &e);
+                }
+                st.publish();
+                None
+            }
+        }
+    }
+
     /// `Conflict` unless memory is enabled for the repo `key`.
     fn require_enabled(&self, key: &str) -> Result<()> {
         if self.lock().store.dna_repo(key)?.is_some_and(|r| r.enabled) {

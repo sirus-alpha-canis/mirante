@@ -314,10 +314,19 @@ pub struct SpawnRequest {
     /// Native id to resume (Claude session id / Codex thread id).
     pub resume: Option<String>,
     pub paths: Paths,
+    /// The `mirante-mcp` binary to give this session as its memory server (Claude:
+    /// `--mcp-config`, Codex: `-c mcp_servers.mirante.*`). Set only for repos whose memory
+    /// was explicitly enabled; `None` launches the agent exactly as before.
+    pub mcp: Option<std::path::PathBuf>,
 }
 
 pub trait DriverFactory: Send + Sync {
     fn spawn(&self, req: SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError>;
+
+    /// The memory MCP server binary, or why there is none (see [`real::mcp_bin`]).
+    fn memory_server(&self) -> Result<std::path::PathBuf, String> {
+        real::mcp_bin()
+    }
 }
 
 #[cfg(test)]

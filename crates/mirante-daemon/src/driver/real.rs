@@ -12,13 +12,19 @@
 //! session, which the hook echoes back and the hub fences on). Added here: `MIRANTE_HOME`
 //! (the hook must reach this daemon) and, on a fresh start, `--session-id <uuid>`, so the
 //! native id is known before Claude prints anything.
+//!
+//! Repo memory (only for repos where it was enabled, `SpawnRequest::mcp`): Claude gets
+//! `--mcp-config <session dir>/mcp.json` and the read-only memory tools pre-allowed in its
+//! settings; Codex gets `-c mcp_servers.mirante.*` overrides. Per task, never global.
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
-use mirante_core::claude_launch::{launch_spec, settings_json, LaunchInput, AGENT_ENV};
+use mirante_core::claude_launch::{
+    launch_spec, mcp_json, memory_allow, settings_json, LaunchInput, AGENT_ENV, MCP_SERVER, TASK_ENV,
+};
 use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
 use mirante_ipc::types::AgentBinView;
@@ -52,6 +58,65 @@ pub fn hook_bin() -> Result<PathBuf, DriverError> {
     } else {
         Err(DriverError::Failed(format!("hook binary not found: {}", p.display())))
     }
+}
+
+/// The memory MCP server: `MIRANTE_MCP_BIN`, else `mirante-mcp` next to the daemon
+/// executable; it must be an executable file. `Err` says why there is none.
+pub fn mcp_bin() -> Result<PathBuf, String> {
+    let p = match std::env::var_os("MIRANTE_MCP_BIN").filter(|p| !p.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("mirante-mcp"),
+    };
+    let ok = std::fs::metadata(&p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if ok {
+        Ok(p)
+    } else {
+        Err(format!("mirante-mcp not found: {}", p.display()))
+    }
+}
+
+/// `s` as a TOML basic string (`"` and `\` escaped). Control characters are refused: they
+/// have no place in a path or a task id, and a `-c` override must stay one value.
+pub fn toml_str(s: &str) -> Result<String, String> {
+    if s.chars().any(char::is_control) {
+        return Err(format!("{s:?} has a control character"));
+    }
+    Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+/// The per-task memory server for `codex app-server`, as `-c` config overrides (nothing is
+/// written to `~/.codex`). Codex hands an MCP server only a few variables of its own
+/// environment, so the task, the daemon's home and the agent marker go in `env`.
+pub fn codex_mcp_args(bin: &Path, task: &str, home: &Path) -> Result<Vec<String>, String> {
+    let (bin, task, home) = (toml_str(&bin.to_string_lossy())?, toml_str(task)?, toml_str(&home.to_string_lossy())?);
+    Ok(vec![
+        "-c".to_string(),
+        format!("mcp_servers.{MCP_SERVER}.command={bin}"),
+        "-c".to_string(),
+        format!("mcp_servers.{MCP_SERVER}.env={{{TASK_ENV}={task},{HOME_ENV}={home},{AGENT_ENV}={task}}}"),
+    ])
+}
+
+/// Writes Claude's per-task config into the session dir: the settings (hook for every
+/// event; the memory read tools pre-allowed when memory is on) and, when `req.mcp` is set,
+/// `mcp.json`. Returns their paths.
+pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(PathBuf, Option<PathBuf>)> {
+    let dir = req.paths.session_dir(&req.task.id);
+    let settings = dir.join("claude-settings.json");
+    let hook = hook.to_string_lossy();
+    let mcp = match &req.mcp {
+        Some(bin) => {
+            let path = dir.join("mcp.json");
+            write_private(&path, &mcp_json(bin, &req.task.id, req.paths.home()).to_string())?;
+            write_private(&settings, &settings_json(&hook, &memory_allow()).to_string())?;
+            Some(path)
+        }
+        None => {
+            write_private(&settings, &settings_json(&hook, &[]).to_string())?;
+            None
+        }
+    };
+    Ok((settings, mcp))
 }
 
 /// Writes `contents` to `path` (mode 0600) inside a 0700 directory.
@@ -104,6 +169,7 @@ pub fn claude_spec(
     settings: &Path,
     size: (u16, u16),
     parent_env: Vec<String>,
+    mcp_config: Option<&Path>,
 ) -> std::io::Result<(PtySpec, Option<String>)> {
     let spec = launch_spec(LaunchInput {
         claude_bin: claude,
@@ -113,6 +179,7 @@ pub fn claude_spec(
         session_id: &req.session_id,
         resume: req.resume.as_deref(),
         parent_env,
+        mcp_config,
     });
     let mut args = spec.args;
     let pinned = match req.resume {
@@ -180,9 +247,9 @@ impl RealFactory {
     fn claude(&self, req: &SpawnRequest, sink: Sink) -> Result<Arc<dyn Driver>, DriverError> {
         let claude = resolve_agent(Agent::Claude)?;
         let hook = hook_bin()?;
-        let settings = req.paths.session_dir(&req.task.id).join("claude-settings.json");
-        write_private(&settings, &settings_json(&hook.to_string_lossy(), &[]).to_string())?;
-        let (mut pty, pinned) = claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env())?;
+        let (settings, mcp) = write_claude_config(req, &hook)?;
+        let (mut pty, pinned) =
+            claude_spec(req, &claude, &settings, (self.rows, self.cols), parent_env(), mcp.as_deref())?;
         pty.env_set.extend(agent_path_env(&claude, std::env::var("PATH").ok().as_deref()));
         let driver = ClaudeDriver::spawn(pty, sink.clone(), ClaudeTiming::default(), req.resume.is_some())?;
         if let Some(id) = pinned {
@@ -200,11 +267,15 @@ impl RealFactory {
         // Appended, never truncated: the last session's stderr explains its crash.
         prepare_append_log(&log, STDERR_LOG_CAP)?;
         let env_remove = codex_env_to_scrub(parent_env());
+        let extra_args = match &req.mcp {
+            Some(mcp) => codex_mcp_args(mcp, &req.task.id, req.paths.home()).map_err(DriverError::Failed)?,
+            None => Vec::new(),
+        };
         let d = CodexDriver::spawn(
             &bin,
             &req.task.worktree_path,
             req.resume.as_deref(),
-            ChildEnv { remove: &env_remove, set: &env_set },
+            ChildEnv { remove: &env_remove, set: &env_set, args: &extra_args },
             &log,
             sink,
             CodexTiming::default(),
@@ -289,6 +360,7 @@ mod tests {
             session_id: "sess-42".into(),
             resume: resume.map(String::from),
             paths: Paths::new(Path::new("/h")),
+            mcp: None,
         }
     }
 
@@ -300,7 +372,8 @@ mod tests {
     fn a_fresh_launch_pins_the_session_id_and_stamps_the_mirante_session() {
         let parent = vec!["CLAUDECODE".to_string(), "ANTHROPIC_API_KEY".to_string()];
         let (spec, pinned) =
-            claude_spec(&request(None), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), parent).unwrap();
+            claude_spec(&request(None), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), parent, None)
+                .unwrap();
         let id = pinned.expect("fresh start pins an id");
         let args = spec.args.join(" ");
         assert!(args.contains(&format!("--session-id {id}")), "{args}");
@@ -317,6 +390,63 @@ mod tests {
     }
 
     #[test]
+    fn codex_mcp_args_are_toml_overrides() {
+        let a = codex_mcp_args(Path::new("/opt/m/mirante-mcp"), "t1", Path::new("/h/.mirante")).unwrap();
+        assert_eq!(
+            a,
+            [
+                "-c",
+                "mcp_servers.mirante.command=\"/opt/m/mirante-mcp\"",
+                "-c",
+                "mcp_servers.mirante.env={MIRANTE_TASK_ID=\"t1\",MIRANTE_HOME=\"/h/.mirante\",MIRANTE_TASK=\"t1\"}"
+            ]
+        );
+    }
+
+    #[test]
+    fn toml_strings_escape_quotes_and_backslashes() {
+        assert_eq!(toml_str(r#"/a "b"\c"#).unwrap(), r#""/a \"b\"\\c""#);
+        assert!(toml_str("a\nb").is_err() && toml_str("a\u{7f}").is_err() && toml_str("\u{1b}[2J").is_err());
+        let a = codex_mcp_args(Path::new("/x/o\"brien/mirante-mcp"), "t1", Path::new("/h")).unwrap();
+        assert_eq!(a[1], "mcp_servers.mirante.command=\"/x/o\\\"brien/mirante-mcp\"");
+        assert!(codex_mcp_args(Path::new("/x\ny/mirante-mcp"), "t1", Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn claude_gets_mcp_json_and_the_read_tools_only_when_memory_is_on() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.paths = Paths::new(&d.path().join("home"));
+        let hook = Path::new("/opt/m/mirante-hook");
+        let (settings, mcp) = write_claude_config(&req, hook).unwrap();
+        assert_eq!(mcp, None);
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(s["permissions"]["allow"], serde_json::json!([]));
+
+        req.mcp = Some(PathBuf::from("/opt/m/mirante-mcp"));
+        let (settings, mcp) = write_claude_config(&req, hook).unwrap();
+        let mcp = mcp.expect("mcp.json written");
+        assert_eq!(mcp, req.paths.session_dir("task-1").join("mcp.json"));
+        assert_eq!(std::fs::metadata(&mcp).unwrap().permissions().mode() & 0o777, 0o600);
+        let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(m["mcpServers"]["mirante"]["command"], "/opt/m/mirante-mcp");
+        assert_eq!(m["mcpServers"]["mirante"]["env"]["MIRANTE_TASK_ID"], "task-1");
+        assert_eq!(m["mcpServers"]["mirante"]["env"]["MIRANTE_HOME"], d.path().join("home").to_str().unwrap());
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            s["permissions"]["allow"],
+            serde_json::json!(["mcp__mirante__memory_search", "mcp__mirante__memory_get"])
+        );
+
+        // The full launch: `--mcp-config` followed only by `--flag value` pairs.
+        let (spec, _) = claude_spec(&req, Path::new("/bin/claude"), &settings, (40, 120), vec![], Some(&mcp)).unwrap();
+        let i = spec.args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(spec.args[i + 1], mcp.to_str().unwrap());
+        assert_eq!((spec.args.len() - i) % 2, 0, "{:?}", spec.args);
+        assert!(spec.args[i + 2..].iter().step_by(2).all(|a| a.starts_with("--")), "{:?}", spec.args);
+    }
+
+    #[test]
     fn codex_runs_with_the_agent_marker() {
         let env = codex_env_set(&request(None), Path::new("/usr/bin/codex"), Some("/usr/bin:/bin"));
         assert_eq!(env, [("MIRANTE_TASK".to_string(), "task-1".to_string())]);
@@ -326,9 +456,15 @@ mod tests {
 
     #[test]
     fn a_resume_passes_the_native_id_and_pins_nothing() {
-        let (spec, pinned) =
-            claude_spec(&request(Some("nat-1")), Path::new("/bin/claude"), Path::new("/h/s.json"), (40, 120), vec![])
-                .unwrap();
+        let (spec, pinned) = claude_spec(
+            &request(Some("nat-1")),
+            Path::new("/bin/claude"),
+            Path::new("/h/s.json"),
+            (40, 120),
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_eq!(pinned, None);
         let args = spec.args.join(" ");
         assert!(args.contains("--resume nat-1") && !args.contains("--session-id"), "{args}");

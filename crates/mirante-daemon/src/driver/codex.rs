@@ -920,11 +920,15 @@ fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, tim
     }
 }
 
-/// Changes to the inherited environment for the codex process: variables removed, then set.
+/// What the codex process gets beyond the defaults: inherited variables removed, then set,
+/// and extra arguments after `app-server`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChildEnv<'a> {
     pub remove: &'a [String],
     pub set: &'a [(String, String)],
+    /// `-c key=value` config overrides (the per-task memory server), which `app-server`
+    /// accepts after the subcommand.
+    pub args: &'a [String],
 }
 
 impl CodexDriver {
@@ -942,6 +946,7 @@ impl CodexDriver {
         let stderr = std::fs::OpenOptions::new().create(true).append(true).open(stderr_log)?;
         let mut cmd = Command::new(bin);
         cmd.arg("app-server")
+            .args(env.args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1752,6 +1757,25 @@ mod tests {
         let cwd = dir.to_string_lossy().into_owned();
         let d = CodexDriver::spawn(&bin, &cwd, None, ChildEnv::default(), &log, Sink::new("s1", tx), timing()).unwrap();
         (d, rx)
+    }
+
+    #[test]
+    fn config_overrides_follow_the_app_server_subcommand() {
+        let dir = mirante_ipc::test_dir::TestDir::new();
+        let argv = dir.path().join("argv");
+        let bin = fake_app_server(dir.path(), &format!("printf '%s\\n' \"$@\" > {}\nsleep 60", argv.display()));
+        let (tx, _rx) = mpsc::channel();
+        let args = ["-c".to_string(), "mcp_servers.mirante.command=\"/m\"".to_string()];
+        let env = ChildEnv { args: &args, ..ChildEnv::default() };
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let d =
+            CodexDriver::spawn(&bin, &cwd, None, env, &dir.path().join("log"), Sink::new("s1", tx), timing()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&argv).map_or(true, |t| t.is_empty()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        d.stop();
+        assert_eq!(std::fs::read_to_string(&argv).unwrap(), "app-server\n-c\nmcp_servers.mirante.command=\"/m\"\n");
     }
 
     #[test]

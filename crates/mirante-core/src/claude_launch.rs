@@ -146,6 +146,29 @@ pub fn settings_json(hook_cmd: &str, allow: &[String]) -> Value {
     json!({ "hooks": Value::Object(hooks), "permissions": { "allow": allow } })
 }
 
+/// Name of Mirante's MCP server in an agent's config (tool ids `mcp__mirante__<tool>`).
+pub const MCP_SERVER: &str = "mirante";
+
+/// The per-task MCP config passed with `claude --mcp-config <file>`: one stdio server,
+/// `mirante-mcp` at `bin`, scoped to `task` and to the daemon under `home`, carrying the
+/// agent marker ([`AGENT_ENV`]) whatever the client passes down. Additive like
+/// `--settings`: the user's own MCP servers still load (no `--strict-mcp-config`), and
+/// nothing is written to `~/.claude`.
+pub fn mcp_json(bin: &Path, task: &str, home: &Path) -> Value {
+    json!({ "mcpServers": { MCP_SERVER: {
+        "type": "stdio",
+        "command": bin.to_string_lossy(),
+        "args": [],
+        "env": { TASK_ENV: task, "MIRANTE_HOME": home.to_string_lossy(), AGENT_ENV: task },
+    }}})
+}
+
+/// The memory tools Claude may call without asking: the read-only ones. `memory_propose`
+/// is not here: Claude asks the user once per call, and the proposal still goes to review.
+pub fn memory_allow() -> Vec<String> {
+    ["memory_search", "memory_get"].iter().map(|t| format!("mcp__{MCP_SERVER}__{t}")).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchInput<'a> {
     pub claude_bin: &'a Path,
@@ -158,6 +181,8 @@ pub struct LaunchInput<'a> {
     pub resume: Option<&'a str>,
     /// Names of the variables in the parent environment (for prefix scrubbing).
     pub parent_env: Vec<String>,
+    /// The per-task MCP config ([`mcp_json`]), only for repos with memory enabled.
+    pub mcp_config: Option<&'a Path>,
 }
 
 /// Everything a PTY spawner needs, with no I/O done yet.
@@ -171,12 +196,15 @@ pub struct LaunchSpec {
 }
 
 pub fn launch_spec(input: LaunchInput<'_>) -> LaunchSpec {
-    let mut args = vec![
-        "--settings".to_string(),
-        input.settings_path.to_string_lossy().into_owned(),
-        "--permission-mode".to_string(),
-        "manual".to_string(),
-    ];
+    let mut args = vec!["--settings".to_string(), input.settings_path.to_string_lossy().into_owned()];
+    if let Some(mcp) = input.mcp_config {
+        // Variadic in Claude's CLI: every argument after it must be a `--flag value` pair,
+        // or the value would be read as another config.
+        args.push("--mcp-config".to_string());
+        args.push(mcp.to_string_lossy().into_owned());
+    }
+    args.push("--permission-mode".to_string());
+    args.push("manual".to_string());
     if let Some(id) = input.resume {
         args.push("--resume".to_string());
         args.push(id.to_string());
@@ -334,6 +362,7 @@ mod tests {
             session_id: "s1",
             resume: None,
             parent_env: vec!["CMUX_AGENT_Y".into()],
+            mcp_config: None,
         };
         let spec = launch_spec(input.clone());
         assert_eq!(spec.program, PathBuf::from("/usr/local/bin/claude"));
@@ -357,5 +386,51 @@ mod tests {
 
         let resumed = launch_spec(LaunchInput { resume: Some("sess-9"), ..input });
         assert_eq!(&resumed.args[4..], ["--resume", "sess-9"]);
+    }
+
+    fn input() -> LaunchInput<'static> {
+        LaunchInput {
+            claude_bin: Path::new("/usr/local/bin/claude"),
+            worktree: Path::new("/wt/app/feat"),
+            settings_path: Path::new("/m/settings/t1.json"),
+            task_id: "t1",
+            session_id: "s1",
+            resume: Some("sess-9"),
+            parent_env: vec![],
+            mcp_config: None,
+        }
+    }
+
+    #[test]
+    fn mcp_json_scopes_the_server_to_the_task() {
+        let v = mcp_json(Path::new("/opt/m/mirante-mcp"), "t1", Path::new("/h/.mirante"));
+        assert_eq!(v["mcpServers"]["mirante"]["type"], "stdio");
+        assert_eq!(v["mcpServers"]["mirante"]["command"], "/opt/m/mirante-mcp");
+        assert_eq!(v["mcpServers"]["mirante"]["args"], json!([]));
+        assert_eq!(v["mcpServers"]["mirante"]["env"]["MIRANTE_TASK_ID"], "t1");
+        assert_eq!(v["mcpServers"]["mirante"]["env"]["MIRANTE_HOME"], "/h/.mirante");
+        assert_eq!(v["mcpServers"]["mirante"]["env"]["MIRANTE_TASK"], "t1");
+        assert_eq!(v["mcpServers"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn launch_with_mcp_config_adds_one_flag_never_strict_and_nothing_positional_after() {
+        let spec = launch_spec(LaunchInput { mcp_config: Some(Path::new("/m/s/t1/mcp.json")), ..input() });
+        let i = spec.args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(spec.args[i - 2..i], ["--settings", "/m/settings/t1.json"]);
+        assert_eq!(spec.args[i + 1], "/m/s/t1/mcp.json");
+        // `--mcp-config` is variadic: only `--flag value` pairs may follow it.
+        assert_eq!((spec.args.len() - i) % 2, 0, "{:?}", spec.args);
+        assert!(spec.args[i + 2..].iter().step_by(2).all(|a| a.starts_with("--")), "{:?}", spec.args);
+        assert_eq!(spec.args.iter().filter(|a| *a == "--mcp-config").count(), 1);
+        assert!(!spec.args.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(!launch_spec(input()).args.iter().any(|a| a == "--mcp-config"));
+    }
+
+    #[test]
+    fn memory_read_tools_are_pre_allowed_and_propose_is_not() {
+        let s = settings_json("/h", &memory_allow());
+        assert_eq!(s["permissions"]["allow"], json!(["mcp__mirante__memory_search", "mcp__mirante__memory_get"]));
+        assert!(!memory_allow().iter().any(|t| t.contains("propose")));
     }
 }
