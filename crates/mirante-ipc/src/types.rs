@@ -72,8 +72,15 @@ pub mod method {
     /// A person imports a skill folder or inline text as a proposal ([`super::SkillAdd`] →
     /// [`super::SkillProposalView`]).
     pub const SKILL_ADD: &str = "skill.add";
+    /// A person queues a skill version's folder, as it is on disk now, for review again
+    /// ([`super::SkillRereview`] → [`super::SkillProposalView`]). The daemon builds the
+    /// path from the name and version (the caller never names a folder); a folder whose
+    /// `SKILL.md` names another skill is refused. A person only.
+    pub const SKILL_REREVIEW: &str = "skill.rereview";
     /// The review queue ([`super::SkillProposals`] → `Vec<`[`super::SkillProposalView`]`>`).
     pub const SKILL_PROPOSALS: &str = "skill.proposals";
+    /// How many proposals wait for review, every client's (`{}` → [`super::SkillPending`]).
+    pub const SKILL_PENDING: &str = "skill.pending";
     /// A person accepts (writes, signs and ledgers a version) or rejects a proposal
     /// ([`super::SkillReview`] → [`super::SkillProposalView`]).
     pub const SKILL_REVIEW: &str = "skill.review";
@@ -1068,6 +1075,20 @@ pub struct SkillAdd {
     pub activation: Option<String>,
 }
 
+/// A skill version to review again (see [`method::SKILL_REREVIEW`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRereview {
+    pub name: String,
+    pub version: u32,
+}
+
+/// See [`method::SKILL_PENDING`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPending {
+    pub pending: usize,
+}
+
 /// The review queue, oldest first, a page at a time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillProposals {
@@ -1095,6 +1116,28 @@ pub struct SkillProposalView {
     pub proposal: mirante_core::skills::index::SkillProposal,
     /// E.g. a personal scope for text learned in a client's tasks.
     pub warnings: Vec<String>,
+    /// For an edit in the review queue: the version it was made against, as a person may
+    /// trust it (its text only when it verifies). What the card diffs against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<SkillBase>,
+}
+
+/// The version an edit proposal changes. `description`, `activation`, `body` and `files`
+/// are filled only when `verified`: a folder changed outside Mirante is never a diff base.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillBase {
+    /// `None` when no reviewed version has the proposal's base hash.
+    pub version: Option<u32>,
+    pub verified: bool,
+    /// Why it does not verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The skill's current version is another one (an accept would be refused).
+    pub moved: bool,
+    pub description: String,
+    pub activation: String,
+    pub body: String,
+    pub files: Vec<SkillFileView>,
 }
 
 /// A person's edits, used instead of the proposed values on accept.

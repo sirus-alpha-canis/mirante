@@ -91,6 +91,8 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::SKILL_LINT, Access::Person),
     (method::SKILL_PROPOSE, Access::Agents),
     (method::SKILL_ADD, Access::Person),
+    (method::SKILL_REREVIEW, Access::Person),
+    (method::SKILL_PENDING, Access::Person),
     (method::SKILL_PROPOSALS, Access::Person),
     (method::SKILL_REVIEW, Access::Person),
     (method::SKILL_ACTION, Access::Person),

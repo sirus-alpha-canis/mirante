@@ -37,10 +37,10 @@ use mirante_core::skills::{
 };
 use mirante_core::CoreError;
 use mirante_ipc::types::{
-    OriginConfirmed, RefusedSkill, RepoOrigin, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits,
-    SkillFileView, SkillGet, SkillLearn, SkillLintParams, SkillListParams, SkillMine, SkillMined, SkillProposalView,
-    SkillProposals, SkillPropose, SkillRepoParams, SkillReview, SkillSummary, SkillTaskParams, SkillView, TaskSkill,
-    TaskSkills, TenantView,
+    OriginConfirmed, RefusedSkill, RepoOrigin, SkillAction, SkillActionKind, SkillAdd, SkillBase, SkillConfirmOrigin,
+    SkillEdits, SkillFileView, SkillGet, SkillLearn, SkillLintParams, SkillListParams, SkillMine, SkillMined,
+    SkillPending, SkillProposalView, SkillProposals, SkillPropose, SkillRepoParams, SkillRereview, SkillReview,
+    SkillSummary, SkillTaskParams, SkillView, TaskSkill, TaskSkills, TenantView,
 };
 
 use super::dna::{today, Caller, Identity};
@@ -652,18 +652,85 @@ impl Hub {
         self.require_skill_person(c).map(|()| serde_json::json!({}))
     }
 
-    /// Pure: the findings for a draft.
+    /// Pure: the findings for a draft, plus a `redaction` warning counting the secrets an
+    /// accept would redact (an accept redacts the edited text again).
     pub fn skill_lint(&self, p: SkillLintParams) -> Result<Vec<Finding>> {
         parse_scope(&p.scope)?;
+        let redactions = redact_counted(p.description.trim()).1 + redact_counted(&p.body).1;
         let d =
             Draft { name: p.name, description: p.description, body: p.body, files: Vec::new(), extra_keys: Vec::new() };
-        Ok(lint(&d))
+        let mut out = lint(&d);
+        if redactions > 0 {
+            let what = if redactions == 1 { "1 secret".to_string() } else { format!("{redactions} secrets") };
+            out.push(Finding {
+                rule: "redaction".into(),
+                severity: Severity::Warn,
+                file: SKILL_MD.into(),
+                line: 0,
+                message: format!("{what} will be redacted when this is accepted"),
+            });
+        }
+        Ok(out)
+    }
+
+    /// `skill.pending`: how many proposals wait, every client's (people only).
+    pub fn skill_pending(&self, c: &Caller) -> Result<SkillPending> {
+        self.skill_reads(c)?;
+        Ok(SkillPending { pending: self.lock().store.skill_pending_count()? })
+    }
+
+    /// The version an edit proposal was made against, as a person may trust it: found by
+    /// the proposal's base hash in the ledger, verified (signature, manifest, files) before
+    /// any of its text is given; a version that does not verify gives only why.
+    fn proposal_base(&self, p: &SkillProposal) -> Option<SkillBase> {
+        let hash = p.base_hash.as_deref()?;
+        let row = self.lock().store.skill_get(&p.name).ok().flatten();
+        let moved = row.as_ref().is_none_or(|r| r.manifest_hash != hash);
+        let versions = library::list_versions(&self.paths.skills(), &p.name).unwrap_or_default();
+        let version = match &row {
+            Some(r) if r.manifest_hash == hash => Some(r.version),
+            _ => versions
+                .iter()
+                .rev()
+                .copied()
+                .find(|v| self.lock().store.skill_review_hash(&p.name, *v).ok().flatten().as_deref() == Some(hash)),
+        };
+        let Some(version) = version else {
+            let reason = Some("no reviewed version of this skill matches the one the proposal changes".into());
+            return Some(SkillBase { version: None, reason, moved, ..Default::default() });
+        };
+        match self.skill_verify(&p.name, version, hash) {
+            Ok(v) => {
+                let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+                let md = v.files.iter().find(|(f, _)| f == SKILL_MD).map(|(_, b)| text(b)).unwrap_or_default();
+                let body = parse_skill_md(&md).map(|ps| ps.body).unwrap_or(md);
+                let files = v
+                    .files
+                    .iter()
+                    .filter(|(f, _)| f != SKILL_MD)
+                    .map(|(f, b)| SkillFileView { path: f.clone(), text: text(b) })
+                    .collect();
+                Some(SkillBase {
+                    version: Some(version),
+                    verified: true,
+                    reason: None,
+                    moved,
+                    description: v.manifest.description.clone(),
+                    activation: v.manifest.activation.as_str().to_string(),
+                    body,
+                    files,
+                })
+            }
+            Err(e) => {
+                Some(SkillBase { version: Some(version), reason: Some(e.to_string()), moved, ..Default::default() })
+            }
+        }
     }
 
     pub(crate) fn proposal_view(&self, p: SkillProposal) -> SkillProposalView {
         let learned = Some(p.tenant.as_str()).filter(|t| *t != "personal");
         let warnings = Scope::parse(&p.scope).map(|s| Hub::scope_warnings(&s, learned)).unwrap_or_default();
-        SkillProposalView { proposal: p, warnings }
+        SkillProposalView { proposal: p, warnings, base: None }
     }
 
     fn insert_proposal(&self, new: &NewSkillProposal) -> Result<SkillProposalView> {
@@ -815,7 +882,9 @@ impl Hub {
     }
 
     /// A person adopts a skill from a folder (or inline text) as a proposal: an edit when
-    /// the name exists (re-reviewing a skill changed on disk goes through here), else new.
+    /// the name exists, else new. The folder may be anywhere: only the CLI sends one (a
+    /// person in a terminal); the cockpit re-reviews with [`Hub::skill_rereview`], whose
+    /// folder the daemon names.
     pub fn skill_add(&self, caller: &Caller, p: SkillAdd) -> Result<SkillProposalView> {
         self.require_skill_person(caller)?;
         let scope = parse_scope(&p.scope)?;
@@ -827,6 +896,52 @@ impl Hub {
             (None, Some(i)) => ("cli", i.name.clone(), i.description.clone(), i.body.clone(), Vec::new(), Vec::new()),
             _ => return Err(HubError::Invalid("give dir or inline, not both".into())),
         };
+        let draft = Draft { name, description, body, files, extra_keys };
+        self.add_proposal(origin, draft, scope, p.activation.as_deref())
+    }
+
+    /// `skill.rereview`: a skill's own version folder (the path built here from the name
+    /// and version, never given by the caller), as it is on disk now, queued as an edit of
+    /// the skill with its current scope and activation. A folder whose `SKILL.md` names
+    /// another skill is refused: a re-review of one skill never proposes another.
+    pub fn skill_rereview(&self, caller: &Caller, p: SkillRereview) -> Result<SkillProposalView> {
+        self.require_skill_person(caller)?;
+        check_name(&p.name)?;
+        let row =
+            self.lock().store.skill_get(&p.name)?.ok_or_else(|| HubError::NotFound(format!("no skill {}", p.name)))?;
+        let versions = library::list_versions(&self.paths.skills(), &row.name).map_err(skill_err)?;
+        if !versions.contains(&p.version) {
+            return Err(HubError::NotFound(format!("no version {} of {} on disk", p.version, row.name)));
+        }
+        let dir = self.paths.skills().join(&row.name).join(library::version_dir(p.version));
+        let (parsed, files) = read_skill_dir(&dir.to_string_lossy())?;
+        if parsed.name != row.name {
+            return Err(HubError::Invalid(format!(
+                "the folder of {} v{} now names the skill {:?}: fix its {SKILL_MD}, or add it as a new skill with \
+                 `mirante skills add`",
+                row.name, p.version, parsed.name
+            )));
+        }
+        let draft = Draft {
+            name: parsed.name,
+            description: parsed.description,
+            body: parsed.body,
+            files,
+            extra_keys: parsed.extra_keys,
+        };
+        self.add_proposal("import", draft, row.scope.clone(), Some(row.activation.as_str()))
+    }
+
+    /// A person's draft as a pending proposal: redacted and linted, an edit when the name
+    /// exists.
+    fn add_proposal(
+        &self,
+        origin: &str,
+        d: Draft,
+        scope: Scope,
+        activation: Option<&str>,
+    ) -> Result<SkillProposalView> {
+        let Draft { name, description, body, files, extra_keys } = d;
         check_name(&name)?;
         let (description, body, redactions) = clean_text(&description, &body)?;
         let mut texts = Vec::with_capacity(files.len());
@@ -836,8 +951,7 @@ impl Hub {
             texts.push(ProposalFile { path: path.clone(), text });
         }
         let current = self.lock().store.skill_get(&name)?;
-        let activation =
-            parse_activation(p.activation.as_deref(), current.as_ref().map_or(Activation::Always, |r| r.activation))?;
+        let activation = parse_activation(activation, current.as_ref().map_or(Activation::Always, |r| r.activation))?;
         let draft =
             Draft { name: name.clone(), description: description.clone(), body: body.clone(), files, extra_keys };
         let new = NewSkillProposal {
@@ -886,7 +1000,13 @@ impl Hub {
                 e => e.into(),
             })?
         };
-        Ok(page.into_iter().map(|p| self.proposal_view(p)).collect())
+        Ok(page
+            .into_iter()
+            .map(|p| {
+                let base = if p.kind == "edit" && p.status == "pending" { self.proposal_base(&p) } else { None };
+                SkillProposalView { base, ..self.proposal_view(p) }
+            })
+            .collect())
     }
 
     /// The signer (the key is generated on first use and its fingerprint pinned). A key on
@@ -1560,7 +1680,8 @@ pub(crate) mod tests {
     use mirante_core::skills::{FORMAT, SKILL_MD};
     use mirante_ipc::types::{
         CreateTask, SkillAction, SkillActionKind, SkillAdd, SkillConfirmOrigin, SkillEdits, SkillGet, SkillInline,
-        SkillLearn, SkillListParams, SkillMine, SkillMined, SkillProposals, SkillPropose, SkillReview, SkillTaskParams,
+        SkillLearn, SkillListParams, SkillMine, SkillMined, SkillProposals, SkillPropose, SkillRereview, SkillReview,
+        SkillTaskParams,
     };
 
     use super::*;
@@ -2333,6 +2454,111 @@ pub(crate) mod tests {
         assert_eq!(k.hub.skill_review(&Caller::Person, accept(&r.proposal.id)).unwrap().proposal.version, Some(2));
         let v = k.hub.skill_get(SkillGet { name: "my-skill".into(), version: None }).unwrap();
         assert!(v.summary.verified && v.files[0].text == "Changed\n", "{v:?}");
+    }
+
+    /// `skill.rereview` reads the version folder the daemon names itself, never a path the
+    /// caller gives, and refuses a folder whose `SKILL.md` names another skill.
+    #[test]
+    fn rereview_queues_the_skill_s_own_folder_and_refuses_another_name() {
+        let k = Kit::new();
+        let rr = |name: &str, version: u32| SkillRereview { name: name.into(), version };
+        let agent = Peer::spawn(&[(AGENT_ENV, "t")], k.dir.path());
+        for c in [agent.caller(), Caller::Unknown] {
+            forbidden(k.hub.skill_rereview(&c, rr("lookup", 1)));
+        }
+        assert!(matches!(k.hub.skill_rereview(&Caller::Person, rr("nope", 1)), Err(HubError::NotFound(_))));
+        assert!(matches!(k.hub.skill_rereview(&Caller::Person, rr("../x", 1)), Err(HubError::Invalid(_))));
+        if keygen().is_none() {
+            return;
+        }
+        install(&k, "lookup", 1, Scope::parse("org:github.com/acme").unwrap(), Activation::OnDemand, "Look it up.\n");
+        assert!(matches!(k.hub.skill_rereview(&Caller::Person, rr("lookup", 7)), Err(HubError::NotFound(_))));
+        let v1 = k.hub.paths().skills().join("lookup/v1");
+        std::fs::write(v1.join(SKILL_MD), render_skill_md("lookup", "About lookup", "Changed.\n")).unwrap();
+        let p = k.hub.skill_rereview(&Caller::Person, rr("lookup", 1)).unwrap().proposal;
+        assert_eq!(
+            (p.origin.as_str(), p.kind.as_str(), p.name.as_str(), p.scope.as_str(), p.body.as_str()),
+            ("import", "edit", "lookup", "org:github.com/acme", "Changed.\n")
+        );
+        assert_eq!(p.activation, "on_demand");
+        // A folder that now says it is another skill would turn this re-review into a
+        // proposal for that one: refused.
+        std::fs::write(v1.join(SKILL_MD), render_skill_md("other", "About other", "Other.\n")).unwrap();
+        let e = k.hub.skill_rereview(&Caller::Person, rr("lookup", 1));
+        assert!(matches!(e, Err(HubError::Invalid(ref m)) if m.contains("other")), "{e:?}");
+    }
+
+    /// An edit in the queue carries the version it changes as a person may trust it: its
+    /// text when it verifies, only why when it does not (a tampered folder is no diff base).
+    #[test]
+    fn queued_edits_carry_their_verified_base_or_why_there_is_none() {
+        let k = Kit::new();
+        if keygen().is_none() {
+            return;
+        }
+        let t = learning(&k, "t");
+        let scope = Scope::parse("org:github.com/acme").unwrap();
+        install(&k, "lookup", 1, scope, Activation::OnDemand, "Look it up.\n");
+        let edit =
+            k.hub.skill_propose(&Caller::Person, propose(&t.id, None, Some("lookup"), "Look it up twice.\n")).unwrap();
+        assert_eq!(edit.base, None, "only the queue reads the base");
+        let new = k.hub.skill_propose(&Caller::Person, propose(&t.id, Some("fresh"), None, "New.\n")).unwrap();
+        let queue = |id: &str| {
+            k.hub.skill_proposals(SkillProposals { id: Some(id.into()), ..Default::default() }).unwrap().remove(0)
+        };
+        assert_eq!(queue(&new.proposal.id).base, None);
+        let b = queue(&edit.proposal.id).base.expect("an edit has a base");
+        assert_eq!(
+            (b.version, b.verified, b.moved, b.body.as_str(), b.description.as_str(), b.activation.as_str()),
+            (Some(1), true, false, "Look it up.\n", "About lookup", "on_demand")
+        );
+        // Tampered on disk: the base does not verify; nothing of its text is offered.
+        let v1 = k.hub.paths().skills().join("lookup/v1");
+        std::fs::write(v1.join(SKILL_MD), render_skill_md("lookup", "About lookup", "Evil.\n")).unwrap();
+        let b = queue(&edit.proposal.id).base.unwrap();
+        assert_eq!((b.version, b.verified, b.body.as_str()), (Some(1), false, ""));
+        assert!(b.reason.is_some(), "{b:?}");
+        assert!(b.files.is_empty() && b.description.is_empty(), "{b:?}");
+    }
+
+    /// `skill.pending` counts every client's pending proposals (the rail and the header).
+    #[test]
+    fn pending_counts_every_waiting_proposal() {
+        let k = Kit::new();
+        assert_eq!(k.hub.skill_pending(&Caller::Person).unwrap().pending, 0);
+        let t = learning(&k, "t");
+        let a = k.hub.skill_propose(&Caller::Person, propose(&t.id, Some("a"), None, "a\n")).unwrap();
+        k.hub.skill_propose(&Caller::Person, propose(&t.id, Some("b"), None, "b\n")).unwrap();
+        assert_eq!(k.hub.skill_pending(&Caller::Person).unwrap().pending, 2);
+        k.hub
+            .skill_review(&Caller::Person, SkillReview { id: a.proposal.id, accept: false, edits: None, note: None })
+            .unwrap();
+        assert_eq!(k.hub.skill_pending(&Caller::Person).unwrap().pending, 1);
+        let agent = Peer::spawn(&[(AGENT_ENV, "t")], k.dir.path());
+        assert!(matches!(k.hub.skill_pending(&agent.caller()), Err(HubError::Forbidden(_))));
+    }
+
+    /// `skill.lint` says how many secrets an accept would redact (the daemon redacts them
+    /// again on accept).
+    #[test]
+    fn lint_counts_the_secrets_an_accept_would_redact() {
+        let k = Kit::new();
+        let lint = |body: &str| {
+            k.hub
+                .skill_lint(mirante_ipc::types::SkillLintParams {
+                    name: "x".into(),
+                    description: "d".into(),
+                    body: body.into(),
+                    scope: "personal".into(),
+                })
+                .unwrap()
+        };
+        let f = lint("Use token ghp_0123456789abcdefghijklmnopqrstuvwxyzAB here.\n");
+        let r: Vec<_> = f.iter().filter(|f| f.rule == "redaction").collect();
+        assert_eq!(r.len(), 1, "{f:?}");
+        assert_eq!(r[0].severity, Severity::Warn);
+        assert!(r[0].message.contains("1 secret"), "{}", r[0].message);
+        assert!(lint("Nothing secret.\n").iter().all(|f| f.rule != "redaction"));
     }
 
     #[test]

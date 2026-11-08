@@ -358,6 +358,8 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::SKILL_LINT => out(hub.skill_lint(params(p)?)),
         method::SKILL_PROPOSE => out(hub.skill_propose(caller, params(p)?)),
         method::SKILL_ADD => out(hub.skill_add(caller, params(p)?)),
+        method::SKILL_REREVIEW => out(hub.skill_rereview(caller, params(p)?)),
+        method::SKILL_PENDING => out(hub.skill_pending(caller)),
         method::SKILL_PROPOSALS => {
             let q = if p.is_null() { Default::default() } else { params(p)? };
             out(hub.skill_proposals_from(caller, q))
@@ -592,7 +594,21 @@ mod tests {
         assert_eq!(e.unwrap_err().code, code::INVALID_PARAMS);
         let e = dispatch(&k.hub, method::SKILL_REVIEW, json!({"id": "nope", "accept": false})).unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
-        for m in [method::SKILL_LIST, method::SKILL_TENANTS, method::SKILL_PROPOSALS, method::SKILL_MAY_REVIEW] {
+        let e = dispatch(&k.hub, method::SKILL_REREVIEW, json!({"name": "nope", "version": 1})).unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        // The caller never names the folder.
+        let e =
+            dispatch(&k.hub, method::SKILL_REREVIEW, json!({"name": "a", "version": 1, "dir": "/etc"})).unwrap_err();
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        assert_eq!(dispatch(&k.hub, method::SKILL_PENDING, Value::Null).unwrap(), json!({"pending": 1}));
+        for m in [
+            method::SKILL_LIST,
+            method::SKILL_TENANTS,
+            method::SKILL_PROPOSALS,
+            method::SKILL_PENDING,
+            method::SKILL_MAY_REVIEW,
+            method::SKILL_REREVIEW,
+        ] {
             assert_eq!(
                 dispatch_from(&k.hub, &agent.caller(), m, Value::Null).unwrap_err().code,
                 code::FORBIDDEN,

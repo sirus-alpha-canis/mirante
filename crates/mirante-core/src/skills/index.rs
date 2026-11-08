@@ -642,6 +642,13 @@ impl Store {
         load_proposal(&self.conn, id)
     }
 
+    /// How many proposals wait for a person (every tenant's).
+    pub fn skill_pending_count(&self) -> Result<usize> {
+        let n: i64 =
+            self.conn.query_row("SELECT COUNT(*) FROM skill_proposals WHERE status = 'pending'", [], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Proposals, oldest first (see [`SkillProposalQuery`]). An unknown `after` is `NotFound`.
     pub fn skill_proposals(&self, q: &SkillProposalQuery) -> Result<Vec<SkillProposal>> {
         let cursor: Option<(i64, String)> = match &q.after {
