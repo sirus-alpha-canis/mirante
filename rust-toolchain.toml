@@ -1,0 +1,6 @@
+# The Rust toolchain for the whole repo, including apps/cockpit/src-tauri (a separate
+# workspace; rustup finds this file by walking up). CI installs exactly this; bump it on purpose.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

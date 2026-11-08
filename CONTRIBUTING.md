@@ -21,13 +21,18 @@ dependencies, under their own licenses (see `THIRD_PARTY_NOTICES.md`).
   scraping. Nothing is auto-approved. Agents never get a person's methods on the daemon
   socket. No network service, account or telemetry. A change that touches one of these
   needs a discussion first.
+- **Fake executables in tests** are written with `mirante_core::test_script::write_sh`, which
+  runs each new script once before the test times it: on macOS the first exec of a fresh
+  file can take seconds (XProtect scans it), long enough to trip a test's timeout.
 - **New socket methods** must be classified in the daemon's access table
   (`crates/mirante-daemon/src/access.rs`). Unclassified methods are person-only, and the
   tests fail until they are classified.
 
 ## Checks
 
-Run these before you open a PR. CI runs the same ones (see below).
+Run these before you open a PR. CI runs the same ones (see below), on the same Rust: the
+toolchain is pinned in `rust-toolchain.toml` (1.99.1, with clippy and rustfmt), which also
+covers `apps/cockpit/src-tauri`. Bump it in its own PR.
 
 ```bash
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"   # rustup's toolchain, not Homebrew cargo
@@ -48,7 +53,7 @@ push to `main`. It uses no secrets and has read-only access to the repo.
   `cargo test --workspace` (the e2e tests run against a fake `claude`; the real-agent tests
   stay ignored), both clippy passes above with `-D warnings`, and the e2e suite again on its
   own (`cargo test -p mirante-cli --test e2e`).
-- **rust (Linux)**: clippy on the whole workspace, and the `mirante-core` and `mirante-ipc`
+- **rust (Linux)**: clippy on the whole workspace (`-D warnings`, as on macOS), and the `mirante-core` and `mirante-ipc`
   tests as the gate. The rest of the workspace's tests also run there, but only as
   information, until the daemon's Linux paths have been proven.
 - **cockpit (macOS)**: in `apps/cockpit`, `pnpm install --frozen-lockfile`, `pnpm test`,

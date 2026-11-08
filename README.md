@@ -29,8 +29,9 @@ Early prototype. Expect rough edges and breaking changes.
 ## Requirements
 
 - macOS (Linux: partial, see above) with the Xcode command line tools and `git` 2.31 or newer.
-- Rust stable, installed through [rustup](https://rustup.rs). Some dependencies use
-  edition 2024, so an older Homebrew `cargo` (1.81, for example) fails to build them.
+- Rust through [rustup](https://rustup.rs), at the version pinned in `rust-toolchain.toml`
+  (1.99.1, with clippy and rustfmt; `rustup toolchain install` in the repo fetches it). Some
+  dependencies use edition 2024, so an older Homebrew `cargo` (1.81, for example) fails to build them.
   If both are installed, put rustup first:
   `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`.
 - Node 22.12 or newer and pnpm 10, for the desktop app.

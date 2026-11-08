@@ -29,11 +29,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # rustup's stable, never a Homebrew cargo (too old for the edition-2024 dependencies).
-      - name: Rust toolchain (rustup stable)
+      # rustup, never a Homebrew cargo (too old for the edition-2024 dependencies). With no
+      # argument rustup installs the toolchain pinned in rust-toolchain.toml (and its components).
+      - name: Rust toolchain (rust-toolchain.toml)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          rustup toolchain install
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Toolchain versions
         run: |
@@ -71,10 +71,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rust toolchain (rustup stable)
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - name: Toolchain versions
         run: rustc -V && cargo -V && cargo clippy -V && git --version
       - name: Git identity for test repos
@@ -83,10 +81,8 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # unnecessary_cast is allowed here only: mode_t is u16 on macOS and u32 on Linux, so
-      # the `as u32` casts that macOS needs are no-ops on Linux.
       - name: cargo clippy (workspace, Linux)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::unnecessary_cast
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test (mirante-core, mirante-ipc)
         run: cargo test -p mirante-core -p mirante-ipc --locked
       - name: cargo build --workspace
@@ -118,10 +114,10 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: apps/cockpit/pnpm-lock.yaml
-      - name: Rust toolchain (rustup stable)
+      # The repo-root rust-toolchain.toml also covers src-tauri (rustup walks up to it).
+      - name: Rust toolchain (rust-toolchain.toml)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          rustup toolchain install
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Toolchain versions
         run: node -v && pnpm -v && rustc -V && cargo -V
@@ -154,10 +150,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rust toolchain (rustup stable)
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - name: cargo fmt --check
         run: |
           cargo fmt --all --check \
