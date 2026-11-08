@@ -406,7 +406,14 @@ impl Hub {
         let mut st = self.lock();
         let cleared = st.store.skill_confirm_origin(&fixed.repo, &p.origin, &tenant)?;
         st.publish();
-        Ok(OriginConfirmed { origin: p.origin, tenant, cleared })
+        let warning = (p.origin != live).then(|| {
+            format!(
+                "the checkout's remote.origin.url still points to {live}: new tasks there wait for a confirmation \
+                 again until it is set back to {}",
+                p.origin
+            )
+        });
+        Ok(OriginConfirmed { origin: p.origin, tenant, cleared, warning })
     }
 }
 
@@ -1514,9 +1521,13 @@ pub(crate) mod tests {
         assert!(matches!(bad, Err(HubError::Invalid(_))), "{bad:?}");
         let r = k.hub.skill_confirm_origin(&Caller::Person, confirm("github.com/acme/app")).unwrap();
         assert_eq!((r.tenant.as_str(), r.cleared), ("github.com/acme", 2));
+        // Confirming the pinned origin does not fix the checkout's remote: say so.
+        let w = r.warning.as_deref().unwrap_or_default();
+        assert!(w.contains("remote.origin.url") && w.contains("github.com/other/x"), "{w:?}");
         assert_eq!(k.hub.lock().store.skill_origin_of(&c.id).unwrap().unwrap().observed, None);
         // Confirming the new origin re-pins the checkout for new tasks.
-        k.hub.skill_confirm_origin(&Caller::Person, confirm("github.com/other/x")).unwrap();
+        let r = k.hub.skill_confirm_origin(&Caller::Person, confirm("github.com/other/x")).unwrap();
+        assert_eq!(r.warning, None, "the live origin was confirmed");
         let d = create_in(&k, &Caller::Person, "d", "g");
         let o = k.hub.lock().store.skill_origin_of(&d.id).unwrap().unwrap();
         assert_eq!((o.tenant.as_str(), o.observed), ("github.com/other", None));

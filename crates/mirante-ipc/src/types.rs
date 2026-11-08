@@ -925,6 +925,10 @@ pub struct OriginConfirmed {
     pub tenant: String,
     /// Tasks of the checkout fixed to this origin that get skills again.
     pub cleared: usize,
+    /// When the confirmed origin is not the checkout's live `remote.origin.url`: new tasks
+    /// will wait for a confirmation again until the remote is fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// A lint finding (`rule`, `severity`, `file`, `line`, `message`).
