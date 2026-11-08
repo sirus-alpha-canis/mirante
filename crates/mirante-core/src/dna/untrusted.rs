@@ -64,10 +64,16 @@ fn invisible(c: char) -> bool {
     )
 }
 
+/// Whether [`line`] (and every agent-facing view) strips `c`: a control character (C0,
+/// DEL, C1; not `\n` or `\t`) or an invisible format character. Skill lint refuses them.
+pub fn hidden(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t') || invisible(c)
+}
+
 /// `text` without control characters (C0, DEL, C1; `\n` and `\t` kept) and invisible
 /// format characters.
 fn strip_controls(text: &str) -> String {
-    text.chars().filter(|&c| !((c.is_control() && c != '\n' && c != '\t') || invisible(c))).collect()
+    text.chars().filter(|&c| !hidden(c)).collect()
 }
 
 /// `<` and the characters that read like it (fullwidth, small, single angle quotation
