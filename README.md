@@ -1,5 +1,7 @@
 # Mirante
 
+[![CI](https://github.com/sirus-alpha-canis/mirante/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sirus-alpha-canis/mirante/actions/workflows/ci.yml)
+
 Mirante is a local-first cockpit for dispatching and supervising coding agents. It runs
 Claude Code and Codex side by side, each task in its own git worktree, and more agents (via
 ACP) are planned. Task status comes from the agents' hooks and protocol events, never from
@@ -260,6 +262,11 @@ cargo clippy --workspace --all-targets
 pnpm --dir apps/cockpit test       # Vitest
 pnpm --dir apps/cockpit typecheck
 ```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request and
+push to `main`: the workspace build, tests and both clippy passes on macOS, the core crates
+and clippy on Linux, and the app's tests, typecheck, build and Tauri crate checks. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md#checks).
 
 The tests against the real agents are ignored by default. They need your logins and spend
 plan quota; see the header of `crates/mirante-daemon/tests/real_agents.rs`.

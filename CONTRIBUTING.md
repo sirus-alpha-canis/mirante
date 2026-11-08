@@ -27,16 +27,38 @@ dependencies, under their own licenses (see `THIRD_PARTY_NOTICES.md`).
 
 ## Checks
 
-Run these before you open a PR. CI, once set up, will run the same ones.
+Run these before you open a PR. CI runs the same ones (see below).
 
 ```bash
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"   # rustup's toolchain, not Homebrew cargo
 cargo build --workspace
 cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features mirante-bridge/fake -- -D warnings
 pnpm --dir apps/cockpit test
 pnpm --dir apps/cockpit typecheck
 ```
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull request and every
+push to `main`. It uses no secrets and has read-only access to the repo.
+
+- **rust (macOS)**, the main gate: `cargo build --workspace --all-targets`,
+  `cargo test --workspace` (the e2e tests run against a fake `claude`; the real-agent tests
+  stay ignored), both clippy passes above with `-D warnings`, and the e2e suite again on its
+  own (`cargo test -p mirante-cli --test e2e`).
+- **rust (Linux)**: clippy on the whole workspace, and the `mirante-core` and `mirante-ipc`
+  tests as the gate. The rest of the workspace's tests also run there, but only as
+  information, until the daemon's Linux paths have been proven.
+- **cockpit (macOS)**: in `apps/cockpit`, `pnpm install --frozen-lockfile`, `pnpm test`,
+  `pnpm typecheck` and `pnpm build`, then `cargo test` and
+  `cargo clippy --all-targets -- -D warnings` in `src-tauri` (its own workspace).
+- **rustfmt (non-blocking)**: `cargo fmt --all --check`, reported as a warning only, since
+  the tree is not formatted yet.
+
+CI does not run the app smoke test or the `docs/dogfood/` checklists: they open windows
+or need real agents.
 
 Format the Rust files you touch with `rustfmt` (the repo has a `rustfmt.toml`; not every
 existing file is formatted yet, so don't reformat unrelated files in your PR).
