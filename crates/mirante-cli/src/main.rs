@@ -397,7 +397,7 @@ fn memory_check(paths: &Paths, repo: Option<String>, rev: Option<String>, offlin
     let graph: DnaGraph = c.call(method::DNA_GRAPH, &at)?;
     let (mut stale, mut unverifiable, mut anchors) = (0, 0, 0);
     for bad in &report.invalid {
-        println!("invalid  {}  {}", mirante_core::dna::untrusted::line(&bad.file, 200), bad.error);
+        println!("{}", render::invalid_line(&bad.file, &bad.error));
     }
     for n in graph.nodes.iter().filter(|n| n.status == "active") {
         for a in &n.anchors {

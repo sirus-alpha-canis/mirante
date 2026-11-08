@@ -8,7 +8,7 @@ use mirante_core::dna::check::{check_all, rev_parse, AnchorState};
 use mirante_core::dna::index::scan;
 use mirante_core::git::Git;
 
-use crate::render::check_line;
+use crate::render::{self, check_line};
 
 /// What a check found: one printable line per anchor (and per broken note), and counts.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -54,7 +54,7 @@ pub fn check(repo: &Path, rev: &str) -> Result<(Report, String), String> {
     let mut r = Report::default();
     for bad in &found.invalid {
         r.invalid += 1;
-        r.lines.push(format!("invalid  {}  {}", mirante_core::dna::untrusted::line(&bad.file, 200), bad.error));
+        r.lines.push(render::invalid_line(&bad.file, &bad.error));
     }
     let active: Vec<_> = found.notes.iter().filter(|n| n.parse_error.is_none() && n.status == "active").collect();
     let anchors: Vec<_> = active.iter().flat_map(|n| n.anchors.iter().cloned()).collect();
@@ -157,5 +157,20 @@ mod tests {
         assert!(r.lines.iter().any(|l| l.starts_with("invalid  c-note.md")), "{:?}", r.lines);
         assert!(check(&repo, "no-such-rev").is_err());
         assert!(toplevel(d.path()).is_err());
+    }
+
+    #[test]
+    fn a_parse_error_is_printed_without_terminal_controls() {
+        let d = TestDir::new();
+        let repo = d.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "trunk"]);
+        commit(&repo, "a.rs", "one\n");
+        let evil = "---\ntitle: \"\u{1b}]0;owned\u{7}\u{1b}[2J\n---\nbody\n";
+        commit(&repo, ".mirante/memory/evil.md", evil);
+        let (r, _) = check(&repo, "HEAD").unwrap();
+        assert_eq!(r.invalid, 1, "{r:?}");
+        let line = r.lines.iter().find(|l| l.starts_with("invalid  evil.md")).expect("the invalid line");
+        assert!(!line.contains(['\u{1b}', '\u{7}', '\n']), "{line:?}");
     }
 }

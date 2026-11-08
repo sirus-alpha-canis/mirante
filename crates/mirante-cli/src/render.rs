@@ -48,6 +48,12 @@ pub fn check_line(state: &str, slug: &str, path: &str, start: u32, end: u32, rea
     out
 }
 
+/// A note file `check` could not read or parse: `invalid  file  error`. Both come from the
+/// repo (the error quotes the file's text): controls stripped.
+pub fn invalid_line(file: &str, error: &str) -> String {
+    format!("invalid  {}  {}", line(file, 200), line(error, 300))
+}
+
 /// What `check` says about an anchor the daemon reported (a relocated one: where it is now).
 pub fn anchor_reason(a: &AnchorView) -> Option<String> {
     match (a.now_start, a.now_end, &a.reason) {
