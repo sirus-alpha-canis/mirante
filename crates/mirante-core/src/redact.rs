@@ -7,8 +7,11 @@ const REDACTED: &str = "«redacted»";
 /// `text` with the credentials a command, URL or note commonly carries masked: an
 /// `Authorization:` header value, a `Bearer` token, the `user:password@` of a URL,
 /// assignments whose name says secret (`*_KEY=`, `*TOKEN*=`, `*SECRET*=`, `*PASSWORD*=`,
-/// any case), query parameters such as `?token=` / `&api_key=` / `&sig=`, PEM private key
-/// blocks, and provider tokens (`AKIA…`, `ghp_…`, `github_pat_…`, `sk-…`, `xox?-…`, JWTs).
+/// any case, also spaced `key = v`, YAML `password: v` and JSON `"api_key": "v"`), query
+/// parameters such as `?token=` / `&api_key=` / `&sig=`, PEM and PGP private key blocks,
+/// and provider tokens (AWS `AKIA…`/`ASIA…`, GitHub `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`/
+/// `github_pat_`, OpenAI/Anthropic `sk-…`, Slack `xox?-…`/`xapp-…`, Google `AIza…`,
+/// Stripe `sk_live_`/`rk_live_`, GitLab `glpat-`, npm `npm_`, Hugging Face `hf_`, JWTs).
 /// Best effort: it lowers what leaks, it is no guarantee.
 pub fn redact(text: &str) -> String {
     redact_counted(text).0
@@ -41,7 +44,8 @@ fn redact_pem(text: &str) -> String {
             .position(|c| !(c.is_ascii_uppercase() || *c == b' '))
             .map_or(b.len(), |p| label_start + p);
         let label = &text[label_start..label_end];
-        if !label.ends_with("PRIVATE KEY") || !b[label_end..].starts_with(b"-----") {
+        let private = label.ends_with("PRIVATE KEY") || label.ends_with("PRIVATE KEY BLOCK");
+        if !private || !b[label_end..].starts_with(b"-----") {
             at = label_start;
             continue;
         }
@@ -56,18 +60,57 @@ fn redact_pem(text: &str) -> String {
 /// A token prefix, the minimum length of the whole token, and its other bytes.
 type Prefixed = (&'static [u8], usize, fn(u8) -> bool);
 
+fn upper_digit(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit()
+}
+
+fn alnum(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+fn alnum_us(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn alnum_dash(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'-'
+}
+
+fn alnum_us_dash(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
+}
+
 const PREFIXED: &[Prefixed] = &[
-    (b"AKIA", 20, |c| c.is_ascii_uppercase() || c.is_ascii_digit()),
-    (b"ghp_", 20, |c| c.is_ascii_alphanumeric() || c == b'_'),
-    (b"gho_", 20, |c| c.is_ascii_alphanumeric() || c == b'_'),
-    (b"ghs_", 20, |c| c.is_ascii_alphanumeric() || c == b'_'),
-    (b"github_pat_", 20, |c| c.is_ascii_alphanumeric() || c == b'_'),
-    (b"sk-", 20, |c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
-    (b"xoxa-", 10, |c| c.is_ascii_alphanumeric() || c == b'-'),
-    (b"xoxb-", 10, |c| c.is_ascii_alphanumeric() || c == b'-'),
-    (b"xoxp-", 10, |c| c.is_ascii_alphanumeric() || c == b'-'),
-    (b"xoxs-", 10, |c| c.is_ascii_alphanumeric() || c == b'-'),
+    (b"AKIA", 20, upper_digit),
+    (b"ASIA", 20, upper_digit),
+    (b"ghp_", 20, alnum_us),
+    (b"gho_", 20, alnum_us),
+    (b"ghs_", 20, alnum_us),
+    (b"ghu_", 20, alnum_us),
+    (b"ghr_", 20, alnum_us),
+    (b"github_pat_", 20, alnum_us),
+    (b"sk-", 20, alnum_us_dash),
+    (b"xapp-", 15, alnum_dash),
+    (b"AIza", 30, alnum_us_dash),
+    (b"sk_live_", 20, alnum),
+    (b"rk_live_", 20, alnum),
+    (b"sk_test_", 20, alnum),
+    (b"rk_test_", 20, alnum),
+    (b"glpat-", 20, alnum_us_dash),
+    (b"npm_", 30, alnum),
+    (b"hf_", 30, alnum),
 ];
+
+/// A Slack token: `xox` + a lowercase letter + `-` or `.` (`xoxb-…`, `xoxe.xoxp-…`).
+fn slack_token(b: &[u8], i: usize) -> Option<usize> {
+    let t = &b[i..];
+    let is_slack = t.len() > 5 && t.starts_with(b"xox") && t[3].is_ascii_lowercase() && matches!(t[4], b'-' | b'.');
+    if !is_slack {
+        return None;
+    }
+    let end = i + t.iter().position(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.'))).unwrap_or(t.len());
+    (end - i >= 10).then_some(end)
+}
 
 fn jwt_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
@@ -90,7 +133,7 @@ fn redact_prefixed(text: &str) -> String {
             let end = i + prefix.len() + rest.iter().position(|c| !ok(*c)).unwrap_or(rest.len());
             (end - i >= *min).then_some(end)
         });
-        let hit = hit.or_else(|| {
+        let hit = hit.or_else(|| slack_token(b, i)).or_else(|| {
             if !b[i..].starts_with(b"eyJ") {
                 return None;
             }
@@ -191,9 +234,55 @@ fn redact_userinfo(text: &str) -> String {
 
 /// A `name=` whose value is masked. `in_query`: the name follows `?` or `&`.
 fn secret_name(name: &str, in_query: bool) -> bool {
-    let up = name.to_ascii_uppercase();
+    let up = name.to_ascii_uppercase().replace('-', "_");
     let env = up.ends_with("_KEY") || ["TOKEN", "SECRET", "PASSWORD", "PASSWD"].iter().any(|w| up.contains(w));
     env || (in_query && ["KEY", "PASS", "SIG", "AUTH", "CREDENTIAL"].iter().any(|w| up.contains(w)))
+}
+
+/// A `name:` whose value is masked: stricter than `=` (code is full of `token_len: usize`),
+/// the name must end with the secret word.
+fn secret_key(name: &str) -> bool {
+    let up = name.to_ascii_uppercase().replace('-', "_");
+    ["_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD"].iter().any(|w| up.ends_with(w))
+}
+
+/// Type names that follow `name:` in code (`password: String`, `token: Option<&str>`,
+/// `secret: string`): not values.
+fn is_type_name(v: &str) -> bool {
+    const TYPES: &[&str] = &[
+        "String",
+        "Option",
+        "Vec",
+        "Box",
+        "Arc",
+        "Rc",
+        "Cow",
+        "Secret",
+        "SecretString",
+        "SecretBox",
+        "PathBuf",
+        "Path",
+        "Bytes",
+        "Uuid",
+        "str",
+        "string",
+        "number",
+        "boolean",
+        "bool",
+        "any",
+        "unknown",
+        "usize",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "i32",
+        "i64",
+    ];
+    let v = v.trim_start_matches('&');
+    let v = v.strip_prefix("'static ").unwrap_or(v);
+    let ident = v.split(['<', '[', '?']).next().unwrap_or_default();
+    TYPES.contains(&ident)
 }
 
 fn redact_assignments(text: &str) -> String {
@@ -201,25 +290,58 @@ fn redact_assignments(text: &str) -> String {
     let mut ranges = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i] != b'=' {
+        let sep = b[i];
+        if sep != b'=' && sep != b':' {
             i += 1;
             continue;
         }
-        let name_start = b[..i].iter().rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_')).map_or(0, |p| p + 1);
-        let in_query = name_start > 0 && matches!(b[name_start - 1], b'?' | b'&');
-        let start = i + 1;
-        if name_start == i || !secret_name(&text[name_start..i], in_query) {
-            i = start;
+        let prev = if i > 0 { b[i - 1] } else { 0 };
+        let next = b.get(i + 1).copied().unwrap_or(0);
+        let comparison = sep == b'=' && (matches!(next, b'=' | b'>') || matches!(prev, b'=' | b'!' | b'<' | b'>'));
+        let path_or_url = sep == b':' && (matches!(next, b':' | b'/' | b'=') || prev == b':');
+        if comparison || path_or_url {
+            i += 1;
             continue;
         }
+        // The name: back over `:` of `:=`, spaces, and a closing quote (`"api_key": …`).
+        let mut j = if sep == b'=' && prev == b':' { i - 1 } else { i };
+        while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+            j -= 1;
+        }
+        let spaced = j < i;
+        if j > 0 && matches!(b[j - 1], b'"' | b'\'') {
+            j -= 1;
+        }
+        let name_end = j;
+        let name_start = b[..name_end]
+            .iter()
+            .rposition(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')))
+            .map_or(0, |p| p + 1);
+        if name_start == name_end {
+            i += 1;
+            continue;
+        }
+        let name = &text[name_start..name_end];
+        let in_query = !spaced && name_start > 0 && matches!(b[name_start - 1], b'?' | b'&');
+        let secret = if sep == b'=' { secret_name(name, in_query) } else { secret_key(name) };
+        if !secret {
+            i += 1;
+            continue;
+        }
+        let mut start = i + 1;
+        while matches!(b.get(start), Some(b' ' | b'\t')) {
+            start += 1;
+        }
+        let quoted = matches!(b.get(start), Some(b'"' | b'\''));
         let end = match b.get(start) {
             Some(q @ (b'"' | b'\'')) => b[start + 1..].iter().position(|c| c == q).map_or(b.len(), |p| start + p + 2),
+            _ if sep == b':' => value_end(b, start, b"\"'&;#)`,}"),
             _ => value_end(b, start, b"\"'&;#)`"),
         };
-        if end > start {
+        if end > start && !(sep == b':' && !quoted && is_type_name(&text[start..end])) {
             ranges.push((start, end));
         }
-        i = end.max(start);
+        i = end.max(i + 1);
     }
     mask(text, &ranges)
 }
@@ -265,6 +387,56 @@ mod tests {
         }
         let pem = "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nb";
         assert_eq!(redact(pem), "a\n«redacted»\nb");
+    }
+
+    #[test]
+    fn masks_more_providers_and_pgp_keys() {
+        let tokens = [
+            "xoxr-1234567890-abcdef",
+            "xoxe.xoxp-1-abcdefghijkl",
+            "xoxc-1234567890-abcdef",
+            "xoxd-1234567890abcdef",
+            "xapp-1-A0123456789-0123456789-abcdef",
+            "ghu_0123456789abcdefghijABCDEFGHIJ0123",
+            "ghr_0123456789abcdefghijABCDEFGHIJ0123",
+            "ASIAABCDEFGHIJKLMNOP",
+            "AIzaSyA0123456789abcdefghijklmnopqrstu",
+            concat!("sk_", "live_0123456789abcdefghijklmn"),
+            concat!("rk_", "live_0123456789abcdefghijklmn"),
+            "glpat-0123456789abcdefghij",
+            "npm_0123456789abcdefghijklmnopqrstuvwxyz",
+            "hf_0123456789abcdefghijklmnopqrstuvwxyzAB",
+        ];
+        for t in tokens {
+            let r = redact(&format!("use {t} now"));
+            assert_eq!(r, "use «redacted» now", "{t}");
+        }
+        let pgp = "x\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOY\n-----END PGP PRIVATE KEY BLOCK-----\ny";
+        assert_eq!(redact(pgp), "x\n«redacted»\ny");
+    }
+
+    #[test]
+    fn masks_spaced_colon_and_quoted_assignments() {
+        let cases = [
+            ("api_key = abc123", "api_key = «redacted»"),
+            ("password: hunter2", "password: «redacted»"),
+            ("  db_password:  'hunter2'", "  db_password:  «redacted»"),
+            ("{\"api_key\": \"v4lue\", \"x\": 1}", "{\"api_key\": «redacted», \"x\": 1}"),
+            ("SECRET = \"a b\"", "SECRET = «redacted»"),
+            ("--password=hunter2", "--password=«redacted»"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(input), want, "{input}");
+        }
+        for code in [
+            "if token == expected { }",
+            "struct C { password: String, token: Option<String> }",
+            "let n = token::parse(x);",
+            "fn f(password: &str) {}",
+            "interface A { secret: string }",
+        ] {
+            assert_eq!(redact(code), code);
+        }
     }
 
     #[test]
