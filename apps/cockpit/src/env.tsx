@@ -14,7 +14,15 @@ export interface Env {
   startDaemon(): Promise<void>;
   /** Native notification (already decided: what it says, and that it is not on screen). */
   notify(n: Note): void;
+  /** The native folder picker (one folder); null when cancelled. */
+  pickFolder(): Promise<string | null>;
+  /** The user's home directory, as the app process sees it (for "~/…"). */
+  homeDir(): Promise<string>;
+  /** What is at an absolute path. */
+  pathKind(path: string): Promise<PathKind>;
 }
+
+export type PathKind = "dir" | "file" | "missing";
 
 export const EnvContext = createContext<Env | null>(null);
 

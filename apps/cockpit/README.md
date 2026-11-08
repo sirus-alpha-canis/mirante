@@ -79,6 +79,13 @@ open apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app
 The bundle is not signed or notarized. Copied to another Mac it is quarantined; clear that
 with `xattr -dr com.apple.quarantine Mirante.app` (only for a build you made yourself).
 
+## Projects
+
+Add a repository on the left with **Choose…** (the macOS folder picker; the app may use the
+picker's `open` and nothing else of the dialog plugin) or by pasting its path and **Add**
+(`~/…` is expanded with your home folder). A path that is missing or a file is refused there;
+whether it is a git checkout is checked when you dispatch a task to it.
+
 ## Dispatch
 
 Home's form: pick **Claude** or **Codex** (remembered on this machine), the repository (one

@@ -1,4 +1,5 @@
-//! Tauri shell of the cockpit: six commands that forward to `mirante-bridge`. No state of
+//! Tauri shell of the cockpit: six commands that forward to `mirante-bridge`, plus two
+//! small path helpers for adding a project (the home directory, and what is at a path). No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
 //! plugin (github.com only, see `capabilities/default.json`), never in the window itself,
@@ -132,12 +133,46 @@ async fn daemon_start(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// The user's home directory, for "~/…" typed in Add project.
+#[tauri::command]
+fn home_dir(app: AppHandle) -> Result<String, String> {
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
+    home.to_str().map(str::to_owned).ok_or_else(|| "the home directory is not valid UTF-8".to_string())
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PathKind {
+    Dir,
+    File,
+    Missing,
+}
+
+/// What is at `path` (following symlinks); relative paths are refused.
+fn path_kind_of(path: &std::path::Path) -> Result<PathKind, String> {
+    if !path.is_absolute() {
+        return Err(format!("{} is not an absolute path", path.display()));
+    }
+    Ok(match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => PathKind::Dir,
+        Ok(_) => PathKind::File,
+        Err(_) => PathKind::Missing,
+    })
+}
+
+/// Whether a project path typed in Add project is a folder (a friendly check before adding).
+#[tauri::command]
+fn path_kind(path: String) -> Result<PathKind, String> {
+    path_kind_of(std::path::Path::new(&path))
+}
+
 pub fn run() {
     let paths = Paths::from_env().expect("cannot locate ~/.mirante (is HOME set?)");
     let socket = paths.socket();
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
                 .on_navigation(|_, url| is_app_url(url, cfg!(debug_assertions)))
@@ -160,7 +195,16 @@ pub fn run() {
             Ok(())
         })
         .manage(Cockpit { paths, socket, stream: Mutex::new(None), attachments: Attachments::default() })
-        .invoke_handler(tauri::generate_handler![rpc, subscribe, attach_open, attach_write, attach_close, daemon_start])
+        .invoke_handler(tauri::generate_handler![
+            rpc,
+            subscribe,
+            attach_open,
+            attach_write,
+            attach_close,
+            daemon_start,
+            home_dir,
+            path_kind
+        ])
         .on_window_event(|window, event| {
             if let WindowEvent::Destroyed = event {
                 window.state::<Cockpit>().attachments.close_all();
@@ -201,6 +245,20 @@ mod tests {
     fn typed_input_is_decoded_from_base64_and_garbage_is_a_protocol_error() {
         assert_eq!(typed_bytes("bHMN/w==").unwrap(), vec![0x6c, 0x73, 0x0d, 0xff]);
         assert!(matches!(typed_bytes("not base64!"), Err(BridgeError::Protocol { .. })));
+    }
+
+    #[test]
+    fn path_kind_tells_folders_files_and_missing_paths_apart() {
+        let dir = std::env::temp_dir().join(format!("mirante-cockpit-pk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(path_kind_of(&dir), Ok(PathKind::Dir));
+        assert_eq!(path_kind_of(&file), Ok(PathKind::File));
+        assert_eq!(path_kind_of(&dir.join("nope")), Ok(PathKind::Missing));
+        assert!(path_kind_of(std::path::Path::new("relative/x")).is_err());
+        assert_eq!(serde_json::to_value(PathKind::Missing).unwrap(), "missing");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addRepo, loadRepos, removeRepo, REPOS_KEY } from "./repos";
+import { addRepo, expandHome, loadRepos, removeRepo, REPOS_KEY } from "./repos";
 
 function mem() {
   const m = new Map<string, string>();
@@ -32,5 +32,18 @@ describe("repo registry", () => {
     expect(addRepo(s, "shop")).toMatchObject({ ok: false });
     s.setItem(REPOS_KEY, "{not json");
     expect(loadRepos(s)).toEqual([]);
+  });
+});
+
+describe("expandHome", () => {
+  it("expands ~ and ~/… with the home the app was given", () => {
+    expect(expandHome("~/code/shop", "/Users/me")).toBe("/Users/me/code/shop");
+    expect(expandHome("  ~/code/shop ", "/Users/me/")).toBe("/Users/me/code/shop");
+    expect(expandHome("~", "/Users/me")).toBe("/Users/me");
+  });
+
+  it("leaves other paths alone, and ~user unexpanded (addRepo then explains it)", () => {
+    expect(expandHome("/a/b", "/Users/me")).toBe("/a/b");
+    expect(expandHome("~bob/x", "/Users/me")).toBe("~bob/x");
   });
 });

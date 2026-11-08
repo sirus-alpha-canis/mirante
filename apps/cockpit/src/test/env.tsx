@@ -35,6 +35,9 @@ export function makeEnv(answers: Record<string, Answer> = {}) {
     openUrl: vi.fn(async () => {}),
     startDaemon: vi.fn(async () => {}),
     notify: vi.fn(),
+    pickFolder: vi.fn(async () => null),
+    homeDir: vi.fn(async () => "/Users/me"),
+    pathKind: vi.fn(async () => "dir" as const),
   };
   return {
     env,

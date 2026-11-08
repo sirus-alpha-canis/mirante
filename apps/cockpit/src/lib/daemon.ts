@@ -125,3 +125,13 @@ export async function daemonStart(): Promise<void> {
     throw typeof e === "string" ? new DaemonError({ kind: "disconnected", message: e }) : toDaemonError(e);
   }
 }
+
+/** The user's home directory as the app process sees it (Tauri's path resolver). */
+export async function homeDir(): Promise<string> {
+  return await invoke<string>("home_dir");
+}
+
+/** What is at `path` (absolute): "dir", "file" or "missing". */
+export async function pathKind(path: string): Promise<"dir" | "file" | "missing"> {
+  return await invoke<"dir" | "file" | "missing">("path_kind", { path });
+}

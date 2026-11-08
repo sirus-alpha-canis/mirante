@@ -13,12 +13,20 @@ export function loadRepos(store: KV): string[] {
   }
 }
 
+/** "~" and "~/…" against `home` (the app's, from the Tauri side); anything else unchanged
+ * ("~bob/…" too: `normaliseRepoPath` then explains it). */
+export function expandHome(raw: string, home: string): string {
+  const text = raw.trim();
+  if (text !== "~" && !text.startsWith("~/")) return text;
+  return home.replace(/\/+$/, "") + text.slice(1);
+}
+
 export type Added = { ok: true; repos: string[] } | { ok: false; error: string };
 
 /** `raw` as one absolute path: no doubled slashes or "." segments; ".." and "~" refused. */
 export function normaliseRepoPath(raw: string): { ok: true; path: string } | { ok: false; error: string } {
   const text = raw.trim();
-  if (text.startsWith("~")) return { ok: false, error: "'~' is not expanded here: type the full path, e.g. /Users/me/code/shop" };
+  if (text.startsWith("~")) return { ok: false, error: "'~user' is not expanded here: type the full path, e.g. /Users/me/code/shop" };
   if (!text.startsWith("/")) return { ok: false, error: "use the repo's absolute path, e.g. /Users/me/code/shop" };
   const parts = text.split("/").filter((p) => p !== "" && p !== ".");
   if (parts.includes("..")) return { ok: false, error: "use a path without '..' segments" };

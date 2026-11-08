@@ -6,7 +6,7 @@ import { RpcCode } from "../lib/protocol";
 import { skillProposals } from "../lib/skills";
 import { useSkillsVersion } from "../lib/useSkills";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
-import { addRepo, loadRepos, removeRepo } from "../lib/repos";
+import { addRepo, expandHome, loadRepos, normaliseRepoPath, removeRepo } from "../lib/repos";
 import type { Project } from "../store/select";
 import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
@@ -23,7 +23,7 @@ export function LeftRail(props: {
   onSkills?(): void;
   status: DaemonStatus | null;
 }) {
-  const { storage, rpc, cockpit } = useEnv();
+  const { storage, rpc, cockpit, pickFolder, homeDir, pathKind } = useEnv();
   const s = useStore();
   // The selected project's memory proposals waiting for a person (none when its memory is
   // off, the daemon is older, or the path is no repo).
@@ -53,12 +53,33 @@ export function LeftRail(props: {
     ];
   }, [s.tasks]);
 
-  const add = () => {
-    const r = addRepo(storage, path);
-    if (!r.ok) return setError(r.error);
-    setError(null);
-    setPath("");
-    props.onReposChanged(r.repos);
+  /** Adds a typed or picked folder: "~/…" expanded with the app's home, then it must be a
+   * folder (whether it is a git checkout the daemon checks when a task is created there). */
+  const add = async (raw: string, typed: boolean) => {
+    try {
+      const text = raw.trim();
+      const expanded = text === "~" || text.startsWith("~/") ? expandHome(text, await homeDir()) : text;
+      const n = normaliseRepoPath(expanded);
+      if (!n.ok) return setError(n.error);
+      const kind = await pathKind(n.path);
+      if (kind === "missing") return setError(`${n.path} does not exist`);
+      if (kind === "file") return setError(`${n.path} is a file, not a folder`);
+      const r = addRepo(storage, n.path);
+      if (!r.ok) return setError(r.error);
+      setError(null);
+      if (typed) setPath("");
+      props.onReposChanged(r.repos);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const choose = async () => {
+    try {
+      const picked = await pickFolder();
+      if (picked) await add(picked, false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
   // Only repos added here can be removed; a task's repo stays listed while the task exists.
   const added = new Set(loadRepos(storage));
@@ -113,13 +134,16 @@ export function LeftRail(props: {
         className="add-repo"
         onSubmit={(e) => {
           e.preventDefault();
-          add();
+          void add(path, true);
         }}
       >
         <label htmlFor="repo-path" className="sr-only">
           Repository path
         </label>
-        <input id="repo-path" placeholder="/path/to/repo" value={path} onChange={(e) => setPath(e.target.value)} />
+        <input id="repo-path" placeholder="/path/to/repo or ~/…" value={path} onChange={(e) => setPath(e.target.value)} />
+        <button className="btn btn-small" type="button" onClick={() => void choose()} title="Pick a repository folder">
+          Choose…
+        </button>
         <button className="btn btn-small" type="submit">
           Add
         </button>

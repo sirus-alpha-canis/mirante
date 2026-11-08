@@ -1,10 +1,11 @@
 // The desktop shell's attack surface, pinned: a CSP with no remote origins or eval, and
-// capabilities limited to notifications plus opening github.com pages. Widening either
+// capabilities limited to notifications, opening github.com pages and the folder picker. Widening either
 // must be a deliberate edit of this test.
 import { describe, expect, it } from "vitest";
 import capabilities from "../src-tauri/capabilities/default.json";
 import conf from "../src-tauri/tauri.conf.json";
 import shell from "../src-tauri/src/lib.rs?raw";
+import picker from "./main.tsx?raw";
 import bridgeRpc from "../../../crates/mirante-bridge/src/rpc.rs?raw";
 import { M } from "./lib/protocol";
 
@@ -41,7 +42,7 @@ describe("Tauri security baseline", () => {
     expect(shell).toContain(".on_new_window(|_, _| NewWindowResponse::Deny)");
   });
 
-  it("grants only notifications and opening github.com URLs", () => {
+  it("grants only notifications, opening github.com URLs, and the folder picker", () => {
     // Notifications: exactly the three commands the plugin's \`window.Notification\` shim
     // calls (is_permission_granted, request_permission, notify); not the plugin's default
     // set (channels, pending/active lists, cancel, listeners…).
@@ -51,10 +52,31 @@ describe("Tauri security baseline", () => {
       "notification:allow-request-permission",
       "notification:allow-notify",
       "opener:allow-open-url",
+      // The native "Choose…" folder picker (Add project): `open` only, no save/ask/message.
+      "dialog:allow-open",
     ]);
     const opener = capabilities.permissions.find((p) => typeof p !== "string");
     expect(opener).toEqual({ identifier: "opener:allow-open-url", allow: [{ url: "https://github.com/*" }] });
     expect(capabilities.windows).toEqual(["main"]);
+    // The picker is asked for one folder, never files or several.
+    expect(picker).toContain("directory: true");
+    expect(picker).toContain("multiple: false");
+    // No filesystem plugin is registered (the dialog crate depends on it, the app does not use it).
+    expect(shell).not.toContain("tauri_plugin_fs");
+  });
+
+  it("the shell's own commands are pinned", () => {
+    const list = /generate_handler!\[([^\]]*)\]/.exec(shell)?.[1] ?? "";
+    expect(list.split(",").map((c) => c.trim())).toEqual([
+      "rpc",
+      "subscribe",
+      "attach_open",
+      "attach_write",
+      "attach_close",
+      "daemon_start",
+      "home_dir",
+      "path_kind",
+    ]);
   });
 
   it("reaches the daemon only through the bridge's allowlist, pinned here too", () => {

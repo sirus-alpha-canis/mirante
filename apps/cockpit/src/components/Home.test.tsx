@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { type DaemonStatus, RpcCode, type TaskDiff } from "../lib/protocol";
 import { REPOS_KEY } from "../lib/repos";
 import { AGENT_KEY } from "./DispatchComposer";
@@ -238,6 +238,53 @@ describe("Home (V3 group chat)", () => {
     setup();
     await userEvent.type(screen.getByLabelText("Repository path"), "shop{Enter}");
     expect(await screen.findByRole("alert")).toHaveTextContent("absolute path");
+  });
+
+  describe("adding a project", () => {
+    const rail = () => screen.getByRole("navigation", { name: "Projects and agents" });
+    const mount = (over: Partial<ReturnType<typeof makeEnv>["env"]> = {}) => {
+      const h = makeEnv();
+      h.load([]);
+      h.env.storage.setItem(REPOS_KEY, JSON.stringify(["/repos/shop"]));
+      Object.assign(h.env, over);
+      renderWith(h.env, <Harness env={h.env} />);
+      return h;
+    };
+
+    it("Choose… opens the native folder picker and adds the folder picked", async () => {
+      const h = mount({ pickFolder: vi.fn(async () => "/Users/me/code/api") });
+      await userEvent.click(within(rail()).getByRole("button", { name: "Choose…" }));
+      expect(h.env.pickFolder).toHaveBeenCalledTimes(1);
+      expect(await within(rail()).findByRole("button", { name: /^api/ })).toBeInTheDocument();
+      expect(JSON.parse(h.env.storage.getItem(REPOS_KEY)!)).toEqual(["/repos/shop", "/Users/me/code/api"]);
+    });
+
+    it("a cancelled picker adds nothing and says nothing", async () => {
+      const h = mount({ pickFolder: vi.fn(async () => null) });
+      await userEvent.click(within(rail()).getByRole("button", { name: "Choose…" }));
+      await waitFor(() => expect(h.env.pickFolder).toHaveBeenCalled());
+      expect(within(rail()).queryByRole("alert")).toBeNull();
+      expect(JSON.parse(h.env.storage.getItem(REPOS_KEY)!)).toEqual(["/repos/shop"]);
+    });
+
+    it("a pasted ~/ path is expanded with the home the app reports", async () => {
+      const h = mount({ homeDir: vi.fn(async () => "/Users/me") });
+      await userEvent.type(screen.getByLabelText("Repository path"), "~/code/api");
+      await userEvent.click(within(rail()).getByRole("button", { name: "Add" }));
+      expect(await within(rail()).findByRole("button", { name: /^api/ })).toBeInTheDocument();
+      expect(h.env.pathKind).toHaveBeenCalledWith("/Users/me/code/api");
+      expect(screen.getByLabelText("Repository path")).toHaveValue("");
+    });
+
+    it.each([
+      ["missing", "/Users/me/nope does not exist"],
+      ["file", "/Users/me/nope is a file, not a folder"],
+    ] as const)("a path that is %s is refused with a plain reason", async (kind, msg) => {
+      const h = mount({ pathKind: vi.fn(async () => kind) });
+      await userEvent.type(screen.getByLabelText("Repository path"), "/Users/me/nope{Enter}");
+      expect(await within(rail()).findByRole("alert")).toHaveTextContent(msg);
+      expect(JSON.parse(h.env.storage.getItem(REPOS_KEY)!)).toEqual(["/repos/shop"]);
+    });
   });
 
   it("Claude cards follow the daemon's inline-answer setting (off when unknown)", async () => {
