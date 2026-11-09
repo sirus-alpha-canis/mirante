@@ -45,12 +45,17 @@ Save it inside a task's worktree (so it runs in that session's process tree).
 
 1. Two idle sessions (`mem-a`, `mem-b`) plus a hog run from a plain terminal outside Mirante:
    `python3 hog.py <about 80 % of RAM in MB> 512`.
-2. Expect: the `mirante watch` header goes `elevated` (the kernel pressure level reaches 2 — `sysctl kern.memorystatus_vm_pressure_level`; swap use alone does not count),
-   `memory.paused` (no new dispatches or queued deliveries), and an offer to hibernate the
-   largest idle session (`mirante hibernate <id>` to accept).
+2. Expect: the `mirante watch` header goes `elevated` (the kernel pressure level reaches 2 — `sysctl kern.memorystatus_vm_pressure_level`; swap use alone does not count)
+   with `pausing: off`, and an offer to hibernate the largest idle session (`mirante
+   hibernate <id>` to accept). **Nothing pauses by default**: new dispatches and queued
+   deliveries go on (a busy Mac reports `warn` most of the time). To check the old
+   behaviour, set **Pause new sessions under memory pressure** to *When elevated* in the
+   app (Sessions), or start the daemon with `MIRANTE_MEMGUARD_PAUSE=elevated`: then expect
+   `memory.paused` here and `memory.resumed` once it eases (`critical`: only from step 3).
 3. Ctrl-C the hog the moment the header shows `critical`. Only if you deliberately let
    critical last 10 s: the largest IDLE session without a pending permission is hibernated
-   (`memory.auto_hibernated`), at most one per minute; `mirante wake <id>` resumes it.
+   (`memory.auto_hibernated`), at most one per minute; `mirante wake <id>` resumes it. This
+   happens whatever the pause setting says (it is the guard against a frozen machine).
 4. With a permission dialog open in `mem-b`, `mem-b` is never hibernated automatically; the
    event `memory.refused` says so.
 

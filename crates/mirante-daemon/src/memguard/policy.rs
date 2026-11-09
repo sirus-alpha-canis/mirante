@@ -5,10 +5,13 @@
 //! 100 % of it, each reported once when the state is entered. For the machine: a [`Level`]
 //! from the OS pressure signal and swap use, stepping up after [`UP_SAMPLES`] samples in a row
 //! and down only after [`CALM_SAMPLES`] calm samples below a lower threshold (hysteresis). The ladder:
-//! 1. `Elevated` → pause new dispatches and queued deliveries, offer to hibernate the
-//!    largest idle session (the user confirms; once per session per episode, and at most
+//! 1. `Elevated` → offer to hibernate the largest idle session (the user confirms; once per session per episode, and at most
 //!    once per `offer_cooldown`, 10 min, per session). Stepping up also takes
 //!    [`UP_SAMPLES`] samples in a row, so a flapping kernel level opens no episode;
+//!    nothing is paused: the guard is advisory unless [`Config::pause`] says otherwise
+//!    (`critical` or `elevated`: from that level on, new dispatches and queued deliveries
+//!    wait until it eases — macOS reports "warn" on a busy Mac most of the time, so pausing
+//!    there by default meant never doing anything);
 //! 2. `Critical` sustained for `critical_sustain` → hibernate the largest IDLE session
 //!    automatically, one action per cooldown. Never a session that is working (turn, tool,
 //!    background work) and never one with a pending permission request: when only such
@@ -22,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use super::sampler::{Pressure, SystemSample, TreeSample};
 use crate::driver::proctree::Proc;
+pub use mirante_ipc::types::PausePolicy;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -55,6 +59,9 @@ pub struct Config {
     pub leak_window: Duration,
     /// Linux only: launch agents under `systemd-run --user --scope -p MemoryHigh=<budget>`.
     pub systemd_scope: bool,
+    /// From which level new dispatches and queued deliveries pause (`Off`: never; the
+    /// default).
+    pub pause: PausePolicy,
 }
 
 impl Config {
@@ -73,6 +80,7 @@ impl Config {
             leak_mb_per_min: 200,
             leak_window: Duration::from_secs(300),
             systemd_scope: false,
+            pause: PausePolicy::Off,
         }
     }
 
@@ -196,6 +204,8 @@ struct Track {
 pub struct Policy {
     cfg: Config,
     level: Level,
+    /// What the last `Pause` said.
+    paused: bool,
     calm: u32,
     /// Samples in a row above the level, and the lowest level they reached.
     rising: u32,
@@ -245,6 +255,7 @@ impl Policy {
         Policy {
             cfg,
             level: Level::Normal,
+            paused: false,
             calm: 0,
             rising: 0,
             rising_to: Level::Normal,
@@ -264,6 +275,25 @@ impl Policy {
 
     pub fn level(&self) -> Level {
         self.level
+    }
+
+    /// New dispatches and queued deliveries wait (the last `Pause` said so).
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// The person's setting changed: the next tick pauses or resumes to match it.
+    pub fn set_pause(&mut self, pause: PausePolicy) {
+        self.cfg.pause = pause;
+    }
+
+    /// Whether `level` pauses under the configured policy.
+    fn pauses_at(&self, level: Level) -> bool {
+        match self.cfg.pause {
+            PausePolicy::Off => false,
+            PausePolicy::Critical => level >= Level::Critical,
+            PausePolicy::Elevated => level >= Level::Elevated,
+        }
     }
 
     pub fn session(&self, task_id: &str) -> Option<SessionMem> {
@@ -316,11 +346,11 @@ impl Policy {
                 self.episode += 1;
             }
             out.push(Action::LevelChanged { from, to: self.level });
-            if from == Level::Normal {
-                out.push(Action::Pause(true));
-            } else if self.level == Level::Normal {
-                out.push(Action::Pause(false));
-            }
+        }
+        let pause = self.pauses_at(self.level);
+        if pause != self.paused {
+            self.paused = pause;
+            out.push(Action::Pause(pause));
         }
         match self.level {
             Level::Critical => {
@@ -581,7 +611,7 @@ mod tests {
         for _ in 1..UP_SAMPLES {
             assert!(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])).is_empty());
         }
-        assert_eq!(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])), ["level:elevated", "pause:true"]);
+        assert_eq!(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])), ["level:elevated"]);
         assert_eq!(p.next_interval(), Duration::from_millis(500));
         // Swap at 72 %: below the 75 % entry threshold but above the 70 % exit margin.
         for _ in 0..5 {
@@ -590,7 +620,7 @@ mod tests {
         assert_eq!(p.level(), Level::Elevated);
         assert!(kinds(&p.tick(t0, &normal(), &[])).is_empty());
         assert!(kinds(&p.tick(t0, &normal(), &[])).is_empty());
-        assert_eq!(kinds(&p.tick(t0, &normal(), &[])), ["level:normal", "pause:false"]);
+        assert_eq!(kinds(&p.tick(t0, &normal(), &[])), ["level:normal"]);
         // Swap over 90 % with little free memory: elevated; falling under 5 %: critical.
         up(&mut p, t0, &sys(Pressure::Normal, 95, 3 * GB / 2));
         assert_eq!(p.level(), Level::Elevated);
@@ -664,14 +694,14 @@ mod tests {
         }
         assert_eq!(p.level(), Level::Normal);
         let warn = SystemSample { kernel_signal: true, ..sys(Pressure::Warn, 0, 8 * GB) };
-        assert_eq!(up(&mut p, t0 + Duration::from_secs(9), &warn), ["level:elevated", "pause:true"]);
+        assert_eq!(up(&mut p, t0 + Duration::from_secs(9), &warn), ["level:elevated"]);
         // Without a kernel signal the same swap counts only with little free memory.
         let mut q = Policy::new(cfg());
         assert!(kinds(&q.tick(t0, &sys(Pressure::Normal, 92, 4 * GB), &[])).is_empty());
     }
 
     #[test]
-    fn pressure_pauses_and_offers_the_largest_idle_session_once_per_episode() {
+    fn pressure_offers_the_largest_idle_session_once_per_episode() {
         let mut p = Policy::new(cfg());
         let t0 = Instant::now();
         let warn = sys(Pressure::Warn, 0, GB);
@@ -680,7 +710,7 @@ mod tests {
             assert!(kinds(&p.tick(t0, &warn, &sessions)).is_empty());
         }
         let a = kinds(&p.tick(t0, &warn, &sessions));
-        assert_eq!(a, ["level:elevated", "pause:true", "offer:big"]);
+        assert_eq!(a, ["level:elevated", "offer:big"]);
         // The whole episode (here half an hour): one offer, never repeated.
         let mut later = Vec::new();
         for i in 1..=900u64 {
@@ -706,12 +736,75 @@ mod tests {
             out
         };
         assert!(episode(&mut p, t0).contains(&"offer:big".to_string()));
-        // Five minutes later, a second episode: paused again, no second offer.
+        // Five minutes later, a second episode: no second offer.
         let second = episode(&mut p, t0 + Duration::from_secs(300));
-        assert!(second.contains(&"pause:true".to_string()) && !second.contains(&"offer:big".to_string()), "{second:?}");
+        assert!(
+            second.contains(&"level:elevated".to_string()) && !second.contains(&"offer:big".to_string()),
+            "{second:?}"
+        );
         // Past the ten minutes: the next episode may offer it once more.
         assert!(episode(&mut p, t0 + Duration::from_secs(700)).contains(&"offer:big".to_string()));
         assert_eq!(cfg().offer_cooldown, Duration::from_secs(600));
+    }
+
+    /// The founder's Mac reports "warn" most of the time: by default the guard is advisory.
+    /// No level pauses anything; the level, the offers and the critical auto-hibernation of
+    /// an idle session stay.
+    #[test]
+    fn by_default_no_pressure_level_pauses_anything() {
+        let mut p = Policy::new(cfg());
+        assert_eq!(p.config().pause, PausePolicy::Off);
+        let t0 = Instant::now();
+        let mut out = up(&mut p, t0, &sys(Pressure::Warn, 0, GB));
+        out.extend(up(&mut p, t0, &sys(Pressure::Critical, 0, GB)));
+        for i in 0..30 {
+            out.extend(kinds(&p.tick(t0 + Duration::from_secs(i), &sys(Pressure::Critical, 0, GB), &[])));
+        }
+        assert!(out.iter().all(|k| !k.starts_with("pause:")), "{out:?}");
+        assert!(!p.paused());
+    }
+
+    #[test]
+    fn set_to_critical_it_pauses_only_at_critical() {
+        let mut p = Policy::new(Config { pause: PausePolicy::Critical, ..cfg() });
+        let t0 = Instant::now();
+        assert_eq!(up(&mut p, t0, &sys(Pressure::Warn, 0, GB)), ["level:elevated"]);
+        assert_eq!(up(&mut p, t0, &sys(Pressure::Critical, 0, GB)), ["level:critical", "pause:true"]);
+        assert!(p.paused());
+        // Back to elevated (after the calm samples): resumed, though not yet normal.
+        let mut out = Vec::new();
+        for _ in 0..CALM_SAMPLES {
+            out.extend(kinds(&p.tick(t0, &sys(Pressure::Warn, 0, GB), &[])));
+        }
+        assert_eq!(out, ["level:elevated", "pause:false"]);
+    }
+
+    #[test]
+    fn set_to_elevated_it_pauses_as_before() {
+        let mut p = Policy::new(Config { pause: PausePolicy::Elevated, ..cfg() });
+        let t0 = Instant::now();
+        assert_eq!(up(&mut p, t0, &sys(Pressure::Warn, 0, GB)), ["level:elevated", "pause:true"]);
+        assert!(up(&mut p, t0, &sys(Pressure::Critical, 0, GB)).iter().all(|k| !k.starts_with("pause:")));
+        let mut out = Vec::new();
+        for _ in 0..CALM_SAMPLES {
+            out.extend(kinds(&p.tick(t0, &normal(), &[])));
+        }
+        assert_eq!(out, ["level:normal", "pause:false"]);
+    }
+
+    /// The person changes the setting while the pressure lasts: the next tick follows it.
+    #[test]
+    fn a_changed_setting_applies_on_the_next_tick() {
+        let mut p = Policy::new(cfg());
+        let t0 = Instant::now();
+        let warn = sys(Pressure::Warn, 0, GB);
+        up(&mut p, t0, &warn);
+        p.set_pause(PausePolicy::Elevated);
+        assert_eq!(kinds(&p.tick(t0, &warn, &[])), ["pause:true"]);
+        p.set_pause(PausePolicy::Critical);
+        assert_eq!(kinds(&p.tick(t0, &warn, &[])), ["pause:false"]);
+        p.set_pause(PausePolicy::Off);
+        assert!(kinds(&p.tick(t0, &warn, &[])).is_empty());
     }
 
     #[test]
@@ -724,7 +817,8 @@ mod tests {
         for _ in 1..UP_SAMPLES {
             assert!(kinds(&p.tick(t0, &crit, &sessions)).is_empty());
         }
-        assert_eq!(kinds(&p.tick(t0, &crit, &sessions)), ["level:critical", "pause:true", "offer:idle"]);
+        // Advisory by default: nothing is paused, even at critical.
+        assert_eq!(kinds(&p.tick(t0, &crit, &sessions)), ["level:critical", "offer:idle"]);
         assert!(kinds(&p.tick(t0 + Duration::from_secs(5), &crit, &sessions)).is_empty());
         assert_eq!(kinds(&p.tick(t0 + Duration::from_secs(10), &crit, &sessions)), ["auto:idle"]);
         // One automatic action per cooldown.

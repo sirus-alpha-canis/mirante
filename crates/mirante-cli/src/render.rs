@@ -301,8 +301,13 @@ pub fn mem_cell(m: &MemView) -> String {
     format!("{}/{}{mark}", bytes(m.bytes), bytes(m.budget))
 }
 
-/// The `watch` header line about the machine's memory.
+/// The `watch` header line about the machine's memory: the level, the room left, swap, and
+/// whether the guard pauses new sessions ("pausing: off" is the default: it only advises).
 pub fn memory_line(s: &SystemView) -> String {
+    let pausing = match s.pausing {
+        Some(p) => format!(" · pausing: {}", p.as_str()),
+        None => String::new(),
+    };
     let paused = if s.paused { " · new sessions and queued messages paused" } else { "" };
     // What the OS calls available when it says (macOS counts the file cache it gives back).
     let (what, n) = match s.available {
@@ -310,7 +315,7 @@ pub fn memory_line(s: &SystemView) -> String {
         None => ("free", s.free),
     };
     format!(
-        "memory: {} · {what} {} of {} · swap {}/{}{paused}",
+        "memory: {} · {what} {} of {} · swap {}/{}{pausing}{paused}",
         s.level,
         bytes(n),
         bytes(s.total),
@@ -764,10 +769,20 @@ mod tests {
             paused: true,
             kernel_level: None,
             kernel_source: None,
+            pausing: None,
         };
         assert_eq!(
             memory_line(&s),
             "memory: elevated · free 512M of 16.0G · swap 9.0G/10.0G · new sessions and queued messages paused"
+        );
+        // The default: advisory, said so.
+        let advisory = SystemView { paused: false, pausing: Some(mirante_ipc::types::PausePolicy::Off), ..s.clone() };
+        assert_eq!(memory_line(&advisory), "memory: elevated · free 512M of 16.0G · swap 9.0G/10.0G · pausing: off");
+        let set = SystemView { pausing: Some(mirante_ipc::types::PausePolicy::Elevated), ..s.clone() };
+        assert!(
+            memory_line(&set).ends_with("· pausing: elevated · new sessions and queued messages paused"),
+            "{}",
+            memory_line(&set)
         );
         let mac = SystemView { available: Some(7 << 30), ..s.clone() };
         assert!(memory_line(&mac).starts_with("memory: elevated · available 7.0G of 16.0G"), "{}", memory_line(&mac));

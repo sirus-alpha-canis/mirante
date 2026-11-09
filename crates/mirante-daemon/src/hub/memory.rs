@@ -1,8 +1,10 @@
 //! The memory guard in the daemon: a thread samples every live session's process tree and
 //! the machine (`crate::memguard`), feeds the policy, and carries out what it decides.
 //! Nothing is limited up front (macOS cannot enforce RLIMIT_AS/RLIMIT_DATA): Mirante
-//! measures and acts, in this order — warn; pause new sessions and queued deliveries; offer
-//! to hibernate the largest idle session (the user confirms with `mirante hibernate`);
+//! measures and acts, in this order — warn; offer to hibernate the largest idle session
+//! (the user confirms with `mirante hibernate`); pause new sessions and queued deliveries
+//! only when the person asked for it (`pause_new_sessions_under_pressure`: off by default,
+//! `critical` or `elevated`; `MIRANTE_MEMGUARD_PAUSE` overrides it for one daemon);
 //! only under sustained critical pressure hibernate an idle session on its own, one per
 //! cooldown, never one with a pending permission and never one that is working. Every
 //! step is an `memory.*` event.
@@ -21,7 +23,9 @@ use serde_json::json;
 
 use super::{Hub, HubError, Result, State};
 use crate::driver::proctree::Kill;
-use crate::memguard::{self, Action, Config, MemSampler, Policy, SessionInfo, SessionMem, SystemSample, TreeSample};
+use crate::memguard::{
+    self, Action, Config, MemSampler, PausePolicy, Policy, SessionInfo, SessionMem, SystemSample, TreeSample,
+};
 
 const GIB: u64 = 1 << 30;
 
@@ -56,7 +60,7 @@ pub fn config_from(total: u64, budget_mb: Option<&str>, idle_min: Option<&str>) 
     c
 }
 
-fn system_view(level: &str, s: &SystemSample, paused: bool) -> SystemView {
+fn system_view(level: &str, s: &SystemSample, paused: bool, pausing: PausePolicy) -> SystemView {
     // Said only when the kernel measured it (then it, not swap or free, set `level`).
     let kernel_level = s.kernel_signal.then(|| {
         match s.pressure {
@@ -77,6 +81,7 @@ fn system_view(level: &str, s: &SystemSample, paused: bool) -> SystemView {
         paused,
         kernel_source: kernel_level.as_ref().map(|_| source.to_string()),
         kernel_level,
+        pausing: Some(pausing),
     }
 }
 
@@ -183,6 +188,9 @@ impl Hub {
                 (i, s)
             })
             .collect();
+        // The person's setting (or the environment's) as it is now: a change applies here.
+        let pausing = self.pause_policy();
+        policy.set_pause(pausing);
         let actions = policy.tick(now, &system, &sessions);
         let mut hibernate = Vec::new();
         {
@@ -195,7 +203,7 @@ impl Hub {
                 }
             }
             let paused = st.mem.paused;
-            st.mem.system = Some(system_view(policy.level().as_str(), &system, paused));
+            st.mem.system = Some(system_view(policy.level().as_str(), &system, paused, pausing));
             st.mem.samples = st.mem.samples.saturating_add(1);
             for a in actions {
                 if let Err(e) = st.apply_mem_action(a, &mut hibernate) {
@@ -391,17 +399,28 @@ mod tests {
 
     #[test]
     fn the_system_view_says_when_the_kernel_judged_the_pressure() {
-        let v = system_view("elevated", &sys(Pressure::Warn), true);
+        let v = system_view("elevated", &sys(Pressure::Warn), true, PausePolicy::Off);
         assert_eq!(v.kernel_level.as_deref(), Some("warn"));
         let os = if cfg!(target_os = "macos") { "macos" } else { "linux-psi" };
         assert_eq!(v.kernel_source.as_deref(), Some(os));
-        assert_eq!(system_view("critical", &sys(Pressure::Critical), true).kernel_level.as_deref(), Some("critical"));
-        assert_eq!(system_view("normal", &sys(Pressure::Normal), false).kernel_level.as_deref(), Some("normal"));
+        assert_eq!(
+            system_view("critical", &sys(Pressure::Critical), true, PausePolicy::Off).kernel_level.as_deref(),
+            Some("critical")
+        );
+        assert_eq!(
+            system_view("normal", &sys(Pressure::Normal), false, PausePolicy::Off).kernel_level.as_deref(),
+            Some("normal")
+        );
         // What macOS calls free (memorystatus level), beside the strict free pages.
-        let v = system_view("normal", &sys(Pressure::Normal), false);
+        let v = system_view("normal", &sys(Pressure::Normal), false, PausePolicy::Off);
         assert_eq!((v.free, v.available), (4 * GIB, Some(6 * GIB)));
         // Judged from swap and free memory (no kernel measure): nothing is claimed for it.
-        let judged = system_view("elevated", &SystemSample { kernel_signal: false, ..sys(Pressure::Normal) }, true);
+        let judged = system_view(
+            "elevated",
+            &SystemSample { kernel_signal: false, ..sys(Pressure::Normal) },
+            true,
+            PausePolicy::Off,
+        );
         assert_eq!((judged.kernel_level, judged.kernel_source), (None, None));
     }
 
@@ -426,9 +445,101 @@ mod tests {
         assert_eq!(k.hub.status().memory.unwrap().level, "normal");
     }
 
+    /// The default: macOS "warn" (and even critical) pressure pauses nothing. A queued
+    /// message goes out and a new session starts; the level and the offer are still said.
     #[test]
-    fn pressure_pauses_queued_deliveries_and_new_sessions_until_it_eases() {
+    fn by_default_pressure_pauses_nothing() {
         let k = Kit::new();
+        let t = with_root(&k, "a", 101);
+        let s = FakeSampler::default();
+        s.set_tree(101, 100 * MB);
+        let mut p = Policy::new(cfg());
+        let now = Instant::now();
+        s.set_system(sys(Pressure::Warn));
+        for _ in 0..crate::memguard::policy::UP_SAMPLES {
+            k.hub.memory_tick(&mut p, &s, now);
+        }
+        let v = k.hub.status().memory.unwrap();
+        assert_eq!((v.level.as_str(), v.paused, v.pausing), ("elevated", false, Some(PausePolicy::Off)));
+        assert_eq!(k.hub.status().pause_new_sessions_under_pressure, Some(PausePolicy::Off));
+        let m = mirante_ipc::types::SendMessage { task: t.clone(), text: "next".into(), mode: SendMode::Queue };
+        k.hub.send(m).unwrap();
+        assert!(k.calls().contains(&"send:next".to_string()), "{:?}", k.calls());
+        let other = k.create(AgentKind::Claude, "b").task.id;
+        k.hub.start_session(StartSession { task: other.clone(), prompt: None }, false).unwrap();
+        assert!(kinds(&k, None).contains(&"memory.offer_hibernate".to_string()));
+        assert!(!kinds(&k, None).contains(&"memory.paused".to_string()));
+        // Critical too: still nothing paused.
+        s.set_system(sys(Pressure::Critical));
+        for i in 0..crate::memguard::policy::UP_SAMPLES {
+            k.hub.memory_tick(&mut p, &s, now + Duration::from_secs(u64::from(i)));
+        }
+        assert!(!k.hub.status().memory.unwrap().paused);
+    }
+
+    /// Set to `critical`: elevated pressure pauses nothing, critical pauses new sessions.
+    #[test]
+    fn set_to_critical_only_critical_pressure_pauses_new_sessions() {
+        let k = Kit::new();
+        with_root(&k, "a", 101);
+        let s = FakeSampler::default();
+        s.set_tree(101, 100 * MB);
+        let mut p = Policy::new(cfg());
+        let now = Instant::now();
+        k.hub
+            .settings(mirante_ipc::types::SettingsParams {
+                pause_new_sessions_under_pressure: Some(PausePolicy::Critical),
+                ..Default::default()
+            })
+            .unwrap();
+        s.set_system(sys(Pressure::Warn));
+        for _ in 0..crate::memguard::policy::UP_SAMPLES {
+            k.hub.memory_tick(&mut p, &s, now);
+        }
+        assert!(!k.hub.status().memory.unwrap().paused);
+        s.set_system(sys(Pressure::Critical));
+        for _ in 0..crate::memguard::policy::UP_SAMPLES {
+            k.hub.memory_tick(&mut p, &s, now);
+        }
+        assert!(k.hub.status().memory.unwrap().paused);
+        let other = k.create(AgentKind::Claude, "b").task.id;
+        let r = k.hub.start_session(StartSession { task: other, prompt: None }, false);
+        assert!(matches!(r, Err(HubError::Conflict(ref m)) if m.contains("memory")), "{r:?}");
+        // Turned off while it lasts: the next tick resumes.
+        k.hub
+            .settings(mirante_ipc::types::SettingsParams {
+                pause_new_sessions_under_pressure: Some(PausePolicy::Off),
+                ..Default::default()
+            })
+            .unwrap();
+        k.hub.memory_tick(&mut p, &s, now);
+        assert!(!k.hub.status().memory.unwrap().paused);
+        assert!(kinds(&k, None).contains(&"memory.resumed".to_string()));
+    }
+
+    /// `MIRANTE_MEMGUARD_PAUSE` decides for this daemon, whatever the setting says.
+    #[test]
+    fn the_environment_override_wins() {
+        let k = Kit::new();
+        with_root(&k, "a", 101);
+        k.hub.force_pause_policy(PausePolicy::Elevated);
+        let s = FakeSampler::default();
+        s.set_tree(101, 100 * MB);
+        s.set_system(sys(Pressure::Warn));
+        let mut p = Policy::new(cfg());
+        let now = Instant::now();
+        for _ in 0..crate::memguard::policy::UP_SAMPLES {
+            k.hub.memory_tick(&mut p, &s, now);
+        }
+        let v = k.hub.status().memory.unwrap();
+        assert_eq!((v.paused, v.pausing), (true, Some(PausePolicy::Elevated)));
+        assert_eq!(k.hub.status().pause_forced_by_env, Some(true));
+    }
+
+    #[test]
+    fn pressure_pauses_queued_deliveries_and_new_sessions_until_it_eases_when_set_to_elevated() {
+        let k = Kit::new();
+        k.hub.force_pause_policy(PausePolicy::Elevated);
         let t = with_root(&k, "a", 101);
         let s = FakeSampler::default();
         s.set_tree(101, 100 * MB);

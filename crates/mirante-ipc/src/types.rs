@@ -234,7 +234,8 @@ pub struct SystemView {
     pub available: Option<u64>,
     pub swap_used: u64,
     pub swap_total: u64,
-    /// New sessions and queued deliveries wait while memory is tight.
+    /// New sessions and queued deliveries wait (only when `pausing` is set and the level
+    /// reached it).
     pub paused: bool,
     /// The operating system's own pressure measure, when it gave one and it decided `level`:
     /// "normal", "warn" or "critical" (macOS `kern.memorystatus_vm_pressure_level`, Linux
@@ -244,6 +245,46 @@ pub struct SystemView {
     /// Where `kernel_level` came from: "macos" (memorystatus) or "linux-psi".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_source: Option<String>,
+    /// From which level the guard pauses new sessions and queued deliveries (the setting
+    /// `pause_new_sessions_under_pressure`). Absent from older daemons (they paused at
+    /// `elevated`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pausing: Option<PausePolicy>,
+}
+
+/// When the memory guard pauses new sessions and queued deliveries. `Off` (the default):
+/// never: pressure is shown and idle sessions are offered for hibernation, but work goes
+/// on (macOS reports "warn" pressure most of the time on a busy Mac). Whatever this says,
+/// sustained critical pressure still hibernates an IDLE session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausePolicy {
+    #[default]
+    Off,
+    /// Only at `critical`.
+    Critical,
+    /// At `elevated` and `critical` (the guard's behaviour before this setting existed).
+    Elevated,
+}
+
+impl PausePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PausePolicy::Off => "off",
+            PausePolicy::Critical => "critical",
+            PausePolicy::Elevated => "elevated",
+        }
+    }
+
+    /// "off", "critical" or "elevated" (any case, trimmed); `None` for anything else.
+    pub fn parse(s: &str) -> Option<PausePolicy> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(PausePolicy::Off),
+            "critical" => Some(PausePolicy::Critical),
+            "elevated" => Some(PausePolicy::Elevated),
+            _ => None,
+        }
+    }
 }
 
 /// A process left behind by an agent: parent gone (ppid 1), working directory or command
@@ -556,6 +597,13 @@ pub struct DaemonStatus {
     /// setting then does not apply until it restarts without it). Absent when not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_resume_forced_off: Option<bool>,
+    /// When the memory guard pauses new sessions (`daemon.settings`'s
+    /// `pause_new_sessions_under_pressure`). Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_new_sessions_under_pressure: Option<PausePolicy>,
+    /// `MIRANTE_MEMGUARD_PAUSE` set it for this daemon. Absent when not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_forced_by_env: Option<bool>,
     /// The daemon's build (`<commit>[-dirty].<unix seconds>`, as `mirante-daemon --version`
     /// prints it): a newer binary on disk has another one. Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -587,6 +635,8 @@ pub struct RepoFiles {
 pub struct SettingsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_resume: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_new_sessions_under_pressure: Option<PausePolicy>,
 }
 
 /// The daemon's settings (`<home>/settings.json`).
@@ -599,12 +649,38 @@ pub struct DaemonSettings {
     /// for the next start.
     #[serde(default)]
     pub forced_by_env: bool,
+    /// When the memory guard pauses new sessions and queued deliveries (what this daemon
+    /// does: the environment's `MIRANTE_MEMGUARD_PAUSE` when set). Off by default.
+    #[serde(default)]
+    pub pause_new_sessions_under_pressure: PausePolicy,
+    /// `MIRANTE_MEMGUARD_PAUSE` decides it for this daemon; the person's choice is saved for
+    /// the next start.
+    #[serde(default)]
+    pub pause_forced_by_env: bool,
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use mirante_core::model::{Lifecycle, Status};
     use serde_json::json;
+
+    /// The pause setting is a word on the wire; an older daemon's settings (no field) read
+    /// as off, and an older status says nothing.
+    #[test]
+    fn the_pause_policy_is_a_word_and_defaults_to_off() {
+        assert_eq!(serde_json::to_value(PausePolicy::Critical).unwrap(), json!("critical"));
+        let p: SettingsParams =
+            serde_json::from_value(json!({ "pause_new_sessions_under_pressure": "elevated" })).unwrap();
+        assert_eq!(p.pause_new_sessions_under_pressure, Some(PausePolicy::Elevated));
+        assert!(
+            serde_json::from_value::<SettingsParams>(json!({ "pause_new_sessions_under_pressure": "always" })).is_err()
+        );
+        let old: DaemonSettings = serde_json::from_value(json!({ "auto_resume": true })).unwrap();
+        assert_eq!((old.pause_new_sessions_under_pressure, old.pause_forced_by_env), (PausePolicy::Off, false));
+        assert_eq!(PausePolicy::parse(" Elevated "), Some(PausePolicy::Elevated));
+        assert_eq!(PausePolicy::parse("on"), None);
+        assert_eq!(PausePolicy::default().as_str(), "off");
+    }
 
     #[test]
     fn task_view_flattens_the_task() {

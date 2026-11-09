@@ -7,8 +7,10 @@
 //! and a pure [`policy`] decides what to do:
 //! - a session over 80 % / 100 % of its budget (default `min(4 GiB, 25 % of RAM)`) → a
 //!   warning;
-//! - the machine under pressure (`Elevated`) → new dispatches and queued deliveries pause,
-//!   and the user is offered to hibernate the largest idle session;
+//! - the machine under pressure (`Elevated`) → the user is offered to hibernate the largest
+//!   idle session; nothing pauses by default (`pause_new_sessions_under_pressure`, off:
+//!   set to `critical` or `elevated`, new dispatches and queued deliveries wait from that
+//!   level until it eases);
 //! - sustained `Critical` pressure → the largest IDLE session is hibernated, at most one per
 //!   60 s, everything logged. Never a working session, never one with a pending permission
 //!   request (the refusal is reported instead);
@@ -23,5 +25,5 @@ pub mod policy;
 pub mod sampler;
 
 pub use orphans::{find_orphans, kill_orphan, Orphan};
-pub use policy::{Action, Config, Level, MemState, Policy, SessionInfo, SessionMem};
+pub use policy::{Action, Config, Level, MemState, PausePolicy, Policy, SessionInfo, SessionMem};
 pub use sampler::{os_sampler, FakeSampler, MemSampler, Pressure, SystemSample, TreeSample};

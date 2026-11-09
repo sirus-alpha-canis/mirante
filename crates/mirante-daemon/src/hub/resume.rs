@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mirante_core::model::{Event, Lifecycle};
-use mirante_ipc::types::{BootState, DaemonSettings, SettingsParams, StartSession};
+use mirante_ipc::types::{BootState, DaemonSettings, PausePolicy, SettingsParams, StartSession};
 use serde_json::json;
 
 use super::session::Launch;
@@ -154,15 +154,35 @@ fn read_settings(path: &Path) -> serde_json::Value {
         .unwrap_or_else(|| json!({}))
 }
 
-/// Writes `auto_resume` into the settings file, keeping its other keys: through a fresh
+/// The settings file's `pause_new_sessions_under_pressure` (off when missing, unreadable
+/// or not a known word).
+pub fn load_pause(path: &Path) -> PausePolicy {
+    read_settings(path)[PAUSE_KEY].as_str().and_then(PausePolicy::parse).unwrap_or_default()
+}
+
+/// The settings key (and `daemon.settings` field) of the memory guard's pause policy.
+pub const PAUSE_KEY: &str = "pause_new_sessions_under_pressure";
+
+/// `MIRANTE_MEMGUARD_PAUSE`: "off", "critical" or "elevated" decide for this daemon;
+/// anything else (or unset) leaves it to the person's setting.
+pub fn env_pause(v: Option<&str>) -> Option<PausePolicy> {
+    v.and_then(PausePolicy::parse)
+}
+
+/// Writes `auto_resume` into the settings file, keeping its other keys.
+fn save_auto_resume(path: &Path, on: bool) -> std::io::Result<()> {
+    save_setting(path, "auto_resume", json!(on))
+}
+
+/// Writes one key into the settings file, keeping its other keys: through a fresh
 /// temporary file (random name, created new, never through a symlink), fsynced, renamed
 /// over the file, and the directory fsynced.
-fn save_auto_resume(path: &Path, on: bool) -> std::io::Result<()> {
+fn save_setting(path: &Path, key: &str, value: serde_json::Value) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut v = read_settings(path);
-    v["auto_resume"] = json!(on);
+    v[key] = value;
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let name = format!(".settings.{}.{nonce}.{}.tmp", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
     let tmp = path.with_file_name(name);
@@ -238,9 +258,28 @@ impl Hub {
         self.resume_gap = gap;
     }
 
-    /// Reads `<home>/settings.json` (auto-resume stays on when it says nothing).
+    /// Reads `<home>/settings.json` (auto-resume stays on, and pausing off, when it says
+    /// nothing).
     pub fn load_settings(&self) {
         self.set_auto_resume(load_auto_resume(&self.paths.settings()));
+        *self.pause_setting.lock().unwrap_or_else(|p| p.into_inner()) = load_pause(&self.paths.settings());
+    }
+
+    /// When the memory guard pauses new sessions and queued deliveries, for this daemon:
+    /// `MIRANTE_MEMGUARD_PAUSE` when set, else the person's setting (off by default).
+    pub fn pause_policy(&self) -> PausePolicy {
+        let env = *self.pause_env.lock().unwrap_or_else(|p| p.into_inner());
+        env.unwrap_or_else(|| *self.pause_setting.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// `MIRANTE_MEMGUARD_PAUSE` decides the pause policy for this daemon (`daemon.settings`
+    /// still saves the person's choice for later runs, and says it is forced).
+    pub fn force_pause_policy(&self, p: PausePolicy) {
+        *self.pause_env.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    }
+
+    pub fn pause_forced_by_env(&self) -> bool {
+        self.pause_env.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
 
     /// `daemon.settings`: the settings, after applying the ones given (persisted).
@@ -263,7 +302,31 @@ impl Hub {
                 st.publish();
             }
         }
-        Ok(DaemonSettings { auto_resume: self.auto_resume_enabled(), forced_by_env: self.auto_resume_forced_off() })
+        if let Some(want) = p.pause_new_sessions_under_pressure {
+            let _gate = self.settings_gate.lock().unwrap_or_else(|p| p.into_inner());
+            let path = self.paths.settings();
+            if read_settings(&path)[PAUSE_KEY].as_str() != Some(want.as_str()) {
+                save_setting(&path, PAUSE_KEY, json!(want.as_str()))
+                    .map_err(|e| HubError::Conflict(format!("could not save the settings: {e}")))?;
+            }
+            let was = std::mem::replace(&mut *self.pause_setting.lock().unwrap_or_else(|p| p.into_inner()), want);
+            if was != want {
+                // The guard follows on its next tick (at most 2 s).
+                let mut st = self.lock();
+                if let Err(e) =
+                    st.event(None, "settings_changed", json!({ "pause_new_sessions_under_pressure": want.as_str() }))
+                {
+                    st.log_error(None, "settings change not recorded", &e);
+                }
+                st.publish();
+            }
+        }
+        Ok(DaemonSettings {
+            auto_resume: self.auto_resume_enabled(),
+            forced_by_env: self.auto_resume_forced_off(),
+            pause_new_sessions_under_pressure: self.pause_policy(),
+            pause_forced_by_env: self.pause_forced_by_env(),
+        })
     }
 
     /// Waits until a resume may launch: auto-resume still on, the memory guard sampled
@@ -566,15 +629,17 @@ mod tests {
             let st = hub.lock();
             st.store.events_since(0, 10_000).unwrap().iter().filter(|e| e.kind == "settings_changed").count()
         };
-        k.hub.settings(SettingsParams { auto_resume: Some(true) }).unwrap();
+        k.hub.settings(SettingsParams { auto_resume: Some(true), ..Default::default() }).unwrap();
         assert_eq!(changed(&k.hub), 0, "already on: nothing changed");
-        k.hub.settings(SettingsParams { auto_resume: Some(false) }).unwrap();
+        k.hub.settings(SettingsParams { auto_resume: Some(false), ..Default::default() }).unwrap();
         assert_eq!(changed(&k.hub), 1);
         let hub = Arc::clone(&k.hub);
         let threads: Vec<_> = (0..16)
             .map(|i| {
                 let hub = Arc::clone(&hub);
-                std::thread::spawn(move || hub.settings(SettingsParams { auto_resume: Some(i % 2 == 0) }).unwrap())
+                std::thread::spawn(move || {
+                    hub.settings(SettingsParams { auto_resume: Some(i % 2 == 0), ..Default::default() }).unwrap()
+                })
             })
             .collect();
         for t in threads {
@@ -589,7 +654,7 @@ mod tests {
         let k = file_kit();
         let t = live_with_native(&k, "a", "nat-a");
         assert!(k.hub.auto_resume_enabled());
-        let s = k.hub.settings(SettingsParams { auto_resume: Some(false) }).unwrap();
+        let s = k.hub.settings(SettingsParams { auto_resume: Some(false), ..Default::default() }).unwrap();
         assert!(!s.auto_resume);
         assert!(!load_auto_resume(&k.hub.paths().settings()));
         k.hub.shutdown();
@@ -598,7 +663,7 @@ mod tests {
         assert!(!hub.auto_resume_enabled());
         assert_eq!(hub.run_auto_resume(&r.resume, false), Vec::<String>::new());
         assert!(!hub.get_task(&t).unwrap().live);
-        assert!(hub.settings(SettingsParams { auto_resume: Some(true) }).unwrap().auto_resume);
+        assert!(hub.settings(SettingsParams { auto_resume: Some(true), ..Default::default() }).unwrap().auto_resume);
         assert!(load_auto_resume(&hub.paths().settings()));
         assert!(hub.settings(SettingsParams::default()).unwrap().auto_resume);
     }
@@ -816,12 +881,93 @@ mod tests {
         assert!(!load_auto_resume(&path));
     }
 
+    /// By default auto-resume does not wait on elevated pressure: the guard pauses nothing.
+    #[test]
+    fn auto_resume_does_not_wait_on_elevated_pressure_by_default() {
+        use crate::memguard::{FakeSampler, Policy, Pressure, SystemSample};
+        let k = file_kit();
+        let t = live_with_native(&k, "a", "nat-a");
+        k.hub.shutdown();
+        let (hub, r) = restarted(&k);
+        let s = FakeSampler::default();
+        s.set_system(SystemSample {
+            total: 16 << 30,
+            free: 1 << 30,
+            swap_used: 0,
+            swap_total: 0,
+            available: None,
+            pressure: Pressure::Warn,
+            kernel_signal: true,
+        });
+        let mut p = Policy::new(crate::memguard::Config::for_ram(16 << 30));
+        for _ in 0..crate::memguard::policy::UP_SAMPLES {
+            hub.memory_tick(&mut p, &s, Instant::now());
+        }
+        assert_eq!(hub.status().memory.unwrap().level, "elevated");
+        assert_eq!(hub.run_auto_resume(&r.resume, true), vec![t.clone()]);
+        assert!(hub.get_task(&t).unwrap().live);
+    }
+
+    #[test]
+    fn the_pause_setting_persists_and_is_one_event_per_change() {
+        let k = file_kit();
+        let path = k.hub.paths().settings();
+        assert_eq!(k.hub.pause_policy(), PausePolicy::Off);
+        assert_eq!(
+            k.hub.settings(SettingsParams::default()).unwrap().pause_new_sessions_under_pressure,
+            PausePolicy::Off
+        );
+        let set = |p: PausePolicy| {
+            k.hub.settings(SettingsParams { pause_new_sessions_under_pressure: Some(p), ..Default::default() }).unwrap()
+        };
+        let r = set(PausePolicy::Critical);
+        assert_eq!((r.pause_new_sessions_under_pressure, r.pause_forced_by_env), (PausePolicy::Critical, false));
+        set(PausePolicy::Critical);
+        assert_eq!(load_pause(&path), PausePolicy::Critical);
+        let events = |hub: &Hub| {
+            let st = hub.lock();
+            st.store.events_since(0, 10_000).unwrap().into_iter().filter(|e| e.kind == "settings_changed").count()
+        };
+        assert_eq!(events(&k.hub), 1, "setting it again is no change");
+        // Other keys are kept.
+        k.hub.settings(SettingsParams { auto_resume: Some(false), ..Default::default() }).unwrap();
+        assert_eq!(load_pause(&path), PausePolicy::Critical);
+        k.hub.shutdown();
+        let (hub, _) = restarted(&k);
+        hub.load_settings();
+        assert_eq!(hub.pause_policy(), PausePolicy::Critical);
+        assert_eq!(hub.status().pause_new_sessions_under_pressure, Some(PausePolicy::Critical));
+        // A word this daemon does not know reads as off.
+        std::fs::write(&path, r#"{"pause_new_sessions_under_pressure":"always"}"#).unwrap();
+        assert_eq!(load_pause(&path), PausePolicy::Off);
+        assert_eq!(load_pause(Path::new("/definitely/not/here.json")), PausePolicy::Off);
+    }
+
+    #[test]
+    fn the_pause_env_override_wins_and_the_choice_is_kept_for_later() {
+        let k = file_kit();
+        assert_eq!(env_pause(Some(" CRITICAL ")), Some(PausePolicy::Critical));
+        assert_eq!(env_pause(Some("nope")), None);
+        assert_eq!(env_pause(None), None);
+        k.hub.force_pause_policy(PausePolicy::Off);
+        let r = k
+            .hub
+            .settings(SettingsParams {
+                pause_new_sessions_under_pressure: Some(PausePolicy::Elevated),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!((r.pause_new_sessions_under_pressure, r.pause_forced_by_env), (PausePolicy::Off, true));
+        assert_eq!(load_pause(&k.hub.paths().settings()), PausePolicy::Elevated);
+        assert_eq!(k.hub.status().pause_forced_by_env, Some(true));
+    }
+
     #[test]
     fn the_env_switch_wins_and_says_so() {
         let k = file_kit();
         k.hub.force_auto_resume_off();
         assert!(!k.hub.auto_resume_enabled());
-        let s = k.hub.settings(SettingsParams { auto_resume: Some(true) }).unwrap();
+        let s = k.hub.settings(SettingsParams { auto_resume: Some(true), ..Default::default() }).unwrap();
         assert_eq!((s.auto_resume, s.forced_by_env), (false, true));
         assert!(load_auto_resume(&k.hub.paths().settings()), "the person's choice is kept for later runs");
         assert!(!k.hub.auto_resume_enabled());

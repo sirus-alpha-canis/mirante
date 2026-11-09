@@ -330,6 +330,11 @@ pub struct Hub {
     pub(crate) auto_resume: AtomicBool,
     /// `MIRANTE_AUTO_RESUME=off`: auto-resume is off for this daemon whatever the setting.
     pub(crate) auto_resume_env_off: AtomicBool,
+    /// When the memory guard pauses new sessions and queued deliveries: the person's
+    /// setting, and `MIRANTE_MEMGUARD_PAUSE` when it decides for this daemon (see
+    /// [`Hub::pause_policy`]).
+    pub(crate) pause_setting: Mutex<mirante_ipc::types::PausePolicy>,
+    pub(crate) pause_env: Mutex<Option<mirante_ipc::types::PausePolicy>>,
     /// The pause between two automatic resumes (see [`resume::RESUME_GAP`]).
     pub(crate) resume_gap: Duration,
     /// DNA: one refresh at a time per repo (taken before, never while holding, the hub lock).
@@ -540,6 +545,8 @@ impl Hub {
             claude_inline: AtomicBool::new(false),
             auto_resume: AtomicBool::new(true),
             auto_resume_env_off: AtomicBool::new(false),
+            pause_setting: Mutex::new(mirante_ipc::types::PausePolicy::Off),
+            pause_env: Mutex::new(None),
             settings_gate: Mutex::new(()),
             git_read_limit: files::GIT_LIMIT,
             shutting_down: AtomicBool::new(false),
@@ -820,6 +827,8 @@ impl Hub {
             claude_inline_answers: self.claude_inline_answers(),
             auto_resume: Some(self.auto_resume_enabled()),
             auto_resume_forced_off: self.auto_resume_forced_off().then_some(true),
+            pause_new_sessions_under_pressure: Some(self.pause_policy()),
+            pause_forced_by_env: self.pause_forced_by_env().then_some(true),
             build: Some(env!("MIRANTE_BUILD").to_string()),
         }
     }

@@ -248,8 +248,16 @@ mirante app                     # open the desktop app (starts the daemon first;
   `mirante allow`), answer the dialog, then detach with **Ctrl-]**.
 - **A red "auto mode on" badge.** That Claude session left manual permission mode and
   approves its own commands. Press Shift+Tab in its terminal until it is back to manual.
-- **New dispatches say memory is paused.** The memory guard paused new sessions and
-  queued deliveries under memory pressure; they resume when it eases. Tune it with
+- **"macOS reports memory pressure" under the dispatch box.** Advice only: by default the
+  memory guard never pauses work (a busy Mac reports pressure most of the time). It shows
+  the level, swap and each session's memory, offers to hibernate the largest idle session,
+  and only under sustained *critical* pressure hibernates an idle one itself (never one
+  that is working or waits on you; `mirante wake <task>` brings it back). `mirante watch`
+  and `mirante doctor` say `pausing: off`.
+- **New dispatches say memory is paused.** You (or `MIRANTE_MEMGUARD_PAUSE`) set the guard
+  to pause: **Pause new sessions under memory pressure** in the app's Sessions section is
+  *Only when critical* or *When elevated*. New sessions and queued deliveries then wait
+  until it eases; set it back to *Off* to keep working. Tune the guard with
   `MIRANTE_MEM_BUDGET_MB` (per-session budget), `MIRANTE_IDLE_HIBERNATE_MIN` (hibernate
   idle sessions) or turn it off with `MIRANTE_MEMGUARD=off`, then restart the daemon.
 - **"This daemon cannot … Update Mirante to use it."** The daemon running is older than
@@ -311,6 +319,7 @@ and `MIRANTE_*` from your login shell.
 | `MIRANTE_MEM_BUDGET_MB` | daemon | Per-session memory budget in MiB (default: 4 GiB or 25 % of RAM, whichever is smaller). |
 | `MIRANTE_IDLE_HIBERNATE_MIN` | daemon | Hibernate a session idle this many minutes (default: off). |
 | `MIRANTE_MEMGUARD` | daemon | `off`: no memory guard at all. |
+| `MIRANTE_MEMGUARD_PAUSE` | daemon | `off`, `critical` or `elevated`: from which pressure level new sessions and queued deliveries wait, for this daemon (default: the app's setting, *Off*). |
 | `MIRANTE_SSH_KEYGEN` | daemon | The `ssh-keygen` used to sign and verify skills (default `/usr/bin/ssh-keygen`; never looked up on `PATH`). |
 | `MIRANTE_HOOK_LOG` | spike kit only | Where `crates/spike-kit`'s hook logs; `mirante-hook` does not read it. |
 | `MIRANTE_TASK`, `MIRANTE_TASK_ID`, `MIRANTE_SESSION_ID` | hook, MCP | Set by the daemon for the agents it launches. Do not set them yourself. |
@@ -328,8 +337,10 @@ flags. A request is persisted, survives an app restart, and is answered once.
 - A Claude session that leaves manual permission mode gets a red **auto mode on** badge.
 
 **Memory guard.** The daemon samples each session's process tree and the machine's memory
-pressure. It sets no hard limits. A session near its budget gets a warning. Under pressure,
-new dispatches and queued deliveries pause. Under sustained critical pressure, the largest
+pressure. It sets no hard limits. A session near its budget gets a warning. Under pressure
+it advises (it offers to hibernate the largest idle session) and work goes on; new
+dispatches and queued deliveries pause only if you ask for it (the app's **Pause new
+sessions under memory pressure**, or `MIRANTE_MEMGUARD_PAUSE`). Under sustained critical pressure, the largest
 *idle* session is hibernated (stopped, resumable), at most one per minute. A working session,
 or one waiting on a permission, is never hibernated. Leftover processes are reported, and
 killing one is your call (`mirante doctor --kill <pid>` asks first). Stress test:

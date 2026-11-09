@@ -104,6 +104,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         hub.force_auto_resume_off();
     }
     eprintln!("mirante-daemon: auto-resume {}", if hub.auto_resume_enabled() { "on" } else { "off" });
+    // The memory guard pauses nothing by default; `MIRANTE_MEMGUARD_PAUSE=off|critical|elevated`
+    // decides for this daemon whatever the person's setting says.
+    if let Some(p) = mirante_daemon::hub::resume::env_pause(std::env::var("MIRANTE_MEMGUARD_PAUSE").ok().as_deref()) {
+        hub.force_pause_policy(p);
+    }
+    eprintln!(
+        "mirante-daemon: memory guard pausing new sessions: {}{}",
+        hub.pause_policy().as_str(),
+        if hub.pause_forced_by_env() { " (MIRANTE_MEMGUARD_PAUSE)" } else { "" }
+    );
     let hub = Arc::new(hub);
     let report = hub.recover()?;
     eprintln!("mirante-daemon: recovered {report:?}");

@@ -428,6 +428,8 @@ mod tests {
             claude_inline_answers: false,
             auto_resume: None,
             auto_resume_forced_off: None,
+            pause_new_sessions_under_pressure: None,
+            pause_forced_by_env: None,
             build: None,
         };
         assert_eq!(version_warning(&st("0.1.0", 0), "0.1.0"), None);
@@ -448,6 +450,8 @@ mod tests {
             claude_inline_answers: false,
             auto_resume: None,
             auto_resume_forced_off: None,
+            pause_new_sessions_under_pressure: None,
+            pause_forced_by_env: None,
             build: build.map(String::from),
         }
     }

@@ -629,7 +629,10 @@ impl Hub {
             }
             if st.mem.paused {
                 return Err(HubError::Conflict(
-                    "memory is tight: new sessions wait until it eases (mirante watch / mirante doctor)".into(),
+                    "memory is tight and the guard is set to pause new sessions: they wait until it eases \
+                     (mirante watch / mirante doctor; the app's Sessions setting \
+                     \"Pause new sessions under memory pressure\" turns it off)"
+                        .into(),
                 ));
             }
             st.mem.hibernated.remove(&task.id);
