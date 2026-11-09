@@ -16,7 +16,7 @@ export type Pressure = "normal" | "elevated" | "critical" | "unknown";
 
 export interface SystemMemory {
   level: Pressure;
-  /** New sessions and queued deliveries wait (level elevated or worse). */
+  /** New sessions and queued deliveries wait (only when the person set the guard to pause). */
   paused: boolean;
   total: number;
   free: number;

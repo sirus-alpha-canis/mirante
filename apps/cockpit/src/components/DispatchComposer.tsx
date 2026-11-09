@@ -35,7 +35,7 @@ import {
   withContext,
 } from "../lib/dispatch";
 import { type AgentKind, type CreatedOrigin, M, type NoteSummary, RpcCode, type SkillSummary, type StartResult, type TaskView } from "../lib/protocol";
-import type { Project } from "../store/select";
+import { type Project, repoName } from "../store/select";
 import type { State } from "../store/state";
 
 /** What the form holds besides the goal: attached context, an edited branch, a repo picked
@@ -104,7 +104,7 @@ const agentLabel = (a: AgentKind) => AGENT_OPTIONS.find((o) => o.id === a)?.labe
  * The dispatch form, one rounded box: the goal on top, a toolbar below it with the agent
  * picker, the repository chip (searchable), the branch chip (once there is a goal: named
  * after it, editable), "+ contexto" (attach repo files, memory notes and skills: they go
- * after the goal as labeled references), a memory hint while new sessions wait, and send
+ * after the goal as labeled references), a quiet hint under memory pressure, and send
  * (⌘↵). Text that starts with "@claude" / "@codex" is the one-line syntax ("@claude goal",
  * "@claude shop goal", "@claude shop/feat/x goal"), with suggestions as it is typed: it sets
  * the agent, and the repo and branch only when it names them (else the toolbar's repo and a
@@ -121,8 +121,9 @@ export function DispatchComposer(props: {
   onDispatched?(taskId: string): void;
   /** The goal textarea, for callers that move the keyboard to it. */
   inputRef?: Ref<HTMLTextAreaElement>;
-  /** The memory guard pauses new sessions (`daemon.status.memory.paused`). */
-  paused?: boolean;
+  /** The machine is under memory pressure (`daemon.status.memory.level` elevated or
+   * critical): a quiet hint. Dispatch is never held back for it. */
+  pressure?: boolean;
   /** The rest of the form, when the caller keeps it (else the form keeps its own). */
   form?: ComposerForm;
   onForm?(update: (cur: ComposerForm) => ComposerForm): void;
@@ -177,7 +178,7 @@ export function DispatchComposer(props: {
   const auto = nextFreeBranch(branchFromGoal(goalText), taken);
   const lineBranch = line?.branch ? line.branch : null;
   const branch = lineBranch ?? edited ?? auto;
-  const repoChip = useRef<HTMLInputElement>(null);
+  const repoChip = useRef<HTMLButtonElement>(null);
 
   // "+ contexto": what is attached to this goal (cleared with it once dispatched).
   const refs = form.refs;
@@ -423,7 +424,7 @@ export function DispatchComposer(props: {
         {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
         <div className="composer-toolbar" role="group" aria-label={t("dispatch.options")}>
           <AgentPicker value={agent} onPick={pickAgent} />
-          <RepoBox projects={props.projects} value={repo} inputRef={repoChip} onPick={setPicked} />
+          <RepoPicker projects={props.projects} value={repo} buttonRef={repoChip} onPick={setPicked} />
           <span id="dispatch-branch" className="small muted dispatch-branch">
             {power ? (
               line && targetRepo ? (
@@ -437,9 +438,9 @@ export function DispatchComposer(props: {
           </span>
           <ContextPicker repo={targetRepo} onAttach={attach} attached={refs} />
           <span className="toolbar-spacer" />
-          {props.paused && (
-            <span className="small warn" role="status">
-              {t("dispatch.paused")}
+          {props.pressure && (
+            <span className="small muted dispatch-pressure" role="status">
+              {t("dispatch.pressure")}
             </span>
           )}
           <button
@@ -539,13 +540,14 @@ function AgentPicker({ value, onPick }: { value: AgentKind; onPick(a: AgentKind)
       trigger={
         <button
           type="button"
-          className="tchip"
+          className="tchip agent-chip"
           aria-haspopup="dialog"
           aria-expanded={open}
           aria-controls={open ? id : undefined}
           onClick={() => setOpen((o) => !o)}
           title={t("dispatch.agentTitle")}
         >
+          {/* One button: the label, the agent and the arrow are one click target. */}
           {t("dispatch.agentChip", { agent: agentLabel(value) })} <span aria-hidden="true">▾</span>
         </button>
       }
@@ -726,83 +728,202 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
   );
 }
 
-/** The form's repository: a combobox over the Projects, filtered by folder name as typed. */
-function RepoBox(props: { projects: Project[]; value: string | null; inputRef?: Ref<HTMLInputElement>; onPick(path: string): void }) {
+/** One row of the repository picker: a folder's group (folds) or a project. */
+type PickerRow = { kind: "group"; folder: string; name: string; count: number; open: boolean } | { kind: "project"; p: Project; nested: boolean };
+
+/** The picker's rows: projects on their own and folders' groups, sorted by name like the
+ * rail; a folded group hides its projects (a search shows every match). */
+function pickerRows(projects: Project[], query: string, folded: Set<string>): PickerRow[] {
+  const q = query.trim();
+  const list = q ? matchProjects(q, projects) : projects;
+  const groups = new Map<string, Project[]>();
+  const top: ({ kind: "project"; name: string; p: Project } | { kind: "group"; name: string; folder: string; members: Project[] })[] = [];
+  for (const p of list) {
+    if (p.group) {
+      const g = groups.get(p.group);
+      if (g) g.push(p);
+      else groups.set(p.group, [p]);
+    } else top.push({ kind: "project", name: p.name, p });
+  }
+  for (const [folder, members] of groups) top.push({ kind: "group", name: repoName(folder), folder, members });
+  // A search keeps the best matches first; else by name, like the rail.
+  if (!q) top.sort((a, b) => a.name.localeCompare(b.name));
+  const rows: PickerRow[] = [];
+  for (const e of top) {
+    if (e.kind === "project") {
+      rows.push({ kind: "project", p: e.p, nested: false });
+      continue;
+    }
+    const open = !!q || !folded.has(e.folder);
+    rows.push({ kind: "group", folder: e.folder, name: e.name, count: e.members.length, open });
+    if (open) {
+      const members = q ? e.members : [...e.members].sort((a, b) => a.name.localeCompare(b.name));
+      for (const p of members) rows.push({ kind: "project", p, nested: true });
+    }
+  }
+  return rows;
+}
+
+/** The form's repository: a chip ("Repository shop ▾") that opens the Projects as a list,
+ * grouped like the rail (a folder's projects under its name, folded with a click), with a
+ * search focused at open. ↑/↓ move, Enter picks (or folds a group), ←/→ fold and unfold;
+ * Escape, a press outside or focus leaving close it (`useDismiss`). Hidden projects are not
+ * here (the caller passes the visible ones). */
+function RepoPicker(props: { projects: Project[]; value: string | null; buttonRef?: Ref<HTMLButtonElement>; onPick(path: string): void }) {
   const t = useT();
-  // null: not searching (the box shows the chosen project's name).
-  const [query, setQuery] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [folded, setFolded] = useState<Set<string>>(() => new Set());
   const [active, setActive] = useState(0);
   const id = useId();
   const listId = `${id}-list`;
+  const searchId = `${id}-search`;
   const optionId = (i: number) => `${id}-opt-${i}`;
   const chosen = props.projects.find((p) => p.path === props.value);
-  const items = query === null ? [] : matchProjects(query, props.projects);
-  const open = items.length > 0;
+  const rows = open ? pickerRows(props.projects, query, folded) : [];
+  const at = Math.min(active, Math.max(rows.length - 1, 0));
   const wrap = useRef<HTMLSpanElement>(null);
-  // The list closes like every menu here; the box shows the chosen project again.
-  useDismiss(wrap, () => setQuery(null), { enabled: open });
-  const at = Math.min(active, Math.max(items.length - 1, 0));
-  const pick = (i: number) => {
-    props.onPick(items[i].path);
-    setQuery(null);
+  const button = useRef<HTMLButtonElement | null>(null);
+  const setButton = useCallback(
+    (el: HTMLButtonElement | null) => {
+      button.current = el;
+      const r = props.buttonRef;
+      if (typeof r === "function") r(el);
+      else if (r) (r as { current: HTMLButtonElement | null }).current = el;
+    },
+    [props.buttonRef],
+  );
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+  };
+  useDismiss(
+    wrap,
+    (why) => {
+      close();
+      if (why === "escape") button.current?.focus();
+    },
+    { enabled: open },
+  );
+  const show = () => {
+    setQuery("");
+    // The keyboard starts on the chosen project.
+    const start = pickerRows(props.projects, "", folded).findIndex((r) => r.kind === "project" && r.p.path === props.value);
+    setActive(Math.max(start, 0));
+    setOpen(true);
+  };
+  const fold = (folder: string, to?: boolean) =>
+    setFolded((cur) => {
+      const next = new Set(cur);
+      const shut = to ?? !next.has(folder);
+      if (shut) next.add(folder);
+      else next.delete(folder);
+      return next;
+    });
+  const choose = (i: number) => {
+    const r = rows[i];
+    if (!r) return;
+    if (r.kind === "group") {
+      setActive(i);
+      return fold(r.folder);
+    }
+    props.onPick(r.p.path);
+    close();
+    button.current?.focus();
   };
   const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    const n = rows.length;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
-      if (query === null) {
-        setQuery("");
-        setActive(0);
-        return;
-      }
-      const n = items.length || 1;
-      setActive((at + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
+      if (n) setActive((at + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
     } else if (e.key === "Enter") {
       // Never submits the form from here.
       e.preventDefault();
-      if (open) pick(at);
-    } else if (e.key === "Tab" && open && !e.shiftKey) {
-      pick(at);
-    } else if (e.key === "Escape" && query !== null) {
+      choose(at);
+    } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && rows[at]?.kind === "group" && !query.trim()) {
       e.preventDefault();
-      setQuery(null);
+      fold((rows[at] as { folder: string }).folder, e.key === "ArrowLeft");
     }
   };
+  const empty = props.projects.length === 0;
   return (
-    <span className="repo-box tchip tchip-static" ref={wrap}>
-      <label htmlFor={id} className="small muted">
-        {t("dispatch.repository")}
-      </label>
-      <input
-        id={id}
-        ref={props.inputRef}
-        role="combobox"
+    <span className="popover-wrap repo-picker" ref={wrap}>
+      <button
+        type="button"
+        ref={setButton}
+        className="tchip repo-chip"
+        aria-haspopup="listbox"
         aria-expanded={open}
-        aria-controls={listId}
-        aria-autocomplete="list"
-        aria-activedescendant={open ? optionId(at) : undefined}
-        title={chosen?.path}
-        placeholder={t(props.projects.length === 0 ? "dispatch.noProjects" : "dispatch.searchProjects")}
-        disabled={props.projects.length === 0}
-        value={query ?? chosen?.name ?? ""}
-        spellCheck={false}
-        autoComplete="off"
-        onChange={(e) => {
-          setQuery(e.target.value);
-          setActive(0);
-        }}
-        onKeyDown={onKey}
-        onBlur={() => setQuery(null)}
-      />
+        aria-controls={open ? listId : undefined}
+        title={chosen?.path ?? t("dispatch.pickRepoTitle")}
+        disabled={empty}
+        onClick={() => (open ? close() : show())}
+      >
+        <span className="muted">{t("dispatch.repository")}</span>{" "}
+        <span className="tchip-name">{chosen?.name ?? t(empty ? "dispatch.noProjects" : "dispatch.pickProject")}</span> <span aria-hidden="true">▾</span>
+      </button>
       {open && (
-        <OptionList
-          id={listId}
-          label={t("dispatch.projects")}
-          items={items.map((p) => ({ label: p.name, detail: p.path, insert: p.path }))}
-          active={at}
-          optionId={optionId}
-          onPick={pick}
-        />
+        <div className="popover repo-popover">
+          <label htmlFor={searchId} className="sr-only">
+            {t("dispatch.searchProjects")}
+          </label>
+          <input
+            id={searchId}
+            className="popover-search"
+            role="combobox"
+            aria-expanded="true"
+            aria-controls={listId}
+            aria-autocomplete="list"
+            aria-activedescendant={rows.length ? optionId(at) : undefined}
+            placeholder={t("dispatch.searchProjects")}
+            value={query}
+            autoFocus
+            spellCheck={false}
+            autoComplete="off"
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setActive(0);
+            }}
+            onKeyDown={onKey}
+          />
+          {rows.length === 0 && <p className="small muted">{t("dispatch.noProjectMatch")}</p>}
+          <ul className="picker-list" id={listId} role="listbox" aria-label={t("dispatch.projects")}>
+            {rows.map((r, i) =>
+              r.kind === "group" ? (
+                <li
+                  key={`g:${r.folder}`}
+                  id={optionId(i)}
+                  role="option"
+                  aria-selected={false}
+                  aria-expanded={r.open}
+                  className={`picker-group${i === at ? " active" : ""}`}
+                  title={r.folder}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => choose(i)}
+                >
+                  <span aria-hidden="true">{r.open ? "▾" : "▸"}</span> <span className="picker-name">{t("dispatch.group", { name: r.name, n: r.count })}</span>
+                </li>
+              ) : (
+                <li
+                  key={r.p.path}
+                  id={optionId(i)}
+                  role="option"
+                  aria-selected={r.p.path === props.value}
+                  className={`picker-project${r.nested ? " nested" : ""}${i === at ? " active" : ""}`}
+                  title={r.p.path}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => choose(i)}
+                >
+                  <span className="picker-check" aria-hidden="true">
+                    {r.p.path === props.value ? "✓" : ""}
+                  </span>
+                  <span className="picker-name">{r.p.name}</span>
+                </li>
+              ),
+            )}
+          </ul>
+        </div>
       )}
     </span>
   );

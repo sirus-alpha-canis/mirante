@@ -6,6 +6,27 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Changed
+
+- **Memory pressure no longer blocks work.** The memory guard is advisory by default: on
+  macOS "warn" pressure (most of the time on a busy Mac) it no longer pauses new sessions,
+  queued deliveries or auto-resume. It still shows the level, swap, what is available and
+  each session's memory, offers to hibernate the largest idle session (rate-limited), and
+  under sustained *critical* pressure still hibernates an IDLE session itself. A new
+  setting, **Pause new sessions under memory pressure** (*Off* / *Only when critical* /
+  *When elevated*; `daemon.settings`' `pause_new_sessions_under_pressure`, saved in
+  `settings.json`), brings pausing back; `MIRANTE_MEMGUARD_PAUSE=off|critical|elevated`
+  decides it for one daemon. `daemon.status` and the memory view say which applies, and
+  `mirante watch` / `mirante doctor` print `pausing: off`. The dispatch box never disables
+  Dispatch for memory: under pressure it shows a quiet hint instead of the red "System
+  memory is tight".
+- **The Repository chip opens a picker.** Clicking anywhere on "Repository <name>" opens
+  the projects (grouped by folder like the rail, foldable; hidden projects left out), with
+  the search focused, ↑/↓/Enter to pick (←/→ fold a group), Escape or a press outside to
+  close, and the chosen one checked. A long name is cut, its full path in the tooltip. It
+  used to be a text field that selected its text on click. The Agent chip's label and
+  arrow are one click target.
+
 ### Fixed
 
 - **`@claude <goal>` in the dispatch box no longer demands `<repo>/<branch>`.** Only the

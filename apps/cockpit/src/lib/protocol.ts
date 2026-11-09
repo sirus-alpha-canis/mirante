@@ -76,7 +76,13 @@ export interface SystemView {
   kernel_level?: string | null;
   /** Where `kernel_level` came from: "macos" or "linux-psi". */
   kernel_source?: string | null;
+  /** From which level new sessions pause (`daemon.settings`); absent from older daemons. */
+  pausing?: PausePolicy | null;
 }
+
+/** When the memory guard pauses new sessions and queued deliveries: "off" (the default:
+ * advisory only), "critical" or "elevated". */
+export type PausePolicy = "off" | "critical" | "elevated";
 
 export interface DaemonEvent {
   seq: number;
@@ -155,6 +161,10 @@ export interface DaemonStatus {
   auto_resume?: boolean | null;
   /** `MIRANTE_AUTO_RESUME=off` keeps auto-resume off for this daemon (absent when not). */
   auto_resume_forced_off?: boolean | null;
+  /** When the memory guard pauses new sessions (absent from older daemons). */
+  pause_new_sessions_under_pressure?: PausePolicy | null;
+  /** `MIRANTE_MEMGUARD_PAUSE` decides it for this daemon (absent when not). */
+  pause_forced_by_env?: boolean | null;
   /** The daemon's build (`<commit>[-dirty].<unix seconds>`); absent from older daemons. */
   build?: string | null;
 }
@@ -171,6 +181,9 @@ export interface DaemonSettings {
   auto_resume: boolean;
   /** `MIRANTE_AUTO_RESUME=off` keeps it off for this daemon (the choice is saved for later). */
   forced_by_env?: boolean;
+  /** Absent from older daemons. */
+  pause_new_sessions_under_pressure?: PausePolicy;
+  pause_forced_by_env?: boolean;
 }
 
 export interface StartResult {

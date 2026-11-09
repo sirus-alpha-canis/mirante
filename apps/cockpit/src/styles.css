@@ -201,8 +201,6 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .seg .btn:last-child { border-radius: 0 6px 6px 0; margin-left: -1px; }
 .seg .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .composer.dispatch { position: relative; }
-.repo-box { position: relative; display: inline-flex; gap: 6px; align-items: center; }
-.repo-box input { border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; background: var(--bg); width: 200px; }
 /* Suggestion lists open upward: the dispatch form sits at the bottom of the feed. */
 .suggest { position: absolute; bottom: 100%; left: 0; z-index: 10; min-width: 240px; max-height: 240px; overflow: auto; list-style: none; margin: 0 0 4px; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15); }
 .composer.dispatch > .suggest { left: 20px; }
@@ -431,7 +429,19 @@ button.skill-chip { cursor: pointer; }
 .tchip[aria-pressed="true"], .tchip[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
 .tchip:disabled { opacity: 0.55; cursor: default; }
 .tchip-static { cursor: default; }
-.repo-box.tchip input { border: none; background: transparent; padding: 0; width: 140px; }
+/* The repository chip: one button (label, name, arrow); a long name is cut, its path in the tooltip. */
+.repo-chip .tchip-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-chip, .repo-chip { padding: 3px 11px; }
+.repo-popover { width: 360px; }
+.picker-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.picker-list li { display: flex; gap: 6px; align-items: center; padding: 4px 8px; border-radius: 6px; cursor: pointer; min-width: 0; }
+.picker-list li.active, .picker-list li:hover { background: var(--panel-2); }
+.picker-list li.nested { padding-left: 22px; }
+.picker-group { font-weight: 600; font-size: 12px; color: var(--muted, inherit); }
+.picker-check { width: 1em; flex: none; color: var(--accent); }
+.picker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.pause-setting { margin-top: 6px; }
+.pause-setting select { border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px; background: var(--bg); font-size: 12px; max-width: 100%; }
 .dispatch-branch { flex-basis: auto; }
 .dispatch-branch input { min-width: 180px; }
 .attached { list-style: none; display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 6px; padding: 0; }

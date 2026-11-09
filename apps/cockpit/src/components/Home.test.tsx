@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { type DaemonStatus, RpcCode, type TaskDiff } from "../lib/protocol";
-import { HIDDEN_KEY, loadRegistry, type Registry, REPOS_KEY } from "../lib/repos";
+import { GROUPS_KEY, HIDDEN_KEY, loadRegistry, type Registry, REPOS_KEY } from "../lib/repos";
 import { AGENT_KEY } from "./DispatchComposer";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
@@ -77,6 +77,10 @@ async function chooseAgent(label: "Claude" | "Codex") {
   await userEvent.click(screen.getByRole("button", { name: /^Agent:/ }));
   await userEvent.click(within(screen.getByRole("group", { name: "Agents" })).getByRole("button", { name: new RegExp(`^${label}`) }));
 }
+
+/** The form's repository chip, and the picker's options as shown. */
+const repoChip = () => screen.getByRole("button", { name: /^Repository/ });
+const projectOptions = () => within(screen.getByRole("listbox", { name: "Projects" })).getAllByRole("option").map((o) => o.textContent?.replace(/^[▾▸✓]?\s*/, "").trim());
 
 /** The agent the form's Agent menu shows. */
 const agentShown = () => screen.getByRole("button", { name: /^Agent:/ }).textContent?.replace(/^Agent: /, "").replace(" ▾", "").trim();
@@ -152,35 +156,96 @@ describe("Home (V3 group chat)", () => {
     expect(agentShown()).toBe("Claude");
   });
 
-  it("the repo box starts on the selected project; typing filters the projects, Enter picks", async () => {
+  it("the repository chip is one button that opens the projects: search focused, ↑/↓/Enter pick", async () => {
     const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [], [], null, ["/repos/shop", "/repos/api", "/repos/apex"]);
-    const repo = screen.getByRole("combobox", { name: "Repository" });
-    expect(repo).toHaveValue("shop");
-    await userEvent.clear(repo);
-    await userEvent.type(repo, "ap");
+    const chip = repoChip();
+    expect(chip).toHaveTextContent("Repository shop");
+    expect(chip).toHaveAttribute("aria-haspopup", "listbox");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    // A click anywhere on it (here on its label) opens the list, never selects text.
+    await userEvent.click(within(chip).getByText("Repository"));
+    expect(chip).toHaveAttribute("aria-expanded", "true");
     const list = screen.getByRole("listbox", { name: "Projects" });
-    expect(within(list).getAllByRole("option").map((o) => o.textContent)).toEqual(["apex/repos/apex", "api/repos/api"]);
-    expect(repo).toHaveAttribute("aria-expanded", "true");
+    expect(chip).toHaveAttribute("aria-controls", list.id);
+    expect(projectOptions()).toEqual(["apex", "api", "shop"]);
+    // The chosen one is checked; the search has the keyboard, on the chosen one.
+    expect(screen.getByRole("option", { name: "shop" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: "api" })).toHaveAttribute("aria-selected", "false");
+    const search = screen.getByRole("combobox", { name: "Search projects" });
+    expect(search).toHaveFocus();
+    expect(search).toHaveAttribute("aria-activedescendant", screen.getByRole("option", { name: "shop" }).id);
+    await userEvent.type(search, "ap");
+    expect(projectOptions()).toEqual(["apex", "api"]);
     await userEvent.keyboard("{ArrowDown}");
-    expect(repo).toHaveAttribute("aria-activedescendant", within(list).getAllByRole("option")[1].id);
+    expect(search).toHaveAttribute("aria-activedescendant", screen.getByRole("option", { name: "api" }).id);
     await userEvent.keyboard("{Enter}");
-    expect(repo).toHaveValue("api");
     expect(screen.queryByRole("listbox", { name: "Projects" })).toBeNull();
+    expect(repoChip()).toHaveTextContent("Repository api");
+    expect(repoChip()).toHaveFocus();
     await userEvent.type(screen.getByLabelText("Goal"), "fix it{Meta>}{Enter}{/Meta}");
     await waitFor(() => expect(sent(h)[0]?.[1]).toMatchObject({ repo: "/repos/api", branch: "mirante/fix-it" }));
   });
 
-  it("the repo box: a click picks; Escape puts the chosen project back", async () => {
+  it("the repository picker: a click picks; Escape closes and keeps the chosen project", async () => {
     setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
-    const repo = screen.getByRole("combobox", { name: "Repository" });
-    await userEvent.clear(repo);
-    await userEvent.type(repo, "a");
-    await userEvent.keyboard("{Escape}");
-    expect(repo).toHaveValue("shop");
-    await userEvent.clear(repo);
-    await userEvent.type(repo, "a");
-    await userEvent.click(screen.getByRole("option", { name: /^api/ }));
-    expect(repo).toHaveValue("api");
+    await userEvent.click(repoChip());
+    await userEvent.keyboard("{ArrowDown}{Escape}");
+    expect(screen.queryByRole("listbox", { name: "Projects" })).toBeNull();
+    expect(repoChip()).toHaveTextContent("Repository shop");
+    expect(repoChip()).toHaveFocus();
+    await userEvent.click(repoChip());
+    await userEvent.click(screen.getByRole("option", { name: "api" }));
+    expect(repoChip()).toHaveTextContent("Repository api");
+    // Open again: api is the checked one now.
+    await userEvent.click(repoChip());
+    expect(screen.getByRole("option", { name: "api" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("the repository picker groups a folder's projects like the rail (folding), and leaves hidden ones out", async () => {
+    const h = makeEnv();
+    h.load([]);
+    const repos = ["/w/gol/site", "/w/gol/api", "/w/gol/old", "/repos/shop"];
+    h.env.storage.setItem(REPOS_KEY, JSON.stringify(repos));
+    h.env.storage.setItem(HIDDEN_KEY, JSON.stringify(["/w/gol/old"]));
+    h.env.storage.setItem(GROUPS_KEY, JSON.stringify({ "/w/gol/site": "/w/gol", "/w/gol/api": "/w/gol", "/w/gol/old": "/w/gol" }));
+    renderWith(h.env, <Harness env={h.env} registry={repos} />);
+    await userEvent.click(repoChip());
+    const group = screen.getByRole("option", { name: /gol \(2\)/ });
+    expect(group).toHaveAttribute("aria-expanded", "true");
+    expect(projectOptions()).toEqual(["gol (2)", "api", "site", "shop"]);
+    expect(screen.queryByRole("option", { name: "old" })).toBeNull();
+    // A click on the group folds it; Enter on it unfolds it again.
+    await userEvent.click(group);
+    expect(projectOptions()).toEqual(["gol (2)", "shop"]);
+    expect(screen.getByRole("listbox", { name: "Projects" })).toBeInTheDocument();
+    const search = screen.getByRole("combobox", { name: "Search projects" });
+    expect(search).toHaveAttribute("aria-activedescendant", screen.getByRole("option", { name: /gol/ }).id);
+    await userEvent.keyboard("{Enter}");
+    expect(projectOptions()).toEqual(["gol (2)", "api", "site", "shop"]);
+    await userEvent.keyboard("{ArrowLeft}");
+    expect(projectOptions()).toEqual(["gol (2)", "shop"]);
+    // A search shows every match, folded or not.
+    await userEvent.type(search, "si");
+    expect(projectOptions()).toEqual(["gol (1)", "site"]);
+    await userEvent.keyboard("{ArrowDown}{Enter}");
+    expect(repoChip()).toHaveTextContent("Repository site");
+  });
+
+  it("a long project name is cut in the chip, its full path in the tooltip", async () => {
+    const long = "/repos/a-very-long-repository-name-that-does-not-fit-in-the-toolbar";
+    setup({}, [], [], null, [long]);
+    const chip = repoChip();
+    expect(chip).toHaveAttribute("title", long);
+    expect(chip.querySelector(".tchip-name")).toHaveTextContent("a-very-long-repository-name-that-does-not-fit-in-the-toolbar");
+    await userEvent.click(chip);
+    expect(screen.getByRole("option", { name: /a-very-long/ })).toHaveAttribute("title", long);
+  });
+
+  it("the Agent chip's label and arrow are one click target", async () => {
+    setup();
+    const chip = screen.getByRole("button", { name: /^Agent:/ });
+    await userEvent.click(within(chip).getByText("▾"));
+    expect(screen.getByRole("group", { name: "Agents" })).toBeInTheDocument();
   });
 
   describe("the @ shortcut's suggestions", () => {
@@ -325,10 +390,8 @@ describe("Home (V3 group chat)", () => {
     const founder = "@claude Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente";
     const founderGoal = "Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente";
     const pickRepo = async (name: string) => {
-      const box = screen.getByRole("combobox", { name: "Repository" });
-      await userEvent.clear(box);
-      await userEvent.type(box, name);
-      await userEvent.click(screen.getByRole("option", { name: new RegExp(`^${name}`) }));
+      await userEvent.click(repoChip());
+      await userEvent.click(screen.getByRole("option", { name }));
     };
 
     it("@claude + a goal goes to the toolbar's repo on a branch Mirante names (the founder's input)", async () => {
@@ -336,7 +399,7 @@ describe("Home (V3 group chat)", () => {
       await pickRepo("Site-B2C");
       fireEvent.change(screen.getByLabelText("Goal"), { target: { value: founder } });
       // The chips stay usable; the hint shows where it will go.
-      expect(screen.getByRole("combobox", { name: "Repository" })).toBeEnabled();
+      expect(repoChip()).toBeEnabled();
       expect(screen.getByRole("button", { name: /^Agent:/ })).toBeEnabled();
       expect(screen.queryByText(/come from the @ line/)).toBeNull();
       const hint = screen.getByLabelText("Where the agent will work");
@@ -475,13 +538,29 @@ describe("Home (V3 group chat)", () => {
     await waitFor(() => expect(screen.queryByRole("list", { name: "Attached context" })).toBeNull());
   });
 
-  it("while memory pauses new sessions, the form says so", () => {
-    const paused: DaemonStatus = {
+  it("under memory pressure the form keeps working and says so quietly", async () => {
+    const hint = "macOS reports memory pressure — Mirante keeps going; consider hibernating idle sessions";
+    const elevated: DaemonStatus = {
       ...daemonStatus(false),
-      memory: { level: "elevated", total: 1, free: 1, swap_used: 0, swap_total: 0, paused: true },
+      memory: { level: "elevated", total: 1, free: 1, swap_used: 0, swap_total: 0, paused: false, pausing: "off" },
     };
-    setup({}, [], [], paused);
-    expect(screen.getByText("System memory is tight: new sessions wait until it eases")).toBeInTheDocument();
+    const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [], [], elevated);
+    const note = screen.getByText(hint);
+    expect(note).not.toHaveClass("warn");
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it");
+    const send = screen.getByRole("button", { name: "Dispatch" });
+    expect(send).toBeEnabled();
+    await userEvent.click(send);
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
+    cleanup();
+    // Even a daemon set to pause: Dispatch is never disabled for memory (the daemon says why).
+    setup({}, [], [], { ...elevated, memory: { ...elevated.memory!, level: "critical", paused: true } });
+    expect(screen.getByText(hint)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Goal"), "x");
+    expect(screen.getByRole("button", { name: "Dispatch" })).toBeEnabled();
+    cleanup();
+    setup({}, [], [], { ...elevated, memory: { ...elevated.memory!, level: "normal" } });
+    expect(screen.queryByText(hint)).toBeNull();
   });
 
   it("files that may hold secrets are flagged in the picker", async () => {
@@ -513,9 +592,8 @@ describe("Home (V3 group chat)", () => {
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
     await userEvent.keyboard("{Escape}");
-    const box = screen.getByRole("combobox", { name: "Repository" });
-    await userEvent.clear(box);
-    await userEvent.type(box, "api{Enter}");
+    await userEvent.click(repoChip());
+    await userEvent.keyboard("api{Enter}");
     await userEvent.type(screen.getByLabelText("Goal"), "do it{Meta>}{Enter}{/Meta}");
     expect(await screen.findByRole("alert")).toHaveTextContent("The attached files and notes are from shop, not api");
     expect(sent(h).map((c) => c[0])).not.toContain("task.create");
@@ -564,6 +642,35 @@ describe("Home (V3 group chat)", () => {
     await userEvent.click(box);
     expect(h.calls).toContainEqual(["daemon.settings", { auto_resume: false }]);
     await waitFor(() => expect(box).not.toBeChecked());
+  });
+
+  it("the Sessions section sets when new sessions pause under memory pressure (off by default)", async () => {
+    const h = setup(
+      { "daemon.settings": (p: Record<string, unknown>) => ({ auto_resume: true, pause_new_sessions_under_pressure: p.pause_new_sessions_under_pressure }) },
+      [],
+      [],
+      { ...daemonStatus(false), auto_resume: true, pause_new_sessions_under_pressure: "off" },
+    );
+    const settings = screen.getByRole("region", { name: "Sessions" });
+    const pick = within(settings).getByRole("combobox", { name: "Pause new sessions under memory pressure" });
+    expect(pick).toHaveValue("off");
+    expect(within(pick).getAllByRole("option").map((o) => o.textContent)).toEqual(["Off", "Only when critical", "When elevated"]);
+    expect(settings).toHaveTextContent("Mirante keeps working under pressure");
+    await userEvent.selectOptions(pick, "critical");
+    expect(h.calls).toContainEqual(["daemon.settings", { pause_new_sessions_under_pressure: "critical" }]);
+    await waitFor(() => expect(pick).toHaveValue("critical"));
+  });
+
+  it("the pause setting is read-only under MIRANTE_MEMGUARD_PAUSE, and absent for an older daemon", () => {
+    setup({}, [], [], { ...daemonStatus(false), auto_resume: true, pause_new_sessions_under_pressure: "elevated", pause_forced_by_env: true });
+    const settings = screen.getByRole("region", { name: "Sessions" });
+    const pick = within(settings).getByRole("combobox", { name: "Pause new sessions under memory pressure" });
+    expect(pick).toHaveValue("elevated");
+    expect(pick).toBeDisabled();
+    expect(settings).toHaveTextContent("MIRANTE_MEMGUARD_PAUSE");
+    cleanup();
+    setup({}, [], [], { ...daemonStatus(false), auto_resume: true });
+    expect(within(screen.getByRole("region", { name: "Sessions" })).queryByRole("combobox")).toBeNull();
   });
 
   it("an agent in the rail with no live session selects it in the form and focuses the goal", async () => {
@@ -864,19 +971,23 @@ describe("the form's menus close like menus", () => {
     });
   }
 
-  it("the repo box's list: a press outside, Escape, focus leaving or the window losing focus closes it", async () => {
+  it("the repository picker: a press outside, Escape, focus leaving or the window losing focus closes it", async () => {
     setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
-    const repo = screen.getByRole("combobox", { name: "Repository" });
     const list = () => screen.queryByRole("listbox", { name: "Projects" });
     const reopen = async () => {
-      await userEvent.clear(repo);
-      await userEvent.type(repo, "a");
+      await userEvent.click(repoChip());
       expect(list()).not.toBeNull();
     };
     await reopen();
+    fireEvent.pointerDown(list()!);
+    expect(list()).not.toBeNull();
     pressOutside();
     expect(list()).toBeNull();
-    expect(repo).toHaveValue("shop");
+    expect(repoChip()).toHaveTextContent("Repository shop");
+    // A press on the chip toggles it.
+    await reopen();
+    await userEvent.click(repoChip());
+    expect(list()).toBeNull();
     await reopen();
     act(() => {
       document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));

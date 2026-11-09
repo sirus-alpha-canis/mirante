@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useDismiss } from "../lib/useDismiss";
 import { shallow, useEnv, useSelect } from "../env";
 import { AGENT_OPTIONS } from "../lib/dispatch";
 import { same, type State } from "../store/state";
 import { dnaStatus } from "../lib/dna";
-import { type DaemonSettings, M } from "../lib/protocol";
+import { type DaemonSettings, M, type PausePolicy } from "../lib/protocol";
 import { usePendingSkills } from "../lib/useSkills";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { addRepo, addRepos, expandHome, loadRegistry, normaliseRepoPath, type Registry, showRepos } from "../lib/repos";
@@ -15,7 +15,7 @@ import { ScanPicker } from "./ScanPicker";
 import { inboxOf } from "../lib/inbox";
 import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
-import { useT } from "../lib/i18n";
+import { type Key, useT } from "../lib/i18n";
 
 const selectColumns = (s: State) => inboxOf(s).columns;
 
@@ -318,12 +318,67 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
         </label>
       )}
       {forced && <p className="small muted">{t("sessions.forced")}</p>}
+      <PauseSetting status={status} />
       {error && (
         <p className="error small" role="alert">
           {error}
         </p>
       )}
     </section>
+  );
+}
+
+const PAUSE_OPTIONS: { id: PausePolicy; label: Key }[] = [
+  { id: "off", label: "sessions.pause.off" },
+  { id: "critical", label: "sessions.pause.critical" },
+  { id: "elevated", label: "sessions.pause.elevated" },
+];
+
+/** When the memory guard pauses new sessions (`daemon.settings`'s
+ * `pause_new_sessions_under_pressure`): off by default, the guard only advises. Hidden for
+ * an older daemon that has no such setting; read-only when `MIRANTE_MEMGUARD_PAUSE` decides. */
+function PauseSetting({ status }: { status: DaemonStatus | null }) {
+  const { rpc } = useEnv();
+  const t = useT();
+  const id = useId();
+  const known = status?.pause_new_sessions_under_pressure ?? null;
+  const [mine, setMine] = useState<PausePolicy | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => setMine(null), [known]);
+  if (!known) return null;
+  const forced = status?.pause_forced_by_env === true;
+  const change = async (want: PausePolicy) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await rpc<DaemonSettings>(M.daemonSettings, { pause_new_sessions_under_pressure: want });
+      setMine(r?.pause_new_sessions_under_pressure ?? want);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="pause-setting">
+      <label htmlFor={id} className="small">
+        {t("sessions.pause")}
+      </label>{" "}
+      <select id={id} value={mine ?? known} disabled={busy || forced} onChange={(e) => void change(e.target.value as PausePolicy)}>
+        {PAUSE_OPTIONS.map((o) => (
+          <option key={o.id} value={o.id}>
+            {t(o.label)}
+          </option>
+        ))}
+      </select>
+      <p className="small muted">{t(forced ? "sessions.pauseForced" : "sessions.pauseHelp")}</p>
+      {error && (
+        <p className="error small" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

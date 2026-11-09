@@ -237,7 +237,7 @@ export const Home = memo(function Home(props: {
           agent={agent}
           onAgent={pickAgent}
           inputRef={composer}
-          paused={props.status?.memory?.paused ?? false}
+          pressure={props.status?.memory?.level === "elevated" || props.status?.memory?.level === "critical"}
           form={props.form}
           onForm={props.onForm}
         />
