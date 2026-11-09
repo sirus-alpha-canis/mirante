@@ -61,10 +61,14 @@ export const AgentCard = memo(function AgentCard({
   return (
     <article className={`card card-${col}`} aria-label={tt("card.label", { agent: t.agent, branch: t.branch })} data-task={t.id}>
       <header className="card-head">
-        <ProjectChip path={t.repo_path} />
         <button className="link" onClick={() => onOpen(t.id)}>
           {t.title}
         </button>
+        <StatusPill column={col} />
+      </header>
+      {/* Who and where, muted on one line. */}
+      <div className="card-meta">
+        <ProjectChip path={t.repo_path} />
         <span className={`agent agent-${t.agent}`}>@{t.agent}</span>
         {mode && (
           <span className="tag" title={mode.title}>
@@ -73,8 +77,7 @@ export const AgentCard = memo(function AgentCard({
         )}
         <AutoModeBadge t={t} />
         <SkillsCount task={t.id} />
-        <StatusPill column={col} />
-      </header>
+      </div>
       {answer && <LastAnswer text={answer} />}
       {t.boot === "trust_prompt" && <TrustCard taskId={t.id} />}
       {unexplained && (

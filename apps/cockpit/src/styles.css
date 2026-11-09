@@ -248,6 +248,8 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .who { font-weight: 600; margin-right: 6px; color: var(--faint); }
 .card-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .card-head .link { font-size: var(--fs); }
+.card-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; color: var(--muted); font-size: var(--fs-sm); min-width: 0; }
+.card-meta > * + *:not(.tag-danger)::before { content: "·"; color: var(--faint); margin-right: 6px; }
 .badges { display: inline-flex; gap: var(--s2); align-items: center; flex-wrap: wrap; color: var(--muted); font-size: var(--fs-sm); }
 .agent { color: var(--muted); font-size: var(--fs-sm); }
 .branch { font-family: var(--mono); font-size: var(--fs-sm); color: var(--muted); background: none; padding: 0; overflow-wrap: anywhere; }
