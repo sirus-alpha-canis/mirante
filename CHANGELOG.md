@@ -1,10 +1,17 @@
 # Changelog
 
 All notable changes to Mirante. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-there are no released versions yet, so everything is under Unreleased. Every crate and the
-app are version 0.1.0 until the first release.
+versions follow [Semantic Versioning](https://semver.org/) (0.x: anything may change). Every
+crate and the app share one version. How a release is cut: [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
+
+## [0.1.0] — 2026-11-09
+
+The first release: prebuilt binaries for macOS (Apple silicon and Intel) on GitHub Releases
+and a Homebrew formula for the CLI, daemon, hook and MCP server
+(`brew install sirus-alpha-canis/tap/mirante`). The desktop app is built from source until
+signed releases.
 
 ### What exists today
 
@@ -35,6 +42,13 @@ app are version 0.1.0 until the first release.
 
 ### Added
 
+- Distribution: `.github/workflows/release.yml` builds `mirante`, `mirante-daemon`,
+  `mirante-hook` and `mirante-mcp` for `aarch64-apple-darwin` and `x86_64-apple-darwin` on a
+  `v*` tag and publishes `mirante-<version>-<target>.tar.gz` (binaries, LICENSE,
+  THIRD_PARTY_NOTICES.md, README.md) with `SHA256SUMS` as a GitHub Release; with the
+  `HOMEBREW_TAP_TOKEN` secret it also updates the formula in
+  [sirus-alpha-canis/homebrew-tap](https://github.com/sirus-alpha-canis/homebrew-tap).
+  `scripts/homebrew-formula.sh` writes that formula. Steps: `RELEASING.md`.
 - `scripts/install.sh` (build, link into `~/.local/bin`, warm up, start the daemon,
   doctor; `--app`, `--prefix`, `--no-start`), `scripts/uninstall.sh` (`--purge` only with a
   typed confirmation) and `scripts/try.sh` (a tour with a fake agent; `--smoke` for CI).
@@ -88,3 +102,6 @@ app are version 0.1.0 until the first release.
   of "not running".
 - A daemon that exits during startup is reported with the end of its log, not
   "No such file or directory (os error 2)".
+
+[Unreleased]: https://github.com/sirus-alpha-canis/mirante/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sirus-alpha-canis/mirante/releases/tag/v0.1.0

@@ -19,7 +19,10 @@ Early prototype. Expect rough edges and breaking changes.
 - **macOS first.** Linux is partially supported: the daemon has Linux code paths (process
   trees, memory sampling), but the app and the full flow are only exercised on macOS.
   Windows is not supported.
-- **The app is unsigned** and not notarized. You build it yourself.
+- **The CLI, daemon, hook and MCP server** ship as prebuilt macOS binaries (Apple silicon
+  and Intel) through Homebrew and [GitHub Releases](https://github.com/sirus-alpha-canis/mirante/releases).
+- **The desktop app is source-only** until signed releases: it is unsigned and not
+  notarized, so you build it yourself.
 - **Some UI labels are in Portuguese** for now (for example "Precisa de você", meaning
   "needs you").
 - **Supported agents:** Claude Code and Codex only.
@@ -28,14 +31,13 @@ Early prototype. Expect rough edges and breaking changes.
 
 ## Quickstart (5 minutes)
 
-You need macOS with the Xcode command line tools (`xcode-select --install`, which brings
-`git`), [rustup](https://rustup.rs), and Claude Code and/or the Codex CLI installed and
-logged in. Then:
+You need macOS with `git` (the Xcode command line tools: `xcode-select --install`), and
+Claude Code and/or the Codex CLI installed and logged in. Then:
 
 ```bash
-git clone https://github.com/sirus-alpha-canis/mirante.git && cd mirante
-scripts/install.sh      # builds, links into ~/.local/bin, starts the daemon, runs `mirante doctor`
-scripts/try.sh          # optional: a one-minute tour with a fake agent (no login, no quota)
+brew install sirus-alpha-canis/tap/mirante
+mirante daemon start
+mirante doctor          # which agent binaries the daemon found, memory, orphans
 
 cd ~/code/your-repo     # any git repository with at least one commit
 mirante new . --agent claude "add a health-check endpoint"   # or --agent codex
@@ -43,20 +45,29 @@ mirante ls              # status, and what needs you
 mirante attach mirante/add-a-health-check-endpoint          # the live terminal; Ctrl-] detaches
 ```
 
-The first build takes a few minutes, and the first start of a fresh build can take about
-20 seconds while macOS scans the new binaries (`install.sh` does that first launch for you).
-`install.sh` is safe to run again after a `git pull`: it rebuilds, relinks and restarts an
-idle daemon. If `~/.local/bin` is not on your `PATH`, it says what to add to your shell
-profile.
+The first start of freshly installed binaries can take about 20 seconds while macOS scans
+them. From source instead (needs [rustup](https://rustup.rs)):
 
-The desktop app: `scripts/install.sh --app` builds it (also needs Node 22.12+ and pnpm 10;
-add `--install-app` to copy it to `/Applications`), then `mirante app` opens it, starting the
-daemon first if needed. The daemon itself has no window: `mirante daemon start` alone opens
+```bash
+git clone https://github.com/sirus-alpha-canis/mirante.git && cd mirante
+scripts/install.sh      # builds, links into ~/.local/bin, starts the daemon, runs `mirante doctor`
+scripts/try.sh          # optional: a one-minute tour with a fake agent (no login, no quota)
+```
+
+The first build takes a few minutes. `install.sh` is safe to run again after a `git pull`:
+it rebuilds, relinks and restarts an idle daemon. If `~/.local/bin` is not on your `PATH`,
+it says what to add to your shell profile.
+
+The desktop app is built from source: `scripts/install.sh --app` builds it (also needs
+Node 22.12+ and pnpm 10; add `--install-app` to copy it to `/Applications`), then
+`mirante app` opens it, starting the daemon first if needed. The daemon itself has no window: `mirante daemon start` alone opens
 nothing. `mirante help` lists every command, `mirante <command> --help` explains one.
 
 ## Requirements
 
 - macOS (Linux: partial, see above) with the Xcode command line tools and `git` 2.31 or newer.
+- Homebrew, for the prebuilt CLI (macOS 12 or newer, Apple silicon or Intel). The rest of
+  this list is for building from source.
 - Rust through [rustup](https://rustup.rs), at the version pinned in `rust-toolchain.toml`
   (1.99.1, with clippy and rustfmt; `rustup toolchain install` in the repo fetches it). Some
   dependencies use edition 2024, so an older Homebrew `cargo` (1.81, for example) fails to build them.
@@ -70,6 +81,25 @@ nothing. `mirante help` lists every command, `mirante <command> --help` explains
 ## Install
 
 ### 1. CLI, daemon, hook and MCP server
+
+#### With Homebrew (prebuilt, macOS)
+
+```bash
+brew install sirus-alpha-canis/tap/mirante
+mirante daemon start
+mirante doctor
+```
+
+This installs `mirante`, `mirante-daemon`, `mirante-hook` and `mirante-mcp` together into
+Homebrew's prefix (`/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on Intel). Upgrade
+with `brew upgrade mirante`, then `mirante daemon restart` once no task is running. Use
+either Homebrew or `install.sh`, not both: if you used `install.sh` before, run
+`scripts/uninstall.sh` (it keeps `~/.mirante`) so only one copy is on your `PATH`. The
+tarballs and their `SHA256SUMS` are also on the
+[releases page](https://github.com/sirus-alpha-canis/mirante/releases) (keep the four
+binaries in one directory). How releases are made: [RELEASING.md](RELEASING.md).
+
+#### From source
 
 `scripts/install.sh` does all of this (`--prefix <dir>` links somewhere other than
 `~/.local/bin`; `--no-start` leaves the daemon alone). By hand:
@@ -104,6 +134,7 @@ mirante doctor          # which agent binaries the daemon resolved, and from whe
 
 ### 2. The desktop app
 
+The app is source-only until there are signed releases (it is not in Homebrew).
 `scripts/install.sh --app` (`--install-app` also copies it to `/Applications`, replacing an
 older copy after you confirm, or with `--yes`), or by hand:
 
@@ -237,6 +268,10 @@ mirante app                     # open the desktop app (starts the daemon first;
   `mirante-hook`.)
 
 ## Uninstall
+
+With Homebrew: `mirante daemon stop`, then `brew uninstall mirante` (and
+`brew untap sirus-alpha-canis/tap`). That leaves `~/.mirante`; delete it yourself if you
+want the data gone. From source:
 
 ```bash
 scripts/uninstall.sh            # stops the daemon, removes the links install.sh made
