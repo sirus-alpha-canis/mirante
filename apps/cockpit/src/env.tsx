@@ -1,7 +1,7 @@
 // What components need from the outside world, injected so tests can fake it.
 import { createContext, useContext } from "react";
 import type { Note } from "./lib/notify";
-import type { DaemonBinary } from "./lib/protocol";
+import type { DaemonBinary, RepoScan } from "./lib/protocol";
 import type { Cockpit } from "./store/cockpit";
 import { useCockpitSelect } from "./store/cockpit";
 import type { State } from "./store/state";
@@ -25,6 +25,8 @@ export interface Env {
   homeDir(): Promise<string>;
   /** What is at an absolute path. */
   pathKind(path: string): Promise<PathKind>;
+  /** The git checkouts in a folder (or that the folder is one). */
+  scanRepos(path: string): Promise<RepoScan>;
   /** Calls `fn` with the task of a notification the person clicked; returns the unsubscribe. */
   onNoteClick?(fn: (taskId: string) => void): () => void;
 }

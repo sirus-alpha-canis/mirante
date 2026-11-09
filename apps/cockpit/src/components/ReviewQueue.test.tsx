@@ -170,7 +170,7 @@ describe("ReviewQueue", () => {
     renderWith(
       h.env,
       <LeftRail
-        projects={[{ path: "/r/app", name: "app", tasks: 1, needsYou: 0 }]}
+        projects={[{ path: "/r/app", name: "app", tasks: 1, live: 0, needsYou: 0, hidden: false, group: null }]}
         selected="/r/app"
         onSelect={() => {}}
         onReposChanged={() => {}}

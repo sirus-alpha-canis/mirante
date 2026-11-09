@@ -2,7 +2,7 @@
 // (store/cockpit.ts) or imports this module (and tests mock it).
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n";
-import type { BridgeError, DaemonBinary, StreamMsg } from "./protocol";
+import type { BridgeError, DaemonBinary, RepoScan, StreamMsg } from "./protocol";
 import { RpcCode } from "./protocol";
 
 export class DaemonError extends Error {
@@ -159,6 +159,16 @@ export async function daemonRestart(): Promise<void> {
 /** The user's home directory as the app process sees it (Tauri's path resolver). */
 export async function homeDir(): Promise<string> {
   return await invoke<string>("home_dir");
+}
+
+/** The git checkouts in a folder given to Add project (`scan_repos`: read-only, two levels
+ * deep, capped); rejects with a message when `path` is no absolute existing folder. */
+export async function scanRepos(path: string): Promise<RepoScan> {
+  try {
+    return await invoke<RepoScan>("scan_repos", { path });
+  } catch (e) {
+    throw e instanceof Error ? e : new Error(String(e));
+  }
 }
 
 /** What is at `path` (absolute): "dir", "file" or "missing". */

@@ -120,6 +120,23 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 .rail-item { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 6px; background: none; border: none; border-radius: 6px; padding: 6px 8px; cursor: pointer; text-align: left; flex-wrap: wrap; }
 .rail-item:hover, .rail-item.selected { background: var(--panel-2); }
 .rail-row { display: flex; align-items: center; gap: 2px; }
+.rail-row > .rail-item, .rail-row > .rail-warn { flex: 1; min-width: 0; }
+.rail-row > .rail-item > span:first-child { overflow-wrap: anywhere; }
+.rail h2:focus { outline: none; }
+.rail-hidden .rail-item { opacity: 0.7; }
+.rail-warn { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 4px 8px; color: var(--needs); overflow-wrap: anywhere; }
+.rail-group-list { margin: 0 0 4px 10px !important; border-left: 1px solid var(--line); padding-left: 4px !important; }
+.rail-filter { width: 100%; box-sizing: border-box; margin-bottom: 4px; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; background: var(--bg); }
+.rail-confirm, .scan-picker { margin: 4px 0 8px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.rail-confirm p { margin: 0 0 6px; }
+.rail-confirm .scan-actions { margin-top: 4px; }
+.rail-failed { margin: 4px 0 0 !important; display: flex; flex-direction: column; gap: 4px; }
+.rail-failed span { overflow-wrap: anywhere; white-space: pre-wrap; }
+.scan-picker h3 { margin: 0 0 6px; font-weight: 600; overflow-wrap: anywhere; }
+.scan-picker:focus, .rail-confirm:focus { outline: 2px solid var(--accent, var(--needs)); outline-offset: 1px; }
+.scan-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.scan-list { max-height: 240px; overflow: auto; margin: 4px 0 6px !important; }
+.scan-list label { padding: 2px 0; overflow-wrap: anywhere; }
 .rail-pick { margin: 2px 0 6px 10px !important; border-left: 1px solid var(--line); padding-left: 4px !important; }
 .btn-ghost { border-color: transparent; background: none; color: var(--muted); }
 .badge { background: var(--needs); color: var(--panel); border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: 700; }

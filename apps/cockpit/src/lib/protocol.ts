@@ -124,6 +124,23 @@ export interface TaskDiff {
   pushed: boolean;
 }
 
+/** The cockpit shell's `scan_repos` (not the daemon): the git checkouts in a folder. */
+export interface FoundRepo {
+  path: string;
+  name: string;
+  kind: "repo" | "worktree";
+  /** A worktree's main repository (its path), when known. */
+  main_repo: string | null;
+}
+
+export interface RepoScan {
+  /** The folder is itself a checkout (then `repos` is empty). */
+  root: "repo" | "worktree" | null;
+  repos: FoundRepo[];
+  /** A cap or the time limit cut the walk short. */
+  truncated: boolean;
+}
+
 export interface DaemonStatus {
   pid: number;
   boot_id: string;

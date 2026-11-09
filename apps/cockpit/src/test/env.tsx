@@ -4,7 +4,7 @@ import type { ReactElement } from "react";
 import { vi } from "vitest";
 import { type Env, EnvContext } from "../env";
 import { DaemonError } from "../lib/daemon";
-import type { BridgeError, DaemonBinary, DaemonEvent, TaskView } from "../lib/protocol";
+import type { BridgeError, DaemonBinary, DaemonEvent, RepoScan, TaskView } from "../lib/protocol";
 import { createCockpit } from "../store/cockpit";
 import { snapshot } from "./fixtures";
 
@@ -40,6 +40,8 @@ export function makeEnv(answers: Record<string, Answer> = {}) {
     pickFolder: vi.fn(async () => null),
     homeDir: vi.fn(async () => "/Users/me"),
     pathKind: vi.fn(async () => "dir" as const),
+    // A folder is a repository unless a test says otherwise.
+    scanRepos: vi.fn(async (): Promise<RepoScan> => ({ root: "repo", repos: [], truncated: false })),
   };
   return {
     env,

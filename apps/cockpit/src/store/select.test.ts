@@ -32,8 +32,17 @@ describe("projects", () => {
   it("merges the registry with task repos and counts needs-you", () => {
     const s = withTasks(task("a", { status: "needs_you" }), task("b"));
     expect(projects(s, ["/repos/mirante", "/repos/shop"])).toEqual([
-      { path: "/repos/mirante", name: "mirante", tasks: 0, needsYou: 0 },
-      { path: "/repos/shop", name: "shop", tasks: 2, needsYou: 1 },
+      { path: "/repos/mirante", name: "mirante", tasks: 0, live: 0, needsYou: 0, hidden: false, group: null },
+      { path: "/repos/shop", name: "shop", tasks: 2, live: 2, needsYou: 1, hidden: false, group: null },
+    ]);
+  });
+
+  it("marks hidden projects and the folder each was picked from", () => {
+    const s = withTasks(task("a", { live: false }), task("b", { repo_path: "/g/api" }));
+    expect(projects(s, ["/g/web"], { hidden: ["/repos/shop"], groups: { "/g/api": "/g", "/g/web": "/g" } })).toEqual([
+      { path: "/g/api", name: "api", tasks: 1, live: 1, needsYou: 0, hidden: false, group: "/g" },
+      { path: "/repos/shop", name: "shop", tasks: 1, live: 0, needsYou: 0, hidden: true, group: null },
+      { path: "/g/web", name: "web", tasks: 0, live: 0, needsYou: 0, hidden: false, group: "/g" },
     ]);
   });
 });

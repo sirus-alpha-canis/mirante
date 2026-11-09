@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import capabilities from "../src-tauri/capabilities/default.json";
 import conf from "../src-tauri/tauri.conf.json";
 import shell from "../src-tauri/src/lib.rs?raw";
+import scanner from "../src-tauri/src/scan.rs?raw";
 import picker from "./main.tsx?raw";
 import bridgeRpc from "../../../crates/mirante-bridge/src/rpc.rs?raw";
 import { M } from "./lib/protocol";
@@ -93,10 +94,27 @@ describe("Tauri security baseline", () => {
       "daemon_restart",
       "home_dir",
       "path_kind",
+      // Add project given a folder: the git checkouts in it (read-only, two levels deep,
+      // capped; see scan.rs).
+      "scan_repos",
     ]);
     // Neither takes anything from the webview: the binary is the one the app resolves itself.
     expect(shell).toContain("async fn daemon_binary_build() -> Option<DaemonBinary>");
     expect(shell).toContain("async fn daemon_restart(app: AppHandle) -> Result<(), String>");
+  });
+
+  it("scan_repos only reads: no shell or process, symlinks never followed, input checked, bounded", () => {
+    expect(shell).toContain("async fn scan_repos(path: String) -> Result<scan::Scan, String>");
+    expect(shell).toContain("scan::scan(&path, scan::LIMITS)");
+    // The code itself (its tests make folders): no process, nothing written or removed.
+    const code = scanner.slice(0, scanner.indexOf("#[cfg(test)]"));
+    expect(code).not.toMatch(/std::process|Command::new|fs::remove|fs::write|create_dir|OpenOptions|read_link|canonicalize/);
+    // The walk goes by `file_type` (which does not follow a link) and `symlink_metadata`.
+    expect(scanner).toContain("entry.file_type()");
+    expect(scanner).toContain("symlink_metadata(&git)");
+    // The webview's path: absolute, no "..", an existing folder.
+    expect(scanner).toMatch(/fn folder\(path: &str\)[\s\S]*is_absolute[\s\S]*ParentDir[\s\S]*is_dir/);
+    expect(scanner).toContain("pub const LIMITS: Limits = Limits { depth: 2, max_dirs: 500, max_repos: 200, time: Duration::from_secs(3) };");
   });
 
   it("reaches the daemon only through the bridge's allowlist, pinned here too", () => {

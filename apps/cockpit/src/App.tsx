@@ -17,7 +17,7 @@ import { useNow } from "./lib/useNow";
 import { needingOrder, nextNeeding } from "./lib/inbox";
 import { type DaemonBinary, type DaemonStatus, M, type TaskView } from "./lib/protocol";
 import { daemonOutdated, type Update, UpdateContext } from "./lib/update";
-import { loadRepos } from "./lib/repos";
+import { loadRegistry, type Registry } from "./lib/repos";
 import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, saveTheme, type Theme } from "./lib/theme";
 import { type DetailTab, loadUi, saveUi } from "./lib/uistate";
@@ -197,7 +197,7 @@ export function App({ env: given }: { env: Env }) {
   const [shownTab, setShownTab] = useState<DetailTab | null>(saved.tab);
   // Bumped by every "Answer in terminal": Detail re-selects its Terminal tab on each new value.
   const [terminalNonce, setTerminalNonce] = useState(0);
-  const [repos, setRepos] = useState(() => loadRepos(env.storage));
+  const [registry, setRegistry] = useState(() => loadRegistry(env.storage));
   const [project, setProject] = useState<string | null>(saved.project);
   // The dispatch form (goal and the rest) lives here: Home unmounts on every other view.
   const [draft, setDraft] = useState("");
@@ -212,18 +212,21 @@ export function App({ env: given }: { env: Env }) {
 
   // The projects, kept while equal: a task refresh that changes no project leaves Home's
   // props alone (and is worked out once per change of the tasks).
-  const projCache = useRef<{ tasks: State["tasks"] | null; repos: string[]; value: Project[] }>({ tasks: null, repos, value: [] });
+  const projCache = useRef<{ tasks: State["tasks"] | null; registry: Registry | null; value: Project[] }>({ tasks: null, registry: null, value: [] });
   const selectProjects = useCallback(
     (s: State) => {
       const c = projCache.current;
-      if (c.tasks === s.tasks && c.repos === repos) return c.value;
-      const next = projects(s, repos);
-      projCache.current = { tasks: s.tasks, repos, value: same(c.value, next) ? c.value : next };
+      if (c.tasks === s.tasks && c.registry === registry) return c.value;
+      const next = projects(s, registry.repos, { hidden: registry.hidden, groups: registry.groups });
+      projCache.current = { tasks: s.tasks, registry, value: same(c.value, next) ? c.value : next };
       return projCache.current.value;
     },
-    [repos],
+    [registry],
   );
-  const projs = useCockpitSelect(env.cockpit, selectProjects);
+  // Every project (the rail lists the hidden ones on request); the rest of the app sees the
+  // ones not hidden.
+  const allProjs = useCockpitSelect(env.cockpit, selectProjects);
+  const projs = useMemo(() => allProjs.filter((p) => !p.hidden), [allProjs]);
   // A remembered project that is no longer listed (removed, its tasks gone) is not shown:
   // the first one is, once the daemon's tasks are known.
   const listed = bootId === null || (project !== null && projs.some((p) => p.path === project));
@@ -655,10 +658,11 @@ export function App({ env: given }: { env: Env }) {
             {!waiting && <UpdateBanner />}
             {!waiting && mode === "home" && (
               <Home
-                projects={projs}
+                projects={allProjs}
+                registry={registry}
                 project={current}
                 onProject={setProject}
-                onReposChanged={setRepos}
+                onReposChanged={setRegistry}
                 onOpen={open}
                 onReview={openReview}
                 onSkills={reviewSkills}

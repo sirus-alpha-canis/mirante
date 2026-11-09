@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { shallow, useEnv, useSelect } from "../env";
 import { inboxOf, inboxSections, type ProjectGroup, type Section, sameSections, waitingLongerThan } from "../lib/inbox";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
+import type { Registry } from "../lib/repos";
 import { useNow } from "../lib/useNow";
 import { columnLabel, type Column, type Project } from "../store/select";
 import { type Key, t, tn, useT } from "../lib/i18n";
@@ -80,10 +81,13 @@ function Groups(props: {
  * there). `focusTask`: the task whose card takes the keyboard (back from its detail).
  */
 export const Home = memo(function Home(props: {
+  /** Every project, hidden ones too (marked): the rail lists those on request; the inbox and
+   * the dispatch form leave them out. */
   projects: Project[];
+  registry?: Registry;
   project: string | null;
   onProject(path: string): void;
-  onReposChanged(repos: string[]): void;
+  onReposChanged(registry: Registry): void;
   /** `tab: "Terminal"` opens the task's detail on its Terminal tab (Claude answered there). */
   onOpen(taskId: string, tab?: "Terminal"): void;
   /** Opens the memory review queue of a project. */
@@ -103,7 +107,20 @@ export const Home = memo(function Home(props: {
 }) {
   const env = useEnv();
   const t = useT();
-  const sections = useSelect(selectSections, sameSections);
+  const all = useSelect(selectSections, sameSections);
+  const { projects: everyProject } = props;
+  const visible = useMemo(() => everyProject.filter((p) => !p.hidden), [everyProject]);
+  // A hidden project's tasks are left out of the inbox.
+  const hiddenKey = everyProject
+    .filter((p) => p.hidden)
+    .map((p) => p.path)
+    .join("\n");
+  const sections = useMemo(() => {
+    if (!hiddenKey) return all;
+    const hidden = new Set(hiddenKey.split("\n"));
+    const keep = (gs: ProjectGroup[]) => gs.filter((g) => !hidden.has(g.path));
+    return { needs_you: keep(all.needs_you), review: keep(all.review), working: keep(all.working), idle: keep(all.idle) };
+  }, [all, hiddenKey]);
   const inlineAnswers = props.status?.claude_inline_answers ?? false;
   const count = (k: Section) => sections[k].reduce((n, g) => n + g.ids.length, 0);
   const total = count("needs_you") + count("review") + count("working") + count("idle");
@@ -190,6 +207,7 @@ export const Home = memo(function Home(props: {
     <div className="home">
       <LeftRail
         projects={props.projects}
+        registry={props.registry}
         selected={props.project}
         onSelect={props.onProject}
         onReposChanged={props.onReposChanged}
@@ -202,7 +220,7 @@ export const Home = memo(function Home(props: {
       <main className="feed inbox" aria-label={t("home.inbox")}>
         <div className="cards" ref={list} onScroll={(e) => scrolled(e.currentTarget.scrollTop)}>
           <Nudge />
-          {total === 0 && <p className="muted empty">{props.projects.length > 0 ? t("home.empty") : t("home.noProject")}</p>}
+          {total === 0 && <p className="muted empty">{visible.length > 0 ? t("home.empty") : t("home.noProject")}</p>}
           {section("needs_you")}
           {section("review")}
           {section("working")}
@@ -212,7 +230,7 @@ export const Home = memo(function Home(props: {
           {announce}
         </p>
         <DispatchComposer
-          projects={props.projects}
+          projects={visible}
           project={props.project}
           value={props.draft}
           onChange={props.onDraft}

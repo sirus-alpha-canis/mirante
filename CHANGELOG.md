@@ -6,6 +6,28 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Fixed
+
+- **The × next to a project in the rail did nothing** for a project that still had tasks
+  (it was listed because of its tasks, so dropping it from the saved list changed nothing,
+  silently). Every project now has a × that works: with no tasks it goes at once; with
+  tasks it asks inline: **Archive tasks and remove** (live sessions stopped first,
+  worktrees removed, branches kept; a dirty worktree the daemon refuses is listed with why
+  and an **Open task**, and its project stays) or **Hide from Projects** (tasks kept; the
+  project and its tasks leave the rail and Home; **Show hidden projects (n)** brings them
+  back).
+
+### Added
+
+- **Add project takes a folder of repositories.** A folder that is no git checkout is looked
+  into (two levels deep, symlinks never followed, hidden / `node_modules` / `target` /
+  `dist` / `build` skipped, capped and time-limited; the app's new `scan_repos` command,
+  read-only) and the repositories found are listed to pick: main ones picked, linked
+  worktrees not ("worktree of …"). The picked ones sit under the folder's name in the
+  rail, foldable, with one × for the group. A folder added before (not a repository) shows
+  "… is a folder, not a repository" with **Scan it for repositories**. Past 8 projects the
+  list gets a filter.
+
 ### Changed
 
 - **Rules is a top-level view** in the app's top bar, next to Brain and Skills (⌘R; Ctrl+R

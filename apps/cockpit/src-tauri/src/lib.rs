@@ -1,9 +1,12 @@
-//! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, plus two
-//! small path helpers for adding a project (the home directory, and what is at a path). No state of
+//! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, plus three
+//! small path helpers for adding a project (the home directory, what is at a path, and the
+//! git checkouts in a folder: see `scan`). No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
 //! plugin (github.com only, see `capabilities/default.json`), never in the window itself,
 //! and never in a window of their own: `window.open` / `target=_blank` are denied.
+mod scan;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -208,6 +211,13 @@ fn path_kind(path: String) -> Result<PathKind, String> {
     path_kind_of(std::path::Path::new(&path))
 }
 
+/// The git checkouts in a folder given to Add project (see `scan`): read-only, bounded, off
+/// the main thread.
+#[tauri::command]
+async fn scan_repos(path: String) -> Result<scan::Scan, String> {
+    tauri::async_runtime::spawn_blocking(move || scan::scan(&path, scan::LIMITS)).await.map_err(|e| e.to_string())?
+}
+
 pub fn run() {
     let paths = Paths::from_env().expect("cannot locate ~/.mirante (is HOME set?)");
     let socket = paths.socket();
@@ -267,7 +277,8 @@ pub fn run() {
             daemon_binary_build,
             daemon_restart,
             home_dir,
-            path_kind
+            path_kind,
+            scan_repos
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::Destroyed = event {

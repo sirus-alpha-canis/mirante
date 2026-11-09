@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { type DaemonStatus, RpcCode, type TaskDiff } from "../lib/protocol";
-import { REPOS_KEY } from "../lib/repos";
+import { HIDDEN_KEY, loadRegistry, type Registry, REPOS_KEY } from "../lib/repos";
 import { AGENT_KEY } from "./DispatchComposer";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
@@ -40,13 +40,14 @@ function Harness({
   onSkills?(): void;
 }) {
   const [draft, setDraft] = useState("");
-  const [repos, setRepos] = useState(registry);
+  const [reg, setReg] = useState<Registry>(() => ({ ...loadRegistry(env.storage), repos: registry }));
   return (
     <Home
-      projects={projects(env.cockpit.getState(), repos)}
+      projects={projects(env.cockpit.getState(), reg.repos, { hidden: reg.hidden, groups: reg.groups })}
+      registry={reg}
       project="/repos/shop"
       onProject={() => {}}
-      onReposChanged={setRepos}
+      onReposChanged={setReg}
       onOpen={(id, tab) => opened.push([id, tab])}
       onSkills={onSkills}
       status={status}
@@ -347,6 +348,19 @@ describe("Home (V3 group chat)", () => {
     // Idle tasks wait folded away.
     expect(within(inbox).getByText(/^Idle \(1\)$/)).toBeInTheDocument();
     expect(screen.queryByRole("complementary", { name: "Board" })).toBeNull();
+  });
+
+  it("a hidden project's tasks are left out of the inbox (until it is shown again)", async () => {
+    const h = makeEnv({ "dna.status": { available: false } });
+    h.load([task("n", { status: "needs_you" }), task("n2", { status: "needs_you", repo_path: "/repos/api" })]);
+    h.env.storage.setItem(HIDDEN_KEY, JSON.stringify(["/repos/api"]));
+    renderWith(h.env, <Harness env={h.env} />);
+    const inbox = screen.getByRole("main", { name: "Inbox" });
+    const needs = within(inbox).getByRole("region", { name: /^Needs you \(1\)$/ });
+    expect(within(needs).getAllByRole("group").map((g) => g.getAttribute("aria-label"))).toEqual(["shop"]);
+    await userEvent.click(screen.getByRole("button", { name: "Show hidden projects (1)" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show api in Projects again" }));
+    expect(within(inbox).getByRole("region", { name: /^Needs you \(2\)$/ })).toBeInTheDocument();
   });
 
   it("says when agents have waited on you more than 10 minutes", () => {

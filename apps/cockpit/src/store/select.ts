@@ -73,20 +73,35 @@ export function repoName(path: string): string {
 export interface Project {
   path: string;
   name: string;
+  /** Its tasks not archived, and how many of them have a live session. */
   tasks: number;
+  live: number;
   needsYou: number;
+  /** Hidden from Projects and Home (its tasks kept). */
+  hidden: boolean;
+  /** The folder it was picked from (its group in the rail). */
+  group: string | null;
 }
 
 /** Repos from the registry plus every repo a task runs in, by name. */
-export function projects(s: Pick<State, "tasks">, registry: string[]): Project[] {
+export function projects(s: Pick<State, "tasks">, registry: string[], opts: { hidden?: string[]; groups?: Record<string, string> } = {}): Project[] {
   const paths = new Set(registry);
   for (const t of Object.values(s.tasks)) if (t.lifecycle !== "archived") paths.add(t.repo_path);
+  const hidden = new Set(opts.hidden ?? []);
   return [...paths]
     .map((path) => {
       const ts = Object.values(s.tasks).filter((t) => t.repo_path === path && t.lifecycle !== "archived");
-      return { path, name: repoName(path), tasks: ts.length, needsYou: ts.filter(needsYou).length };
+      return {
+        path,
+        name: repoName(path),
+        tasks: ts.length,
+        live: ts.filter((t) => t.live).length,
+        needsYou: ts.filter(needsYou).length,
+        hidden: hidden.has(path),
+        group: opts.groups?.[path] ?? null,
+      };
     })
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
 }
 
 /** The last `n` feed lines worth showing on a small tile. */

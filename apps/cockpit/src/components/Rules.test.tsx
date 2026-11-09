@@ -126,8 +126,8 @@ describe("Rules", () => {
 
 describe("Rules view", () => {
   const PROJECTS = [
-    { path: "/r/app", name: "app", tasks: 2, needsYou: 0 },
-    { path: "/r/web", name: "web", tasks: 0, needsYou: 0 },
+    { path: "/r/app", name: "app", tasks: 2, live: 0, needsYou: 0, hidden: false, group: null },
+    { path: "/r/web", name: "web", tasks: 0, live: 0, needsYou: 0, hidden: false, group: null },
   ];
   const TASKS = [task("t1", { repo_path: "/r/app", agent: "codex", title: "Fix login" }), task("t2", { repo_path: "/r/app" }), task("t3", { repo_path: "/r/web", lifecycle: "archived" })];
 

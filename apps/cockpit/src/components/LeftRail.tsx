@@ -7,12 +7,15 @@ import { dnaStatus } from "../lib/dna";
 import { type DaemonSettings, M } from "../lib/protocol";
 import { usePendingSkills } from "../lib/useSkills";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
-import { addRepo, expandHome, loadRepos, normaliseRepoPath, removeRepo } from "../lib/repos";
+import { addRepo, addRepos, expandHome, loadRegistry, normaliseRepoPath, type Registry, showRepos } from "../lib/repos";
+import type { RepoScan } from "../lib/protocol";
 import { columnLabel, needsYou, type Project, repoName } from "../store/select";
+import { ProjectList } from "./ProjectList";
+import { ScanPicker } from "./ScanPicker";
 import { inboxOf } from "../lib/inbox";
 import { learnDnaKey, useDnaRev } from "../lib/useDna";
 import { MemoryPanel } from "./MemoryPanel";
-import { tn, useT } from "../lib/i18n";
+import { useT } from "../lib/i18n";
 
 const selectColumns = (s: State) => inboxOf(s).columns;
 
@@ -36,10 +39,13 @@ function selectLive(s: State): LiveSession[] {
 }
 
 export function LeftRail(props: {
+  /** Every project, hidden ones too (marked). */
   projects: Project[];
+  /** What the rail remembers (read from storage when not given). */
+  registry?: Registry;
   selected: string | null;
   onSelect(path: string): void;
-  onReposChanged(repos: string[]): void;
+  onReposChanged(registry: Registry): void;
   /** Selects the agent in the dispatch form and focuses its goal. */
   onMention(agent: AgentKind): void;
   /** Opens a task's detail (`"Terminal"` when it needs the person). */
@@ -50,7 +56,7 @@ export function LeftRail(props: {
   onSkills?(): void;
   status: DaemonStatus | null;
 }) {
-  const { storage, rpc, cockpit, pickFolder, homeDir, pathKind } = useEnv();
+  const { storage, rpc, cockpit, pickFolder, homeDir, pathKind, scanRepos } = useEnv();
   const tr = useT();
   // Live sessions per agent (the task objects: kept while unchanged, so a step elsewhere
   // renders nothing here).
@@ -105,8 +111,25 @@ export function LeftRail(props: {
     props.onMention(a.agent);
   };
 
+  const registry = props.registry ?? loadRegistry(storage);
+  // The repositories found in a folder given to Add project, to pick from.
+  const [picker, setPicker] = useState<{ folder: string; scan: RepoScan } | null>(null);
+  const [scanning, setScanning] = useState<string | null>(null);
+  /** Looks for the repositories in `folder` and lists them to pick from. */
+  const scan = async (folder: string) => {
+    setScanning(folder);
+    try {
+      const found = await scanRepos(folder);
+      setPicker({ folder, scan: found });
+      return found;
+    } finally {
+      setScanning(null);
+    }
+  };
+
   /** Adds a typed or picked folder: "~/…" expanded with the app's home, then it must be a
-   * folder (whether it is a git checkout the daemon checks when a task is created there). */
+   * folder. A git checkout is added; another folder is looked into, and the repositories
+   * found in it are listed to pick from. */
   const add = async (raw: string, typed: boolean) => {
     try {
       const text = raw.trim();
@@ -116,14 +139,32 @@ export function LeftRail(props: {
       const kind = await pathKind(n.path);
       if (kind === "missing") return setError(tr("rail.missing", { path: n.path }));
       if (kind === "file") return setError(tr("rail.isFile", { path: n.path }));
+      setPicker(null);
+      setScanning(n.path);
+      let found: RepoScan;
+      try {
+        found = await scanRepos(n.path);
+      } finally {
+        setScanning(null);
+      }
+      setError(null);
+      if (found.root === null) {
+        setPicker({ folder: n.path, scan: found });
+        return;
+      }
       const r = addRepo(storage, n.path);
       if (!r.ok) return setError(r.error);
-      setError(null);
       if (typed) setPath("");
-      props.onReposChanged(r.repos);
+      props.onReposChanged(showRepos(storage, [n.path]));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  };
+  const addPicked = (paths: string[]) => {
+    if (!picker) return;
+    props.onReposChanged(addRepos(storage, paths, picker.folder));
+    setPicker(null);
+    setPath("");
   };
   const choose = async () => {
     try {
@@ -133,55 +174,19 @@ export function LeftRail(props: {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  // Only repos added here can be removed; a task's repo stays listed while the task exists.
-  const added = useMemo(() => new Set(loadRepos(storage)), [storage, props.projects]);
-  const remove = (p: string) => props.onReposChanged(removeRepo(storage, p));
-
   return (
     <nav className="rail" aria-label={tr("rail.aria")}>
-      <h2>{tr("rail.projects")}</h2>
-      <ul>
-        {props.projects.map((p) => (
-          <li key={p.path} className="rail-row">
-            <button
-              className={`rail-item ${props.selected === p.path ? "selected" : ""}`}
-              aria-current={props.selected === p.path ? "page" : undefined}
-              title={p.path}
-              onClick={() => props.onSelect(p.path)}
-            >
-              <span>{p.name}</span>
-              {p.needsYou > 0 && (
-                <>
-                  <span className="badge" aria-hidden="true">
-                    {p.needsYou}
-                  </span>
-                  <span className="sr-only">, {tn(p.needsYou, "rail.needsOne", "rail.needsMany")}</span>
-                </>
-              )}
-            </button>
-            {pending?.path === p.path && pending.n > 0 && (
-              <button
-                className="btn btn-small btn-ghost dna-pending"
-                title={tr("rail.proposalsTitle", { path: p.path })}
-                disabled={!props.onReview}
-                onClick={() => props.onReview?.(p.path)}
-              >
-                {tr("rail.toReview", { n: pending.n })}
-              </button>
-            )}
-            {added.has(p.path) && (
-              <button
-                className="btn btn-small btn-ghost"
-                aria-label={tr("rail.remove", { name: p.name })}
-                title={tr("rail.removeTitle", { path: p.path })}
-                onClick={() => remove(p.path)}
-              >
-                ×
-              </button>
-            )}
-          </li>
-        ))}
-      </ul>
+      <ProjectList
+        projects={props.projects}
+        registry={registry}
+        selected={props.selected}
+        onSelect={props.onSelect}
+        onReposChanged={props.onReposChanged}
+        onOpen={(id) => props.onOpen(id)}
+        onScan={(folder) => void scan(folder).catch((e) => setError(e instanceof Error ? e.message : String(e)))}
+        pending={pending}
+        onReview={props.onReview}
+      />
       <form
         className="add-repo"
         onSubmit={(e) => {
@@ -205,6 +210,21 @@ export function LeftRail(props: {
           </p>
         )}
       </form>
+      {scanning && (
+        <p className="small muted" role="status">
+          {tr("rail.scanning", { name: repoName(scanning) })}
+        </p>
+      )}
+      {picker && (
+        <ScanPicker
+          key={picker.folder}
+          folder={picker.folder}
+          scan={picker.scan}
+          inProjects={new Set(registry.repos)}
+          onAdd={addPicked}
+          onCancel={() => setPicker(null)}
+        />
+      )}
       <h2>{tr("rail.agents")}</h2>
       <ul>
         {agents.map((a) => (
