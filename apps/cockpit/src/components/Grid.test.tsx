@@ -44,7 +44,11 @@ describe("Grid (V2)", () => {
     renderWith(h.env, <Grid onOpen={() => {}} status={null} />);
     const [trust, work] = screen.getAllByRole("article");
     expect(within(trust).getByRole("group", { name: "Trust this folder" })).toBeInTheDocument();
-    await userEvent.type(within(work).getByRole("textbox"), "go{Enter}");
+    const arrow = within(work).getByRole("button", { name: /^Send to / });
+    expect(arrow).toBeDisabled();
+    await userEvent.type(within(work).getByRole("textbox"), "go");
+    expect(arrow).toBeEnabled();
+    await userEvent.type(within(work).getByRole("textbox"), "{Enter}");
     expect(h.calls).toContainEqual(["message.send", { task: "a", text: "go", mode: "steer" }]);
     expect(within(work).getByRole("status")).toHaveTextContent("sent");
   });

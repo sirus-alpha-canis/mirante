@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { SendArrow, useAutoGrow } from "./composer";
 import { useEnv, useLive } from "../env";
 import { onMac } from "../lib/shortcuts";
 import { useT } from "../lib/i18n";
@@ -25,6 +26,8 @@ export function MessageComposer({ t }: { t: TaskView }) {
   // A ref, not only `busy`: a second click arrives before React re-renders.
   const inFlight = useRef(false);
   const [busy, setBusy] = useState(false);
+  const box = useRef<HTMLTextAreaElement>(null);
+  useAutoGrow(box, text);
 
   const guarded = async (work: () => Promise<void>) => {
     if (inFlight.current) return;
@@ -80,38 +83,56 @@ export function MessageComposer({ t }: { t: TaskView }) {
   if (!t.live) return <p className="muted small composer-off">{tt("composer.noLive")}</p>;
   // Nothing can be sent while the daemon is away.
   const empty = !text.trim() || !live;
+  const steerKey = mac ? "⌘↵" : "Ctrl+↵";
+  const queueKey = mac ? "⌥↵" : "Alt+↵";
   return (
-    <div className="composer">
-      <label htmlFor={`msg-${t.id}`} className="sr-only">
-        {tt("composer.label")}
-      </label>
-      <textarea
-        id={`msg-${t.id}`}
-        rows={2}
-        value={text}
-        placeholder={tt("composer.placeholder", { steer: mac ? "⌘↵" : "Ctrl+↵", queue: mac ? "⌥↵" : "Alt+↵" })}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.
-          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault();
-            void send("steer");
-          } else if (e.key === "Enter" && e.altKey) {
-            e.preventDefault();
-            void send("queue");
-          }
-        }}
-      />
-      <div className="composer-actions">
-        <button className="btn btn-primary" onClick={() => send("steer")} disabled={empty || busy}>
-          {tt("composer.steer")}
+    <div className="composer composer-msg">
+      <div className="composer-field">
+        <label htmlFor={`msg-${t.id}`} className="sr-only">
+          {tt("composer.label")}
+        </label>
+        <textarea
+          id={`msg-${t.id}`}
+          ref={box}
+          rows={1}
+          value={text}
+          placeholder={tt("composer.placeholder", { steer: steerKey, queue: queueKey })}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              void send("steer");
+            } else if (e.key === "Enter" && e.altKey) {
+              e.preventDefault();
+              void send("queue");
+            }
+          }}
+        />
+        {/* The arrow steers; with ⌥ held it queues (also the "queue" token below). */}
+        <button
+          className="send"
+          aria-label={tt("composer.steer")}
+          title={tt("composer.sendTitle", { steer: steerKey, queue: queueKey, alt: mac ? "⌥" : "Alt" })}
+          onClick={(e) => send(e.altKey ? "queue" : "steer")}
+          disabled={empty || busy}
+        >
+          <SendArrow />
         </button>
-        <button className="btn" onClick={() => send("queue")} disabled={empty || busy}>
-          {tt("composer.queue")}
+      </div>
+      <div className="composer-tokens">
+        <span className="composer-hint" aria-hidden="true">
+          {steerKey} {tt("hint.steer")}
+        </span>
+        <span className="sep" aria-hidden="true">
+          ·
+        </span>
+        <button className="token" aria-label={tt("composer.queue")} title={tt("composer.queueTitle", { key: queueKey })} onClick={() => send("queue")} disabled={empty || busy}>
+          {tt("hint.queue")} <span className="faint">{queueKey}</span>
         </button>
         {fallback && (
-          <button className="btn btn-warn" onClick={interruptThenSend} disabled={empty || busy}>
+          <button className="btn btn-small btn-warn" onClick={interruptThenSend} disabled={empty || busy}>
             {tt("composer.interruptSend")}
           </button>
         )}

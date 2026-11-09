@@ -83,7 +83,7 @@ const repoChip = () => screen.getByRole("button", { name: /^Repository/ });
 const projectOptions = () => within(screen.getByRole("listbox", { name: "Projects" })).getAllByRole("option").map((o) => o.textContent?.replace(/^[▾▸✓]?\s*/, "").trim());
 
 /** The agent the form's Agent menu shows. */
-const agentShown = () => screen.getByRole("button", { name: /^Agent:/ }).textContent?.replace(/^Agent: /, "").replace(" ▾", "").trim();
+const agentShown = () => screen.getByRole("button", { name: /^Agent:/ }).getAttribute("aria-label")?.replace(/^Agent: /, "");
 
 const daemonStatus = (claude_inline_answers: boolean): DaemonStatus => ({
   pid: 1,
@@ -236,16 +236,31 @@ describe("Home (V3 group chat)", () => {
     setup({}, [], [], null, [long]);
     const chip = repoChip();
     expect(chip).toHaveAttribute("title", long);
-    expect(chip.querySelector(".tchip-name")).toHaveTextContent("a-very-long-repository-name-that-does-not-fit-in-the-toolbar");
+    expect(chip.querySelector(".token-name")).toHaveTextContent("a-very-long-repository-name-that-does-not-fit-in-the-toolbar");
     await userEvent.click(chip);
     expect(screen.getByRole("option", { name: /a-very-long/ })).toHaveAttribute("title", long);
   });
 
-  it("the Agent chip's label and arrow are one click target", async () => {
+  it("the agent is a plain-text token (its name), labelled for screen readers, that opens the agents", async () => {
     setup();
     const chip = screen.getByRole("button", { name: /^Agent:/ });
-    await userEvent.click(within(chip).getByText("▾"));
+    expect(chip).toHaveTextContent(/^claude$/);
+    expect(chip).toHaveAttribute("aria-label", "Agent: Claude");
+    await userEvent.click(chip);
     expect(screen.getByRole("group", { name: "Agents" })).toBeInTheDocument();
+  });
+
+  it("the send arrow is quiet while the goal is empty and lights up with text; ⌘↵ is the hint", async () => {
+    setup();
+    const send = screen.getByRole("button", { name: "Dispatch" });
+    expect(send).toBeDisabled();
+    expect(send).toHaveAttribute("title", expect.stringMatching(/^Dispatch \((⌘|Ctrl\+)↵\)$/));
+    // No big button: the arrow is inside the field, with the goal.
+    expect(send.closest(".composer-field")).toContainElement(screen.getByLabelText("Goal"));
+    expect(screen.getByLabelText("Goal")).toHaveAttribute("rows", "1");
+    await userEvent.type(screen.getByLabelText("Goal"), "fix it");
+    expect(send).toBeEnabled();
+    expect(document.querySelector(".composer-hint")).toHaveClass("on");
   });
 
   describe("the @ shortcut's suggestions", () => {
@@ -454,7 +469,7 @@ describe("Home (V3 group chat)", () => {
       setup();
       expect(screen.getByLabelText("Goal")).toHaveAttribute(
         "placeholder",
-        expect.stringMatching(/^What should the agent do\? \((⌘|Ctrl\+)↵ to dispatch · optional: @claude or @codex, a project name, or project\/branch\)$/),
+        expect.stringMatching(/^Ask an agent… \(optional: @claude or @codex, a project, or project\/branch\)$/),
       );
     });
   });
@@ -518,7 +533,7 @@ describe("Home (V3 group chat)", () => {
     expect(screen.queryByRole("button", { name: "Edit branch" })).toBeNull();
     await userEvent.type(screen.getByLabelText("Goal"), "Fix the login");
     expect(screen.getByText("mirante/fix-the-login")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.type(within(dialog).getByLabelText("Search Files"), "log");
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
@@ -565,7 +580,7 @@ describe("Home (V3 group chat)", () => {
 
   it("files that may hold secrets are flagged in the picker", async () => {
     setup({ "repo.files": ["src/env.ts", "config/.env"] });
-    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     const secret = await within(dialog).findByRole("button", { name: /^config\/\.env/ });
     expect(secret).toHaveTextContent("may hold secrets");
@@ -574,7 +589,7 @@ describe("Home (V3 group chat)", () => {
 
   it("a power dispatch to another repo refuses files and notes attached for this one", async () => {
     const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" }, "repo.files": ["src/login.ts"] }, [task("x", { repo_path: "/repos/api" })]);
-    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
     await userEvent.keyboard("{Escape}");
@@ -588,7 +603,7 @@ describe("Home (V3 group chat)", () => {
       "/repos/shop",
       "/repos/api",
     ]);
-    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
     await userEvent.keyboard("{Escape}");
@@ -608,7 +623,7 @@ describe("Home (V3 group chat)", () => {
       ],
     });
     const count = (m: string) => h.calls.filter(([x]) => x === m).length;
-    await userEvent.click(screen.getByRole("button", { name: "+ context" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add context" }));
     const dialog = screen.getByRole("dialog", { name: "Add context" });
     await waitFor(() => expect(count("repo.files")).toBe(1));
     await userEvent.type(within(dialog).getByLabelText("Search Files"), "login");
@@ -931,7 +946,7 @@ const pressOutside = () => fireEvent.pointerDown(document.body);
 describe("the form's menus close like menus", () => {
   const menus = [
     { name: "the Agent menu", trigger: () => screen.getByRole("button", { name: /^Agent:/ }), shown: () => screen.queryByRole("dialog", { name: "Agent" }) },
-    { name: "the + context picker", trigger: () => screen.getByRole("button", { name: "+ context" }), shown: () => screen.queryByRole("dialog", { name: "Add context" }) },
+    { name: "the + context picker", trigger: () => screen.getByRole("button", { name: "Add context" }), shown: () => screen.queryByRole("dialog", { name: "Add context" }) },
   ];
   for (const m of menus) {
     it(`${m.name}: a press outside closes it (and a press on its button toggles it)`, async () => {

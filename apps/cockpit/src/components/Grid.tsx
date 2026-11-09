@@ -11,6 +11,7 @@ import { HibernateButton } from "./MemoryPanel";
 import { PermissionCard } from "./PermissionCard";
 import { TrustCard } from "./TrustCard";
 import { useT } from "../lib/i18n";
+import { SendArrow } from "./composer";
 
 const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onOpen(id: string, tab?: "Terminal"): void; inlineAnswers: boolean }) {
   const { rpc } = useEnv();
@@ -76,21 +77,32 @@ const Tile = memo(function Tile({ t, onOpen, inlineAnswers }: { t: TaskView; onO
         />
       )}
       {t.live && (
-        <input
-          className="mini"
-          aria-label={tt("grid.messageLabel", { branch: t.branch })}
-          placeholder={tt("grid.messagePlaceholder")}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            // Enter that confirms an IME composition is not a send.
-            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-            if (e.key === "Enter") {
-              e.preventDefault();
-              void send(e.altKey ? "queue" : "steer");
-            }
-          }}
-        />
+        <div className="composer-field mini-field">
+          <input
+            className="mini"
+            aria-label={tt("grid.messageLabel", { branch: t.branch })}
+            placeholder={tt("grid.messagePlaceholder")}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter that confirms an IME composition is not a send.
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void send(e.altKey ? "queue" : "steer");
+              }
+            }}
+          />
+          <button
+            className="send"
+            aria-label={tt("grid.send", { branch: t.branch })}
+            title={tt("grid.sendTitle")}
+            disabled={!text.trim()}
+            onClick={(e) => void send(e.altKey ? "queue" : "steer")}
+          >
+            <SendArrow />
+          </button>
+        </div>
       )}
       <footer className="tile-foot">
         {note && (

@@ -36,6 +36,7 @@ import {
 } from "../lib/dispatch";
 import { type AgentKind, type CreatedOrigin, M, type NoteSummary, RpcCode, type SkillSummary, type StartResult, type TaskView } from "../lib/protocol";
 import { type Project, repoName } from "../store/select";
+import { PressureHint, SendArrow, useAutoGrow } from "./composer";
 import type { State } from "../store/state";
 
 /** What the form holds besides the goal: attached context, an edited branch, a repo picked
@@ -289,6 +290,7 @@ export function DispatchComposer(props: {
     },
     [props.inputRef],
   );
+  useAutoGrow(box, props.value);
   const [caret, setCaret] = useState(0);
   const [focused, setFocused] = useState(false);
   // The text Escape closed the list on: it stays closed until the text changes.
@@ -350,27 +352,32 @@ export function DispatchComposer(props: {
     props.onAgent(a);
     if (power) props.onChange(props.value.replace(/^(\s*)@(claude|codex)/i, `$1@${a}`));
   };
+  // The branch, as a plain-text token: the @ line's, the auto-named one (editable), or the
+  // one being edited.
   const branchChip =
     lineBranch !== null ? (
-      <span className="tchip tchip-static">
+      <span className="token token-static">
         <span aria-hidden="true">⎇</span> <code>{lineBranch}</code>
       </span>
     ) : edited === null ? (
-      <span className="tchip tchip-static">
-        <span aria-hidden="true">⎇</span> <code>{auto}</code>{" "}
-        <button type="button" className="btn btn-small btn-ghost" aria-label={t("dispatch.editBranch")} onClick={() => setEdited(auto)}>
+      <>
+        <span className="token token-static">
+          <span aria-hidden="true">⎇</span> <code>{auto}</code>
+        </span>
+        <button type="button" className="token" aria-label={t("dispatch.editBranch")} onClick={() => setEdited(auto)}>
           {t("dispatch.edit")}
         </button>
-      </span>
+      </>
     ) : (
-      <span className="tchip tchip-static">
+      <span className="token token-static">
         <label htmlFor="dispatch-branch-name">{t("dispatch.branch")}</label>{" "}
         <input id="dispatch-branch-name" value={edited} onChange={(e) => setEdited(e.target.value)} spellCheck={false} />{" "}
-        <button type="button" className="btn btn-small btn-ghost" onClick={() => setEdited(null)}>
+        <button type="button" className="token" onClick={() => setEdited(null)}>
           {t("dispatch.useAuto", { branch: auto })}
         </button>
       </span>
     );
+  const sendable = !busy && hasGoal && live;
   return (
     <form
       className="composer dispatch"
@@ -380,32 +387,33 @@ export function DispatchComposer(props: {
         void submit();
       }}
     >
-      <div className="composer-box">
-        {refs.length > 0 && (
-          <ul className="attached" aria-label={t("dispatch.attached")}>
-            {refs.map((r) => (
-              <li key={contextKey(r)} className="attached-chip">
-                <span className="muted small">{t(r.kind === "file" ? "context.kindFile" : r.kind === "note" ? "context.kindNote" : "context.kindSkill")}</span>{" "}
-                <span>{r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name}</span>
-                <button
-                  type="button"
-                  className="btn btn-small btn-ghost"
-                  aria-label={t("dispatch.remove", { name: r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name })}
-                  onClick={() => detach(contextKey(r))}
-                >
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+      {refs.length > 0 && (
+        <ul className="attached" aria-label={t("dispatch.attached")}>
+          {refs.map((r) => (
+            <li key={contextKey(r)} className="attached-chip">
+              <span className="muted small">{t(r.kind === "file" ? "context.kindFile" : r.kind === "note" ? "context.kindNote" : "context.kindSkill")}</span>{" "}
+              <span>{r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name}</span>
+              <button
+                type="button"
+                className="btn btn-small btn-ghost"
+                aria-label={t("dispatch.remove", { name: r.kind === "file" ? r.path : r.kind === "note" ? r.title : r.name })}
+                onClick={() => detach(contextKey(r))}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {/* One rounded field: the goal grows from one line; the send arrow sits inside it. */}
+      <div className="composer-field">
         <label htmlFor="dispatch" className="sr-only">
           {t("dispatch.goal")}
         </label>
         <textarea
           id="dispatch"
           ref={setBox}
-          rows={2}
+          rows={1}
           placeholder={goalHelp(hints.send)}
           value={props.value}
           onChange={(e) => {
@@ -421,37 +429,53 @@ export function DispatchComposer(props: {
           aria-controls={sugg ? listId : undefined}
           aria-activedescendant={sugg ? optionId(active) : undefined}
         />
-        {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
-        <div className="composer-toolbar" role="group" aria-label={t("dispatch.options")}>
-          <AgentPicker value={agent} onPick={pickAgent} />
-          <RepoPicker projects={props.projects} value={repo} buttonRef={repoChip} onPick={setPicked} />
-          <span id="dispatch-branch" className="small muted dispatch-branch">
-            {power ? (
-              line && targetRepo ? (
-                <span className="dispatch-target" aria-label={t("dispatch.target")}>
-                  <span aria-hidden="true">→</span> <span>{repoLabel(targetRepo)}</span> <span aria-hidden="true">·</span> {branchChip}
-                </span>
-              ) : null
-            ) : !hasGoal ? null : (
-              branchChip
-            )}
-          </span>
-          <ContextPicker repo={targetRepo} onAttach={attach} attached={refs} />
-          <span className="toolbar-spacer" />
-          {props.pressure && (
-            <span className="small muted dispatch-pressure" role="status">
-              {t("dispatch.pressure")}
-            </span>
+        <button
+          className="send"
+          type="submit"
+          disabled={!sendable}
+          aria-label={t("dispatch.send")}
+          title={live ? t("dispatch.sendTitle", { key: hints.send }) : t("dispatch.offline")}
+        >
+          <SendArrow />
+        </button>
+      </div>
+      {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
+      {/* The context as plain-text tokens: each opens its picker. */}
+      <div className="composer-tokens" role="group" aria-label={t("dispatch.options")}>
+        <ContextPicker repo={targetRepo} onAttach={attach} attached={refs} />
+        <AgentPicker value={agent} onPick={pickAgent} />
+        <span className="sep" aria-hidden="true">
+          ·
+        </span>
+        <RepoPicker projects={props.projects} value={repo} buttonRef={repoChip} onPick={setPicked} />
+        <span id="dispatch-branch" className="composer-tokens">
+          {power ? (
+            line && targetRepo ? (
+              <span className="composer-tokens" aria-label={t("dispatch.target")}>
+                <span className="sep" aria-hidden="true">
+                  →
+                </span>{" "}
+                <span className="token token-static">{repoLabel(targetRepo)}</span>{" "}
+                <span className="sep" aria-hidden="true">
+                  ·
+                </span>{" "}
+                {branchChip}
+              </span>
+            ) : null
+          ) : !hasGoal ? null : (
+            <>
+              <span className="sep" aria-hidden="true">
+                ·
+              </span>
+              {branchChip}
+            </>
           )}
-          <button
-            className="btn btn-primary"
-            type="submit"
-            disabled={busy || !hasGoal || !live}
-            title={live ? t("dispatch.sendTitle", { key: hints.send }) : t("dispatch.offline")}
-          >
-            {t("dispatch.send")}
-          </button>
-        </div>
+        </span>
+        <span className="token-spacer" />
+        {props.pressure && <PressureHint text={t("dispatch.pressure")} />}
+        <span className={`composer-hint${sendable ? " on" : ""}`} aria-hidden="true">
+          {hints.send}
+        </span>
       </div>
       {error && (
         <p id="dispatch-error" className="error" role="alert">
@@ -540,15 +564,15 @@ function AgentPicker({ value, onPick }: { value: AgentKind; onPick(a: AgentKind)
       trigger={
         <button
           type="button"
-          className="tchip agent-chip"
+          className="token agent-chip"
           aria-haspopup="dialog"
           aria-expanded={open}
           aria-controls={open ? id : undefined}
+          aria-label={t("dispatch.agentChip", { agent: agentLabel(value) })}
           onClick={() => setOpen((o) => !o)}
           title={t("dispatch.agentTitle")}
         >
-          {/* One button: the label, the agent and the arrow are one click target. */}
-          {t("dispatch.agentChip", { agent: agentLabel(value) })} <span aria-hidden="true">▾</span>
+          {value}
         </button>
       }
     >
@@ -669,8 +693,16 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
       open={open}
       onClose={() => setOpen(false)}
       trigger={
-        <button type="button" className="tchip" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
-          {t("context.button")}
+        <button
+          type="button"
+          className="token token-icon"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          aria-label={t("context.button")}
+          title={t("context.button")}
+          onClick={() => setOpen((o) => !o)}
+        >
+          <span aria-hidden="true">+</span>
         </button>
       }
     >
@@ -852,7 +884,7 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
       <button
         type="button"
         ref={setButton}
-        className="tchip repo-chip"
+        className="token repo-chip"
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
@@ -860,8 +892,8 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
         disabled={empty}
         onClick={() => (open ? close() : show())}
       >
-        <span className="muted">{t("dispatch.repository")}</span>{" "}
-        <span className="tchip-name">{chosen?.name ?? t(empty ? "dispatch.noProjects" : "dispatch.pickProject")}</span> <span aria-hidden="true">▾</span>
+        <span className="sr-only">{t("dispatch.repository")}</span>{" "}
+        <span className="token-name">{chosen?.name ?? t(empty ? "dispatch.noProjects" : "dispatch.pickProject")}</span>
       </button>
       {open && (
         <div className="popover repo-popover">

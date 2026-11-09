@@ -25,6 +25,7 @@ export const dispatchHelp = () => t("dispatch.help");
 /** The goal box's hint: plain words, with the one-line syntax as a shortcut. `send`: the
  * platform's send chord (⌘↵ on macOS, Ctrl+↵ elsewhere). */
 export function goalHelp(send: string): string {
+  // The send key is shown beside the field (the "⌘↵" hint), not in the placeholder.
   return t("dispatch.goalHelp", { send });
 }
 

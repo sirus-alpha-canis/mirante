@@ -482,7 +482,7 @@ describe("App", () => {
       const name = screen.getByLabelText("Branch");
       await userEvent.clear(name);
       await userEvent.type(name, "feat/mine");
-      await userEvent.click(screen.getByRole("button", { name: "+ context" }));
+      await userEvent.click(screen.getByRole("button", { name: "Add context" }));
       const dialog = screen.getByRole("dialog", { name: "Add context" });
       await userEvent.click(await within(dialog).findByRole("button", { name: /^src\/login\.ts/ }));
       await userEvent.keyboard("{Escape}");
