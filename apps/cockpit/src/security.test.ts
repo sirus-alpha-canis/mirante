@@ -24,6 +24,9 @@ describe("Tauri security baseline", () => {
     expect(directive("connect-src")).toBe("connect-src ipc: http://ipc.localhost");
     expect(csp).not.toMatch(/unsafe-eval|https?:\/\/(?!ipc\.localhost)|\*/);
     expect(directive("object-src")).toBe("object-src 'none'");
+    // Fonts are the app's own files (bundled, never a font CDN).
+    expect(directive("font-src")).toBe("font-src 'self'");
+    expect(directive("style-src")).toBe("style-src 'self' 'unsafe-inline'");
   });
 
   it("the dev policy only adds what Vite's dev server needs", () => {

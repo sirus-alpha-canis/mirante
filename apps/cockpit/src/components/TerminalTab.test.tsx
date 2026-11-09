@@ -407,11 +407,12 @@ describe("TerminalTab", () => {
     expect(h.log.filter((l) => l === "addon:webgl")).toHaveLength(1);
   });
 
-  it("uses the system monospace font and Unicode 11 widths, and takes focus when it opens", async () => {
+  it("uses JetBrains Mono (else the system monospace), the graphite theme and Unicode 11 widths, and takes focus when it opens", async () => {
     h.attachOpen.mockResolvedValue({ id: 6, input: true });
     mount(task("a"));
     await waitFor(() => expect(h.onData).not.toBeNull());
-    expect(h.options!.fontFamily).toBe('"SF Mono", Menlo, monospace');
+    expect(h.options!.fontFamily).toBe('"JetBrains Mono", "SF Mono", Menlo, monospace');
+    expect((h.options as { theme?: { background?: string } }).theme?.background).toBe("#141519");
     expect(h.options!.allowProposedApi).toBe(true);
     expect(h.log).toContain("addon:unicode11");
     expect(h.unicode.activeVersion).toBe("11");
@@ -444,6 +445,28 @@ describe("TerminalTab", () => {
     r.rerender(task("a"), false);
     await waitFor(() => expect(h.onData).not.toBeNull());
     expect(h.focused).toBe(0);
+  });
+
+  it("waits for the fonts before the first fit and the attach at its size", async () => {
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    let loaded!: () => void;
+    const ready = new Promise<void>((res) => (loaded = res));
+    Object.defineProperty(document, "fonts", { configurable: true, value: { status: "loading", ready } });
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
+    try {
+      mount(task("a"));
+      await new Promise((res) => setTimeout(res, 20));
+      expect(h.fits).toBe(0);
+      expect(h.attachOpen).not.toHaveBeenCalled();
+      loaded();
+      await waitFor(() => expect(h.attachOpen).toHaveBeenCalledTimes(1));
+      expect(h.fits).toBe(1);
+    } finally {
+      delete (document as { fonts?: unknown }).fonts;
+      width.mockRestore();
+      height.mockRestore();
+    }
   });
 
   it("fits at most once per frame, and never while hidden", async () => {

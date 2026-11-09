@@ -12,29 +12,30 @@
       Orb-Dot (ProjectDNA brand, docs/brand/logo/orb-dot.svg): a bright core, three satellites
       on a dashed orbit; here the satellites orbit the core. The app's own waiting state
       (src/components/Splash.tsx) draws the same mark with these classes.
-      Backgrounds match the app's --bg (src/styles.css): no white flash, in either theme.
+      Background, text and muted match the app's --panel, --text and --muted (src/styles.css):
+      no flash, in either theme. The mark keeps its own colors (it is the identity).
     -->
     <style>
       :root {
-        --splash-bg: #f6f7f9;
-        --splash-text: #15191f;
-        --splash-muted: #5b6573;
+        --splash-bg: #f8f7f4;
+        --splash-text: #23211e;
+        --splash-muted: #5f5b55;
         --splash-dot: #0891b2;
         --splash-core: #22d3ee;
       }
       @media (prefers-color-scheme: dark) {
         :root:not([data-theme="light"]) {
-          --splash-bg: #0f1216;
-          --splash-text: #f1fafd;
-          --splash-muted: #94adb6;
+          --splash-bg: #1b1c21;
+          --splash-text: #e7e3dd;
+          --splash-muted: #a7a29a;
           --splash-dot: #22d3ee;
           --splash-core: #7af3ff;
         }
       }
       :root[data-theme="dark"] {
-        --splash-bg: #0f1216;
-        --splash-text: #f1fafd;
-        --splash-muted: #94adb6;
+        --splash-bg: #1b1c21;
+        --splash-text: #e7e3dd;
+        --splash-muted: #a7a29a;
         --splash-dot: #22d3ee;
         --splash-core: #7af3ff;
       }
@@ -43,9 +44,9 @@
       .splash {
         display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
         color: var(--splash-text);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
-      #splash { position: fixed; inset: 0; z-index: 1000; background: var(--splash-bg); transition: opacity 200ms ease-out; }
+      #splash { position: fixed; inset: 0; z-index: 1000; background: var(--splash-bg); transition: opacity 180ms ease-out; }
       #splash.splash-out { opacity: 0; pointer-events: none; }
       .splash-inline { flex: 1; min-height: 240px; }
       .splash .orb { width: 88px; height: 88px; overflow: visible; }
@@ -56,7 +57,7 @@
       .splash .orb-ring { animation: splash-orbit 30s linear infinite reverse; }
       .splash .orb-halo { fill: var(--splash-dot); opacity: 0.15; }
       .splash .orb-core { fill: var(--splash-core); filter: drop-shadow(0 0 4px #22d3ee); animation: splash-pulse 2.6s ease-in-out infinite; }
-      .splash-word { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+      .splash-word { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
       .splash-note { font-size: 13px; color: var(--splash-muted); margin: 0; }
       @keyframes splash-orbit { to { transform: rotate(360deg); } }
       @keyframes splash-pulse { 50% { transform: scale(1.25); opacity: 0.8; } }

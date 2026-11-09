@@ -2,7 +2,7 @@
 // mounted, it fades out and goes; with reduced motion it goes at once.
 
 /** How long the fade lasts (the `.splash-out` transition in index.html), then it is removed. */
-export const SPLASH_FADE_MS = 200;
+export const SPLASH_FADE_MS = 180;
 
 export function prefersReducedMotion(): boolean {
   try {

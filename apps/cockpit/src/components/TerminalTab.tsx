@@ -17,7 +17,24 @@ const MAX_PENDING_INPUT = 64 * 1024;
 const ACK_BATCH = 64 * 1024;
 /** …or after this long, whichever comes first. */
 const ACK_DELAY_MS = 50;
-const FONT = '"SF Mono", Menlo, monospace';
+/** JetBrains Mono when the app has it, else the system's monospace. Its ligatures stay off
+ * (xterm draws cell by cell; "=>" is two cells). */
+export const FONT = '"JetBrains Mono", "SF Mono", Menlo, monospace';
+/** The terminal is graphite in both themes (agents' TUIs assume a dark screen): the
+ * Observatório dark surfaces and text (styles.css). */
+export const TERMINAL_THEME = { background: "#141519", foreground: "#e7e3dd", cursor: "#e7e3dd", cursorAccent: "#141519", selectionBackground: "#3a3c43" };
+
+/** null when the document's fonts have loaded (or the engine cannot say); else a promise of
+ * that moment. The first fit (and the attach at its size) waits for it: cells measured in a
+ * fallback font's metrics would size the PTY wrong. */
+export function fontsPending(doc: Document = document): Promise<void> | null {
+  const fonts = (doc as Document & { fonts?: FontFaceSet }).fonts;
+  if (!fonts || fonts.status === "loaded") return null;
+  return fonts.ready.then(
+    () => undefined,
+    () => undefined,
+  );
+}
 
 /** Re-attach waits after a stream ends (or an attach fails) while the task is live; past
  * the last one the note offers Reconnect. */
@@ -140,6 +157,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       cursorBlink: true,
       fontSize: 13,
       fontFamily: FONT,
+      theme: TERMINAL_THEME,
       scrollback: 5000,
       // For the Unicode 11 width tables (emoji and CJK take two cells, as agents' TUIs assume).
       allowProposedApi: true,
@@ -179,7 +197,8 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       if (!closed && glLost && !document.hidden) loadGl();
     };
     document.addEventListener("visibilitychange", onVisible);
-    if (sized(el)) fit.fit();
+    // The first fit waits for the fonts (see `fontsPending`); the first attach follows it.
+    let fontsLoaded = false;
     // The attachment keys go to (null: none now), whether it takes them, and its number:
     // output, ends and replies of an older attach are dropped.
     let id: number | null = null;
@@ -212,7 +231,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       fitQueued = true;
       nextFrame(() => {
         fitQueued = false;
-        if (!closed && sized(el)) fit.fit();
+        if (!closed && fontsLoaded && sized(el)) fit.fit();
       });
     });
     ro.observe(el);
@@ -356,9 +375,17 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
           lost(again ? null : why);
         });
     };
-    attach(false);
-    kick.current = (when) => {
+    const start = () => {
       if (closed) return;
+      fontsLoaded = true;
+      if (sized(el)) fit.fit();
+      attach(false);
+    };
+    const fonts = fontsPending();
+    if (fonts) void fonts.then(start);
+    else start();
+    kick.current = (when) => {
+      if (closed || !fontsLoaded) return;
       if (when === "detached" && (id !== null || attaching || retryTimer !== null)) return;
       // Already attached under this boot (the terminal was opened after it began).
       if (when === "boot" && attachedBoot === bootRef.current) return;

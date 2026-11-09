@@ -39,13 +39,13 @@ fn is_app_url(url: &Url, dev: bool) -> bool {
     }
 }
 
-/// The window's colour before the page paints: the app's `--bg` (`src/styles.css`, and the
+/// The window's colour before the page paints: the app's `--panel` (`src/styles.css`, and the
 /// launch splash in `index.html`) for the system's theme. macOS paints no webview background of
 /// its own colour, hence the window also starts hidden (see `run`).
 fn backdrop(theme: Theme) -> Color {
     match theme {
-        Theme::Dark => Color(0x0f, 0x12, 0x16, 0xff),
-        _ => Color(0xf6, 0xf7, 0xf9, 0xff),
+        Theme::Dark => Color(0x1b, 0x1c, 0x21, 0xff),
+        _ => Color(0xf8, 0xf7, 0xf4, 0xff),
     }
 }
 
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn the_backdrop_is_the_app_background_of_each_theme() {
         let page = include_str!("../../index.html");
-        for (theme, hex) in [(Theme::Dark, "#0f1216"), (Theme::Light, "#f6f7f9")] {
+        for (theme, hex) in [(Theme::Dark, "#1b1c21"), (Theme::Light, "#f8f7f4")] {
             let Color(r, g, b, a) = backdrop(theme);
             assert_eq!(format!("#{r:02x}{g:02x}{b:02x}"), hex);
             assert_eq!(a, 0xff);
