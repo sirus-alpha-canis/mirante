@@ -1185,3 +1185,85 @@ fn every_binary_answers_version_without_side_effects() {
     }
     assert!(!env.home.exists(), "nothing was written under MIRANTE_HOME");
 }
+
+impl Env {
+    /// A fake `open` that logs its arguments (no window opens) and a fake `Mirante.app`
+    /// directory: `(open, its log, the bundle)`.
+    fn fake_open(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let open = self.dir.path().join("fake-open.sh");
+        let log = self.dir.path().join("open.log");
+        mirante_core::test_script::write_sh(&open, &format!("echo \"$@\" >> '{}'", log.display()), 0o755);
+        let bundle = self.dir.path().join("Fake Mirante.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        (open, log, bundle)
+    }
+
+    fn mirante_with(&self, args: &[&str], envs: &[(&str, &Path)]) -> Output {
+        let mut c = self.cmd(&bin("mirante"));
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.args(args).stdin(Stdio::null()).output().unwrap()
+    }
+}
+
+#[test]
+fn app_no_daemon_opens_the_bundle_without_starting_a_daemon() {
+    let env = Env::new();
+    let (open, log, bundle) = env.fake_open();
+    let envs = [("MIRANTE_OPEN_BIN", open.as_path()), ("MIRANTE_APP", bundle.as_path())];
+    for alias in ["app", "open"] {
+        let out = env.mirante_with(&[alias, "--no-daemon"], &envs);
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if cfg!(target_os = "macos") {
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("opening") && stdout.contains("Fake Mirante.app"), "{stdout}");
+        } else {
+            assert!(!out.status.success());
+            assert!(stderr.contains("macOS-only"), "{stderr}");
+        }
+    }
+    if cfg!(target_os = "macos") {
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(seen, format!("-a {}\n", bundle.display()).repeat(2), "one `open -a <bundle>` per run");
+    } else {
+        assert!(!log.exists());
+    }
+    assert!(!env.home.join("daemon.sock").exists(), "--no-daemon starts no daemon");
+}
+
+#[test]
+fn app_starts_the_daemon_first_and_refuses_a_bad_mirante_app() {
+    let env = Env::new();
+    let (open, log, bundle) = env.fake_open();
+    let not_a_bundle = env.dir.path().join("Mirante");
+    std::fs::create_dir_all(&not_a_bundle).unwrap();
+    let out = env.mirante_with(&["app"], &[("MIRANTE_OPEN_BIN", &open), ("MIRANTE_APP", &not_a_bundle)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    if cfg!(target_os = "macos") {
+        assert!(stderr.contains("MIRANTE_APP") && stderr.contains("not an app bundle"), "{stderr}");
+    }
+    assert!(!log.exists(), "nothing opened");
+    assert!(!env.home.join("daemon.sock").exists(), "no daemon for an app that is not there");
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let out = env.mirante_with(&["app"], &[("MIRANTE_OPEN_BIN", &open), ("MIRANTE_APP", &bundle)]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.ok(&["daemon", "status"]).starts_with("running"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("-a {}\n", bundle.display()));
+}
+
+#[test]
+fn daemon_start_and_restart_hint_at_the_app_only_on_a_terminal() {
+    let env = Env::new();
+    let piped = env.ok(&["daemon", "start"]);
+    assert!(piped.contains("started") && !piped.contains("mirante app"), "{piped}");
+    let piped = env.ok(&["daemon", "restart"]);
+    assert!(piped.contains("started") && !piped.contains("mirante app"), "{piped}");
+    for args in [&["daemon", "restart"][..], &["daemon", "start"]] {
+        let tty = env.on_tty_with(&env.repo, args, None, &[]);
+        assert!(tty.contains("open the cockpit with: mirante app"), "{args:?}: {tty}");
+    }
+}

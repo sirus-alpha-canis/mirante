@@ -113,11 +113,19 @@ const COMMANDS: &[Help] = &[
   skills lint <SKILL.md> offline lint; exits 1 on an error finding, 3 when it could not run",
     },
     Help {
+        names: &["app", "open"],
+        text: "  app [--no-daemon]      open the desktop app (macOS; also: mirante open), starting the
+                         daemon first unless --no-daemon. Looks for $MIRANTE_APP, then
+                         /Applications/Mirante.app, ~/Applications/Mirante.app, then the
+                         build in the checkout this mirante was built from",
+    },
+    Help {
         names: &["daemon"],
         text: "  daemon start|stop|restart|status
                          restart: stop (ends live sessions) then start, e.g. after an upgrade;
                          the new daemon resumes them unless auto-resume is off
-                         (MIRANTE_AUTO_RESUME=off, or the cockpit's setting)",
+                         (MIRANTE_AUTO_RESUME=off, or the cockpit's setting); then
+                         `mirante app` opens the desktop app (the daemon has no window)",
     },
     Help {
         names: &["help"],
@@ -142,6 +150,7 @@ environment (the daemon reads it when it starts: run `mirante daemon restart` af
                                let the daemon type Claude answers when it has the evidence
   MIRANTE_MEM_BUDGET_MB, MIRANTE_IDLE_HIBERNATE_MIN, MIRANTE_MEMGUARD=off
                                the memory guard's per-session budget, idle hibernation, off switch
+  MIRANTE_APP                  the Mirante.app `mirante app` opens (read by the CLI, not the daemon)
 every variable: the Environment section of the README";
 
 const FLAGS: &str = "\
@@ -389,6 +398,10 @@ pub enum Cmd {
         kill: Option<i32>,
     },
     Daemon(DaemonCmd),
+    /// Open the desktop app, starting the daemon first unless `no_daemon`.
+    App {
+        no_daemon: bool,
+    },
     Memory(MemoryCmd),
     Skills(SkillsCmd),
     /// The full help, or one command's.
@@ -795,6 +808,13 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             "status" => Ok(Cmd::Daemon(DaemonCmd::Status)),
             other => Err(format!("unknown daemon command {other}")),
         },
+        "app" | "open" => {
+            let p = split(rest, none, &["--no-daemon"])?;
+            if !p.positional.is_empty() {
+                return Err(format!("{sub} takes no arguments"));
+            }
+            Ok(Cmd::App { no_daemon: !p.bools.is_empty() })
+        }
         "help" | "-h" | "--help" => match rest {
             [] => Ok(Cmd::Help(None)),
             [c] if COMMANDS.iter().any(|h| h.names.contains(&c.as_str())) => Ok(Cmd::Help(Some(c.clone()))),
@@ -1064,6 +1084,18 @@ mod tests {
     fn archive_can_stop_first() {
         assert_eq!(p("archive feat").unwrap(), Cmd::Archive { task: "feat".into(), stop: false });
         assert_eq!(p("archive --stop feat").unwrap(), Cmd::Archive { task: "feat".into(), stop: true });
+    }
+
+    #[test]
+    fn app_and_its_alias_open() {
+        assert_eq!(p("app").unwrap(), Cmd::App { no_daemon: false });
+        assert_eq!(p("open --no-daemon").unwrap(), Cmd::App { no_daemon: true });
+        assert_eq!(p("app x").unwrap_err(), "app takes no arguments");
+        assert!(p("app --bogus").is_err());
+        assert_eq!(p("open --help").unwrap(), Cmd::Help(Some("open".into())));
+        let u = command_usage("open").unwrap();
+        assert!(u.starts_with("usage:\n  mirante app [--no-daemon]"), "{u}");
+        assert!(usage().contains("MIRANTE_APP"));
     }
 
     #[test]

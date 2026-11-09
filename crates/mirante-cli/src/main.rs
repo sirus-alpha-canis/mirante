@@ -23,7 +23,7 @@ use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
 use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd};
-use mirante_cli::{confirm, daemon_ctl, memcheck, render, skilllint, term};
+use mirante_cli::{app, confirm, daemon_ctl, memcheck, render, skilllint, term};
 use mirante_core::branch_name::{branch_from_goal, next_free_branch};
 use mirante_core::skills::lint::has_errors;
 
@@ -766,6 +766,14 @@ fn stop_note(c: &mut Client) -> &'static str {
     }
 }
 
+/// After `daemon start|restart` on a terminal: the daemon has no window, the app is one
+/// command away.
+fn hint_the_app(stdout_is_tty: bool) {
+    if let Some(h) = app::daemon_hint(stdout_is_tty) {
+        println!("{h}");
+    }
+}
+
 fn run(cmd: Cmd) -> Res {
     let paths = Paths::from_env()?;
     let color = term::is_tty(1);
@@ -793,6 +801,7 @@ fn run(cmd: Cmd) -> Res {
                 daemon_ctl::start_daemon_with_notice(&paths, &notice)?;
                 println!("started");
             }
+            hint_the_app(color);
         }
         Cmd::Daemon(DaemonCmd::Stop) => match Client::connect(&paths.socket()) {
             Ok(mut c) => {
@@ -815,6 +824,23 @@ fn run(cmd: Cmd) -> Res {
             c.set_timeout(Some(Duration::from_secs(10)))?;
             let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
             println!("started: pid {} (v{})", s.pid, s.version);
+            hint_the_app(color);
+        }
+        Cmd::App { no_daemon } => {
+            if !cfg!(target_os = "macos") {
+                return Err(app::MACOS_ONLY.into());
+            }
+            // Found before the daemon starts: no side effect for an app that is not there.
+            let bundle = app::resolve(&app::Where::from_env())?;
+            if !no_daemon {
+                let mut c = daemon_ctl::connect_with_notice(&paths, &notice)?;
+                warn_on_version_skew(&mut c);
+            }
+            println!("opening {}", bundle.display());
+            let status = app::open_command(&bundle).status().map_err(|e| format!("could not run open: {e}"))?;
+            if !status.success() {
+                return Err(format!("open could not open {} ({status})", bundle.display()).into());
+            }
         }
         Cmd::New { repo, agent, branch, base, title, goal, trust } => {
             let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
