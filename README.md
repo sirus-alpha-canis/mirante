@@ -178,8 +178,11 @@ More detail, including the fake daemon for UI work without agents:
   its path.
 - **Dispatch.** Home has one form. Write the goal, then pick the agent, the repository and
   the branch with the chips below it. The branch defaults to `mirante/<words-of-the-goal>`,
-  and you can edit it. **+ contexto** attaches repo files, memory notes or skills. The
-  one-line form `@claude shop/feat/login add a login page` works too. ⌘↵ dispatches.
+  and you can edit it. **+ contexto** attaches repo files, memory notes or skills. You can
+  also start the text with `@claude` or `@codex`: `@claude fix the login` uses the selected
+  repository and names the branch for you; `@claude shop fix the login` picks a project by
+  name; `@claude shop/feat/login fix the login` also names the branch. You never have to
+  type a branch. ⌘↵ dispatches.
 - **Home** is an inbox across all projects: what needs you first, then what is ready to
   review, then what is working. The Mirante logo at the top left (or **⌘1**) brings you
   back to it. **⌘J** jumps to the next task that needs you.
@@ -191,7 +194,7 @@ More detail, including the fake daemon for UI work without agents:
 - **Brain (⌘B)** is the repo memory graph and its review queue.
 - **Skills (⌘L)** lists the skill library and its proposals.
 - **Rules (⌘R)** lists what each agent session reads, for a project or one of its tasks.
-- **⌘K** opens the command bar: tasks, projects, and `@agent repo/branch goal`.
+- **⌘K** opens the command bar: tasks, projects, and `@agent [project[/branch]] goal`.
 
 Closing the app never ends a session, because the daemon owns them. Off macOS, ⌘ is Ctrl.
 

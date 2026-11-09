@@ -8,6 +8,15 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ### Fixed
 
+- **`@claude <goal>` in the dispatch box no longer demands `<repo>/<branch>`.** Only the
+  agent is required: the repository is the toolbar's (or a project named as the second
+  word, any case), and the branch is named by Mirante from the goal (`mirante/<slug>`,
+  `-2`, `-3`… when taken) unless typed as `project/branch`. A word with a `/` that names no
+  project is part of the goal. The agent and repository chips stay usable in `@` mode (the
+  agent chip follows the `@` word) and a hint shows the target (`→ Site-B2C · ⎇
+  mirante/…`, branch editable). With no repository at all the form says "Pick a
+  repository". The CLI's `mirante new` already names the branch when `--branch` is left out.
+
 - **The × next to a project in the rail did nothing** for a project that still had tasks
   (it was listed because of its tasks, so dropping it from the saved list changed nothing,
   silently). Every project now has a × that works: with no tasks it goes at once; with

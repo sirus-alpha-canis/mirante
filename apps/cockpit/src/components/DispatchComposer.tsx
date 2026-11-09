@@ -22,6 +22,7 @@ import {
   branchProblem,
   type ContextRef,
   contextKey,
+  dispatchRepo,
   foreignRepo,
   goalHelp,
   isPowerSyntax,
@@ -29,7 +30,6 @@ import {
   mayHoldSecrets,
   nextFreeBranch,
   parseDispatch,
-  resolveRepo,
   suggest,
   type SuggestionItem,
   withContext,
@@ -105,8 +105,10 @@ const agentLabel = (a: AgentKind) => AGENT_OPTIONS.find((o) => o.id === a)?.labe
  * picker, the repository chip (searchable), the branch chip (once there is a goal: named
  * after it, editable), "+ contexto" (attach repo files, memory notes and skills: they go
  * after the goal as labeled references), a memory hint while new sessions wait, and send
- * (⌘↵). Text that starts with "@claude" / "@codex" is the one-line syntax
- * ("@claude shop/feat/x goal"), with suggestions as it is typed.
+ * (⌘↵). Text that starts with "@claude" / "@codex" is the one-line syntax ("@claude goal",
+ * "@claude shop goal", "@claude shop/feat/x goal"), with suggestions as it is typed: it sets
+ * the agent, and the repo and branch only when it names them (else the toolbar's repo and a
+ * branch named after the goal; the hint under the box shows where it will go).
  */
 export function DispatchComposer(props: {
   projects: Project[];
@@ -154,16 +156,28 @@ export function DispatchComposer(props: {
   const has = (p: string | null) => !!p && props.projects.some((x) => x.path === p);
   const repo = has(picked) ? picked : has(props.project) ? props.project : (props.projects[0]?.path ?? null);
 
-  // The branch: named after the goal, past the names this repo's tasks already use, unless edited.
+  // The @ line: the agent always, the repo and branch when it names them.
+  const power = isPowerSyntax(props.value);
+  const parsed = useMemo(() => (power ? parseDispatch(props.value, props.projects) : null), [power, props.value, props.projects]);
+  const line = parsed?.ok ? parsed.value : null;
+  const lineRepo = line && line.repo !== null ? dispatchRepo(line.repo, repo, props.projects) : null;
+  // Where the task goes: the @ line's project, else the toolbar's.
+  const targetRepo = lineRepo ? (lineRepo.ok ? lineRepo.path : null) : repo;
+  const agent = line?.agent ?? props.agent;
+  const goalText = power ? (line?.goal ?? "") : props.value;
+
+  // The branch: named after the goal, past the names this repo's tasks already use, unless
+  // edited (or typed on the @ line as project/branch).
   const edited = form.edited;
   const setEdited = (b: string | null) => setForm((f) => ({ ...f, edited: b }));
-  const power = isPowerSyntax(props.value);
   const takenIn = (path: string | null) => new Set(branchesIn(cockpit.getState(), path));
-  const selectBranches = useCallback((s: State) => branchesIn(s, repo), [repo]);
+  const selectBranches = useCallback((s: State) => branchesIn(s, targetRepo), [targetRepo]);
   const branches = useSelect(selectBranches, shallow);
   const taken = useMemo(() => new Set(branches), [branches]);
-  const auto = nextFreeBranch(branchFromGoal(props.value), taken);
-  const branch = edited ?? auto;
+  const auto = nextFreeBranch(branchFromGoal(goalText), taken);
+  const lineBranch = line?.branch ? line.branch : null;
+  const branch = lineBranch ?? edited ?? auto;
+  const repoChip = useRef<HTMLInputElement>(null);
 
   // "+ contexto": what is attached to this goal (cleared with it once dispatched).
   const refs = form.refs;
@@ -195,25 +209,38 @@ export function DispatchComposer(props: {
     let target: { repo: string; agent: AgentKind; branch: string; goal: string };
     let renames = false;
     if (power) {
-      const p = parseDispatch(sent);
+      const p = parseDispatch(sent, props.projects);
       if (!p.ok) return setError(p.error);
-      const r = resolveRepo(p.value.repo, props.projects);
-      if (!r.ok) return setError(r.error);
+      if (props.projects.length === 0) return setError(t("dispatch.noRepo"));
+      const r = dispatchRepo(p.value.repo, repo, props.projects);
+      if (!r.ok) {
+        if ("pick" in r) repoChip.current?.focus();
+        return setError(r.error);
+      }
       // Files and notes were picked in the form's repo: elsewhere they name nothing (or
       // something else).
       const other = foreignRepo(sentRefs, r.path);
       if (other) {
         const from = repoLabel(other);
-        return setError(t("dispatch.foreignRefs", { from, to: p.value.repo }));
+        return setError(t("dispatch.foreignRefs", { from, to: repoLabel(r.path) }));
       }
-      // "shop/" with no branch: named from the goal, like the form's.
-      renames = p.value.branch === "";
-      const b = renames ? nextFreeBranch(branchFromGoal(p.value.goal), takenIn(r.path)) : p.value.branch;
+      // No branch on the line: the one shown (named from the goal, or edited in the hint).
+      let b = p.value.branch;
+      if (b === "") {
+        renames = edited === null;
+        b = edited ?? nextFreeBranch(branchFromGoal(p.value.goal), takenIn(r.path));
+        const bad = branchProblem(b);
+        if (bad) return setError(bad);
+      }
       target = { repo: r.path, agent: p.value.agent, branch: b, goal: withContext(p.value.goal, sentRefs) };
     } else {
       const goal = sent.trim();
       if (!goal) return setError(t("dispatch.noGoal"));
-      if (!repo) return setError(t("dispatch.noRepo"));
+      if (!repo) {
+        if (props.projects.length === 0) return setError(t("dispatch.noRepo"));
+        repoChip.current?.focus();
+        return setError(t("dispatch.pickRepo"));
+      }
       const bad = branchProblem(branch);
       if (bad) return setError(bad);
       const other = foreignRepo(sentRefs, repo);
@@ -317,6 +344,32 @@ export function DispatchComposer(props: {
   };
 
   const hasGoal = props.value.trim().length > 0;
+  // An agent picked in the toolbar while the @ line names one: the line changes with it.
+  const pickAgent = (a: AgentKind) => {
+    props.onAgent(a);
+    if (power) props.onChange(props.value.replace(/^(\s*)@(claude|codex)/i, `$1@${a}`));
+  };
+  const branchChip =
+    lineBranch !== null ? (
+      <span className="tchip tchip-static">
+        <span aria-hidden="true">⎇</span> <code>{lineBranch}</code>
+      </span>
+    ) : edited === null ? (
+      <span className="tchip tchip-static">
+        <span aria-hidden="true">⎇</span> <code>{auto}</code>{" "}
+        <button type="button" className="btn btn-small btn-ghost" aria-label={t("dispatch.editBranch")} onClick={() => setEdited(auto)}>
+          {t("dispatch.edit")}
+        </button>
+      </span>
+    ) : (
+      <span className="tchip tchip-static">
+        <label htmlFor="dispatch-branch-name">{t("dispatch.branch")}</label>{" "}
+        <input id="dispatch-branch-name" value={edited} onChange={(e) => setEdited(e.target.value)} spellCheck={false} />{" "}
+        <button type="button" className="btn btn-small btn-ghost" onClick={() => setEdited(null)}>
+          {t("dispatch.useAuto", { branch: auto })}
+        </button>
+      </span>
+    );
   return (
     <form
       className="composer dispatch"
@@ -369,29 +422,20 @@ export function DispatchComposer(props: {
         />
         {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
         <div className="composer-toolbar" role="group" aria-label={t("dispatch.options")}>
-          <AgentPicker value={props.agent} disabled={power} onPick={props.onAgent} />
-          <RepoBox projects={props.projects} value={repo} disabled={power} onPick={setPicked} />
+          <AgentPicker value={agent} onPick={pickAgent} />
+          <RepoBox projects={props.projects} value={repo} inputRef={repoChip} onPick={setPicked} />
           <span id="dispatch-branch" className="small muted dispatch-branch">
             {power ? (
-              <>{t("dispatch.fromAtLine")}</>
-            ) : !hasGoal ? null : edited === null ? (
-              <span className="tchip tchip-static">
-                <span aria-hidden="true">⎇</span> <code>{auto}</code>{" "}
-                <button type="button" className="btn btn-small btn-ghost" aria-label={t("dispatch.editBranch")} onClick={() => setEdited(auto)}>
-                  {t("dispatch.edit")}
-                </button>
-              </span>
-            ) : (
-              <span className="tchip tchip-static">
-                <label htmlFor="dispatch-branch-name">{t("dispatch.branch")}</label>{" "}
-                <input id="dispatch-branch-name" value={edited} onChange={(e) => setEdited(e.target.value)} spellCheck={false} />{" "}
-                <button type="button" className="btn btn-small btn-ghost" onClick={() => setEdited(null)}>
-                  {t("dispatch.useAuto", { branch: auto })}
-                </button>
-              </span>
+              line && targetRepo ? (
+                <span className="dispatch-target" aria-label={t("dispatch.target")}>
+                  <span aria-hidden="true">→</span> <span>{repoLabel(targetRepo)}</span> <span aria-hidden="true">·</span> {branchChip}
+                </span>
+              ) : null
+            ) : !hasGoal ? null : (
+              branchChip
             )}
           </span>
-          <ContextPicker repo={power ? null : repo} onAttach={attach} attached={refs} />
+          <ContextPicker repo={targetRepo} onAttach={attach} attached={refs} />
           <span className="toolbar-spacer" />
           {props.paused && (
             <span className="small warn" role="status">
@@ -479,7 +523,7 @@ function Popover(props: { label: string; open: boolean; onClose(): void; trigger
 }
 
 /** Which agent runs the task: a menu (Claude, Codex; more agents join `AGENT_OPTIONS`). */
-function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: boolean; onPick(a: AgentKind): void }) {
+function AgentPicker({ value, onPick }: { value: AgentKind; onPick(a: AgentKind): void }) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const id = useId();
@@ -499,7 +543,6 @@ function AgentPicker({ value, disabled, onPick }: { value: AgentKind; disabled: 
           aria-haspopup="dialog"
           aria-expanded={open}
           aria-controls={open ? id : undefined}
-          disabled={disabled}
           onClick={() => setOpen((o) => !o)}
           title={t("dispatch.agentTitle")}
         >
@@ -684,7 +727,7 @@ function ContextPicker({ repo, onAttach, attached }: { repo: string | null; onAt
 }
 
 /** The form's repository: a combobox over the Projects, filtered by folder name as typed. */
-function RepoBox(props: { projects: Project[]; value: string | null; disabled: boolean; onPick(path: string): void }) {
+function RepoBox(props: { projects: Project[]; value: string | null; inputRef?: Ref<HTMLInputElement>; onPick(path: string): void }) {
   const t = useT();
   // null: not searching (the box shows the chosen project's name).
   const [query, setQuery] = useState<string | null>(null);
@@ -732,6 +775,7 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
       </label>
       <input
         id={id}
+        ref={props.inputRef}
         role="combobox"
         aria-expanded={open}
         aria-controls={listId}
@@ -739,7 +783,7 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
         aria-activedescendant={open ? optionId(at) : undefined}
         title={chosen?.path}
         placeholder={t(props.projects.length === 0 ? "dispatch.noProjects" : "dispatch.searchProjects")}
-        disabled={props.disabled || props.projects.length === 0}
+        disabled={props.projects.length === 0}
         value={query ?? chosen?.name ?? ""}
         spellCheck={false}
         autoComplete="off"

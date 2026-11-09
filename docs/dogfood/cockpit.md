@@ -63,9 +63,10 @@ no window of its own). Keep `mirante watch` open in a terminal the first day to 
 - [ ] A new folder: the trust card appears; **Trust folder** continues, **Decline** ends the
       session (try both, on two tasks).
 - [ ] Agent **Codex**: the card shows the **auto-edits** label.
-- [ ] The one-line form `@claude <repo>/<branch> <goal>` in the same box (typing `@` suggests
-      the agents, then the Projects); a typo (`@claud`, an unknown repo) shows the reason and
-      calls nothing.
+- [ ] The one-line form in the same box: `@claude <goal>` goes to the toolbar's repository on
+      a branch Mirante names (the hint shows `→ <repo> · ⎇ mirante/…`); `@claude <project>
+      <goal>` and `@claude <project>/<branch> <goal>` pick the project (and branch). Typing `@`
+      suggests the agents, then the Projects. An unknown `a/b` word stays in the goal.
 - [ ] **+ context** attaches a repo file and a memory note; the agent's first message lists
       them under "Context references".
 - [ ] With two tasks waiting on you, **⌘J** opens the next one (Claude's on its Terminal tab)

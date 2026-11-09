@@ -151,16 +151,22 @@ added after the goal as a labeled list of references for the agent ("Context att
 Mirante"), nothing else is read or sent. Files and notes belong to the repository they were
 picked in: a dispatch to another repository is refused until they are removed. The form
 (goal, attached context, edited branch, picked repository) is kept while you visit other
-views. While the memory guard pauses new sessions the form says so. Text starting with `@claude` or `@codex` is the one-line form,
-`@claude shop/feat/login add a login page`: typing `@` suggests the agents, then the
-Projects (filtered as you type; ↑/↓, Enter or Tab picks, Esc closes); `shop/` with no
-branch gets one named from the goal.
+views. While the memory guard pauses new sessions the form says so. Text starting with `@claude` or `@codex` is the one-line form. Only the agent is
+required: `@claude fix the login` goes to the repository selected in the toolbar on a branch
+named from the goal (`mirante/fix-the-login`, `-2`, `-3`… when taken). A second word that is
+a project's name (any case) picks that project (`@claude shop fix the login`), and
+`project/branch` also names the branch (`@claude shop/feat/login add a login page`). A word
+with a `/` whose first part is no project is just part of the goal. The toolbar chips stay
+usable: the agent chip follows the `@` word (picking another rewrites it), the repository
+chip is the one used unless the line names a project, and a hint shows where the task will
+go (`→ shop · ⎇ mirante/fix-the-login`, the branch editable). Typing `@` suggests the
+agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab picks, Esc closes).
 
 ## Keys
 
 | Keys | What |
 |---|---|
-| ⌘K | Command bar (tasks, projects, `@claude repo/branch goal` into the dispatch form) |
+| ⌘K | Command bar (tasks, projects, `@claude [project[/branch]] goal` into the dispatch form) |
 | ⌘G | Toggle the agent grid |
 | ⌘1 | Home (also: the Mirante logo at the top left) |
 | ⌘J | Next: the next task that needs you |

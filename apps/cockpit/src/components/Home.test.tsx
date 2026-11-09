@@ -199,14 +199,14 @@ describe("Home (V3 group chat)", () => {
       expect(goal()).toHaveValue("@codex ");
     });
 
-    it("after the agent, the projects filtered as typed; Tab inserts repo/", async () => {
+    it("after the agent, the projects filtered as typed; Tab inserts the project and a space", async () => {
       setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
       await userEvent.type(goal(), "@claude ");
       expect(options()).toEqual(["api/repos/api", "shop/repos/shop"]);
       await userEvent.type(goal(), "a");
       expect(options()).toEqual(["api/repos/api"]);
       await userEvent.keyboard("{Tab}");
-      expect(goal()).toHaveValue("@claude api/");
+      expect(goal()).toHaveValue("@claude api ");
       expect(goal()).toHaveFocus();
       expect(screen.queryByRole("listbox", { name: "Suggestions" })).toBeNull();
     });
@@ -219,7 +219,7 @@ describe("Home (V3 group chat)", () => {
       expect(goal()).toHaveValue("@claude s");
       await userEvent.type(goal(), "h");
       await userEvent.click(screen.getByRole("option", { name: /^shop/ }));
-      expect(goal()).toHaveValue("@claude shop/");
+      expect(goal()).toHaveValue("@claude shop ");
     });
 
     it("never inside the goal text", async () => {
@@ -313,11 +313,87 @@ describe("Home (V3 group chat)", () => {
     expect(sent(h)[1][1]).toEqual({ task: "new", prompt: "add a login page" });
   });
 
-  it("explains a bad power-user dispatch without calling the daemon", async () => {
+  it("explains a bad power-user branch without calling the daemon", async () => {
     const h = setup();
-    await userEvent.type(screen.getByLabelText("Goal"), "@claude web/x do it{Meta>}{Enter}{/Meta}");
-    expect(await screen.findByRole("alert")).toHaveTextContent('unknown repo "web"');
+    await userEvent.type(screen.getByLabelText("Goal"), "@claude shop/a..b do it{Meta>}{Enter}{/Meta}");
+    expect(await screen.findByRole("alert")).toHaveTextContent("cannot contain '..'");
     expect(sent(h)).toEqual([]);
+  });
+
+  describe("the @ line never asks for a repo or a branch", () => {
+    const twoRepos = ["/repos/shop", "/repos/Site-B2C"];
+    const founder = "@claude Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente";
+    const founderGoal = "Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente";
+    const pickRepo = async (name: string) => {
+      const box = screen.getByRole("combobox", { name: "Repository" });
+      await userEvent.clear(box);
+      await userEvent.type(box, name);
+      await userEvent.click(screen.getByRole("option", { name: new RegExp(`^${name}`) }));
+    };
+
+    it("@claude + a goal goes to the toolbar's repo on a branch Mirante names (the founder's input)", async () => {
+      const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [], [], null, twoRepos);
+      await pickRepo("Site-B2C");
+      fireEvent.change(screen.getByLabelText("Goal"), { target: { value: founder } });
+      // The chips stay usable; the hint shows where it will go.
+      expect(screen.getByRole("combobox", { name: "Repository" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: /^Agent:/ })).toBeEnabled();
+      expect(screen.queryByText(/come from the @ line/)).toBeNull();
+      const hint = screen.getByLabelText("Where the agent will work");
+      expect(hint).toHaveTextContent("→ Site-B2C · ⎇ mirante/ao-buscar-um-voo-na-cultura-colombia-o");
+      await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+      await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(sent(h)[0][1]).toEqual({
+        repo: "/repos/Site-B2C",
+        agent: "claude",
+        branch: "mirante/ao-buscar-um-voo-na-cultura-colombia-o",
+        goal: founderGoal,
+        base: "HEAD",
+      });
+    });
+
+    it("@codex + a project name + a goal: that project, auto branch (-2 when taken); the agent chip follows the line", async () => {
+      const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } }, [task("a", { branch: "mirante/corrigir-o-preco", repo_path: "/repos/Site-B2C" })], [], null, twoRepos);
+      await userEvent.type(screen.getByLabelText("Goal"), "@codex site-b2c corrigir o preço");
+      expect(agentShown()).toBe("Codex");
+      expect(screen.getByLabelText("Where the agent will work")).toHaveTextContent("→ Site-B2C · ⎇ mirante/corrigir-o-preco-2");
+      await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+      await waitFor(() =>
+        expect(sent(h)[0]?.[1]).toEqual({ repo: "/repos/Site-B2C", agent: "codex", branch: "mirante/corrigir-o-preco-2", goal: "corrigir o preço", base: "HEAD" }),
+      );
+    });
+
+    it("an unknown a/b word is part of the goal, sent to the toolbar's repo", async () => {
+      const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } });
+      await userEvent.type(screen.getByLabelText("Goal"), "@claude web/x do it{Meta>}{Enter}{/Meta}");
+      await waitFor(() => expect(sent(h)[0]?.[1]).toEqual({ repo: "/repos/shop", agent: "claude", branch: "mirante/web-x-do-it", goal: "web/x do it", base: "HEAD" }));
+    });
+
+    it("the auto branch in the hint can be edited", async () => {
+      const h = setup({ "task.create": task("new"), "session.start": { boot: "booting" } });
+      await userEvent.type(screen.getByLabelText("Goal"), "@claude fix it");
+      await userEvent.click(screen.getByRole("button", { name: "Edit branch" }));
+      await userEvent.clear(screen.getByLabelText("Branch"));
+      await userEvent.type(screen.getByLabelText("Branch"), "feat/mine");
+      await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+      await waitFor(() => expect(sent(h)[0]?.[1]).toEqual({ repo: "/repos/shop", agent: "claude", branch: "feat/mine", goal: "fix it" }));
+    });
+
+    it("choosing an agent in the toolbar rewrites the @ word", async () => {
+      setup();
+      await userEvent.type(screen.getByLabelText("Goal"), "@claude fix it");
+      await chooseAgent("Codex");
+      expect(screen.getByLabelText("Goal")).toHaveValue("@codex fix it");
+    });
+
+    it("the placeholder says the @ parts are optional", () => {
+      setup();
+      expect(screen.getByLabelText("Goal")).toHaveAttribute(
+        "placeholder",
+        expect.stringMatching(/^What should the agent do\? \((⌘|Ctrl\+)↵ to dispatch · optional: @claude or @codex, a project name, or project\/branch\)$/),
+      );
+    });
   });
 
   it("Home is an inbox across projects: needs you, ready for review, working, grouped by project", async () => {

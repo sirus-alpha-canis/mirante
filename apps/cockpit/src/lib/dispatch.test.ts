@@ -9,6 +9,7 @@ import {
   applySuggestion,
   branchFromGoal,
   branchProblem,
+  dispatchRepo,
   isPowerSyntax,
   matchProjects,
   nextFreeBranch,
@@ -17,24 +18,61 @@ import {
   suggest,
 } from "./dispatch";
 
+const known = [
+  { name: "shop", path: "/a/shop" },
+  { name: "api", path: "/a/api" },
+  { name: "Site-B2C", path: "/w/Site-B2C" },
+];
+const parse = (input: string) => parseDispatch(input, known);
+
 describe("parseDispatch", () => {
-  it("parses agent, repo, a branch with slashes and a multi-word goal", () => {
-    expect(parseDispatch("@claude shop/feat/login add a login page")).toEqual({
+  it("@agent then the goal: the repo is the toolbar's, the branch is named by Mirante (the founder's input)", () => {
+    const input = "@claude Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente";
+    expect(parse(input)).toEqual({
+      ok: true,
+      value: { agent: "claude", repo: null, branch: "", goal: "Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente" },
+    });
+    expect(parse("@codex corrigir o login")).toEqual({ ok: true, value: { agent: "codex", repo: null, branch: "", goal: "corrigir o login" } });
+  });
+
+  it("@agent, a known project name (any case), then the goal: that repo, branch named by Mirante", () => {
+    expect(parse("@claude shop fix the login")).toEqual({ ok: true, value: { agent: "claude", repo: "shop", branch: "", goal: "fix the login" } });
+    expect(parse("@codex site-b2c corrigir o preço")).toEqual({ ok: true, value: { agent: "codex", repo: "Site-B2C", branch: "", goal: "corrigir o preço" } });
+  });
+
+  it("@agent project/branch goal: as before, a branch with slashes and a multi-word goal", () => {
+    expect(parse("@claude shop/feat/login add a login page")).toEqual({
       ok: true,
       value: { agent: "claude", repo: "shop", branch: "feat/login", goal: "add a login page" },
     });
-    expect(parseDispatch("  @Codex   api/fix-42   fix the\nflaky test ")).toEqual({
+    expect(parse("  @Codex   API/fix-42   fix the\nflaky test ")).toEqual({
       ok: true,
       value: { agent: "codex", repo: "api", branch: "fix-42", goal: "fix the\nflaky test" },
     });
+    // "shop/" with nothing after the slash: the branch is named from the goal.
+    expect(parse("@claude shop/ fix the login")).toEqual({ ok: true, value: { agent: "claude", repo: "shop", branch: "", goal: "fix the login" } });
+  });
+
+  it("a word with a slash that names no project is just part of the goal", () => {
+    expect(parse("@claude a/b testing on the checkout")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "a/b testing on the checkout" } });
+    expect(parse("@claude web/x do it")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "web/x do it" } });
+    expect(parse("@claude /main do it")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "/main do it" } });
+    // A project name only counts as the second word, whole.
+    expect(parse("@claude shopping list")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "shopping list" } });
+  });
+
+  it("never asks for a repo or a branch", () => {
+    for (const input of ["@claude Ao buscar", "@claude fix", "@claude x/y z", "@codex shop"]) {
+      const r = parse(input);
+      if (!r.ok) expect(r.error).not.toMatch(/<repo>|<branch>|repo\/branch/);
+    }
   });
 
   it.each([
     ["fix it", "start with an agent"],
     ["@gpt shop/x do", 'unknown agent "@gpt"'],
-    ["@claude", "say where"],
-    ["@claude shop do it", '"shop" must be <repo>/<branch>'],
-    ["@claude /main do it", "must be <repo>/<branch>"],
+    ["@claude", "say what the agent should do"],
+    ["@claude shop", "say what the agent should do"],
     ["@claude shop/feat/x", "say what the agent should do"],
     ["@claude shop/-rf do", "cannot start with '-'"],
     ["@claude shop/a..b do", "cannot contain '..'"],
@@ -47,31 +85,42 @@ describe("parseDispatch", () => {
     ["@claude shop/a.lock/b do", "cannot end with '.lock'"],
     ["@claude shop/@ do", "not a valid branch name"],
   ])("rejects %j", (input, msg) => {
-    const r = parseDispatch(input);
+    const r = parse(input);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain(msg);
   });
 });
 
-describe("parseDispatch with no branch", () => {
-  it("'repo/' with nothing after the slash leaves the branch to be named from the goal", () => {
-    expect(parseDispatch("@claude shop/ fix the login")).toEqual({
-      ok: true,
-      value: { agent: "claude", repo: "shop", branch: "", goal: "fix the login" },
-    });
+describe("dispatchRepo", () => {
+  it("the @ line's project, else the toolbar's; with neither, 'Pick a repository'", () => {
+    expect(dispatchRepo("shop", "/w/Site-B2C", known)).toEqual({ ok: true, path: "/a/shop" });
+    expect(dispatchRepo(null, "/w/Site-B2C", known)).toEqual({ ok: true, path: "/w/Site-B2C" });
+    expect(dispatchRepo(null, null, known)).toEqual({ ok: false, error: "Pick a repository", pick: true });
+  });
+});
+
+describe("the auto branch for an @ line", () => {
+  it("is mirante/<slug of the goal>, accents folded, -2 when taken", () => {
+    const r = parse("@claude Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente");
+    if (!r.ok) throw new Error(r.error);
+    expect(branchFromGoal(r.value.goal)).toBe("mirante/ao-buscar-um-voo-na-cultura-colombia-o");
+    expect(branchFromGoal("Corrigir a exibição do preço")).toBe("mirante/corrigir-a-exibicao-do-preco");
+    expect(nextFreeBranch(branchFromGoal(r.value.goal), new Set(["mirante/ao-buscar-um-voo-na-cultura-colombia-o"]))).toBe(
+      "mirante/ao-buscar-um-voo-na-cultura-colombia-o-2",
+    );
   });
 });
 
 describe("resolveRepo", () => {
-  const known = [
+  const dup = [
     { name: "shop", path: "/a/shop" },
     { name: "api", path: "/a/api" },
     { name: "api", path: "/b/api" },
   ];
   it("finds a unique name, refuses ambiguous and unknown ones", () => {
-    expect(resolveRepo("shop", known)).toEqual({ ok: true, path: "/a/shop" });
-    expect(resolveRepo("api", known)).toMatchObject({ ok: false });
-    expect(resolveRepo("web", known)).toEqual({ ok: false, error: 'unknown repo "web": add it under Projects first' });
+    expect(resolveRepo("shop", dup)).toEqual({ ok: true, path: "/a/shop" });
+    expect(resolveRepo("api", dup)).toMatchObject({ ok: false });
+    expect(resolveRepo("web", dup)).toEqual({ ok: false, error: 'unknown repo "web": add it under Projects first' });
   });
 });
 
@@ -165,11 +214,15 @@ describe("suggest", () => {
     expect(at("@gpt sh")).toBeNull();
   });
 
-  it("applying replaces the word: an agent gets a space, a project its slash", () => {
+  it("applying replaces the word: an agent and a project each get a space (a branch is optional)", () => {
     const a = at("@cl")!;
     expect(applySuggestion("@cl", a, a.items[0])).toEqual({ text: "@claude ", caret: 8 });
     const r = at("@claude sh")!;
-    expect(applySuggestion("@claude sh", r, r.items[0])).toEqual({ text: "@claude shop/", caret: 13 });
+    expect(applySuggestion("@claude sh", r, r.items[0])).toEqual({ text: "@claude shop ", caret: 13 });
+    // A space already after the word is kept, not doubled.
+    const text = "@claude sh fix it";
+    const m = suggest(text, 10, projs)!;
+    expect(applySuggestion(text, m, m.items[0])).toEqual({ text: "@claude shop fix it", caret: 13 });
   });
 
   it("a project picked mid-text keeps the branch already typed after it", () => {

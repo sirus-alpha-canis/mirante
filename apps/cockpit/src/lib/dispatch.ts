@@ -1,14 +1,18 @@
-// "@claude shop/feat/login add a login page" -> agent claude, repo "shop", branch
-// "feat/login", goal "add a login page". The repo is everything before the first "/";
-// the branch is the rest of that word (it may contain "/"; empty, as in "shop/", leaves it to
-// be named from the goal); the goal is the rest of the text.
+// The one-line syntax: "@claude <goal>", optionally with a project ("@claude shop <goal>")
+// or a project and branch ("@claude shop/feat/login <goal>"). The person never has to name
+// a repo or a branch: with no project the toolbar's repository is used, and with no branch
+// Mirante names one after the goal (mirante/<slug>, -2, -3… when taken). A word with a "/"
+// counts as project/branch only when the part before the "/" is a known project; anything
+// else is the goal's own text.
 import { foldChar } from "./dna";
 import { t } from "./i18n";
 import type { AgentKind } from "./protocol";
 
 export interface Dispatch {
   agent: AgentKind;
-  repo: string;
+  /** The project named on the line (its name as registered), or null: the toolbar's. */
+  repo: string | null;
+  /** The branch typed after "project/", or "": named after the goal. */
   branch: string;
   goal: string;
 }
@@ -43,25 +47,51 @@ export function branchProblem(b: string): string | null {
   return null;
 }
 
-export function parseDispatch(input: string): Parsed {
+/** The registered name `word` matches (ignoring case; an exact match first), if any. */
+function knownName(word: string, projects: readonly { name: string }[]): string | null {
+  if (!word) return null;
+  const exact = projects.find((p) => p.name === word);
+  if (exact) return exact.name;
+  const lower = word.toLowerCase();
+  return projects.find((p) => p.name.toLowerCase() === lower)?.name ?? null;
+}
+
+export function parseDispatch(input: string, projects: readonly { name: string }[]): Parsed {
   const text = input.trim();
-  const m = /^(\S+)(?:\s+(\S+))?(?:\s+([\s\S]*))?$/.exec(text);
+  const m = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text);
   if (!text.startsWith("@") || !m) return { ok: false, error: t("dispatch.parseAgent", { help: dispatchHelp() }) };
   const agent = AGENTS[m[1].toLowerCase()];
   if (!agent) return { ok: false, error: t("dispatch.parseUnknownAgent", { agent: m[1] }) };
-  const target = m[2];
-  if (!target) return { ok: false, error: t("dispatch.parseWhere", { help: dispatchHelp() }) };
-  const slash = target.indexOf("/");
-  if (slash <= 0) {
-    return { ok: false, error: t("dispatch.parseTarget", { target }) };
+  let rest = (m[2] ?? "").trim();
+  let repo: string | null = null;
+  let branch = "";
+  const w = /^(\S+)(?:\s+([\s\S]*))?$/.exec(rest);
+  if (w) {
+    const word = w[1];
+    const slash = word.indexOf("/");
+    const name = knownName(slash < 0 ? word : word.slice(0, slash), projects);
+    if (name !== null) {
+      repo = name;
+      branch = slash < 0 ? "" : word.slice(slash + 1);
+      const bad = branch === "" ? null : branchProblem(branch);
+      if (bad) return { ok: false, error: bad };
+      rest = (w[2] ?? "").trim();
+    }
   }
-  const repo = target.slice(0, slash);
-  const branch = target.slice(slash + 1);
-  const bad = branch === "" ? null : branchProblem(branch);
-  if (bad) return { ok: false, error: bad };
-  const goal = (m[3] ?? "").trim();
-  if (!goal) return { ok: false, error: t("dispatch.parseGoal") };
-  return { ok: true, value: { agent, repo, branch, goal } };
+  if (!rest) return { ok: false, error: t("dispatch.parseGoal") };
+  return { ok: true, value: { agent, repo, branch, goal: rest } };
+}
+
+/** The repository a dispatch goes to: the project named on the @ line, else the one picked in
+ * the toolbar (`selected`, a path). Neither: ask to pick one (`pick`: focus the repo chip). */
+export function dispatchRepo(
+  named: string | null,
+  selected: string | null,
+  projects: { name: string; path: string }[],
+): { ok: true; path: string } | { ok: false; error: string; pick?: true } {
+  if (named !== null) return resolveRepo(named, projects);
+  if (selected) return { ok: true, path: selected };
+  return { ok: false, error: t("dispatch.pickRepo"), pick: true };
 }
 
 export type Resolved = { ok: true; path: string } | { ok: false; error: string };
@@ -142,7 +172,7 @@ export interface Suggestions {
 }
 
 /** Agents while the first word ("@cl") is typed; projects while the second ("@claude sh")
- * is, before its "/". Nothing anywhere else: never inside the goal. */
+ * is, before any "/". Nothing anywhere else: never inside the goal. */
 export function suggest(text: string, caret: number, projects: { name: string; path: string }[]): Suggestions | null {
   const before = text.slice(0, caret);
   const word = (re: RegExp) => caret + (re.exec(text.slice(caret))?.[0].length ?? 0);
@@ -157,18 +187,20 @@ export function suggest(text: string, caret: number, projects: { name: string; p
   const repo = /^(\s*@(?:claude|codex)\s+)([^\s/]*)$/i.exec(before);
   if (repo) {
     const to = word(/^[^\s/]*/);
-    // A branch typed after it already has its "/".
-    const slash = text[to] === "/" ? "" : "/";
-    const items = matchProjects(repo[2], projects).map((p) => ({ label: p.name, detail: p.path, insert: p.name + slash }));
+    // A "/branch" or the goal already after it keeps its separator; else a space (a branch is optional).
+    const sep = text[to] === "/" || /\s/.test(text[to] ?? "") ? "" : " ";
+    const items = matchProjects(repo[2], projects).map((p) => ({ label: p.name, detail: p.path, insert: p.name + sep }));
     return items.length ? { kind: "repo", from: repo[1].length, to, items } : null;
   }
   return null;
 }
 
-/** The text with `item` in place, and where the caret goes (after it, past a kept "/"). */
+/** The text with `item` in place, and where the caret goes (after it, past a kept "/" or space). */
 export function applySuggestion(text: string, s: Suggestions, item: SuggestionItem): { text: string; caret: number } {
   const out = text.slice(0, s.from) + item.insert + text.slice(s.to);
-  const caret = s.from + item.insert.length + (out[s.from + item.insert.length] === "/" && !item.insert.endsWith("/") ? 1 : 0);
+  const end = s.from + item.insert.length;
+  const kept = !/[\s/]$/.test(item.insert) && /^[\s/]$/.test(out[end] ?? "");
+  const caret = end + (kept ? 1 : 0);
   return { text: out, caret };
 }
 
