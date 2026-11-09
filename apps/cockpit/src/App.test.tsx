@@ -321,12 +321,14 @@ describe("App", () => {
       task("b", { status: "needs_you", updated_at: 1 }),
       task("w", { status: "working" }),
     ]);
-    const next = screen.getByRole("button", { name: /^Next/ });
-    expect(next).toHaveTextContent("– of 2");
+    // Not going through them yet: just the count, no "– of 2".
+    const next = screen.getByRole("button", { name: "Next: 2 need you" });
+    expect(next).toHaveTextContent(/^2 need you$/);
+    expect(next).not.toHaveTextContent(/of/);
     fireEvent.keyDown(window, { key: "j", code: "KeyJ", ...mod });
     expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("button", { name: /^Next/ })).toHaveTextContent("1 of 2");
+    expect(screen.getByRole("button", { name: "Next, 1 of 2" })).toHaveTextContent("2 need you · 1 of 2");
     await userEvent.click(screen.getByRole("button", { name: /^Next/ }));
     expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Next/ })).toHaveTextContent("2 of 2");
@@ -334,6 +336,14 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "j", code: "KeyJ", ...mod });
     expect(screen.getByRole("main", { name: "Task goal of b" })).toBeInTheDocument();
     void h;
+  });
+
+  it("the top bar's pill says just \"1 needs you\" while no task that needs you is open", () => {
+    setup({}, [task("a", { status: "needs_you" }), task("w", { status: "working" })]);
+    const pill = screen.getByRole("button", { name: "Next: 1 needs you" });
+    expect(pill).toHaveTextContent(/^1 needs you$/);
+    expect(pill).not.toHaveTextContent("–");
+    expect(pill.querySelector(".needs-at")).toBeNull();
   });
 
   it("the top bar says where you are, the daemon's health and what needs you; the status line the view's keys", async () => {

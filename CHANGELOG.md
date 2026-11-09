@@ -39,6 +39,9 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ### Fixed
 
+- **The top bar's "needs you" pill said "– of 1"** when no task was open. It now says just
+  "1 needs you" ("2 need you"…), and "· i of n" only while going through them (⌘J).
+
 - **`@claude <goal>` in the dispatch box no longer demands `<repo>/<branch>`.** Only the
   agent is required: the repository is the toolbar's (or a project named as the second
   word, any case), and the branch is named by Mirante from the goal (`mirante/<slug>`,

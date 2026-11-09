@@ -649,17 +649,24 @@ export function App({ env: given }: { env: Env }) {
                 <span className="health" role="img" aria-label={t(daemon.top)} title={t(daemon.top)}>
                   <span className={`dot ${daemon.dot}`} />
                 </span>
-                {/* What needs you, and the way to it (⌘J: the next one). */}
+                {/* What needs you, and the way to it (⌘J: the next one). "i of n" only while
+                    one of them is open (going through them); else just the count. */}
                 <button
                   className="needs-badge"
                   disabled={needing.length === 0}
                   onClick={goNext}
                   title={needing.length === 0 ? t("next.none") : t("next.title", { key: hints.next })}
-                  aria-label={needing.length === 0 ? t("next.ariaNone") : t("next.aria", { at: Math.max(next.at, 1), n: needing.length })}
+                  aria-label={
+                    needing.length === 0
+                      ? t("next.ariaNone")
+                      : next.at > 0
+                        ? t("next.aria", { at: next.at, n: needing.length })
+                        : t("next.ariaCount", { needs: tn(needing.length, "top.needsOne", "top.needsMany") })
+                  }
                 >
                   {needing.length > 0 && <span className="dot dot-needs" aria-hidden="true" />}
                   {needing.length === 0 ? t("top.needsNone") : tn(needing.length, "top.needsOne", "top.needsMany")}
-                  {needing.length > 0 && <span className="needs-at"> · {t("next.position", { at: next.at > 0 ? next.at : "–", n: needing.length })}</span>}
+                  {next.at > 0 && <span className="needs-at"> · {t("next.position", { at: next.at, n: needing.length })}</span>}
                 </button>
                 <button className="icon-btn" onClick={() => setPalette(true)} aria-label={t("top.commands")} title={`${t("top.commands")} (${hints.palette})`}>
                   <kbd>{hints.palette}</kbd>
