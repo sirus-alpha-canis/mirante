@@ -13,7 +13,6 @@ import { EnableMemory } from "./MemoryTab";
 import { NoteView, StatePill } from "./NoteView";
 import { ReviewQueue } from "./ReviewQueue";
 import { ErrorRetry } from "./ErrorRetry";
-import { Rules } from "./Rules";
 import { type Key, t as tr, tn, useT } from "../lib/i18n";
 import { Unsupported } from "./Restart";
 
@@ -178,22 +177,6 @@ type Loaded =
 
 type Panel = { kind: "note"; slug: string } | { kind: "review" } | null;
 
-type View = "notes" | "rules";
-
-/** Notes (the repo's memory) or Rules (what its agents are told; works with memory off). */
-function ViewSwitch({ view, onView }: { view: View; onView(v: View): void }) {
-  const t = useT();
-  return (
-    <span role="group" aria-label={t("brain.view")} className="brain-pills brain-view">
-      {(["notes", "rules"] as View[]).map((v) => (
-        <button key={v} className="btn btn-small" aria-pressed={view === v} onClick={() => onView(v)}>
-          {t(v === "notes" ? "brain.view.notes" : "brain.view.rules")}
-        </button>
-      ))}
-    </span>
-  );
-}
-
 /** The brain of `repo` (the selected project, or the open task's). Each new `reviewNonce`
  * (above 0) switches the panel to the review queue, without starting the brain over. */
 export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNonce?: number }) {
@@ -218,7 +201,6 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
   const [checked, setChecked] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [asList, setAsList] = useState(false);
-  const [view, setView] = useState<View>("notes");
 
   useEffect(() => {
     if (!repo) return;
@@ -249,21 +231,6 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
     return (
       <main className="brain" aria-label={t("brain.aria")}>
         <p className="muted empty">{t("brain.noRepo")}</p>
-      </main>
-    );
-  }
-
-  if (view === "rules") {
-    return (
-      <main className="brain brain-rules" aria-label={t("brain.aria")}>
-        <section className="brain-main">
-          <header className="feed-head">
-            <h1>{t("brain.title", { name: repoName(repo) })}</h1>
-            <ViewSwitch view={view} onView={setView} />
-            <span className="muted small">{repo}</span>
-          </header>
-          <Rules at={{ repo }} />
-        </section>
       </main>
     );
   }
@@ -389,7 +356,6 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
       <section className="brain-main">
         <header className="feed-head">
           <h1>{t("brain.title", { name: repoName(repo) })}</h1>
-          <ViewSwitch view={view} onView={setView} />
           <span className="muted small">{repo}</span>
         </header>
         {body}

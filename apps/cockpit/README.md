@@ -164,8 +164,10 @@ branch gets one named from the goal.
 | ⌘G | Toggle the agent grid |
 | ⌘1 | Home (also: the Mirante logo at the top left) |
 | ⌘J | Next: the next task that needs you |
+| ⌘B | Brain: the repo memory graph and its review queue |
 | ⌘L | Skills |
-| Esc | Leave a task's detail (back to the view it was opened from) |
+| ⌘R | Rules: what each agent session reads, for a project or one task (again: back) |
+| Esc | Leave a task's detail (back to the view it was opened from); in Rules opened from a task, back to that task |
 | ⇧⌘J | Theme: system → light → dark |
 | ⌘↵ | In Home's dispatch form: dispatch (Enter is a new line of the goal) |
 | ⌘↵ / ⌥↵ | In a task's composer: steer now / queue |

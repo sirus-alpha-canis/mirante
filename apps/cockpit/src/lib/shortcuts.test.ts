@@ -66,7 +66,7 @@ describe("platform", () => {
   });
 
   it("hints name the keys of the platform", () => {
-    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", send: "⌘↵" });
+    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", rules: "⌘R", send: "⌘↵" });
     expect(hintsFor(false)).toEqual({
       palette: "Ctrl+K",
       grid: "Ctrl+G",
@@ -75,6 +75,7 @@ describe("platform", () => {
       theme: "Ctrl+Shift+J",
       next: "Ctrl+J",
       skills: "Ctrl+L",
+      rules: "Ctrl+R",
       send: "Ctrl+↵",
     });
   });
@@ -82,6 +83,13 @@ describe("platform", () => {
   it("⌘L (Ctrl+L elsewhere) is the Skills chord", () => {
     expect(shortcutFor({ key: "l", code: "KeyL", metaKey: true, ctrlKey: false, shiftKey: false, altKey: false }, true)).toBe("skills");
     expect(shortcutFor({ key: "l", code: "KeyL", metaKey: false, ctrlKey: true, shiftKey: false, altKey: false }, false)).toBe("skills");
+  });
+
+  it("⌘R (Ctrl+R elsewhere) is the Rules chord; ⇧⌘R is not", () => {
+    expect(shortcutFor({ key: "r", code: "KeyR", metaKey: true, ctrlKey: false, shiftKey: false, altKey: false }, true)).toBe("rules");
+    expect(shortcutFor({ key: "r", code: "KeyR", metaKey: false, ctrlKey: true, shiftKey: false, altKey: false }, false)).toBe("rules");
+    expect(shortcutFor({ key: "r", metaKey: true, ctrlKey: false, shiftKey: false, altKey: false }, true)).toBe("rules");
+    expect(shortcutFor({ key: "R", code: "KeyR", metaKey: true, ctrlKey: false, shiftKey: true, altKey: false }, true)).toBeNull();
   });
 });
 

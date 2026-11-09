@@ -1,12 +1,14 @@
-import { screen, within } from "@testing-library/react";
+import { cleanup, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { NO_UPDATE, UpdateContext } from "../lib/update";
 import type { DnaStatus, RuleLayer, RulesView } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
+import { EnvContext } from "../env";
 import { makeEnv, renderWith, rpcError } from "../test/env";
+import { task } from "../test/fixtures";
 import { Brain } from "./Brain";
-import { bytes, Rules } from "./Rules";
+import { bytes, Rules, RulesPage } from "./Rules";
 
 const layer = (over: Partial<RuleLayer>): RuleLayer => ({
   scope: "user",
@@ -122,16 +124,81 @@ describe("Rules", () => {
   });
 });
 
-describe("Brain → Rules", () => {
-  it("works with repo memory off", async () => {
+describe("Rules view", () => {
+  const PROJECTS = [
+    { path: "/r/app", name: "app", tasks: 2, needsYou: 0 },
+    { path: "/r/web", name: "web", tasks: 0, needsYou: 0 },
+  ];
+  const TASKS = [task("t1", { repo_path: "/r/app", agent: "codex", title: "Fix login" }), task("t2", { repo_path: "/r/app" }), task("t3", { repo_path: "/r/web", lifecycle: "archived" })];
+
+  function page(over: Partial<Parameters<typeof RulesPage>[0]> = {}, answers: Record<string, unknown> = {}) {
+    const h = makeEnv({ "rules.layers": rules, ...answers });
+    h.load(TASKS);
+    const onProject = vi.fn();
+    const onTask = vi.fn();
+    const props = { projects: PROJECTS, project: "/r/app", task: null, onProject, onTask, ...over };
+    const r = renderWith(h.env, <RulesPage {...props} />);
+    return { ...h, ...r, onProject, onTask, props };
+  }
+
+  it("shows the selected project's rules, with no repo memory involved", async () => {
+    const h = page();
+    expect(screen.getByRole("main", { name: "Rules" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("/r/app");
+    expect(await screen.findByText(/This Claude session reads/)).toBeInTheDocument();
+    expect(h.calls).toContainEqual(["rules.layers", { repo: "/r/app", agent: "claude" }]);
+    expect(h.calls.some((c) => c[0].startsWith("dna."))).toBe(false);
+  });
+
+  it("the project picker picks another project", async () => {
+    const h = page();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Project" }), "/r/web");
+    expect(h.onProject).toHaveBeenCalledWith("/r/web");
+  });
+
+  it("for a task: lists the project's live tasks, and scopes to one with its agent", async () => {
+    const h = page();
+    const pick = screen.getByRole("combobox", { name: "For" });
+    expect(within(pick).getAllByRole("option").map((o) => o.textContent)).toEqual(["The whole project", "Fix login (@codex feat/t1)", "goal of t2 (@claude feat/t2)"]);
+    await userEvent.selectOptions(pick, "t1");
+    expect(h.onTask).toHaveBeenCalledWith("t1");
+    h.rerender(
+      <EnvContext.Provider value={h.env}>
+        <RulesPage {...h.props} task="t1" />
+      </EnvContext.Provider>,
+    );
+    expect(await screen.findByText("~/.codex/AGENTS.md")).toBeInTheDocument();
+    expect(h.calls).toContainEqual(["rules.layers", { task: "t1", agent: "codex" }]);
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "For" }), "");
+    expect(h.onTask).toHaveBeenLastCalledWith(null);
+  });
+
+  it("a project with no tasks has no task picker; a gone task falls back to the project", async () => {
+    page({ project: "/r/web" });
+    expect(screen.queryByRole("combobox", { name: "For" })).toBeNull();
+    cleanup();
+    const h = page({ task: "gone" });
+    await screen.findByText(/This Claude session reads/);
+    expect(h.calls).toContainEqual(["rules.layers", { repo: "/r/app", agent: "claude" }]);
+    expect(h.calls.some((c) => c[1].task === "gone")).toBe(false);
+  });
+
+  it("with no project yet, says where to add one", () => {
+    const h = page({ projects: [], project: null });
+    expect(screen.getByText(/Add a repository/)).toBeInTheDocument();
+    expect(h.calls.filter((c) => c[0] === "rules.layers")).toEqual([]);
+  });
+});
+
+describe("Brain", () => {
+  it("is the notes graph only: no Notes | Rules switch", async () => {
     const off: DnaStatus = { repo: "/r/app", enabled: false, dir: false, notes: 0, stale: 0, unreviewed: 0, pending: 0, invalid: 0, head: null };
     const h = makeEnv({ "dna.status": off, "rules.layers": rules });
     renderWith(h.env, <Brain repo="/r/app" />);
     expect(await screen.findByRole("button", { name: /Turn on|Enable/i })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Rules" }));
-    expect(await screen.findByText(/This Claude session reads/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Rules" })).toHaveAttribute("aria-pressed", "true");
-    await userEvent.click(screen.getByRole("button", { name: "Notes" }));
-    expect(await screen.findByRole("button", { name: /Turn on|Enable/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rules" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Notes" })).toBeNull();
+    expect(screen.queryByRole("group", { name: "Brain view" })).toBeNull();
+    expect(h.calls.filter((c) => c[0] === "rules.layers")).toEqual([]);
   });
 });

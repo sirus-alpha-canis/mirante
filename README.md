@@ -189,7 +189,8 @@ More detail, including the fake daemon for UI work without agents:
   composer steers now (⌘↵) or queues for the turn end (⌥↵).
 - **Grid (⌘G)** shows every agent at once.
 - **Brain (⌘B)** is the repo memory graph and its review queue.
-- **Skills** lists the skill library and its proposals.
+- **Skills (⌘L)** lists the skill library and its proposals.
+- **Rules (⌘R)** lists what each agent session reads, for a project or one of its tasks.
 - **⌘K** opens the command bar: tasks, projects, and `@agent repo/branch goal`.
 
 Closing the app never ends a session, because the daemon owns them. Off macOS, ⌘ is Ctrl.
@@ -367,11 +368,13 @@ Every agent session reads more than your goal: an organization's managed policy,
 global `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md`, the project's `CLAUDE.md` /
 `AGENTS.md` and their `@imports`, rules folders, settings (permissions, hooks), skills,
 Claude's auto memory, and what Mirante itself adds per task (launch mode, injected skills,
-the repo-memory tools, the operator-message label). In the app, **Brain → Rules** lists
-all of them for a repo, for Claude or Codex, in the order the agent loads them: scope,
-path, size, contents as plain text, imports you can expand, and the places where rules
-could live but do not (greyed). From a task, **Rules this agent received** shows the same
-for that task's worktree and session. It works with repo memory off.
+the repo-memory tools, the operator-message label). In the app, **Rules** (⌘R, in the top
+bar) lists all of them for a project, for Claude or Codex, in the order the agent loads
+them: scope, path, size, contents as plain text, imports you can expand, and the places
+where rules could live but do not (greyed). Its project picker starts on the selected
+project; **For** picks one of the project's tasks to show that task's worktree and
+session instead. From a task, **Rules this agent received** (or "Rules this task received"
+in ⌘K) opens it on that task. It works with repo memory off.
 
 It is read-only: Mirante never writes to `~/.claude`, `~/.codex` or your files. It reads
 only inside your home folder, the project and the managed folders, never a FIFO or device,

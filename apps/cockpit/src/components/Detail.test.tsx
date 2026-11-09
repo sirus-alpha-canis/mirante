@@ -43,25 +43,15 @@ function setup(answers = {}, tasks = [task("a", { status: "working" }), task("b"
 }
 
 describe("Detail (V1 classic)", () => {
-  it("shows the rules this task's agent received, for its task and agent", async () => {
-    const view = {
-      agent: "claude",
-      root: "~/.mirante/worktrees/a",
-      task: "a",
-      researched: "Claude Code 2.1.285",
-      summary: { instruction_files: 1, instruction_bytes: 10, settings_files: 0, skills: 0 },
-      layers: [{ scope: "mirante", agent: "claude", kind: "mode", path: "claude --permission-mode manual", exists: true, truncated: false, note: "", loaded: true, skills: 0 }],
-    };
-    const h = setup({ "rules.layers": view });
-    const link = screen.getByRole("button", { name: "Rules this agent received" });
-    expect(link).toHaveAttribute("aria-expanded", "false");
-    await userEvent.click(link);
-    const region = screen.getByRole("region", { name: "Rules of this task's agent" });
-    expect(await within(region).findByText("claude --permission-mode manual")).toBeInTheDocument();
-    expect(within(region).getByRole("heading", { name: "Mirante" })).toBeInTheDocument();
-    expect(h.calls).toContainEqual(["rules.layers", { task: "a", agent: "claude" }]);
-    await userEvent.click(within(region).getByRole("button", { name: "Close rules" }));
-    expect(screen.queryByRole("region", { name: "Rules of this task's agent" })).toBeNull();
+  it("Rules this agent received opens the Rules view for this task", async () => {
+    const h = makeEnv();
+    h.load([task("a", { status: "working" })]);
+    const onRules = vi.fn();
+    renderWith(h.env, <Detail taskId="a" onSelect={vi.fn()} onRules={onRules} />);
+    await userEvent.click(screen.getByRole("button", { name: "Rules this agent received" }));
+    expect(onRules).toHaveBeenCalledWith("a");
+    // One place for rules: nothing inline, nothing fetched here.
+    expect(h.calls.filter((c) => c[0] === "rules.layers")).toEqual([]);
   });
 
   it("lists tasks by project, then by state, and selects one", async () => {

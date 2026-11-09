@@ -1,7 +1,7 @@
 // Where the person was when the app closed: the view, the project, the open task and its
 // tab, and Home's scroll. Per viewer, in this machine's storage; storage that refuses (a
 // private window, blocked site data) just means starting on Home.
-export type View = "home" | "detail" | "grid" | "brain" | "skills";
+export type View = "home" | "detail" | "grid" | "brain" | "skills" | "rules";
 export type DetailTab = "Steps" | "Terminal" | "Diff" | "Memory";
 
 export interface UiState {
@@ -15,7 +15,7 @@ export interface UiState {
 
 export const UI_KEY = "mirante.ui";
 
-const VIEWS: View[] = ["home", "detail", "grid", "brain", "skills"];
+const VIEWS: View[] = ["home", "detail", "grid", "brain", "skills", "rules"];
 const TABS: DetailTab[] = ["Steps", "Terminal", "Diff", "Memory"];
 
 export const DEFAULT_UI: UiState = { mode: "home", project: null, taskId: null, tab: null, scroll: 0 };

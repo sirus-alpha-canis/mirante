@@ -1,7 +1,7 @@
 # Instruction layers: what each agent session reads
 
 What Claude Code and Codex load as instructions, settings, skills and memory when a session
-starts, and what Mirante adds per task. This is what `rules.layers` (Brain → Rules in the
+starts, and what Mirante adds per task. This is what `rules.layers` (the Rules view, ⌘R, in the
 app) lists, in this order. Researched on 2026-11-09.
 
 **Versions checked:** Claude Code **2.1.285** (Homebrew cask), Codex CLI **0.167.0** (npm

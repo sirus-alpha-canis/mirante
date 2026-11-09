@@ -4,6 +4,7 @@ import { CommandBar, type Command } from "./components/CommandBar";
 import { Detail } from "./components/Detail";
 import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
+import { RulesPage } from "./components/Rules";
 import { Skills } from "./components/Skills";
 import { OrbMark, Splash } from "./components/Splash";
 import { UpdateBanner } from "./components/Restart";
@@ -25,7 +26,7 @@ import { gridTasks, needsYou, newlyNeedingYou, type Project, projects } from "./
 import { safeStorage, shallow, useSelect } from "./env";
 import { type Connection, same, type State } from "./store/state";
 
-export type Mode = "home" | "detail" | "grid" | "brain" | "skills";
+export type Mode = "home" | "detail" | "grid" | "brain" | "skills" | "rules";
 
 export const STATUS_POLL_MS = 5000;
 /** How often the daemon binary on disk is asked its build (besides each new daemon boot):
@@ -67,8 +68,8 @@ export function visibleTasks(
   taskId: string | null,
   onScreen: (id: string) => boolean = cardOnScreen,
 ): Set<string> {
-  // The brain shows notes, no task: every task that starts needing you is off screen.
-  if (mode === "brain" || mode === "skills") return new Set();
+  // The brain, skills and rules show no task: every task that starts needing you is off screen.
+  if (mode === "brain" || mode === "skills" || mode === "rules") return new Set();
   if (mode === "detail") return new Set(taskId ? [taskId] : []);
   if (mode === "grid") return new Set(gridTasks(s).map((t) => t.id));
   // Home is an inbox of every project: the tasks whose card or row is on screen.
@@ -179,6 +180,9 @@ export function App({ env: given }: { env: Env }) {
   const [mode, setMode] = useState<Mode>(saved.mode);
   const [beforeGrid, setBeforeGrid] = useState<Mode>("home");
   const [beforeBrain, setBeforeBrain] = useState<Mode>("home");
+  const [beforeRules, setBeforeRules] = useState<Mode>("home");
+  // The task the Rules view shows (null: the selected project's rules).
+  const [rulesTask, setRulesTask] = useState<string | null>(null);
   // The view a detail was opened from (Escape goes back there).
   const [beforeDetail, setBeforeDetail] = useState<Mode>("home");
   // The task whose detail was left for Home: its card takes the keyboard there.
@@ -449,6 +453,33 @@ export function App({ env: given }: { env: Env }) {
     },
     [mode, detailRepo, leave],
   );
+  const toggleRules = useCallback(() => {
+    if (mode === "rules") {
+      setMode(beforeRules);
+    } else {
+      // From a task's detail: its project (the task itself is one pick away).
+      if (detailRepo) setProject(detailRepo);
+      setRulesTask(null);
+      setBeforeRules(mode);
+      leave("rules");
+    }
+  }, [mode, beforeRules, detailRepo, leave]);
+  /** The Rules view for one task: what its agent received. */
+  const openTaskRules = useCallback(
+    (id: string) => {
+      const task = env.cockpit.getState().tasks[id];
+      if (!task) return;
+      setProject(task.repo_path);
+      setRulesTask(id);
+      if (mode !== "rules") setBeforeRules(mode);
+      leave("rules");
+    },
+    [env, mode, leave],
+  );
+  const rulesProject = useCallback((path: string) => {
+    setProject(path);
+    setRulesTask(null);
+  }, []);
   const reviewSkills = useCallback(() => {
     setSkillsReviewNonce((n) => n + 1);
     leave("skills");
@@ -463,12 +494,18 @@ export function App({ env: given }: { env: Env }) {
       if (a === "escape") {
         // Escape belongs to whatever is being typed in (the terminal, a composer).
         if (!palette && mode === "detail" && !isTypingTarget(e.target)) leave(beforeDetail === "detail" ? "home" : beforeDetail);
+        // Rules opened from a task's detail: back to that task.
+        else if (!palette && mode === "rules" && beforeRules === "detail" && taskId && !isTypingTarget(e.target)) setMode("detail");
         return;
       }
       // Off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K, Ctrl+G…). On macOS
       // ⌘ is no terminal key, so ⌘K opens the command bar even from the terminal.
       if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
-      if ((a === "brain" || a === "grid" || a === "home" || a === "next" || a === "skills") && isFormField(e.target)) return;
+      if ((a === "brain" || a === "grid" || a === "home" || a === "next" || a === "skills" || a === "rules") && isFormField(e.target)) {
+        // Ctrl+R would reload the webview off macOS (and lose the edit): never.
+        if (a === "rules") e.preventDefault();
+        return;
+      }
       e.preventDefault();
       if (a === "next") goNext();
       if (a === "palette") setPalette((p) => !p);
@@ -476,11 +513,12 @@ export function App({ env: given }: { env: Env }) {
       if (a === "brain") toggleBrain();
       if (a === "home") goHome();
       if (a === "skills") goSkills();
+      if (a === "rules") toggleRules();
       if (a === "theme") setTheme(nextTheme);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, mode, beforeDetail, toggleGrid, toggleBrain, goHome, goSkills, leave, mac, goNext]);
+  }, [palette, mode, beforeDetail, beforeRules, taskId, toggleGrid, toggleBrain, toggleRules, goHome, goSkills, leave, mac, goNext]);
 
   const themeName = (x: Theme) => t(x === "system" ? "theme.system" : x === "light" ? "theme.light" : "theme.dark");
   // Built only while the command bar is open.
@@ -503,6 +541,16 @@ export function App({ env: given }: { env: Env }) {
             { id: "review", label: t("cmd.review"), run: () => openReview() },
             { id: "skills", label: t("cmd.skills"), hint: hints.skills, run: goSkills },
             { id: "skills-review", label: t("cmd.skillsReview"), run: reviewSkills },
+            {
+              id: "rules",
+              label: t("cmd.rules"),
+              hint: hints.rules,
+              run: () => {
+                if (mode !== "rules") toggleRules();
+              },
+            },
+            // A task is open: what its agent was told.
+            ...(mode === "detail" && taskId ? [{ id: "task-rules", label: t("cmd.taskRules"), run: () => openTaskRules(taskId) }] : []),
             { id: "theme", label: t("theme.label", { theme: themeName(nextTheme(theme)) }), hint: hints.theme, run: () => setTheme(nextTheme) },
             {
               id: "lang",
@@ -519,7 +567,7 @@ export function App({ env: given }: { env: Env }) {
             })),
           ],
     // `t` follows `lang`.
-    [palette, projs, theme, lang, toggleGrid, toggleBrain, openReview, mode, hints, goNext, goHome, goSkills, reviewSkills, leave, changeLang],
+    [palette, projs, theme, lang, toggleGrid, toggleBrain, toggleRules, openTaskRules, openReview, mode, taskId, hints, goNext, goHome, goSkills, reviewSkills, leave, changeLang],
   );
   const onDispatchText = useCallback(
     (text: string) => {
@@ -560,6 +608,9 @@ export function App({ env: given }: { env: Env }) {
                 </button>
                 <button aria-pressed={mode === "skills"} onClick={goSkills}>
                   {t("nav.skills")} <kbd>{hints.skills}</kbd>
+                </button>
+                <button aria-pressed={mode === "rules"} onClick={toggleRules}>
+                  {t("nav.rules")} <kbd>{hints.rules}</kbd>
                 </button>
               </nav>
               <button
@@ -630,11 +681,15 @@ export function App({ env: given }: { env: Env }) {
                 focusTerminalNonce={terminalNonce}
                 inlineAnswers={inlineAnswers}
                 onTab={setShownTab}
+                onRules={openTaskRules}
               />
             )}
             {!waiting && mode === "grid" && <Grid onOpen={open} status={status} />}
             {!waiting && mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
             {!waiting && mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
+            {!waiting && mode === "rules" && (
+              <RulesPage projects={projs} project={current} task={rulesTask} onProject={rulesProject} onTask={setRulesTask} />
+            )}
             {palette && <Palette base={baseCommands} inlineAnswers={inlineAnswers} onOpen={open} onClose={closePalette} onDispatch={onDispatchText} />}
           </div>
         </UpdateContext.Provider>

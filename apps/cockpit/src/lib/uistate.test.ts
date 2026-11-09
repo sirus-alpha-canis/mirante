@@ -13,6 +13,12 @@ describe("ui state", () => {
     expect(loadUi(s)).toEqual({ mode: "detail", project: "/r/shop", taskId: "t1", tab: "Diff", scroll: 120 });
   });
 
+  it("remembers the Rules view", () => {
+    const s = mem();
+    saveUi(s, { mode: "rules", project: "/r/shop", taskId: null, tab: null, scroll: 0 });
+    expect(loadUi(s).mode).toBe("rules");
+  });
+
   it("anything missing, bad or refused falls back to Home", () => {
     const s = mem();
     expect(loadUi(s)).toEqual(DEFAULT_UI);

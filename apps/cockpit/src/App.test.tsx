@@ -383,6 +383,7 @@ describe("App", () => {
     expect([...visibleTasks(s, "detail", null, "a")]).toEqual(["a"]);
     expect([...visibleTasks(s, "brain", "/x", "a")]).toEqual([]);
     expect([...visibleTasks(s, "skills", "/x", "a")]).toEqual([]);
+    expect([...visibleTasks(s, "rules", "/x", "a")]).toEqual([]);
   });
 
   it("the Skills view opens from the nav and the command bar", async () => {
@@ -518,6 +519,88 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "k", ...mod });
     const option = screen.getAllByRole("option").find((o) => o.textContent?.startsWith("Go to Skills"));
     expect(option?.querySelector("kbd")?.textContent).toMatch(/L$/);
+  });
+
+  describe("Rules", () => {
+    const VIEW = (p: Record<string, unknown>) => ({
+      agent: p.agent,
+      root: "/repos/shop",
+      ...(p.task ? { task: p.task } : {}),
+      researched: "Claude Code 2.1.285",
+      summary: { instruction_files: 1, instruction_bytes: 10, settings_files: 0, skills: 0 },
+      layers: [],
+    });
+    const rulesNav = () => within(screen.getByRole("navigation", { name: "Views" })).getByRole("button", { name: /^Rules/ });
+
+    it("is a top-level view: the nav button shows its chord and opens it for the selected project", async () => {
+      const h = setup({ "rules.layers": VIEW });
+      expect(rulesNav().querySelector("kbd")?.textContent).toMatch(/R$/);
+      await userEvent.click(rulesNav());
+      expect(rulesNav()).toHaveAttribute("aria-pressed", "true");
+      expect(await screen.findByRole("main", { name: "Rules" })).toBeInTheDocument();
+      // Home starts on the first project (other).
+      expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("/repos/other");
+      await screen.findByText(/This Claude session reads/);
+      expect(h.calls).toContainEqual(["rules.layers", { repo: "/repos/other", agent: "claude" }]);
+    });
+
+    it("⌘R toggles Rules and back; it waits while a form field is typed in", async () => {
+      setup({ "rules.layers": VIEW });
+      const goal = screen.getByLabelText("Goal");
+      goal.focus();
+      const typed = fireEvent.keyDown(goal, { key: "r", code: "KeyR", ...mod });
+      expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
+      // Never a webview reload either (Ctrl+R off macOS).
+      expect(typed).toBe(false);
+      goal.blur();
+      fireEvent.keyDown(window, { key: "r", code: "KeyR", ...mod });
+      expect(await screen.findByRole("main", { name: "Rules" })).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: "r", code: "KeyR", ...mod });
+      expect(screen.getByRole("main", { name: "Inbox" })).toBeInTheDocument();
+    });
+
+    it("the command bar goes to Rules, with its chord", async () => {
+      setup({ "rules.layers": VIEW });
+      fireEvent.keyDown(window, { key: "k", ...mod });
+      const option = screen.getAllByRole("option").find((o) => o.textContent?.startsWith("Go to Rules"));
+      expect(option?.querySelector("kbd")?.textContent).toMatch(/R$/);
+      // No task open: no task's rules to offer.
+      expect(screen.getAllByRole("option").some((o) => o.textContent?.startsWith("Rules this task received"))).toBe(false);
+      await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Go to Rules{Enter}");
+      expect(await screen.findByRole("main", { name: "Rules" })).toBeInTheDocument();
+    });
+
+    it("from an open task: the command bar and the detail's link show the rules that task received; Escape goes back", async () => {
+      const h = setup({ "rules.layers": VIEW }, [task("a", { repo_path: "/repos/shop", agent: "codex" }), task("z", { repo_path: "/repos/other" })]);
+      openViaPalette("goal of a");
+      fireEvent.keyDown(window, { key: "k", ...mod });
+      await userEvent.type(screen.getByRole("combobox", { name: "Command" }), "Rules this task received{Enter}");
+      expect(await screen.findByRole("main", { name: "Rules" })).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("/repos/shop");
+      expect(screen.getByRole("combobox", { name: "For" })).toHaveValue("a");
+      await screen.findByText(/This Codex session reads/);
+      expect(h.calls).toContainEqual(["rules.layers", { task: "a", agent: "codex" }]);
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Rules this agent received" }));
+      expect(screen.getByRole("combobox", { name: "For" })).toHaveValue("a");
+      // Another project drops the task.
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Project" }), "/repos/other");
+      expect(screen.getByRole("combobox", { name: "For" })).toHaveValue("");
+    });
+
+    it("reopens on Rules when the app last closed there", async () => {
+      const h = makeEnv({ "daemon.status": STATUS, "message.list_queued": [], "rules.layers": VIEW });
+      h.load([task("a")]);
+      const { unmount } = render(<App env={h.env} />);
+      fireEvent.keyDown(window, { key: "r", code: "KeyR", ...mod });
+      await screen.findByRole("main", { name: "Rules" });
+      unmount();
+      render(<App env={h.env} />);
+      expect(screen.getByRole("main", { name: "Rules" })).toBeInTheDocument();
+      expect(rulesNav()).toHaveAttribute("aria-pressed", "true");
+      await screen.findByText(/This Claude session reads/);
+    });
   });
 
   it("clicking a task's notification opens it", () => {

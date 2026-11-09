@@ -2,12 +2,15 @@
 // your global files, the project's, local, nested, and what Mirante adds), in the order the
 // agent loads them. Read-only. File contents are shown as plain text in <pre> (React text
 // nodes; never Markdown rendered as HTML). Places where rules could live but do not are
-// listed greyed, so a person learns where to look.
-import { useEffect, useState } from "react";
-import { useBoot, useEnv } from "../env";
+// listed greyed, so a person learns where to look. `RulesPage` is the top-level Rules view
+// (⌘R): a project picker and, for one of its tasks, what that task's agent received.
+import { useCallback, useEffect, useId, useState } from "react";
+import { shallow, useBoot, useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { type Key, useT } from "../lib/i18n";
-import { type AgentKind, M, type RuleImport, type RuleLayer, type RuleScope, type RulesView, RpcCode } from "../lib/protocol";
+import { type AgentKind, M, type RuleImport, type RuleLayer, type RuleScope, type RulesView, RpcCode, type TaskView } from "../lib/protocol";
+import type { Project } from "../store/select";
+import type { State } from "../store/state";
 import { ErrorRetry } from "./ErrorRetry";
 import { Unsupported } from "./Restart";
 
@@ -186,5 +189,78 @@ export function Rules({ at, agent: initial }: { at: RulesAt; agent?: AgentKind }
       </div>
       {body}
     </div>
+  );
+}
+
+/** The tasks of `repo` a person can pick (archived ones are not). */
+function tasksOf(s: State, repo: string | null): TaskView[] {
+  if (!repo) return [];
+  return Object.values(s.tasks)
+    .filter((x) => x.repo_path === repo && x.lifecycle !== "archived")
+    .sort((a, b) => b.updated_at - a.updated_at);
+}
+
+/** The Rules view: a project (the selected one by default) or one of its tasks. Works with
+ * repo memory off: rules are files, not notes. */
+export function RulesPage({
+  projects,
+  project,
+  task,
+  onProject,
+  onTask,
+}: {
+  projects: Project[];
+  project: string | null;
+  /** The task whose rules are shown (null: the project's). */
+  task: string | null;
+  onProject(path: string): void;
+  onTask(id: string | null): void;
+}) {
+  const t = useT();
+  const tasks = useSelect(useCallback((s: State) => tasksOf(s, project), [project]), shallow);
+  // A task that is gone (or of another project) is the project's rules.
+  const scoped = tasks.find((x) => x.id === task) ?? null;
+  const id = useId();
+  return (
+    <main className="brain rules-page" aria-label={t("rules.title")}>
+      <section className="brain-main">
+        <header className="feed-head">
+          <h1>{t("rules.title")}</h1>
+          {projects.length > 0 && (
+            <span className="rules-pick">
+              <label htmlFor={`${id}-project`}>{t("rules.project")}</label>
+              <select id={`${id}-project`} value={project ?? ""} onChange={(e) => onProject(e.target.value)}>
+                {projects.map((p) => (
+                  <option key={p.path} value={p.path}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </span>
+          )}
+          {tasks.length > 0 && (
+            <span className="rules-pick">
+              <label htmlFor={`${id}-task`}>{t("rules.for")}</label>
+              <select id={`${id}-task`} value={scoped?.id ?? ""} onChange={(e) => onTask(e.target.value || null)}>
+                <option value="">{t("rules.forProject")}</option>
+                {tasks.map((x) => (
+                  <option key={x.id} value={x.id}>
+                    {t("rules.forTask", { title: x.title, agent: x.agent, branch: x.branch })}
+                  </option>
+                ))}
+              </select>
+            </span>
+          )}
+          {project && <span className="muted small">{scoped ? scoped.worktree_path : project}</span>}
+        </header>
+        {!project ? (
+          <p className="muted empty">{t("rules.noProject")}</p>
+        ) : scoped ? (
+          <Rules key={`t:${scoped.id}`} at={{ task: scoped.id }} agent={scoped.agent} />
+        ) : (
+          <Rules key={`r:${project}`} at={{ repo: project }} />
+        )}
+      </section>
+    </main>
   );
 }

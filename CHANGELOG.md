@@ -6,6 +6,16 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Changed
+
+- **Rules is a top-level view** in the app's top bar, next to Brain and Skills (⌘R; Ctrl+R
+  off macOS, which never reloads the window). A project picker (the selected project by
+  default, works with repo memory off), the Claude / Codex switch, and **For** to show
+  what one of the project's tasks received. ⌘K has "Go to Rules" and, with a task open,
+  "Rules this task received"; a task's **Rules this agent received** opens the view on
+  that task (Esc goes back to it). The app reopens on Rules if it closed there. Brain no
+  longer has a Notes | Rules switch: it is the notes graph only.
+
 ## [0.1.0] — 2026-11-09
 
 The first release: prebuilt binaries for macOS (Apple silicon and Intel) on GitHub Releases
