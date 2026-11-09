@@ -32,17 +32,16 @@ cat <<EOF
 class Mirante < Formula
   desc "Local-first cockpit for dispatching and supervising coding agents"
   homepage "https://github.com/sirus-alpha-canis/mirante"
-  version "${version}"
-  license "Apache-2.0"
-
-  on_arm do
+  # Prebuilt per architecture. (brew style allows no url inside on_arm/on_intel blocks.)
+  if Hardware::CPU.arm?
     url "${base}/mirante-${version}-aarch64-apple-darwin.tar.gz"
     sha256 "${sha_arm}"
-  end
-  on_intel do
+  else
     url "${base}/mirante-${version}-x86_64-apple-darwin.tar.gz"
     sha256 "${sha_intel}"
   end
+  version "${version}"
+  license "Apache-2.0"
 
   livecheck do
     url :stable
