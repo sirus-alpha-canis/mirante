@@ -422,3 +422,25 @@ button.skill-chip { cursor: pointer; }
 .filters { display: flex; gap: 4px; flex-wrap: wrap; }
 .tasklist h3 { font-size: 11px; color: var(--muted); font-weight: 600; margin: 8px 0 2px; }
 .tasklist-project h2 { text-transform: none; letter-spacing: 0; }
+
+/* Brain → Rules: the instruction layers an agent session reads. */
+.brain-rules { grid-template-columns: 1fr; }
+.brain-view { margin-left: 8px; }
+.rules-summary { font-weight: 600; margin: 8px 0 2px; }
+.rule-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.rule { padding: 6px 8px; border-radius: 6px; background: var(--panel-2); }
+.rule-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rule-path { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.rule-note { margin: 2px 0 0; }
+.rule-error { margin: 2px 0 0; color: var(--needs); overflow-wrap: anywhere; }
+.rule-missing, .rule-off { opacity: 0.6; }
+.rule-missing { background: none; border: 1px dashed var(--line); }
+.rule-scope-managed { border-color: var(--danger); color: var(--danger); }
+.rule-scope-user { border-color: var(--work); color: var(--work); }
+.rule-scope-project, .rule-scope-local { border-color: var(--review); color: var(--review); }
+.rule-scope-mirante { border-color: var(--accent); color: var(--accent); }
+.rule-body summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.rule-text { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 4px 0; }
+.rule-imports { list-style: none; margin: 4px 0 0 12px; padding: 0 0 0 8px; border-left: 2px solid var(--line); display: grid; gap: 4px; }
+.rules-inline { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 6px 0; max-height: 50vh; overflow: auto; background: var(--panel); }
+.brain-view button[aria-pressed="true"] { background: var(--panel-2); border-color: var(--accent); color: var(--accent); }

@@ -18,6 +18,7 @@ import { MessageComposer } from "./MessageComposer";
 import { PermissionCard } from "./PermissionCard";
 import { ProjectChip } from "./ProjectChip";
 import { QueueList } from "./QueueList";
+import { Rules } from "./Rules";
 import { SkillsChip } from "./SkillsChip";
 import { TerminalTab } from "./TerminalTab";
 import { TrustCard } from "./TrustCard";
@@ -297,6 +298,8 @@ export function Detail({
   onTab?(tab: Tab): void;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab ?? "Steps");
+  // "Rules this agent received": open for one task (another task starts closed).
+  const [rulesFor, setRulesFor] = useState<string | null>(null);
   useEffect(() => onTab?.(tab), [tab, onTab]);
   // Before the first snapshot nothing is known: "loading", not "gone".
   const loaded = useSelect((s) => s.bootId !== null);
@@ -377,8 +380,19 @@ export function Detail({
             <TaskBadges t={t} />
             <StatusPill column={columnOf(t, feed)} />
             <SkillsChip key={`skills-${t.id}`} task={t.id} />
+            <button className="btn btn-small btn-ghost" aria-expanded={rulesFor === t.id} onClick={() => setRulesFor(rulesFor === t.id ? null : t.id)}>
+              {tt("detail.rules")}
+            </button>
             <Actions key={t.id} t={t} />
           </header>
+          {rulesFor === t.id && (
+            <section className="rules-inline" aria-label={tt("detail.rulesAria")}>
+              <button className="btn btn-small" onClick={() => setRulesFor(null)}>
+                {tt("detail.rulesClose")}
+              </button>
+              <Rules key={t.id} at={{ task: t.id }} agent={t.agent} />
+            </section>
+          )}
           {!onTerminal && notices}
           <div role="tablist" aria-label={tt("detail.views")} className="tabs" onKeyDown={onTabKey}>
             {TABS.map((name) => (

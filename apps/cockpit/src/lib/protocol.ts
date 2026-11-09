@@ -560,4 +560,47 @@ export const M = {
   skillPending: "skill.pending",
   skillReview: "skill.review",
   skillAction: "skill.action",
+  rulesLayers: "rules.layers",
 } as const;
+
+/** `rules.layers`: a file pulled in by an `@path` import (Claude), with its own imports. */
+export interface RuleImport {
+  spec: string;
+  path: string;
+  exists: boolean;
+  size?: number;
+  content?: string;
+  truncated: boolean;
+  error?: string;
+  imports?: RuleImport[];
+}
+
+export type RuleScope = "managed" | "user" | "project" | "local" | "nested" | "mirante";
+export type RuleKind = "instructions" | "settings" | "skills" | "memory" | "mode";
+
+/** One place an agent session takes instructions, settings, skills, memory or a mode from. */
+export interface RuleLayer {
+  scope: RuleScope;
+  agent: AgentKind;
+  kind: RuleKind;
+  path: string;
+  exists: boolean;
+  size?: number;
+  mtime?: number;
+  content?: string;
+  truncated: boolean;
+  imports?: RuleImport[];
+  note: string;
+  loaded: boolean;
+  skills: number;
+  error?: string;
+}
+
+export interface RulesView {
+  agent: AgentKind;
+  root: string;
+  task?: string;
+  researched: string;
+  layers: RuleLayer[];
+  summary: { instruction_files: number; instruction_bytes: number; settings_files: number; skills: number };
+}
