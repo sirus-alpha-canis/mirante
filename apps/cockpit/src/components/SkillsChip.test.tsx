@@ -83,6 +83,24 @@ describe("SkillsChip", () => {
     expect(document.activeElement).toBe(chip);
   });
 
+  it("a press outside, focus leaving it, or the window losing focus closes it", async () => {
+    setup(TS);
+    renderWith(makeEnv().env, <button>elsewhere</button>);
+    const chip = await screen.findByRole("button", { name: "Skills 3" });
+    const shown = () => screen.queryByRole("dialog", { name: "Skills of this task" });
+    await userEvent.click(chip);
+    fireEvent.pointerDown(shown()!);
+    expect(shown()).not.toBeNull();
+    fireEvent.pointerDown(document.body);
+    expect(shown()).toBeNull();
+    await userEvent.click(chip);
+    act(() => screen.getByRole("button", { name: "elsewhere" }).focus());
+    expect(shown()).toBeNull();
+    await userEvent.click(chip);
+    fireEvent.blur(window);
+    expect(shown()).toBeNull();
+  });
+
   it("refetches on skill.injected", async () => {
     const h = setup(TS);
     await screen.findByRole("button", { name: "Skills 3" });

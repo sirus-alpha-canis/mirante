@@ -12,6 +12,7 @@ import {
 } from "react";
 import { shallow, useEnv, useLive, useSelect } from "../env";
 import { hintsFor, onMac } from "../lib/shortcuts";
+import { useDismiss } from "../lib/useDismiss";
 import { type Key, t, useT } from "../lib/i18n";
 import { DaemonError } from "../lib/daemon";
 import {
@@ -451,26 +452,22 @@ function OptionList(props: {
   );
 }
 
-/** A popover opened by a toolbar button: Escape (or Tab out) closes it and the keyboard goes
- * back to the button. */
+/** A popover opened by a toolbar button. It closes like every menu here (`useDismiss`): a
+ * press outside, Escape (the keyboard goes back to the button), focus leaving it, or the window
+ * losing focus. */
 function Popover(props: { label: string; open: boolean; onClose(): void; trigger: ReactNode; children: ReactNode }) {
   const wrap = useRef<HTMLSpanElement>(null);
+  const { onClose } = props;
+  useDismiss(
+    wrap,
+    (why) => {
+      onClose();
+      if (why === "escape") wrap.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    },
+    { enabled: props.open },
+  );
   return (
-    <span
-      className="popover-wrap"
-      ref={wrap}
-      onKeyDown={(e) => {
-        if (e.key === "Escape" && props.open) {
-          e.preventDefault();
-          e.stopPropagation();
-          props.onClose();
-          wrap.current?.querySelector<HTMLButtonElement>("button")?.focus();
-        }
-      }}
-      onBlur={(e) => {
-        if (props.open && !wrap.current?.contains(e.relatedTarget as Node | null)) props.onClose();
-      }}
-    >
+    <span className="popover-wrap" ref={wrap}>
       {props.trigger}
       {props.open && (
         <div className="popover" role="dialog" aria-label={props.label}>
@@ -698,6 +695,9 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
   const chosen = props.projects.find((p) => p.path === props.value);
   const items = query === null ? [] : matchProjects(query, props.projects);
   const open = items.length > 0;
+  const wrap = useRef<HTMLSpanElement>(null);
+  // The list closes like every menu here; the box shows the chosen project again.
+  useDismiss(wrap, () => setQuery(null), { enabled: open });
   const at = Math.min(active, Math.max(items.length - 1, 0));
   const pick = (i: number) => {
     props.onPick(items[i].path);
@@ -726,7 +726,7 @@ function RepoBox(props: { projects: Project[]; value: string | null; disabled: b
     }
   };
   return (
-    <span className="repo-box tchip tchip-static">
+    <span className="repo-box tchip tchip-static" ref={wrap}>
       <label htmlFor={id} className="small muted">
         {t("dispatch.repository")}
       </label>

@@ -727,3 +727,76 @@ describe("dispatch and the task's origin", () => {
     expect(screen.getByText(/github.com\/evil\/shop/)).toBeInTheDocument();
   });
 });
+
+/** A press outside the form: plain text that takes no focus (as on macOS's WebKit). */
+const pressOutside = () => fireEvent.pointerDown(document.body);
+
+describe("the form's menus close like menus", () => {
+  const menus = [
+    { name: "the Agent menu", trigger: () => screen.getByRole("button", { name: /^Agent:/ }), shown: () => screen.queryByRole("dialog", { name: "Agent" }) },
+    { name: "the + context picker", trigger: () => screen.getByRole("button", { name: "+ context" }), shown: () => screen.queryByRole("dialog", { name: "Add context" }) },
+  ];
+  for (const m of menus) {
+    it(`${m.name}: a press outside closes it (and a press on its button toggles it)`, async () => {
+      setup({ "repo.files": [] });
+      await userEvent.click(m.trigger());
+      expect(m.shown()).not.toBeNull();
+      fireEvent.pointerDown(m.shown()!);
+      expect(m.shown()).not.toBeNull();
+      pressOutside();
+      expect(m.shown()).toBeNull();
+      await userEvent.click(m.trigger());
+      await userEvent.click(m.trigger());
+      expect(m.shown()).toBeNull();
+      await act(async () => {});
+    });
+
+    it(`${m.name}: Escape closes it and the keyboard goes back to its button`, async () => {
+      setup({ "repo.files": [] });
+      await userEvent.click(m.trigger());
+      act(() => {
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      });
+      expect(m.shown()).toBeNull();
+      expect(m.trigger()).toHaveFocus();
+      await act(async () => {});
+    });
+
+    it(`${m.name}: focus leaving it (or the window losing focus) closes it`, async () => {
+      setup({ "repo.files": [] });
+      await userEvent.click(m.trigger());
+      act(() => screen.getByLabelText("Goal").focus());
+      expect(m.shown()).toBeNull();
+      await userEvent.click(m.trigger());
+      fireEvent.blur(window);
+      expect(m.shown()).toBeNull();
+      await act(async () => {});
+    });
+  }
+
+  it("the repo box's list: a press outside, Escape, focus leaving or the window losing focus closes it", async () => {
+    setup({}, [], [], null, ["/repos/shop", "/repos/api"]);
+    const repo = screen.getByRole("combobox", { name: "Repository" });
+    const list = () => screen.queryByRole("listbox", { name: "Projects" });
+    const reopen = async () => {
+      await userEvent.clear(repo);
+      await userEvent.type(repo, "a");
+      expect(list()).not.toBeNull();
+    };
+    await reopen();
+    pressOutside();
+    expect(list()).toBeNull();
+    expect(repo).toHaveValue("shop");
+    await reopen();
+    act(() => {
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(list()).toBeNull();
+    await reopen();
+    act(() => screen.getByLabelText("Goal").focus());
+    expect(list()).toBeNull();
+    await reopen();
+    fireEvent.blur(window);
+    expect(list()).toBeNull();
+  });
+});

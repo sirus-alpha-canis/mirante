@@ -1,4 +1,4 @@
-import { act, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { REPOS_KEY } from "../lib/repos";
@@ -43,5 +43,41 @@ describe("LeftRail", () => {
     await userEvent.type(screen.getByLabelText("Repository path"), "/nope{Enter}");
     expect(await screen.findByRole("alert")).toHaveTextContent("/nope does not exist");
     await act(async () => {});
+  });
+});
+
+describe("the rail's list of an agent's live sessions", () => {
+  const two = () => setup([task("a", { branch: "feat/a" }), task("b", { branch: "feat/b" })]);
+  const list = () => screen.queryByRole("list", { name: "Live @claude sessions" });
+  const agent = () => screen.getByRole("button", { name: /^@claude/ });
+
+  it("a press outside closes it", async () => {
+    two();
+    await userEvent.click(agent());
+    expect(list()).not.toBeNull();
+    fireEvent.pointerDown(list()!);
+    expect(list()).not.toBeNull();
+    fireEvent.pointerDown(document.body);
+    expect(list()).toBeNull();
+  });
+
+  it("Escape closes it and the keyboard goes back to the agent", async () => {
+    two();
+    await userEvent.click(agent());
+    act(() => {
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(list()).toBeNull();
+    expect(agent()).toHaveFocus();
+  });
+
+  it("focus leaving it, or the window losing focus, closes it", async () => {
+    two();
+    await userEvent.click(agent());
+    act(() => screen.getByLabelText("Repository path").focus());
+    expect(list()).toBeNull();
+    await userEvent.click(agent());
+    fireEvent.blur(window);
+    expect(list()).toBeNull();
   });
 });

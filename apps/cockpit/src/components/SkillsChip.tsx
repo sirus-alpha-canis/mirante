@@ -10,6 +10,7 @@ import type { RepoOrigin, TaskSkills } from "../lib/protocol";
 import { t, tn, useT } from "../lib/i18n";
 import { activationShort, confirmOrigin, originTenant, skillErrorText, skillRepoOrigin, taskSkills } from "../lib/skills";
 import { useTaskSkillsVersion } from "../lib/useSkills";
+import { useDismiss } from "../lib/useDismiss";
 
 function chipText(ts: TaskSkills): string {
   if (!ts.confirmed) return t("skillChip.off");
@@ -130,19 +131,19 @@ export function SkillsChip({ task }: { task: string }) {
     };
   }, [rpc, task, version, nonce]);
   useEffect(() => {
-    if (!open) return;
-    pop.current?.querySelector<HTMLElement>("button, [tabindex]")?.focus();
-    // Escape anywhere closes it first (capture): it is not the app's "leave the detail".
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.preventDefault();
-      e.stopPropagation();
-      setOpen(false);
-      chip.current?.focus();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    if (open) pop.current?.querySelector<HTMLElement>("button, [tabindex]")?.focus();
   }, [open]);
+  // Closes like every menu here (`useDismiss`). Escape anywhere closes it first (capture): it is
+  // not the app's "leave the detail"; then the keyboard goes back to the chip.
+  const wrap = useRef<HTMLSpanElement>(null);
+  useDismiss(
+    wrap,
+    (why) => {
+      setOpen(false);
+      if (why === "escape") chip.current?.focus();
+    },
+    { enabled: open },
+  );
   if (!ts) return error ? <span className="skill-chip skill-chip-warn" title={error}>{t("skillChip.unavailable")}</span> : null;
   const warn = !ts.confirmed || ts.refused.length > 0;
   const state = (name: string) => {
@@ -154,7 +155,7 @@ export function SkillsChip({ task }: { task: string }) {
     chip.current?.focus();
   };
   return (
-    <span className="skills-chip">
+    <span className="skills-chip" ref={wrap}>
       <button
         ref={chip}
         className={`skill-chip ${warn ? "skill-chip-warn" : ""}`}

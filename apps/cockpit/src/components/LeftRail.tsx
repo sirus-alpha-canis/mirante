@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useDismiss } from "../lib/useDismiss";
 import { shallow, useEnv, useSelect } from "../env";
 import { AGENT_OPTIONS } from "../lib/dispatch";
 import { same, type State } from "../store/state";
@@ -81,6 +82,17 @@ export function LeftRail(props: {
   );
   // The agent whose live sessions are listed to pick from (it has several).
   const [picking, setPicking] = useState<AgentKind | null>(null);
+  // The open list (with its agent's button) closes like every menu here; after Escape the
+  // keyboard goes back to the agent.
+  const pickWrap = useRef<HTMLLIElement>(null);
+  useDismiss(
+    pickWrap,
+    (why) => {
+      setPicking(null);
+      if (why === "escape") pickWrap.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    },
+    { enabled: picking !== null },
+  );
   const openTask = (t: LiveSession) => {
     setPicking(null);
     props.onOpen(t.id, t.needsYou ? "Terminal" : undefined);
@@ -196,12 +208,7 @@ export function LeftRail(props: {
       <h2>{tr("rail.agents")}</h2>
       <ul>
         {agents.map((a) => (
-          <li
-            key={a.agent}
-            onKeyDown={(e) => {
-              if (e.key === "Escape" && picking === a.agent) setPicking(null);
-            }}
-          >
+          <li key={a.agent} ref={picking === a.agent ? pickWrap : undefined}>
             <button
               className="rail-item"
               onClick={() => agentClick(a)}
