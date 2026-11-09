@@ -73,8 +73,13 @@ apps/cockpit/scripts/smoke.sh
 
 ```bash
 pnpm --dir apps/cockpit tauri build --bundles app
-open apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app
+mirante app             # starts the daemon if needed, then opens this build
 ```
+
+`mirante app` opens `$MIRANTE_APP` if set, else `/Applications/Mirante.app`, else
+`~/Applications/Mirante.app`, else this checkout's build, so a stale copy in `/Applications`
+wins over a fresh build: `scripts/install.sh --install-app` replaces it (after you confirm,
+or with `--yes`), or point `MIRANTE_APP` at the build.
 
 The bundle is not signed or notarized. Copied to another Mac it is quarantined; clear that
 with `xattr -dr com.apple.quarantine Mirante.app` (only for a build you made yourself).

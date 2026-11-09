@@ -9,8 +9,9 @@ This sits on top of the CLI dogfood (`2026-11-07-plan-2b-dogfood.md`, results in
 what that run left for the founder to try by hand.
 
 Setup: `scripts/install.sh --app` (the four binaries linked into `~/.local/bin`, the
-daemon started, `mirante doctor`, and the app built; see the README's Quickstart). Keep
-`mirante watch` open in a terminal the first day to compare.
+daemon started, `mirante doctor`, and the app built; `--install-app` also copies it to
+`/Applications`; see the README's Quickstart), then `mirante app` to open it (the daemon has
+no window of its own). Keep `mirante watch` open in a terminal the first day to compare.
 
 - [ ] The app finds `mirante-daemon` in `~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`
       or `/usr/local/bin`, then on your login shell's PATH (or at `$MIRANTE_DAEMON_BIN`):

@@ -45,6 +45,13 @@ app are version 0.1.0 until the first release.
 - `mirante new` without `--branch` names the branch `mirante/<words-of-the-goal>` with the
   app's rule (`-2`, `-3`… when taken); both check one shared set of test vectors.
 - `mirante archive --stop`.
+- `mirante app` (alias `mirante open`) opens the desktop app on macOS, starting the daemon
+  first unless `--no-daemon`. It opens `$MIRANTE_APP`, `/Applications/Mirante.app`,
+  `~/Applications/Mirante.app` or the build in the CLI's own checkout, and says how to
+  build the app when there is none. `mirante daemon start|restart` on a terminal end with
+  a hint to it (the daemon has no window).
+- `scripts/install.sh --install-app` copies the built app to `/Applications` (an older copy
+  is replaced after you confirm, or with `--yes`); its next steps suggest `mirante app`.
 - `mirante --verbose` keeps the daemon's error codes in error messages.
 - README: Quickstart, Troubleshooting, Uninstall and an Environment reference;
   `SECURITY.md`; issue templates; Dependabot and `cargo deny` in CI.

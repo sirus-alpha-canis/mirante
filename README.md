@@ -49,9 +49,10 @@ The first build takes a few minutes, and the first start of a fresh build can ta
 idle daemon. If `~/.local/bin` is not on your `PATH`, it says what to add to your shell
 profile.
 
-The desktop app: `scripts/install.sh --app` (also needs Node 22.12+ and pnpm 10), then open
-the `Mirante.app` it prints. `mirante help` lists every command, `mirante <command> --help`
-explains one.
+The desktop app: `scripts/install.sh --app` builds it (also needs Node 22.12+ and pnpm 10;
+add `--install-app` to copy it to `/Applications`), then `mirante app` opens it, starting the
+daemon first if needed. The daemon itself has no window: `mirante daemon start` alone opens
+nothing. `mirante help` lists every command, `mirante <command> --help` explains one.
 
 ## Requirements
 
@@ -103,13 +104,21 @@ mirante doctor          # which agent binaries the daemon resolved, and from whe
 
 ### 2. The desktop app
 
-`scripts/install.sh --app`, or by hand:
+`scripts/install.sh --app` (`--install-app` also copies it to `/Applications`, replacing an
+older copy after you confirm, or with `--yes`), or by hand:
 
 ```bash
 pnpm --dir apps/cockpit install
 pnpm --dir apps/cockpit tauri build --bundles app
-open apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app
+mirante app             # starts the daemon if needed, then opens the app
 ```
+
+`mirante app` (alias `mirante open`; `--no-daemon` leaves the daemon alone) opens the first
+of: `$MIRANTE_APP`, `/Applications/Mirante.app`, `~/Applications/Mirante.app`, then the
+build in the checkout the `mirante` on your `PATH` was built from
+(`apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app`). A copy in
+`/Applications` wins over a fresh build, so after rebuilding either reinstall it
+(`scripts/install.sh --install-app`) or remove it. The desktop app is macOS-only for now.
 
 The app is a thin client of the daemon. It looks for `mirante-daemon` in `~/.cargo/bin`,
 `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, then on your login shell's `PATH`
@@ -129,6 +138,8 @@ More detail, including the fake daemon for UI work without agents:
 ## Use
 
 ### The app
+
+`mirante app` opens it (and starts the daemon first if it is not running).
 
 - **Projects.** Add a repository on the left with **Choose…** (the folder picker), or paste
   its path.
@@ -173,6 +184,7 @@ mirante hibernate feat/login    # free memory from an idle agent; `mirante wake`
 mirante archive feat/login      # remove the worktree, keep the branch (--stop: end it first)
 mirante doctor                  # orphan processes and checkouts, memory, agent binaries
 mirante daemon start|stop|restart|status
+mirante app                     # open the desktop app (starts the daemon first; --no-daemon: not)
 ```
 
 ## Troubleshooting
@@ -201,6 +213,8 @@ mirante daemon start|stop|restart|status
   `MIRANTE_HOME` must be a short directory (for experiments, `/tmp/mh`).
 - **"… is not a git repository" / "has no commit yet".** A task's worktree is a branch of a
   repository with at least one commit: `git init && git commit --allow-empty -m init`.
+- **`mirante daemon start` opened no window.** The daemon has none; `mirante app` opens the
+  desktop app. If it says the app is not built or installed, run `scripts/install.sh --app`.
 - **The app does not open on another Mac.** A copied, unsigned bundle is quarantined. For
   a build you made yourself: `xattr -dr com.apple.quarantine Mirante.app`.
 - **After a reboot nothing is running.** There is no login item (launchd agent) yet. The
@@ -239,6 +253,7 @@ and `MIRANTE_*` from your login shell.
 | `MIRANTE_CLAUDE_BIN` | daemon | The real `claude` binary (default: `PATH` without shims, then the usual install directories). |
 | `MIRANTE_CODEX_BIN` | daemon | The real `codex` binary (same search). |
 | `MIRANTE_DAEMON_BIN` | CLI, app | The `mirante-daemon` to start (default: the one next to `mirante`; the app searches `~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, then your login shell's `PATH`). |
+| `MIRANTE_APP` | CLI | The `Mirante.app` that `mirante app` opens (default: `/Applications`, `~/Applications`, then the checkout's build). |
 | `MIRANTE_HOOK_BIN` | daemon | The `mirante-hook` Claude sessions report through (default: next to the daemon). |
 | `MIRANTE_MCP_BIN` | daemon | The `mirante-mcp` server for memory and skills (default: next to the daemon). |
 | `MIRANTE_AUTO_RESUME` | daemon | `off` (or `0`, `false`, `no`): do not resume sessions when the daemon starts again. The app's setting does the same. |

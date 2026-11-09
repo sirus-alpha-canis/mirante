@@ -3,10 +3,13 @@
 # mirante-hook, mirante-mcp) into a bin directory, then starts the daemon and runs
 # `mirante doctor`. Safe to run again: it rebuilds, relinks and restarts an idle daemon.
 #
-#   scripts/install.sh [--prefix <bin dir>] [--app] [--no-start]
+#   scripts/install.sh [--prefix <bin dir>] [--app [--install-app [--yes]]] [--no-start]
 #
 #   --prefix <dir>  where the links go (default: $PREFIX, else ~/.local/bin)
 #   --app           also build the desktop app (needs Node 22.12+ and pnpm 10)
+#   --install-app   build it (implies --app) and copy it to /Applications (macOS); an older
+#                   copy there is replaced only after you confirm, or with --yes
+#   --yes           replace an older /Applications/Mirante.app without asking
 #   --no-start      do not start or restart the daemon (and skip doctor)
 #
 # It never edits your shell profile, ~/.claude or ~/.codex. Undo with scripts/uninstall.sh.
@@ -21,10 +24,12 @@ die() {
   exit 1
 }
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
 prefix="${PREFIX:-$HOME/.local/bin}"
 app=0
+install_app=0
+yes=0
 start=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,6 +46,15 @@ while [ $# -gt 0 ]; do
       app=1
       shift
       ;;
+    --install-app)
+      app=1
+      install_app=1
+      shift
+      ;;
+    --yes | -y)
+      yes=1
+      shift
+      ;;
     --no-start)
       start=0
       shift
@@ -53,6 +67,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$prefix" ] || die "--prefix is empty"
+if [ "$install_app" = 1 ] && [ "$(uname -s)" != Darwin ]; then
+  die "--install-app copies the app to /Applications, which is macOS-only"
+fi
 case "$prefix" in /*) ;; *) prefix="$PWD/$prefix" ;; esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -132,6 +149,34 @@ if [ "$start" = 1 ]; then
 fi
 
 # --- The desktop app.
+# Copies the built bundle to /Applications/Mirante.app. An older copy is replaced only after
+# a "y" on the terminal (or with --yes); without a terminal it is left alone.
+install_app_bundle() {
+  local src="$1" dest=/Applications/Mirante.app answer=""
+  if [ -e "$dest" ] && [ "$yes" != 1 ]; then
+    if [ -r /dev/tty ] && { : </dev/tty; } 2>/dev/null; then
+      printf 'Replace the existing %s with this build? [y/N] ' "$dest" >/dev/tty
+      read -r answer </dev/tty || answer=""
+    fi
+    case "$answer" in
+      y | Y | yes | YES) ;;
+      *)
+        warn "left $dest as it was (scripts/install.sh --install-app --yes replaces it); 'mirante app' opens it"
+        return 0
+        ;;
+    esac
+  fi
+  say "Copying the app to $dest"
+  local tmp="$dest.installing.$$"
+  rm -rf "$tmp"
+  ditto "$src" "$tmp" || {
+    rm -rf "$tmp"
+    die "could not copy the app to /Applications (permissions?)"
+  }
+  rm -rf "$dest"
+  mv "$tmp" "$dest"
+}
+
 if [ "$app" = 1 ]; then
   command -v pnpm >/dev/null 2>&1 || die "--app needs pnpm 10 (corepack enable, or npm i -g pnpm@10) and Node 22.12+"
   say "Building the desktop app (apps/cockpit)"
@@ -139,7 +184,18 @@ if [ "$app" = 1 ]; then
   pnpm --dir apps/cockpit tauri build --bundles app
   bundle="$root/apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app"
   if [ -d "$bundle" ]; then
-    say "App: $bundle (open it, or copy it to /Applications)"
+    say "App: $bundle"
+    if [ "$install_app" = 1 ]; then
+      install_app_bundle "$bundle"
+    else
+      if [ -e /Applications/Mirante.app ]; then
+        warn "'mirante app' opens /Applications/Mirante.app first, an older copy: run with --install-app to replace it"
+      else
+        say "Open it with 'mirante app'; to copy it to /Applications: scripts/install.sh --install-app"
+      fi
+    fi
+  elif [ "$install_app" = 1 ]; then
+    die "the app build left no $bundle to copy"
   fi
 fi
 
@@ -148,13 +204,14 @@ cat <<EOF
 Mirante is installed: ${BINS[*]} -> $prefix
 $([ "$on_path" = 1 ] || printf '(add %s to your PATH first; see the warning above)\n' "$prefix")
 Next:
+  mirante app                   # open the desktop app (build it with --app; the daemon has no window)
   cd <a git repo>
   mirante new . --agent claude "describe what you want done"   # or --agent codex
   mirante ls                    # status; what needs you
   mirante attach <branch>       # the live terminal; Ctrl-] detaches
 
   scripts/try.sh                # a 1-minute tour with a fake agent (no login, no quota)
-  scripts/install.sh --app      # also build the desktop app
+  scripts/install.sh --app      # also build the desktop app (--install-app: copy it to /Applications)
   mirante help                  # every command; mirante <command> --help for one
 
 If an agent is not found: set MIRANTE_CLAUDE_BIN / MIRANTE_CODEX_BIN in your shell profile,
