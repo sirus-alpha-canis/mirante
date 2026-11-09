@@ -7,6 +7,8 @@ import conf from "../src-tauri/tauri.conf.json";
 import shell from "../src-tauri/src/lib.rs?raw";
 import scanner from "../src-tauri/src/scan.rs?raw";
 import picker from "./main.tsx?raw";
+import css from "./styles.css?raw";
+import page from "../index.html?raw";
 import bridgeRpc from "../../../crates/mirante-bridge/src/rpc.rs?raw";
 import { M } from "./lib/protocol";
 
@@ -27,6 +29,19 @@ describe("Tauri security baseline", () => {
     // Fonts are the app's own files (bundled, never a font CDN).
     expect(directive("font-src")).toBe("font-src 'self'");
     expect(directive("style-src")).toBe("style-src 'self' 'unsafe-inline'");
+  });
+
+  it("fonts are the app's own files: no font CDN, no remote url() or @import anywhere", () => {
+    for (const [name, text] of [["styles.css", css], ["index.html", page]] as const) {
+      expect(text, name).not.toMatch(/@import/);
+      expect(text, name).not.toMatch(/fonts\.googleapis|fonts\.gstatic|use\.typekit|fonts\.bunny|rsms\.me|jsdelivr|unpkg|cdnjs/);
+      expect(text, name).not.toMatch(/<link[^>]+href=["']?(https?:)?\/\//);
+      for (const [, url] of text.matchAll(/url\(\s*["']?([^"')]+)/g)) expect(url, `${name}: ${url}`).not.toMatch(/^(https?:|\/\/)/);
+    }
+    // Each @font-face loads a woff2 bundled next to the stylesheet (styles.test.ts checks they exist).
+    const faces = [...css.matchAll(/@font-face \{([^}]*)\}/g)].map((m) => m[1]);
+    expect(faces.length).toBeGreaterThan(0);
+    for (const f of faces) expect(f).toMatch(/src: url\("\.\/assets\/fonts\/[\w-]+\.woff2"\) format\("woff2"\);/);
   });
 
   it("the dev policy only adds what Vite's dev server needs", () => {

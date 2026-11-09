@@ -18,6 +18,13 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
   the context as plain-text tokens (`claude · shop · ⎇ branch`), a faint ⌘↵ hint; in a
   task, the arrow steers and ⌥ queues. The terminal waits for its font before its first fit.
 
+- **The cockpit ships its fonts.** Inter 4.1 (one variable woff2) for the UI and JetBrains
+  Mono 2.304 (regular and bold woff2) for code and the terminal are bundled into the app
+  (SIL OFL 1.1; licenses in `apps/cockpit/src/assets/fonts/` and THIRD_PARTY_NOTICES.md),
+  so the look no longer depends on what is installed on the Mac; nothing is fetched (the
+  CSP allows fonts from the app only). The terminal loads JetBrains Mono before its first
+  fit, so the PTY is sized in the real font's cells. About 540 KB more in the app.
+
 - **Memory pressure no longer blocks work.** The memory guard is advisory by default: on
   macOS "warn" pressure (most of the time on a busy Mac) it no longer pauses new sessions,
   queued deliveries or auto-resume. It still shows the level, swap, what is available and

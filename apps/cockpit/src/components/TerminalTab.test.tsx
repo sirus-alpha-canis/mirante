@@ -115,7 +115,7 @@ import { DaemonError } from "../lib/daemon";
 import type { TaskView } from "../lib/protocol";
 import { makeEnv } from "../test/env";
 import { snapshot, task } from "../test/fixtures";
-import { TerminalTab } from "./TerminalTab";
+import { fontsPending, TerminalTab } from "./TerminalTab";
 import css from "../styles.css?raw";
 
 /** The declarations of `selector`'s one-line rule in styles.css. */
@@ -467,6 +467,39 @@ describe("TerminalTab", () => {
       width.mockRestore();
       height.mockRestore();
     }
+  });
+
+  it("loads the bundled JetBrains Mono (regular and bold) before the first fit, even when nothing else is loading", async () => {
+    // The canvas never asks for the web font, so the set can say "loaded" before it is.
+    h.attachOpen.mockResolvedValue({ id: 6, input: true });
+    let fetched!: () => void;
+    const face = new Promise<FontFace[]>((res) => (fetched = () => res([])));
+    const asked: string[] = [];
+    const fonts = { status: "loaded", ready: Promise.resolve(), check: () => false, load: (f: string) => (asked.push(f), face) };
+    Object.defineProperty(document, "fonts", { configurable: true, value: fonts });
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
+    try {
+      mount(task("a"));
+      await new Promise((res) => setTimeout(res, 20));
+      expect(asked).toEqual(['13px "JetBrains Mono"', 'bold 13px "JetBrains Mono"']);
+      expect(h.fits).toBe(0);
+      expect(h.attachOpen).not.toHaveBeenCalled();
+      fetched();
+      await waitFor(() => expect(h.attachOpen).toHaveBeenCalledTimes(1));
+      expect(h.fits).toBe(1);
+    } finally {
+      delete (document as { fonts?: unknown }).fonts;
+      width.mockRestore();
+      height.mockRestore();
+    }
+  });
+
+  it("does not wait when the terminal's faces are already loaded", () => {
+    const doc = { fonts: { status: "loaded", ready: Promise.resolve(), check: () => true, load: vi.fn() } } as unknown as Document;
+    expect(fontsPending(doc)).toBeNull();
+    expect(doc.fonts.load).not.toHaveBeenCalled();
+    expect(fontsPending({} as Document)).toBeNull();
   });
 
   it("fits at most once per frame, and never while hidden", async () => {

@@ -176,8 +176,13 @@ you are (Home › project › task), the views, the daemon's health dot, what ne
 you and the keys of the current view. Tokens live at the top of `src/styles.css`;
 `styles.test.ts` checks their contrast (WCAG AA) in every theme.
 
-The UI asks for Inter and the terminal for JetBrains Mono (both SIL OFL 1.1), falling back
-to the system fonts; the font files are not bundled yet.
+The UI is set in Inter and code and the terminal in JetBrains Mono (both SIL OFL 1.1),
+bundled with the app: `src/assets/fonts/` holds Inter 4.1 as one variable woff2 and
+JetBrains Mono 2.304 as regular and bold woff2, each with its license, and `@font-face` in
+`src/styles.css` loads them (Vite fingerprints them into `dist/assets/`; the CSP's
+`font-src 'self'` allows nothing else). System fonts stay as the fallback. The terminal
+loads JetBrains Mono before its first fit. `fonts.test.ts` checks each face's file is
+there and that a build emits it; `security.test.ts` that no font comes from elsewhere.
 
 ## Keys
 

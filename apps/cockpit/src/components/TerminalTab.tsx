@@ -17,20 +17,28 @@ const MAX_PENDING_INPUT = 64 * 1024;
 const ACK_BATCH = 64 * 1024;
 /** …or after this long, whichever comes first. */
 const ACK_DELAY_MS = 50;
-/** JetBrains Mono when the app has it, else the system's monospace. Its ligatures stay off
- * (xterm draws cell by cell; "=>" is two cells). */
+/** JetBrains Mono, bundled (styles.css @font-face), else the system's monospace. Its
+ * ligatures stay off (xterm draws cell by cell; "=>" is two cells). */
 export const FONT = '"JetBrains Mono", "SF Mono", Menlo, monospace';
+export const FONT_SIZE = 13;
+/** The faces the terminal draws with (regular and bold), as `FontFaceSet.load` takes them. */
+export const FONT_FACES = [`${FONT_SIZE}px "JetBrains Mono"`, `bold ${FONT_SIZE}px "JetBrains Mono"`];
 /** The terminal is graphite in both themes (agents' TUIs assume a dark screen): the
  * Observatório dark surfaces and text (styles.css). */
 export const TERMINAL_THEME = { background: "#141519", foreground: "#e7e3dd", cursor: "#e7e3dd", cursorAccent: "#141519", selectionBackground: "#3a3c43" };
 
-/** null when the document's fonts have loaded (or the engine cannot say); else a promise of
- * that moment. The first fit (and the attach at its size) waits for it: cells measured in a
- * fallback font's metrics would size the PTY wrong. */
+/** null when the terminal's font is ready (or the engine cannot say); else a promise of that
+ * moment. The first fit (and the attach at its size) waits for it: cells measured in a
+ * fallback font's metrics would size the PTY wrong. xterm draws on a canvas, which never
+ * asks for a web font, so `fonts.ready` alone could settle before JetBrains Mono was ever
+ * fetched: the faces are loaded explicitly. A failed load still settles (the fallback). */
 export function fontsPending(doc: Document = document): Promise<void> | null {
   const fonts = (doc as Document & { fonts?: FontFaceSet }).fonts;
-  if (!fonts || fonts.status === "loaded") return null;
-  return fonts.ready.then(
+  if (!fonts) return null;
+  const ready = fonts.status === "loaded" && FONT_FACES.every((f) => fonts.check?.(f) ?? true);
+  if (ready) return null;
+  const loads = FONT_FACES.map((f) => (typeof fonts.load === "function" ? fonts.load(f) : Promise.resolve([])));
+  return Promise.all([...loads, fonts.ready]).then(
     () => undefined,
     () => undefined,
   );
@@ -155,7 +163,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     const term = new Terminal({
       convertEol: false,
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: FONT_SIZE,
       fontFamily: FONT,
       theme: TERMINAL_THEME,
       scrollback: 5000,
