@@ -5,6 +5,8 @@ import { Detail } from "./components/Detail";
 import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
 import { Skills } from "./components/Skills";
+import { Splash } from "./components/Splash";
+import { dismissSplash } from "./lib/splash";
 import { type Env, EnvContext } from "./env";
 import { type ComposerForm, EMPTY_FORM } from "./components/DispatchComposer";
 import { type Lang, LANGS, LangContext, loadLang, saveLang, setLang, t as tr, useT } from "./lib/i18n";
@@ -222,6 +224,8 @@ export function App({ env: given }: { env: Env }) {
   useEffect(() => {
     env.cockpit.connect().catch(() => {});
   }, [env]);
+  // The launch splash (index.html) has done its job once the app is on screen.
+  useEffect(() => dismissSplash(), []);
 
   useEffect(() => {
     // Tasks due a notification, collected for NOTIFY_BATCH_MS. Whether one is on screen is
@@ -253,6 +257,8 @@ export function App({ env: given }: { env: Env }) {
   }, [env]);
 
   const live = connection.state === "live";
+  // Never connected yet (no snapshot): nothing to show but that it is connecting.
+  const waiting = connection.state === "connecting" && bootId === null;
   useEffect(() => {
     // Away from the daemon nothing is known: no stale memory numbers, no stale inline-answers flag.
     if (!live) {
@@ -544,8 +550,9 @@ export function App({ env: given }: { env: Env }) {
               ))}
             </select>
           </header>
-          <ConnectionBanner connection={connection} env={env} />
-          {mode === "home" && (
+          {/* Until the daemon first answers, the launch splash's mark says so (not an empty view). */}
+          {waiting ? <Splash text={t("conn.connecting")} /> : <ConnectionBanner connection={connection} env={env} />}
+          {!waiting && mode === "home" && (
             <Home
               projects={projs}
               project={current}
@@ -565,7 +572,7 @@ export function App({ env: given }: { env: Env }) {
               onFocused={consumedReturn}
             />
           )}
-          {mode === "detail" && taskId && (
+          {!waiting && mode === "detail" && taskId && (
             <Detail
               taskId={taskId}
               onSelect={setTaskId}
@@ -575,9 +582,9 @@ export function App({ env: given }: { env: Env }) {
               onTab={setShownTab}
             />
           )}
-          {mode === "grid" && <Grid onOpen={open} status={status} />}
-          {mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
-          {mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
+          {!waiting && mode === "grid" && <Grid onOpen={open} status={status} />}
+          {!waiting && mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
+          {!waiting && mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
           {palette && <Palette base={baseCommands} inlineAnswers={inlineAnswers} onOpen={open} onClose={closePalette} onDispatch={onDispatchText} />}
         </div>
       </LangContext.Provider>

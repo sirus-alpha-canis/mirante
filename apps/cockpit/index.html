@@ -3,9 +3,85 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>Mirante</title>
+    <script src="/theme-boot.js"></script>
+    <!--
+      The launch splash: painted from the very first frame, before any script of the app runs
+      (pure CSS and SVG, nothing remote: the CSP allows neither). The mark is the founder's
+      Orb-Dot (ProjectDNA brand, docs/brand/logo/orb-dot.svg): a bright core, three satellites
+      on a dashed orbit; here the satellites orbit the core. The app's own waiting state
+      (src/components/Splash.tsx) draws the same mark with these classes.
+      Backgrounds match the app's --bg (src/styles.css): no white flash, in either theme.
+    -->
+    <style>
+      :root {
+        --splash-bg: #f6f7f9;
+        --splash-text: #15191f;
+        --splash-muted: #5b6573;
+        --splash-dot: #0891b2;
+        --splash-core: #22d3ee;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) {
+          --splash-bg: #0f1216;
+          --splash-text: #f1fafd;
+          --splash-muted: #94adb6;
+          --splash-dot: #22d3ee;
+          --splash-core: #7af3ff;
+        }
+      }
+      :root[data-theme="dark"] {
+        --splash-bg: #0f1216;
+        --splash-text: #f1fafd;
+        --splash-muted: #94adb6;
+        --splash-dot: #22d3ee;
+        --splash-core: #7af3ff;
+      }
+      html { background: var(--splash-bg); }
+      body { margin: 0; background: var(--splash-bg); }
+      .splash {
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+        color: var(--splash-text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+      }
+      #splash { position: fixed; inset: 0; z-index: 1000; background: var(--splash-bg); transition: opacity 200ms ease-out; }
+      #splash.splash-out { opacity: 0; pointer-events: none; }
+      .splash-inline { flex: 1; min-height: 240px; }
+      .splash .orb { width: 88px; height: 88px; overflow: visible; }
+      .splash .orb-ring { fill: none; stroke: var(--splash-dot); stroke-width: 1; stroke-dasharray: 2 4; opacity: 0.35; }
+      .splash .orb-sats, .splash .orb-ring, .splash .orb-core { transform-box: view-box; transform-origin: 40px 40px; }
+      .splash .orb-sats { fill: var(--splash-dot); stroke: var(--splash-dot); animation: splash-orbit 6s linear infinite; }
+      .splash .orb-sats line { stroke-width: 0.5; }
+      .splash .orb-ring { animation: splash-orbit 30s linear infinite reverse; }
+      .splash .orb-halo { fill: var(--splash-dot); opacity: 0.15; }
+      .splash .orb-core { fill: var(--splash-core); filter: drop-shadow(0 0 4px #22d3ee); animation: splash-pulse 2.6s ease-in-out infinite; }
+      .splash-word { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+      .splash-note { font-size: 13px; color: var(--splash-muted); margin: 0; }
+      @keyframes splash-orbit { to { transform: rotate(360deg); } }
+      @keyframes splash-pulse { 50% { transform: scale(1.25); opacity: 0.8; } }
+      @media (prefers-reduced-motion: reduce) {
+        .splash .orb-sats, .splash .orb-ring, .splash .orb-core, #splash { animation: none; transition: none; }
+      }
+    </style>
   </head>
   <body>
+    <div id="splash" class="splash" role="status" aria-live="polite" aria-label="Starting Mirante">
+      <svg class="orb" viewBox="0 0 80 80" aria-hidden="true">
+        <circle class="orb-ring" cx="40" cy="40" r="28" />
+        <g class="orb-sats">
+          <line x1="40" y1="40" x2="40" y2="12" opacity="0.25" />
+          <line x1="40" y1="40" x2="68" y2="46" opacity="0.15" />
+          <line x1="40" y1="40" x2="14" y2="58" opacity="0.12" />
+          <circle cx="40" cy="12" r="3" stroke="none" />
+          <circle cx="68" cy="46" r="2.5" stroke="none" opacity="0.7" />
+          <circle cx="14" cy="58" r="2.5" stroke="none" opacity="0.5" />
+        </g>
+        <circle class="orb-halo" cx="40" cy="40" r="10" />
+        <circle class="orb-core" cx="40" cy="40" r="5" />
+      </svg>
+      <span class="splash-word">Mirante</span>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

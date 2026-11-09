@@ -535,6 +535,53 @@ describe("App", () => {
     expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
   });
 
+  describe("launch", () => {
+    afterEach(() => {
+      document.getElementById("splash")?.remove();
+      delete (window as { matchMedia?: unknown }).matchMedia;
+    });
+
+    it("the launch splash in index.html goes once the app has mounted", () => {
+      const splash = document.createElement("div");
+      splash.id = "splash";
+      document.body.append(splash);
+      // jsdom has no matchMedia: the person asked for reduced motion.
+      Object.defineProperty(window, "matchMedia", { configurable: true, value: (q: string) => ({ matches: q.includes("reduce") }) as MediaQueryList });
+      render(<App env={makeEnv().env} />);
+      // Reduced motion: removed at once (with motion it fades first, see splash.test.ts).
+      expect(document.getElementById("splash")).toBeNull();
+    });
+
+    it("until the daemon first answers, the orbiting dots say it is connecting; then the view", () => {
+      const h = makeEnv({ "daemon.status": STATUS });
+      render(<App env={h.env} />);
+      const waiting = screen.getByRole("status", { name: "Connecting to the Mirante daemon…" });
+      expect(waiting).toHaveAttribute("aria-live", "polite");
+      expect(waiting).toHaveTextContent("Connecting to the Mirante daemon…");
+      expect(waiting.querySelector("svg .orb-sats")).not.toBeNull();
+      // One message, not the banner too.
+      expect(screen.queryByRole("status", { name: "Daemon connection" })).toBeNull();
+      act(() => h.load([task("a", { repo_path: "/repos/shop" })]));
+      expect(screen.queryByRole("status", { name: "Connecting to the Mirante daemon…" })).toBeNull();
+      expect(screen.getByLabelText("Goal")).toBeInTheDocument();
+    });
+
+    it("in Portuguese too", async () => {
+      const h = makeEnv();
+      h.env.storage.setItem("mirante.lang", "pt");
+      render(<App env={h.env} />);
+      expect(screen.getByRole("status", { name: "Conectando ao daemon do Mirante…" })).toBeInTheDocument();
+    });
+
+    it("a reconnect after the first answer keeps the view and shows the banner", async () => {
+      const h = setup();
+      await act(async () => {});
+      act(() => h.env.cockpit.dispatch({ type: "disconnected", error: "no socket", retryMs: 3000 }));
+      expect(screen.queryByRole("status", { name: "Connecting to the Mirante daemon…" })).toBeNull();
+      expect(screen.getByLabelText("Goal")).toBeInTheDocument();
+    });
+  });
+
   it("while the daemon is down, dispatch is off and the banner counts down", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const h = setup();

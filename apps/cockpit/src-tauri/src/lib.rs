@@ -5,7 +5,9 @@
 //! plugin (github.com only, see `capabilities/default.json`), never in the window itself,
 //! and never in a window of their own: `window.open` / `target=_blank` are denied.
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine;
 use mirante_bridge::attach::{Attachments, Opened};
@@ -15,8 +17,9 @@ use mirante_ipc::Paths;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::webview::NewWindowResponse;
-use tauri::{AppHandle, Manager, State, Url, WebviewWindowBuilder, WindowEvent};
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
+use tauri::window::Color;
+use tauri::{AppHandle, Manager, State, Theme, Url, WebviewWindowBuilder, WindowEvent};
 
 /// Vite's dev server (`build.devUrl` in `tauri.conf.json`), loaded only by `tauri dev`.
 const DEV_ORIGIN: (&str, u16) = ("127.0.0.1", 1420);
@@ -31,6 +34,19 @@ fn is_app_url(url: &Url, dev: bool) -> bool {
         _ => false,
     }
 }
+
+/// The window's colour before the page paints: the app's `--bg` (`src/styles.css`, and the
+/// launch splash in `index.html`) for the system's theme. macOS paints no webview background of
+/// its own colour, hence the window also starts hidden (see `run`).
+fn backdrop(theme: Theme) -> Color {
+    match theme {
+        Theme::Dark => Color(0x0f, 0x12, 0x16, 0xff),
+        _ => Color(0xf6, 0xf7, 0xf9, 0xff),
+    }
+}
+
+/// The longest the window stays hidden waiting for its page (it shows on the first load).
+const SHOW_AT_THE_LATEST: Duration = Duration::from_secs(3);
 
 struct Cockpit {
     paths: Paths,
@@ -197,9 +213,28 @@ pub fn run() {
                 .find(|w| w.label == "main")
                 .cloned()
                 .ok_or("tauri.conf.json has no \"main\" window")?;
-            WebviewWindowBuilder::from_config(app.handle(), &config)?
+            // `visible: false` in tauri.conf.json: the window shows once its page has loaded
+            // (the launch splash in index.html is painted by then), never as a white rectangle;
+            // at the latest after SHOW_AT_THE_LATEST, whatever happened to the page.
+            let shown = Arc::new(AtomicBool::new(false));
+            let on_load = shown.clone();
+            let window = WebviewWindowBuilder::from_config(app.handle(), &config)?
                 .on_new_window(|_, _| NewWindowResponse::Deny)
+                .on_page_load(move |w, p| {
+                    if p.event() == PageLoadEvent::Finished && !on_load.swap(true, Ordering::SeqCst) {
+                        let _ = w.show();
+                    }
+                })
                 .build()?;
+            if let Ok(theme) = window.theme() {
+                let _ = window.set_background_color(Some(backdrop(theme)));
+            }
+            std::thread::spawn(move || {
+                std::thread::sleep(SHOW_AT_THE_LATEST);
+                if !shown.swap(true, Ordering::SeqCst) {
+                    let _ = window.show();
+                }
+            });
             Ok(())
         })
         .manage(Cockpit { paths, socket, stream: Mutex::new(None), attachments: Attachments::default() })
@@ -278,6 +313,17 @@ mod tests {
                 assert_eq!(serde_json::from_str::<Value>(&j).unwrap(), serde_json::json!({"type": "end"}))
             }
             InvokeResponseBody::Raw(_) => panic!("the end is JSON"),
+        }
+    }
+
+    #[test]
+    fn the_backdrop_is_the_app_background_of_each_theme() {
+        let page = include_str!("../../index.html");
+        for (theme, hex) in [(Theme::Dark, "#0f1216"), (Theme::Light, "#f6f7f9")] {
+            let Color(r, g, b, a) = backdrop(theme);
+            assert_eq!(format!("#{r:02x}{g:02x}{b:02x}"), hex);
+            assert_eq!(a, 0xff);
+            assert!(page.contains(&format!("--splash-bg: {hex}")), "{hex} is the splash's background too");
         }
     }
 
