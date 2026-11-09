@@ -40,7 +40,6 @@ class Mirante < Formula
     url "${base}/mirante-${version}-x86_64-apple-darwin.tar.gz"
     sha256 "${sha_intel}"
   end
-  version "${version}"
   license "Apache-2.0"
 
   livecheck do
@@ -67,7 +66,8 @@ class Mirante < Formula
 
       Homebrew installs mirante, mirante-daemon, mirante-hook and mirante-mcp together in its
       own prefix, so the daemon finds the hook and MCP server next to itself. After
-      \`brew upgrade mirante\`, run \`mirante daemon restart\` once no task is running.
+      \`brew upgrade sirus-alpha-canis/tap/mirante\`, run \`mirante daemon restart\` once
+      no task is running.
 
       The desktop app is not in Homebrew yet (it is unsigned). Build it from the repository
       with scripts/install.sh --app (needs rustup, Node 22.12+ and pnpm 10):

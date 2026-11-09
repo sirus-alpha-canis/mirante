@@ -92,7 +92,9 @@ mirante doctor
 
 This installs `mirante`, `mirante-daemon`, `mirante-hook` and `mirante-mcp` together into
 Homebrew's prefix (`/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on Intel). Upgrade
-with `brew upgrade mirante`, then `mirante daemon restart` once no task is running. Use
+with `brew upgrade sirus-alpha-canis/tap/mirante` (a plain `brew upgrade` includes it once
+you `brew trust --formula sirus-alpha-canis/tap/mirante`), then `mirante daemon restart`
+once no task is running. Use
 either Homebrew or `install.sh`, not both: if you used `install.sh` before, run
 `scripts/uninstall.sh` (it keeps `~/.mirante`) so only one copy is on your `PATH`. The
 tarballs and their `SHA256SUMS` are also on the
