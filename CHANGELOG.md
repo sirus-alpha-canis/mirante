@@ -8,6 +8,16 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ### Changed
 
+- **A calmer cockpit ("Observatório").** Surfaces instead of borders, color only for state
+  (amber needs you, cyan working, green ready), no brand accent, type 12/13/15/20, in light
+  and dark (following macOS). A 36px top bar (Home mark, where you are, quiet view tabs,
+  daemon health, what needs you, ⌘K) and a 24px status line (daemon, system memory, what
+  needs you, the view's keys). Cards are borderless with a 3px state stripe and one primary
+  action; labels and pills lose their borders. The composers lose their big buttons: one
+  field that grows from one line, a small send arrow inside it (quiet until there is text),
+  the context as plain-text tokens (`claude · shop · ⎇ branch`), a faint ⌘↵ hint; in a
+  task, the arrow steers and ⌥ queues. The terminal waits for its font before its first fit.
+
 - **Memory pressure no longer blocks work.** The memory guard is advisory by default: on
   macOS "warn" pressure (most of the time on a busy Mac) it no longer pauses new sessions,
   queued deliveries or auto-resume. It still shows the level, swap, what is available and

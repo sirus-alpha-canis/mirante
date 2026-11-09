@@ -89,7 +89,7 @@ const TaskList = memo(function TaskList({ selected, onSelect }: { selected: stri
         <input id="task-search" type="search" placeholder={tt("detail.search")} value={query} onChange={(e) => setQuery(e.target.value)} />
         <div className="filters" role="group" aria-label={tt("detail.filterTasks")}>
           {FILTERS.map((f) => (
-            <button key={f} type="button" className="tchip" aria-pressed={filter === f} onClick={() => setFilter(f)}>
+            <button key={f} type="button" className="token" aria-pressed={filter === f} onClick={() => setFilter(f)}>
               {tt(FILTER_KEY[f])} ({counts[f]})
             </button>
           ))}

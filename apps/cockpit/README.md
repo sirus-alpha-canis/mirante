@@ -140,18 +140,21 @@ stays in English whatever the interface's language.
 
 ## Dispatch
 
-Home's form is one box: write the goal, then use the chips below it. **Agent** (Claude or
+Home's form is one rounded field that grows with the goal; a small arrow inside it sends
+(⌘↵; quiet until there is text). Under it the context reads as plain-text tokens
+(`+ · claude · shop · ⎇ branch`), each opening its picker: **Agent** (Claude or
 Codex, remembered on this machine; more agents will join the menu), **Repository** (one of
 your Projects; it starts on the one selected on the left; type to filter), the branch (it
 appears once there is a goal: `mirante/<words-of-the-goal>`, accents dropped, about 40
 characters; a name another task of the repo uses, or one git already has, moves on to `-2`,
 `-3`…; **edit** to type your own, and an existing branch is then checked out as it is), and
-**+ context**: attach repo files (searched by path), repo memory notes or skills; they are
+**+** (Add context): attach repo files (searched by path), repo memory notes or skills; they are
 added after the goal as a labeled list of references for the agent ("Context attached in
 Mirante"), nothing else is read or sent. Files and notes belong to the repository they were
 picked in: a dispatch to another repository is refused until they are removed. The form
 (goal, attached context, edited branch, picked repository) is kept while you visit other
-views. While the memory guard pauses new sessions the form says so. Text starting with `@claude` or `@codex` is the one-line form. Only the agent is
+views. Under memory pressure a small gauge icon beside the "⌘↵" hint says so (its tooltip
+has the sentence); dispatching is never held back for it. Text starting with `@claude` or `@codex` is the one-line form. Only the agent is
 required: `@claude fix the login` goes to the repository selected in the toolbar on a branch
 named from the goal (`mirante/fix-the-login`, `-2`, `-3`… when taken). A second word that is
 a project's name (any case) picks that project (`@claude shop fix the login`), and
@@ -161,6 +164,20 @@ usable: the agent chip follows the `@` word (picking another rewrites it), the r
 chip is the one used unless the line names a project, and a hint shows where the task will
 go (`→ shop · ⎇ mirante/fix-the-login`, the branch editable). Typing `@` suggests the
 agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab picks, Esc closes).
+
+## Look
+
+Direction "Observatório": surfaces instead of borders (a frame, a reading surface, cards,
+a lift for what is active), color only for state (amber needs you, cyan working, green
+ready), no brand accent (the Orb-Dot mark is the identity), type 12/13/15/20. The theme
+follows macOS (◐ cycles system → light → dark). A 36px top bar holds the mark (Home), where
+you are (Home › project › task), the views, the daemon's health dot, what needs you (click:
+⌘J) and ⌘K; a 24px status line at the foot shows the daemon, system memory, what needs
+you and the keys of the current view. Tokens live at the top of `src/styles.css`;
+`styles.test.ts` checks their contrast (WCAG AA) in every theme.
+
+The UI asks for Inter and the terminal for JetBrains Mono (both SIL OFL 1.1), falling back
+to the system fonts; the font files are not bundled yet.
 
 ## Keys
 
@@ -176,7 +193,7 @@ agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab picks, Es
 | Esc | Leave a task's detail (back to the view it was opened from); in Rules opened from a task, back to that task |
 | ⇧⌘J | Theme: system → light → dark |
 | ⌘↵ | In Home's dispatch form: dispatch (Enter is a new line of the goal) |
-| ⌘↵ / ⌥↵ | In a task's composer: steer now / queue |
+| ⌘↵ / ⌥↵ | In a task's composer: steer now / queue (the arrow steers; ⌥-click queues) |
 
 Off macOS, ⌘ is Ctrl (the hints in the app name your platform's keys). Keys match their
 physical position, so they work on any keyboard layout; holding a key never repeats a

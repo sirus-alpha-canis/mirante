@@ -578,8 +578,8 @@ button.skill-chip:hover { color: var(--text); }
 .tasklist-tools { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
 .tasklist-tools input { border: none; border-radius: var(--r); height: 28px; padding: 0 var(--s2); background: var(--panel-2); }
 .filters { display: flex; gap: 2px; flex-wrap: wrap; }
-.filters .btn { background: none; color: var(--muted); }
-.filters .btn[aria-pressed="true"] { background: var(--panel-2); color: var(--text); font-weight: 600; }
+.filters .token { font-size: var(--fs-sm); padding: 2px 6px; }
+.filters .token[aria-pressed="true"] { background: var(--panel-2); color: var(--text); font-weight: 600; }
 .tasklist h3 { font-size: var(--fs-sm); color: var(--faint); font-weight: 600; margin: var(--s2) var(--s2) 2px; }
 .tasklist-project h2 { text-transform: none; letter-spacing: 0; }
 

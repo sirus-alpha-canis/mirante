@@ -176,9 +176,10 @@ More detail, including the fake daemon for UI work without agents:
 
 - **Projects.** Add a repository on the left with **Choose…** (the folder picker), or paste
   its path.
-- **Dispatch.** Home has one form. Write the goal, then pick the agent, the repository and
-  the branch with the chips below it. The branch defaults to `mirante/<words-of-the-goal>`,
-  and you can edit it. **+ contexto** attaches repo files, memory notes or skills. You can
+- **Dispatch.** Home has one field. Write the goal (the arrow inside the field, or ⌘↵,
+  sends), then pick the agent, the repository and the branch from the tokens under it. The
+  branch defaults to `mirante/<words-of-the-goal>`, and you can edit it. **+** attaches repo
+  files, memory notes or skills. You can
   also start the text with `@claude` or `@codex`: `@claude fix the login` uses the selected
   repository and names the branch for you; `@claude shop fix the login` picks a project by
   name; `@claude shop/feat/login fix the login` also names the branch. You never have to
@@ -189,7 +190,7 @@ More detail, including the fake daemon for UI work without agents:
 - **Detail.** Each task has four tabs. **Steps** shows tool steps summed up. **Terminal** is
   the live terminal. **Diff** shows the task's changes. **Memory** shows the repo notes
   relevant to the task, the notes its branch puts at risk, and what it proposed. The
-  composer steers now (⌘↵) or queues for the turn end (⌥↵).
+  composer's arrow steers now (⌘↵); ⌥-click or ⌥↵ queues for the turn end.
 - **Grid (⌘G)** shows every agent at once.
 - **Brain (⌘B)** is the repo memory graph and its review queue.
 - **Skills (⌘L)** lists the skill library and its proposals.
