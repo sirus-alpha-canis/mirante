@@ -139,8 +139,9 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .app { display: flex; flex-direction: column; height: 100%; }
 .topbar { display: flex; align-items: center; gap: var(--s2); height: 36px; flex: none; padding: 0 var(--s2) 0 var(--s2); background: var(--bg); }
 /* The mark is the Home button. */
-.brand-home { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; background: none; border: none; border-radius: var(--r); padding: 0; cursor: pointer; }
-.brand-home:hover, .brand-home[aria-pressed="true"] { background: var(--panel-2); }
+.brand-home { display: inline-flex; align-items: center; gap: 6px; height: 28px; background: none; border: none; border-radius: var(--r); padding: 0 8px 0 5px; cursor: pointer; color: var(--muted); }
+.brand-word { font-weight: 600; letter-spacing: 0.01em; }
+.brand-home:hover, .brand-home[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
 .brand-home .orb { width: 18px; height: 18px; overflow: visible; flex: none; }
 .orb-static .orb-ring { fill: none; stroke: var(--splash-dot); stroke-width: 2; stroke-dasharray: 3 5; opacity: 0.45; }
 .orb-static .orb-sats { fill: var(--splash-dot); stroke: var(--splash-dot); }

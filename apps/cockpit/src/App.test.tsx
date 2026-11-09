@@ -336,6 +336,23 @@ describe("App", () => {
     void h;
   });
 
+  it("the top bar says where you are, the daemon's health and what needs you; the status line the view's keys", async () => {
+    setup({}, [task("a", { status: "needs_you", repo_path: "/repos/shop" }), task("w", { status: "working" })]);
+    const crumbs = () => within(screen.getByRole("navigation", { name: "Where you are" })).getAllByRole("listitem");
+    expect(crumbs().map((c) => c.textContent)).toEqual(["Home"]);
+    expect(crumbs()[0]).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("img", { name: "Daemon running" })).toBeInTheDocument();
+    const badge = screen.getByRole("button", { name: /^Next/ });
+    expect(badge).toHaveTextContent("1 needs you");
+    const line = screen.getByRole("contentinfo", { name: "Status" });
+    expect(line).toHaveTextContent(/next · .*commands · .*dispatch/);
+    await userEvent.click(badge);
+    expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+    expect(crumbs().map((c) => c.textContent)).toEqual(["Home", "shop", "goal of a"]);
+    expect(crumbs()[2]).toHaveAttribute("aria-current", "page");
+    expect(line).toHaveTextContent(/steer · .*queue · Esc back/);
+  });
+
   it("⌘J waits while a form field is being typed in; with nothing waiting, the button is off", () => {
     setup({}, [task("w", { status: "working" })]);
     expect(screen.getByRole("button", { name: /^Next/ })).toBeDisabled();
@@ -532,9 +549,11 @@ describe("App", () => {
     });
     const rulesNav = () => within(screen.getByRole("navigation", { name: "Views" })).getByRole("button", { name: /^Rules/ });
 
-    it("is a top-level view: the nav button shows its chord and opens it for the selected project", async () => {
+    it("is a top-level view: the nav button's tooltip shows its chord; it opens it for the selected project", async () => {
       const h = setup({ "rules.layers": VIEW });
-      expect(rulesNav().querySelector("kbd")?.textContent).toMatch(/R$/);
+      // A quiet text tab: the chord is in its tooltip (and the status line), not on the tab.
+      expect(rulesNav().getAttribute("title")).toMatch(/R\)$/);
+      expect(rulesNav().querySelector("kbd")).toBeNull();
       await userEvent.click(rulesNav());
       expect(rulesNav()).toHaveAttribute("aria-pressed", "true");
       expect(await screen.findByRole("main", { name: "Rules" })).toBeInTheDocument();

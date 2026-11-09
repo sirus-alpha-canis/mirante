@@ -4,6 +4,7 @@ import { type ArchiveFailure, archiveTasks } from "../lib/archive";
 import { tn, useT } from "../lib/i18n";
 import type { RepoScan, TaskView } from "../lib/protocol";
 import { forgetRepos, hideRepos, type Registry, setCollapsed, showRepos } from "../lib/repos";
+import { projectColor } from "../lib/inbox";
 import { useDismiss } from "../lib/useDismiss";
 import { type Project, repoName } from "../store/select";
 import { same, type State } from "../store/state";
@@ -268,7 +269,10 @@ function ProjectRow(props: {
             title={p.path}
             onClick={() => props.onSelect(p.path)}
           >
-            <span>{p.name}</span>
+            <span className="rail-name">
+              <span className={`pdot proj-${projectColor(p.path)}`} aria-hidden="true" />
+              {p.name}
+            </span>
             {p.hidden && <span className="muted small">{tr("rail.hidden")}</span>}
             {p.needsYou > 0 && (
               <>

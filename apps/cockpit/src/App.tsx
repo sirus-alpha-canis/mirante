@@ -8,10 +8,11 @@ import { RulesPage } from "./components/Rules";
 import { Skills } from "./components/Skills";
 import { OrbMark, Splash } from "./components/Splash";
 import { UpdateBanner } from "./components/Restart";
+import { daemonState, StatusLine } from "./components/StatusLine";
 import { dismissSplash } from "./lib/splash";
 import { type Env, EnvContext } from "./env";
 import { type ComposerForm, EMPTY_FORM } from "./components/DispatchComposer";
-import { type Lang, LANGS, LangContext, loadLang, saveLang, setLang, t as tr, useT } from "./lib/i18n";
+import { type Lang, LANGS, LangContext, loadLang, saveLang, setLang, t as tr, tn, useT } from "./lib/i18n";
 import { notificationsFor, shouldNotify } from "./lib/notify";
 import { useNow } from "./lib/useNow";
 import { needingOrder, nextNeeding } from "./lib/inbox";
@@ -22,7 +23,7 @@ import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, saveTheme, type Theme } from "./lib/theme";
 import { type DetailTab, loadUi, saveUi } from "./lib/uistate";
 import { useCockpitSelect } from "./store/cockpit";
-import { gridTasks, needsYou, newlyNeedingYou, type Project, projects } from "./store/select";
+import { gridTasks, needsYou, newlyNeedingYou, type Project, projects, repoName } from "./store/select";
 import { safeStorage, shallow, useSelect } from "./env";
 import { type Connection, same, type State } from "./store/state";
 
@@ -580,6 +581,23 @@ export function App({ env: given }: { env: Env }) {
     [leave],
   );
   const closePalette = useCallback(() => setPalette(false), []);
+  // Where the person is: Home › project › task (or the view).
+  // One string (repo, then title): App renders when they change, not on every event of the task.
+  const shownTask = useCockpitSelect(
+    env.cockpit,
+    useCallback((s: State) => {
+      const x = taskId ? s.tasks[taskId] : undefined;
+      return x ? `${x.repo_path}\n${x.title}` : "";
+    }, [taskId]),
+  );
+  const crumbs: string[] = [t("nav.home")];
+  if (mode === "detail" && shownTask) {
+    const [repo, ...title] = shownTask.split("\n");
+    crumbs.push(repoName(repo), title.join("\n"));
+  }
+  else if ((mode === "brain" || mode === "rules") && current) crumbs.push(repoName(current), t(mode === "brain" ? "nav.brain" : "nav.rules"));
+  else if (mode === "grid" || mode === "skills") crumbs.push(t(mode === "grid" ? "nav.grid" : "nav.skills"));
+  const daemon = daemonState(connection);
   const consumedReturn = useCallback(() => setReturnTo(null), []);
 
   return (
@@ -588,7 +606,7 @@ export function App({ env: given }: { env: Env }) {
         <UpdateContext.Provider value={update}>
           <div className="app">
             <header className="topbar">
-              {/* The brand is the way Home (⌘1). */}
+              {/* The mark is the way Home (⌘1). */}
               <button
                 className="brand-home"
                 aria-label={t("nav.home")}
@@ -597,61 +615,74 @@ export function App({ env: given }: { env: Env }) {
                 onClick={goHome}
               >
                 <OrbMark still />
-                <span aria-hidden="true">Mirante</span>
+                <span className="brand-word" aria-hidden="true">
+                  Mirante
+                </span>
               </button>
+              <nav aria-label={t("top.breadcrumb")}>
+                <ol className="crumbs">
+                  {crumbs.map((c, i) => (
+                    <li key={i} aria-current={i === crumbs.length - 1 ? "page" : undefined} title={c}>
+                      {c}
+                    </li>
+                  ))}
+                </ol>
+              </nav>
               <nav aria-label={t("nav.views")} className="modes">
                 <button aria-pressed={mode === "detail"} disabled={!taskId} onClick={() => setMode("detail")}>
                   {t("nav.detail")}
                 </button>
-                <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
-                  {t("nav.grid")} <kbd>{hints.grid}</kbd>
+                <button aria-pressed={mode === "grid"} onClick={toggleGrid} title={`${t("nav.grid")} (${hints.grid})`}>
+                  {t("nav.grid")}
                 </button>
-                <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
-                  {t("nav.brain")} <kbd>{hints.brain}</kbd>
+                <button aria-pressed={mode === "brain"} onClick={toggleBrain} title={`${t("nav.brain")} (${hints.brain})`}>
+                  {t("nav.brain")}
                 </button>
-                <button aria-pressed={mode === "skills"} onClick={goSkills}>
-                  {t("nav.skills")} <kbd>{hints.skills}</kbd>
+                <button aria-pressed={mode === "skills"} onClick={goSkills} title={`${t("nav.skills")} (${hints.skills})`}>
+                  {t("nav.skills")}
                 </button>
-                <button aria-pressed={mode === "rules"} onClick={toggleRules}>
-                  {t("nav.rules")} <kbd>{hints.rules}</kbd>
+                <button aria-pressed={mode === "rules"} onClick={toggleRules} title={`${t("nav.rules")} (${hints.rules})`}>
+                  {t("nav.rules")}
                 </button>
               </nav>
-              <button
-                className="btn btn-small next"
-                disabled={needing.length === 0}
-                onClick={goNext}
-                title={needing.length === 0 ? t("next.none") : t("next.title", { key: hints.next })}
-                aria-label={needing.length === 0 ? t("next.ariaNone") : t("next.aria", { at: Math.max(next.at, 1), n: needing.length })}
-              >
-                {t("next.label")} <kbd>{hints.next}</kbd>
-                {needing.length > 0 && (
-                  <span className="muted small">
-                    {" "}
-                    · {t("next.position", { at: next.at > 0 ? next.at : "–", n: needing.length })}
-                  </span>
-                )}
-              </button>
-              <button className="btn btn-small" onClick={() => setPalette(true)}>
-                {t("top.commands")} <kbd>{hints.palette}</kbd>
-              </button>
-              <button
-                className="btn btn-small"
-                onClick={() => setTheme(nextTheme)}
-                aria-label={t("theme.label", { theme: themeName(theme) })}
-                title={`${t("theme.label", { theme: themeName(theme) })} (${hints.theme})`}
-              >
-                <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
-              </button>
-              <label className="sr-only" htmlFor="lang">
-                {t("lang.label")}
-              </label>
-              <select id="lang" className="lang" value={lang} onChange={(e) => changeLang(e.target.value as Lang)} title={t("lang.label")}>
-                {LANGS.map((l) => (
-                  <option key={l} value={l}>
-                    {l === "en" ? "EN · English" : "PT · Português"}
-                  </option>
-                ))}
-              </select>
+              <div className="top-right">
+                <span className="health" role="img" aria-label={t(daemon.top)} title={t(daemon.top)}>
+                  <span className={`dot ${daemon.dot}`} />
+                </span>
+                {/* What needs you, and the way to it (⌘J: the next one). */}
+                <button
+                  className="needs-badge"
+                  disabled={needing.length === 0}
+                  onClick={goNext}
+                  title={needing.length === 0 ? t("next.none") : t("next.title", { key: hints.next })}
+                  aria-label={needing.length === 0 ? t("next.ariaNone") : t("next.aria", { at: Math.max(next.at, 1), n: needing.length })}
+                >
+                  {needing.length > 0 && <span className="dot dot-needs" aria-hidden="true" />}
+                  {needing.length === 0 ? t("top.needsNone") : tn(needing.length, "top.needsOne", "top.needsMany")}
+                  {needing.length > 0 && <span className="needs-at"> · {t("next.position", { at: next.at > 0 ? next.at : "–", n: needing.length })}</span>}
+                </button>
+                <button className="icon-btn" onClick={() => setPalette(true)} aria-label={t("top.commands")} title={`${t("top.commands")} (${hints.palette})`}>
+                  <kbd>{hints.palette}</kbd>
+                </button>
+                <button
+                  className="icon-btn"
+                  onClick={() => setTheme(nextTheme)}
+                  aria-label={t("theme.label", { theme: themeName(theme) })}
+                  title={`${t("theme.label", { theme: themeName(theme) })} (${hints.theme})`}
+                >
+                  <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
+                </button>
+                <label className="sr-only" htmlFor="lang">
+                  {t("lang.label")}
+                </label>
+                <select id="lang" className="lang" value={lang} onChange={(e) => changeLang(e.target.value as Lang)} title={`${t("lang.label")}: ${t(lang === "en" ? "lang.en" : "lang.pt")}`}>
+                  {LANGS.map((l) => (
+                    <option key={l} value={l}>
+                      {l.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </header>
             {/* Until the daemon first answers, the launch splash's mark says so (not an empty view). */}
             {waiting ? <Splash text={t("conn.connecting")} /> : <ConnectionBanner connection={connection} env={env} />}
@@ -694,6 +725,7 @@ export function App({ env: given }: { env: Env }) {
             {!waiting && mode === "rules" && (
               <RulesPage projects={projs} project={current} task={rulesTask} onProject={rulesProject} onTask={setRulesTask} />
             )}
+            {!waiting && <StatusLine connection={connection} status={status} needing={needing.length} view={mode} hints={hints} mac={mac} />}
             {palette && <Palette base={baseCommands} inlineAnswers={inlineAnswers} onOpen={open} onClose={closePalette} onDispatch={onDispatchText} />}
           </div>
         </UpdateContext.Provider>

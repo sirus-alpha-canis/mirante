@@ -273,8 +273,10 @@ export function LeftRail(props: {
         ))}
       </ul>
       {props.onSkills && <SkillsEntry onOpen={props.onSkills} />}
-      <MemoryPanel status={props.status} onOpen={(id) => props.onOpen(id)} />
-      <SessionSettings status={props.status} />
+      <div className="rail-foot">
+        <MemoryPanel status={props.status} onOpen={(id) => props.onOpen(id)} />
+        <SessionSettings status={props.status} />
+      </div>
     </nav>
   );
 }
