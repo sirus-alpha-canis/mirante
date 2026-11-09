@@ -315,6 +315,25 @@ again before each injection. Details:
 [`docs/plans/2026-11-08-plan-5-evolving-skills.md`](docs/plans/2026-11-08-plan-5-evolving-skills.md),
 [`docs/dogfood/skills.md`](docs/dogfood/skills.md).
 
+## See what your agents are told
+
+Every agent session reads more than your goal: an organization's managed policy, your
+global `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md`, the project's `CLAUDE.md` /
+`AGENTS.md` and their `@imports`, rules folders, settings (permissions, hooks), skills,
+Claude's auto memory, and what Mirante itself adds per task (launch mode, injected skills,
+the repo-memory tools, the operator-message label). In the app, **Brain → Rules** lists
+all of them for a repo, for Claude or Codex, in the order the agent loads them: scope,
+path, size, contents as plain text, imports you can expand, and the places where rules
+could live but do not (greyed). From a task, **Rules this agent received** shows the same
+for that task's worktree and session. It works with repo memory off.
+
+It is read-only: Mirante never writes to `~/.claude`, `~/.codex` or your files. It reads
+only inside your home folder, the project and the managed folders, never a FIFO or device,
+at most 64 KiB per file; files that usually hold credentials are never shown, and secrets
+in settings (`env` values, tokens) are masked. The loading rules, with the agent versions
+they were checked against and their sources:
+[`docs/agents/instruction-layers.md`](docs/agents/instruction-layers.md).
+
 ## Architecture
 
 ```

@@ -53,6 +53,11 @@ app are version 0.1.0 until the first release.
 - `scripts/install.sh --install-app` copies the built app to `/Applications` (an older copy
   is replaced after you confirm, or with `--yes`); its next steps suggest `mirante app`.
 - `mirante --verbose` keeps the daemon's error codes in error messages.
+- **Brain → Rules** and a task's **Rules this agent received**: every instruction layer a
+  Claude or Codex session reads (managed, global, project, local, nested, and what Mirante
+  adds), with contents as plain text, `@imports`, settings with secrets masked, and missing
+  places greyed; read-only, works with repo memory off. Daemon: `rules.layers` (a person
+  only). Loading rules: `docs/agents/instruction-layers.md`.
 - README: Quickstart, Troubleshooting, Uninstall and an Environment reference;
   `SECURITY.md`; issue templates; Dependabot and `cargo deny` in CI.
 
