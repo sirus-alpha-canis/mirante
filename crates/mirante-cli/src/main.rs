@@ -933,8 +933,19 @@ fn run(cmd: Cmd) -> Res {
             boot_flow(&mut c, r, trust)?;
         }
         Cmd::Doctor { kill: None } => {
-            let d: DoctorReport = client(&paths)?.call(method::DAEMON_DOCTOR, json!({}))?;
+            let mut c = client(&paths)?;
+            let d: DoctorReport = c.call(method::DAEMON_DOCTOR, json!({}))?;
             print!("{}", render::doctor_report(&d));
+            // A running daemon older than the binary `mirante` would start (best effort).
+            if let (Ok(s), Ok(bin)) =
+                (c.call::<DaemonStatus>(method::DAEMON_STATUS, json!({})), daemon_ctl::daemon_bin())
+            {
+                let line = daemon_ctl::binary_version(&bin, daemon_ctl::VERSION_TIMEOUT)
+                    .and_then(|disk| daemon_ctl::outdated_line(&s, &bin, &disk));
+                if let Some(line) = line {
+                    print!("{line}");
+                }
+            }
         }
         Cmd::Doctor { kill: Some(pid) } => {
             let mut c = client(&paths)?;

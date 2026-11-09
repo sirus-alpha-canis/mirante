@@ -148,7 +148,8 @@ More detail, including the fake daemon for UI work without agents:
   and you can edit it. **+ contexto** attaches repo files, memory notes or skills. The
   one-line form `@claude shop/feat/login add a login page` works too. ⌘↵ dispatches.
 - **Home** is an inbox across all projects: what needs you first, then what is ready to
-  review, then what is working. **⌘J** jumps to the next task that needs you.
+  review, then what is working. The Mirante logo at the top left (or **⌘1**) brings you
+  back to it. **⌘J** jumps to the next task that needs you.
 - **Detail.** Each task has four tabs. **Steps** shows tool steps summed up. **Terminal** is
   the live terminal. **Diff** shows the task's changes. **Memory** shows the repo notes
   relevant to the task, the notes its branch puts at risk, and what it proposed. The
@@ -159,6 +160,11 @@ More detail, including the fake daemon for UI work without agents:
 - **⌘K** opens the command bar: tasks, projects, and `@agent repo/branch goal`.
 
 Closing the app never ends a session, because the daemon owns them. Off macOS, ⌘ is Ctrl.
+
+After an update the old daemon keeps running until it restarts. The app notices (the
+daemon's build differs from the `mirante-daemon` binary on disk) and offers **Restart
+daemon**; views the old daemon cannot serve offer the same button. Live sessions come back
+on their conversations when auto-resume is on.
 
 ### The CLI
 
@@ -209,6 +215,9 @@ mirante app                     # open the desktop app (starts the daemon first;
   queued deliveries under memory pressure; they resume when it eases. Tune it with
   `MIRANTE_MEM_BUDGET_MB` (per-session budget), `MIRANTE_IDLE_HIBERNATE_MIN` (hibernate
   idle sessions) or turn it off with `MIRANTE_MEMGUARD=off`, then restart the daemon.
+- **"This daemon cannot … Update Mirante to use it."** The daemon running is older than
+  the one installed (`mirante doctor` says so: "restart with: mirante daemon restart"). Run
+  `mirante daemon restart`, or click **Restart daemon** in the app.
 - **"socket path is N bytes, limit is 103".** Unix socket paths are short:
   `MIRANTE_HOME` must be a short directory (for experiments, `/tmp/mh`).
 - **"… is not a git repository" / "has no commit yet".** A task's worktree is a branch of a

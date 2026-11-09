@@ -43,6 +43,12 @@ no window of its own). Keep `mirante watch` open in a terminal the first day to 
       (960×600) and at full screen.
 - [ ] `mirante daemon restart` while the app is open: the banner shows, then the app
       reconnects by itself; tasks and their Steps are intact (no duplicate lines).
+- [ ] The top bar's Orb-Dot mark + "Mirante" is the Home button (pressed on Home; ⌘1 too);
+      there is no separate Home tab.
+- [ ] After an update (`scripts/install.sh` with the old daemon still running): a banner says
+      "Mirante was updated — restart the daemon…"; **Restart daemon** brings the new one up and
+      the banner goes; live sessions come back (auto-resume on). `mirante doctor` says
+      "restart with: mirante daemon restart" until then.
 - [ ] Quit and reopen the app: it reopens where you were (view, project, open task and tab);
       every task, its steps and pending permission cards are back.
 
@@ -123,7 +129,8 @@ no window of its own). Keep `mirante watch` open in a terminal the first day to 
 - [ ] **Hibernate** on an idle task: the process ends, the task shows "hibernated";
       **Wake** resumes the same conversation (ask about something from before it slept).
 - [ ] Follow `docs/dogfood/memory-stress.md` §B with the app open: the pressure level and the
-      "hibernate suggested" notice appear in the panel.
+      "hibernate suggested" notice appear in the panel (one muted line); once pressure is
+      normal the suggestion goes, and after 10 minutes only **History** keeps the notices.
 
 ## H. Look and feel
 

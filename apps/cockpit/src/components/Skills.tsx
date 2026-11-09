@@ -28,6 +28,7 @@ import {
 import { usePendingSkills, useSkillsVersion } from "../lib/useSkills";
 import { SkillProposals } from "./SkillProposals";
 import { ErrorRetry } from "./ErrorRetry";
+import { Unsupported } from "./Restart";
 
 const KIND_ORDER = { personal: 0, org: 1, repo: 2 } as const;
 
@@ -343,7 +344,7 @@ export function Skills({ reviewNonce = 0 }: { reviewNonce?: number }) {
 
   let body: React.ReactNode;
   if (lib.state === "loading") body = <p className="muted">{t("skills.loadingLibrary")}</p>;
-  else if (lib.state === "unavailable") body = <p className="muted">{t("skills.predates")}</p>;
+  else if (lib.state === "unavailable") body = <Unsupported text={t("skills.predates")} />;
   else if (lib.state === "error") body = <ErrorRetry text={t("skills.libUnavailable", { error: lib.error })} onRetry={reload} />;
   else
     body = (

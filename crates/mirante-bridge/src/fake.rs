@@ -21,6 +21,8 @@ struct Shared {
     open: Vec<UnixStream>,
     dna: crate::fake_dna::DnaDemo,
     skills: crate::fake_skills::SkillsDemo,
+    /// Removed on `daemon.shutdown` (nothing answers there any more).
+    socket: PathBuf,
 }
 
 #[derive(Clone)]
@@ -34,7 +36,11 @@ impl FakeDaemon {
     pub fn start(socket: &Path) -> FakeDaemon {
         let _ = std::fs::remove_file(socket);
         let listener = UnixListener::bind(socket).expect("bind fake daemon socket");
-        let shared = Arc::new(Mutex::new(Shared { boot_id: "boot-1".into(), ..Default::default() }));
+        let shared = Arc::new(Mutex::new(Shared {
+            boot_id: "boot-1".into(),
+            socket: socket.to_path_buf(),
+            ..Default::default()
+        }));
         let s = shared.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
@@ -150,6 +156,10 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
                 "available": 7_730_941_132u64, "swap_used": 0, "swap_total": 0, "paused": false,
                 "kernel_level": "normal", "kernel_source": "macos"},
         })),
+        method::DAEMON_SHUTDOWN => {
+            let _ = std::fs::remove_file(&s.socket);
+            Ok(json!({}))
+        }
         method::TASK_LIST => Ok(Value::Array(s.tasks.clone())),
         method::TASK_GET => s
             .tasks

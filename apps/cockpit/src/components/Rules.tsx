@@ -9,6 +9,7 @@ import { DaemonError } from "../lib/daemon";
 import { type Key, useT } from "../lib/i18n";
 import { type AgentKind, M, type RuleImport, type RuleLayer, type RuleScope, type RulesView, RpcCode } from "../lib/protocol";
 import { ErrorRetry } from "./ErrorRetry";
+import { Unsupported } from "./Restart";
 
 export type RulesAt = { repo: string } | { task: string };
 
@@ -137,7 +138,7 @@ export function Rules({ at, agent: initial }: { at: RulesAt; agent?: AgentKind }
 
   let body: React.ReactNode;
   if (loaded.state === "loading") body = <p className="muted">{t("rules.loading")}</p>;
-  else if (loaded.state === "unavailable") body = <p className="muted">{t("rules.unavailable")}</p>;
+  else if (loaded.state === "unavailable") body = <Unsupported text={t("rules.unavailable")} />;
   else if (loaded.state === "error") body = <ErrorRetry text={t("rules.error", { error: loaded.error })} onRetry={() => setNonce((n) => n + 1)} />;
   else {
     const { view } = loaded;

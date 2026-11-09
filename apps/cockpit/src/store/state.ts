@@ -49,6 +49,8 @@ export interface Perm {
 
 export interface MemoryNotice {
   seq: number;
+  /** When the daemon said it (ms since the epoch). */
+  ts: number;
   task_id: string | null;
   kind: string;
   text: string;
@@ -501,7 +503,7 @@ function keepSame<T>(prev: Record<string, T>, next: Record<string, T>): Record<s
 
 function memoryNotice(e: DaemonEvent): MemoryNotice {
   const m = memoryMsg(e.kind, e.payload ?? {});
-  return { seq: e.seq, task_id: e.task_id, kind: e.kind, text: describeMemoryEvent(e.kind, e.payload ?? {}), ...(m ? { msg: m } : {}) };
+  return { seq: e.seq, ts: e.ts_ms, task_id: e.task_id, kind: e.kind, text: describeMemoryEvent(e.kind, e.payload ?? {}), ...(m ? { msg: m } : {}) };
 }
 
 export function reduce(s: State, a: Action): State {

@@ -88,7 +88,16 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 
 .app { display: flex; flex-direction: column; height: 100%; }
 .topbar { display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.brand { font-weight: 700; letter-spacing: 0.02em; }
+/* The brand is the Home button: the Orb-Dot mark (still) and the wordmark. */
+.brand-home { display: inline-flex; align-items: center; gap: 6px; background: none; border: 1px solid transparent; border-radius: 6px; padding: 3px 8px 3px 4px; cursor: pointer; font: inherit; color: inherit; font-weight: 700; letter-spacing: 0.02em; }
+.brand-home[aria-pressed="true"] { border-color: var(--line); background: var(--panel-2); }
+.brand-home .orb { width: 20px; height: 20px; overflow: visible; flex: none; }
+.orb-static .orb-ring { fill: none; stroke: var(--splash-dot); stroke-width: 2; stroke-dasharray: 3 5; opacity: 0.45; }
+.orb-static .orb-sats { fill: var(--splash-dot); stroke: var(--splash-dot); }
+.orb-static .orb-sats line { stroke-width: 1; }
+.orb-static .orb-halo { fill: var(--splash-dot); opacity: 0.18; }
+.orb-static .orb-core { fill: var(--splash-core); }
+.banner-update { background: var(--panel-2); }
 .modes { display: flex; gap: 4px; margin-right: auto; }
 .modes button { background: none; border: 1px solid transparent; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
 .modes button[aria-pressed="true"] { border-color: var(--line); background: var(--panel-2); }
@@ -195,6 +204,9 @@ kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: 
 
 .memory { margin-top: 16px; border-top: 1px solid var(--line); }
 .mem-list, .mem-notices { list-style: none; padding: 0; margin: 6px 0; }
+.mem-latest { margin: 6px 0 2px; }
+.mem-history summary { cursor: pointer; margin: 2px 0; }
+.mem-history .mem-notices li { margin: 2px 0; }
 .mem-list li { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 2px 0; }
 .mem-soft .mem-name { color: var(--needs); }
 .mem-hard .mem-name { color: var(--danger); }

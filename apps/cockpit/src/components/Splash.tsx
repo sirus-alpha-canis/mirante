@@ -1,8 +1,9 @@
 /** The Orb-Dot mark with its orbiting satellites: the launch splash's (index.html, whose
- * <style> holds these classes and their animation; still with reduced motion). */
-export function OrbMark() {
+ * <style> holds these classes and their animation; still with reduced motion). `still`:
+ * the same mark without motion (the top bar's, styled in styles.css). */
+export function OrbMark({ still = false }: { still?: boolean }) {
   return (
-    <svg className="orb" viewBox="0 0 80 80" aria-hidden="true">
+    <svg className={still ? "orb orb-static" : "orb"} viewBox="0 0 80 80" aria-hidden="true">
       <circle className="orb-ring" cx="40" cy="40" r="28" />
       <g className="orb-sats">
         <line x1="40" y1="40" x2="40" y2="12" opacity="0.25" />

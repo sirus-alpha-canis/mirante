@@ -10,6 +10,7 @@ import { turnsEnded } from "../store/select";
 import { NoteView, StatePill } from "./NoteView";
 import { ErrorRetry } from "./ErrorRetry";
 import { t as tr, tn, useT } from "../lib/i18n";
+import { Unsupported } from "./Restart";
 
 export type TaskMemory =
   | { state: "loading" }
@@ -193,7 +194,7 @@ export function MemoryTab({ t, mem, reload, version }: { t: TaskView; mem: TaskM
   const tt = useT();
   const [open, setOpen] = useState<string | null>(null);
   if (mem.state === "loading") return <p className="muted">{tt("brain.loading")}</p>;
-  if (mem.state === "unavailable") return <p className="muted">{tt("brain.unavailable")}</p>;
+  if (mem.state === "unavailable") return <Unsupported text={tt("brain.unavailable")} />;
   if (mem.state === "error") return <ErrorRetry text={tt("brain.error", { error: mem.error })} onRetry={reload} />;
   const { ctx } = mem;
   if (!ctx.enabled) return <EnableMemory repo={t.repo_path} onEnabled={reload} />;

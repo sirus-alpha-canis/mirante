@@ -820,6 +820,7 @@ impl Hub {
             claude_inline_answers: self.claude_inline_answers(),
             auto_resume: Some(self.auto_resume_enabled()),
             auto_resume_forced_off: self.auto_resume_forced_off().then_some(true),
+            build: Some(env!("MIRANTE_BUILD").to_string()),
         }
     }
 }

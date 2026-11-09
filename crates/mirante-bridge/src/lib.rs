@@ -7,7 +7,8 @@
 //! - [`stream`]: `events.subscribe` in a thread that reconnects and resumes with
 //!   `since_seq` + `boot_id`.
 //! - [`attach`]: a task's live terminal as raw bytes both ways.
-//! - [`daemon`]: finding and starting `mirante-daemon`.
+//! - [`daemon`]: finding, starting and restarting `mirante-daemon`, and asking the binary
+//!   its build.
 //! - [`login_env`]: the login shell's PATH and `MIRANTE_*` for a daemon the app starts.
 pub mod attach;
 pub mod daemon;

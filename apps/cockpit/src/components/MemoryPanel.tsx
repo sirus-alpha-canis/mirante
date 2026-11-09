@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { shallow, useEnv, useLive, useSelect } from "../env";
 import { feedText, type FeedMsg, same, type State } from "../store/state";
 import { useT } from "../lib/i18n";
+import { useNow } from "../lib/useNow";
 import { DaemonError } from "../lib/daemon";
 import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
 import type { DaemonStatus, TaskView } from "../lib/protocol";
@@ -86,13 +87,33 @@ function selectHeavy(s: State): TaskView[] {
     .slice(0, 5);
 }
 
-/** The latest three memory-guard notices, newest first, with their task's branch. */
-function selectNotices(s: State): { seq: number; text: string; msg?: FeedMsg; branch: string | null }[] {
-  return s.memory
-    .slice(-3)
-    .reverse()
-    .map((n) => ({ seq: n.seq, text: n.text, msg: n.msg, branch: n.task_id ? (s.tasks[n.task_id]?.branch ?? null) : null }));
+/** A notice stays on the panel's one line this long; older ones are only in its history. */
+export const NOTICE_FRESH_MS = 10 * 60_000;
+
+interface Notice {
+  seq: number;
+  ts: number;
+  kind: string;
+  text: string;
+  msg?: FeedMsg;
+  branch: string | null;
 }
+
+/** The memory-guard notices kept (the last 20), newest first, with their task's branch. */
+function selectNotices(s: State): Notice[] {
+  return s.memory
+    .slice()
+    .reverse()
+    .map((n) => ({ seq: n.seq, ts: n.ts, kind: n.kind, text: n.text, msg: n.msg, branch: n.task_id ? (s.tasks[n.task_id]?.branch ?? null) : null }));
+}
+
+/** The one notice worth a line now: the newest of the last [`NOTICE_FRESH_MS`], skipping a
+ * hibernate suggestion once pressure is back to normal (or unknown). */
+export function latestNotice<N extends { ts: number; kind: string }>(newestFirst: N[], now: number, elevated: boolean): N | null {
+  return newestFirst.find((n) => now - n.ts <= NOTICE_FRESH_MS && (n.kind !== "memory.offer_hibernate" || elevated)) ?? null;
+}
+
+const noticeLine = (n: Notice) => `${n.branch ? `${n.branch}: ` : ""}${feedText(n)}`;
 
 /** The daemon's memory guard: machine pressure, the heaviest sessions, the latest notices. */
 export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; onOpen?(taskId: string): void }) {
@@ -101,6 +122,8 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
   const heavy = useSelect(selectHeavy, shallow);
   const notices = useSelect(selectNotices, same);
   const sys = systemMemory(status);
+  const now = useNow(30_000);
+  const latest = latestNotice(notices, now, sys?.level === "elevated" || sys?.level === "critical");
   return (
     <section className="memory" aria-label={t("mem.guard")}>
       <h2>{t("mem.heading")}</h2>
@@ -136,15 +159,18 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
           })}
         </ul>
       )}
+      {latest && <p className="small muted mem-latest">{noticeLine(latest)}</p>}
       {notices.length > 0 && (
-        <ul className="mem-notices" aria-label={t("mem.notices")}>
-          {notices.map((n) => (
-            <li key={n.seq} className="small">
-              {n.branch ? `${n.branch}: ` : ""}
-              {feedText(n)}
-            </li>
-          ))}
-        </ul>
+        <details className="mem-history">
+          <summary className="small muted">{t("mem.history", { n: notices.length })}</summary>
+          <ul className="mem-notices" aria-label={t("mem.notices")}>
+            {notices.map((n) => (
+              <li key={n.seq} className="small muted">
+                {noticeLine(n)}
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
     </section>
   );

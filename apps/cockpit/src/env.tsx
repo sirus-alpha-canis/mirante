@@ -1,6 +1,7 @@
 // What components need from the outside world, injected so tests can fake it.
 import { createContext, useContext } from "react";
 import type { Note } from "./lib/notify";
+import type { DaemonBinary } from "./lib/protocol";
 import type { Cockpit } from "./store/cockpit";
 import { useCockpitSelect } from "./store/cockpit";
 import type { State } from "./store/state";
@@ -12,6 +13,10 @@ export interface Env {
   storage: Pick<Storage, "getItem" | "setItem">;
   openUrl(url: string): Promise<void>;
   startDaemon(): Promise<void>;
+  /** What the daemon binary the app would start says it is; null when it cannot tell. */
+  daemonBinaryBuild(): Promise<DaemonBinary | null>;
+  /** Stops the running daemon and starts the one on disk. Rejects with a message. */
+  restartDaemon(): Promise<void>;
   /** Native notification (already decided: what it says, and that it is not on screen). */
   notify(n: Note): void;
   /** The native folder picker (one folder); null when cancelled. */

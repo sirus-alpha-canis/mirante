@@ -138,6 +138,15 @@ export interface DaemonStatus {
   auto_resume?: boolean | null;
   /** `MIRANTE_AUTO_RESUME=off` keeps auto-resume off for this daemon (absent when not). */
   auto_resume_forced_off?: boolean | null;
+  /** The daemon's build (`<commit>[-dirty].<unix seconds>`); absent from older daemons. */
+  build?: string | null;
+}
+
+/** What the daemon binary on disk says it is (`mirante-daemon --version`). */
+export interface DaemonBinary {
+  version: string;
+  /** Absent from binaries older than build ids. */
+  build?: string | null;
 }
 
 /** `daemon.settings`. */

@@ -556,6 +556,19 @@ pub struct DaemonStatus {
     /// setting then does not apply until it restarts without it). Absent when not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_resume_forced_off: Option<bool>,
+    /// The daemon's build (`<commit>[-dirty].<unix seconds>`, as `mirante-daemon --version`
+    /// prints it): a newer binary on disk has another one. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+}
+
+/// What `mirante-daemon --version` says: its version, and its build (absent from older
+/// binaries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonBinary {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 /// `repo.files` parameters.

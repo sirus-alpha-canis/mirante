@@ -15,6 +15,7 @@ import { ReviewQueue } from "./ReviewQueue";
 import { ErrorRetry } from "./ErrorRetry";
 import { Rules } from "./Rules";
 import { type Key, t as tr, tn, useT } from "../lib/i18n";
+import { Unsupported } from "./Restart";
 
 const W = 820;
 const H = 540;
@@ -302,7 +303,7 @@ export function Brain({ repo, reviewNonce = 0 }: { repo: string | null; reviewNo
 
   let body: React.ReactNode;
   if (loaded.state === "loading") body = <p className="muted">{t("brain.loading")}</p>;
-  else if (loaded.state === "unavailable") body = <p className="muted">{t("brain.unavailable")}</p>;
+  else if (loaded.state === "unavailable") body = <Unsupported text={t("brain.unavailable")} />;
   else if (loaded.state === "error") body = <ErrorRetry text={t("brain.error", { error: loaded.error })} onRetry={() => setNonce((n) => n + 1)} />;
   else if (loaded.state === "off") body = <EnableMemory repo={repo} onEnabled={() => setNonce((n) => n + 1)} />;
   else if (shown) {

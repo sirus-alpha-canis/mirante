@@ -20,7 +20,10 @@ pnpm --dir apps/cockpit install
 pnpm --dir apps/cockpit tauri dev
 ```
 
-If no daemon is running, the banner offers **Start daemon**.
+If no daemon is running, the banner offers **Start daemon**. If the daemon running is older
+than the `mirante-daemon` binary the app would start (its build, from `daemon.status`,
+differs from what `mirante-daemon --version` prints), a banner offers **Restart daemon**
+(the shell's `daemon_restart`: `daemon.shutdown`, then the same start).
 
 An app opened from Finder or the Dock gets macOS's minimal `PATH` and none of your
 exports, so before **Start daemon** starts a daemon the app asks your login shell once per
@@ -159,7 +162,7 @@ branch gets one named from the goal.
 |---|---|
 | ⌘K | Command bar (tasks, projects, `@claude repo/branch goal` into the dispatch form) |
 | ⌘G | Toggle the agent grid |
-| ⌘1 | Home |
+| ⌘1 | Home (also: the Mirante logo at the top left) |
 | ⌘J | Next: the next task that needs you |
 | ⌘L | Skills |
 | Esc | Leave a task's detail (back to the view it was opened from) |

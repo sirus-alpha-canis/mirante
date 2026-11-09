@@ -1,4 +1,4 @@
-//! Tauri shell of the cockpit: seven commands that forward to `mirante-bridge`, plus two
+//! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, plus two
 //! small path helpers for adding a project (the home directory, and what is at a path). No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
@@ -13,6 +13,7 @@ use base64::Engine;
 use mirante_bridge::attach::{Attachments, Opened};
 use mirante_bridge::stream::{self, Stream, StreamMsg};
 use mirante_bridge::{rpc as bridge_rpc, BridgeError};
+use mirante_ipc::types::DaemonBinary;
 use mirante_ipc::Paths;
 use serde::Serialize;
 use serde_json::Value;
@@ -157,6 +158,23 @@ async fn daemon_start(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// What the `mirante-daemon` the app would start says it is (`--version`: no shell, a time
+/// limit); null when it cannot tell. The frontend compares its build with `daemon.status`'s.
+#[tauri::command]
+async fn daemon_binary_build() -> Option<DaemonBinary> {
+    tauri::async_runtime::spawn_blocking(mirante_bridge::daemon::binary_version).await.ok().flatten()
+}
+
+/// Restarts the daemon (after an update): `daemon.shutdown`, then the same start as
+/// `daemon_start`. Live sessions end and come back on their conversations when auto-resume
+/// is on. The webview cannot call `daemon.shutdown` itself (the bridge's allowlist).
+#[tauri::command]
+async fn daemon_restart(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || mirante_bridge::daemon::restart(&app.state::<Cockpit>().paths))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The user's home directory, for "~/…" typed in Add project.
 #[tauri::command]
 fn home_dir(app: AppHandle) -> Result<String, String> {
@@ -246,6 +264,8 @@ pub fn run() {
             attach_ack,
             attach_close,
             daemon_start,
+            daemon_binary_build,
+            daemon_restart,
             home_dir,
             path_kind
         ])

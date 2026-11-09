@@ -5,7 +5,8 @@ import { Detail } from "./components/Detail";
 import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
 import { Skills } from "./components/Skills";
-import { Splash } from "./components/Splash";
+import { OrbMark, Splash } from "./components/Splash";
+import { UpdateBanner } from "./components/Restart";
 import { dismissSplash } from "./lib/splash";
 import { type Env, EnvContext } from "./env";
 import { type ComposerForm, EMPTY_FORM } from "./components/DispatchComposer";
@@ -13,7 +14,8 @@ import { type Lang, LANGS, LangContext, loadLang, saveLang, setLang, t as tr, us
 import { notificationsFor, shouldNotify } from "./lib/notify";
 import { useNow } from "./lib/useNow";
 import { needingOrder, nextNeeding } from "./lib/inbox";
-import { type DaemonStatus, M, type TaskView } from "./lib/protocol";
+import { type DaemonBinary, type DaemonStatus, M, type TaskView } from "./lib/protocol";
+import { daemonOutdated, type Update, UpdateContext } from "./lib/update";
 import { loadRepos } from "./lib/repos";
 import { hintsFor, isTypingTarget, onMac, shortcutFor } from "./lib/shortcuts";
 import { applyTheme, loadTheme, nextTheme, saveTheme, type Theme } from "./lib/theme";
@@ -26,6 +28,9 @@ import { type Connection, same, type State } from "./store/state";
 export type Mode = "home" | "detail" | "grid" | "brain" | "skills";
 
 export const STATUS_POLL_MS = 5000;
+/** How often the daemon binary on disk is asked its build (besides each new daemon boot):
+ * an update installed while the app runs is noticed within this. */
+export const BINARY_CHECK_MS = 120_000;
 
 /** A form field with what the person is typing (not the terminal: on macOS ⌘ chords pass
  * through it, and leaving it loses nothing). View chords wait there: switching views would
@@ -196,6 +201,10 @@ export function App({ env: given }: { env: Env }) {
   const [palette, setPalette] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => loadTheme(env.storage));
   const [status, setStatus] = useState<DaemonStatus | null>(null);
+  // What the daemon binary on disk says it is (null: not known).
+  const [disk, setDisk] = useState<DaemonBinary | null>(null);
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
 
   // The projects, kept while equal: a task refresh that changes no project leaves Home's
   // props alone (and is worked out once per change of the tasks).
@@ -287,6 +296,38 @@ export function App({ env: given }: { env: Env }) {
       setStatus(null);
     };
   }, [env, live]);
+
+  // The binary on disk, asked again at each daemon boot (a restart may have run it) and now
+  // and then (an update installed meanwhile).
+  useEffect(() => {
+    if (!live) return;
+    let stopped = false;
+    const check = () =>
+      void env
+        .daemonBinaryBuild()
+        .catch(() => null)
+        .then((b) => !stopped && setDisk((cur) => (same(cur, b ?? null) ? cur : (b ?? null))));
+    check();
+    const timer = setInterval(check, BINARY_CHECK_MS);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [env, live, bootId]);
+  const restart = useCallback(() => {
+    setRestarting(true);
+    setRestartError(null);
+    env
+      .restartDaemon()
+      .catch((e) => setRestartError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setRestarting(false));
+  }, [env]);
+  const outdated = daemonOutdated(status, disk);
+  const autoResume = status?.auto_resume !== false;
+  const update = useMemo<Update>(
+    () => ({ outdated, autoResume, restarting, error: restartError, restart }),
+    [outdated, autoResume, restarting, restartError, restart],
+  );
 
   // Home's scroll is kept here at once and saved a moment after scrolling stops.
   const ui = useRef({ ...saved });
@@ -493,100 +534,110 @@ export function App({ env: given }: { env: Env }) {
   return (
     <EnvContext.Provider value={env}>
       <LangContext.Provider value={lang}>
-        <div className="app">
-          <header className="topbar">
-            <span className="brand">Mirante</span>
-            <nav aria-label={t("nav.views")} className="modes">
-              <button aria-pressed={mode === "home"} onClick={goHome}>
-                {t("nav.home")} <kbd>{hints.home}</kbd>
+        <UpdateContext.Provider value={update}>
+          <div className="app">
+            <header className="topbar">
+              {/* The brand is the way Home (⌘1). */}
+              <button
+                className="brand-home"
+                aria-label={t("nav.home")}
+                aria-pressed={mode === "home"}
+                title={`${t("nav.home")} (${hints.home})`}
+                onClick={goHome}
+              >
+                <OrbMark still />
+                <span aria-hidden="true">Mirante</span>
               </button>
-              <button aria-pressed={mode === "detail"} disabled={!taskId} onClick={() => setMode("detail")}>
-                {t("nav.detail")}
+              <nav aria-label={t("nav.views")} className="modes">
+                <button aria-pressed={mode === "detail"} disabled={!taskId} onClick={() => setMode("detail")}>
+                  {t("nav.detail")}
+                </button>
+                <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
+                  {t("nav.grid")} <kbd>{hints.grid}</kbd>
+                </button>
+                <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
+                  {t("nav.brain")} <kbd>{hints.brain}</kbd>
+                </button>
+                <button aria-pressed={mode === "skills"} onClick={goSkills}>
+                  {t("nav.skills")} <kbd>{hints.skills}</kbd>
+                </button>
+              </nav>
+              <button
+                className="btn btn-small next"
+                disabled={needing.length === 0}
+                onClick={goNext}
+                title={needing.length === 0 ? t("next.none") : t("next.title", { key: hints.next })}
+                aria-label={needing.length === 0 ? t("next.ariaNone") : t("next.aria", { at: Math.max(next.at, 1), n: needing.length })}
+              >
+                {t("next.label")} <kbd>{hints.next}</kbd>
+                {needing.length > 0 && (
+                  <span className="muted small">
+                    {" "}
+                    · {t("next.position", { at: next.at > 0 ? next.at : "–", n: needing.length })}
+                  </span>
+                )}
               </button>
-              <button aria-pressed={mode === "grid"} onClick={toggleGrid}>
-                {t("nav.grid")} <kbd>{hints.grid}</kbd>
+              <button className="btn btn-small" onClick={() => setPalette(true)}>
+                {t("top.commands")} <kbd>{hints.palette}</kbd>
               </button>
-              <button aria-pressed={mode === "brain"} onClick={toggleBrain}>
-                {t("nav.brain")} <kbd>{hints.brain}</kbd>
+              <button
+                className="btn btn-small"
+                onClick={() => setTheme(nextTheme)}
+                aria-label={t("theme.label", { theme: themeName(theme) })}
+                title={`${t("theme.label", { theme: themeName(theme) })} (${hints.theme})`}
+              >
+                <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
               </button>
-              <button aria-pressed={mode === "skills"} onClick={goSkills}>
-                {t("nav.skills")} <kbd>{hints.skills}</kbd>
-              </button>
-            </nav>
-            <button
-              className="btn btn-small next"
-              disabled={needing.length === 0}
-              onClick={goNext}
-              title={needing.length === 0 ? t("next.none") : t("next.title", { key: hints.next })}
-              aria-label={needing.length === 0 ? t("next.ariaNone") : t("next.aria", { at: Math.max(next.at, 1), n: needing.length })}
-            >
-              {t("next.label")} <kbd>{hints.next}</kbd>
-              {needing.length > 0 && (
-                <span className="muted small">
-                  {" "}
-                  · {t("next.position", { at: next.at > 0 ? next.at : "–", n: needing.length })}
-                </span>
-              )}
-            </button>
-            <button className="btn btn-small" onClick={() => setPalette(true)}>
-              {t("top.commands")} <kbd>{hints.palette}</kbd>
-            </button>
-            <button
-              className="btn btn-small"
-              onClick={() => setTheme(nextTheme)}
-              aria-label={t("theme.label", { theme: themeName(theme) })}
-              title={`${t("theme.label", { theme: themeName(theme) })} (${hints.theme})`}
-            >
-              <span aria-hidden="true">{theme === "system" ? "◐" : theme === "light" ? "☀" : "☾"}</span>
-            </button>
-            <label className="sr-only" htmlFor="lang">
-              {t("lang.label")}
-            </label>
-            <select id="lang" className="lang" value={lang} onChange={(e) => changeLang(e.target.value as Lang)} title={t("lang.label")}>
-              {LANGS.map((l) => (
-                <option key={l} value={l}>
-                  {l === "en" ? "EN · English" : "PT · Português"}
-                </option>
-              ))}
-            </select>
-          </header>
-          {/* Until the daemon first answers, the launch splash's mark says so (not an empty view). */}
-          {waiting ? <Splash text={t("conn.connecting")} /> : <ConnectionBanner connection={connection} env={env} />}
-          {!waiting && mode === "home" && (
-            <Home
-              projects={projs}
-              project={current}
-              onProject={setProject}
-              onReposChanged={setRepos}
-              onOpen={open}
-              onReview={openReview}
-              onSkills={reviewSkills}
-              status={status}
-              draft={draft}
-              onDraft={setDraft}
-              form={form}
-              onForm={setForm}
-              scroll={ui.current.scroll}
-              onScroll={onHomeScroll}
-              focusTask={returnTo}
-              onFocused={consumedReturn}
-            />
-          )}
-          {!waiting && mode === "detail" && taskId && (
-            <Detail
-              taskId={taskId}
-              onSelect={setTaskId}
-              initialTab={detailTab}
-              focusTerminalNonce={terminalNonce}
-              inlineAnswers={inlineAnswers}
-              onTab={setShownTab}
-            />
-          )}
-          {!waiting && mode === "grid" && <Grid onOpen={open} status={status} />}
-          {!waiting && mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
-          {!waiting && mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
-          {palette && <Palette base={baseCommands} inlineAnswers={inlineAnswers} onOpen={open} onClose={closePalette} onDispatch={onDispatchText} />}
-        </div>
+              <label className="sr-only" htmlFor="lang">
+                {t("lang.label")}
+              </label>
+              <select id="lang" className="lang" value={lang} onChange={(e) => changeLang(e.target.value as Lang)} title={t("lang.label")}>
+                {LANGS.map((l) => (
+                  <option key={l} value={l}>
+                    {l === "en" ? "EN · English" : "PT · Português"}
+                  </option>
+                ))}
+              </select>
+            </header>
+            {/* Until the daemon first answers, the launch splash's mark says so (not an empty view). */}
+            {waiting ? <Splash text={t("conn.connecting")} /> : <ConnectionBanner connection={connection} env={env} />}
+            {!waiting && <UpdateBanner />}
+            {!waiting && mode === "home" && (
+              <Home
+                projects={projs}
+                project={current}
+                onProject={setProject}
+                onReposChanged={setRepos}
+                onOpen={open}
+                onReview={openReview}
+                onSkills={reviewSkills}
+                status={status}
+                draft={draft}
+                onDraft={setDraft}
+                form={form}
+                onForm={setForm}
+                scroll={ui.current.scroll}
+                onScroll={onHomeScroll}
+                focusTask={returnTo}
+                onFocused={consumedReturn}
+              />
+            )}
+            {!waiting && mode === "detail" && taskId && (
+              <Detail
+                taskId={taskId}
+                onSelect={setTaskId}
+                initialTab={detailTab}
+                focusTerminalNonce={terminalNonce}
+                inlineAnswers={inlineAnswers}
+                onTab={setShownTab}
+              />
+            )}
+            {!waiting && mode === "grid" && <Grid onOpen={open} status={status} />}
+            {!waiting && mode === "brain" && <Brain key={current ?? ""} repo={current} reviewNonce={reviewNonce} />}
+            {!waiting && mode === "skills" && <Skills reviewNonce={skillsReviewNonce} />}
+            {palette && <Palette base={baseCommands} inlineAnswers={inlineAnswers} onOpen={open} onClose={closePalette} onDispatch={onDispatchText} />}
+          </div>
+        </UpdateContext.Provider>
       </LangContext.Provider>
     </EnvContext.Provider>
   );

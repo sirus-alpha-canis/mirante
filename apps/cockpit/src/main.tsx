@@ -7,7 +7,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { type Env, safeStorage } from "./env";
-import { daemonStart, homeDir, pathKind, rpc, subscribe } from "./lib/daemon";
+import { daemonBinaryBuild, daemonRestart, daemonStart, homeDir, pathKind, rpc, subscribe } from "./lib/daemon";
 import { t } from "./lib/i18n";
 import { notify, onNotificationClick } from "./lib/notify";
 import { createCockpit } from "./store/cockpit";
@@ -27,6 +27,8 @@ const env: Env = {
   ),
   openUrl: (url) => openUrl(url),
   startDaemon: daemonStart,
+  daemonBinaryBuild,
+  restartDaemon: daemonRestart,
   notify: (n) => void notify(n).catch(() => {}),
   // The native picker: one folder, nothing else (the capability grants `dialog:allow-open` only).
   pickFolder: async () => {

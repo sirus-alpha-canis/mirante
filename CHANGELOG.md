@@ -58,6 +58,12 @@ app are version 0.1.0 until the first release.
   adds), with contents as plain text, `@imports`, settings with secrets masked, and missing
   places greyed; read-only, works with repo memory off. Daemon: `rules.layers` (a person
   only). Loading rules: `docs/agents/instruction-layers.md`.
+- The daemon reports its build (`<commit>[-dirty].<unix seconds>`, embedded at compile
+  time; `MIRANTE_BUILD_ID` / `SOURCE_DATE_EPOCH` for reproducible builds) in
+  `daemon.status` and `mirante-daemon --version`. When the running daemon is older than the
+  binary on disk the app shows "Mirante was updated — restart the daemon…" with a
+  **Restart daemon** button (also in place of "Update Mirante" in Rules, repo memory and
+  Skills), and `mirante doctor` prints "restart with: mirante daemon restart".
 - README: Quickstart, Troubleshooting, Uninstall and an Environment reference;
   `SECURITY.md`; issue templates; Dependabot and `cargo deny` in CI.
 
@@ -70,6 +76,11 @@ app are version 0.1.0 until the first release.
 - Error messages no longer end in the daemon's internal "(code N)".
 - `mirante doctor` names the wrapper shims it skipped.
 - The app's auto-named branches fold ß, æ and œ to ss, ae and oe, like the CLI's.
+- The app's top bar: the Orb-Dot mark and "Mirante" are the Home button (⌘1); the
+  separate Home tab is gone.
+- The left rail's System memory panel shows one muted line, the latest notice of the last
+  10 minutes (a hibernate suggestion only while pressure is still elevated), and the rest
+  under **History**.
 
 ### Fixed
 

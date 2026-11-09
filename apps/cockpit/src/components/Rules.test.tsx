@@ -1,6 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { NO_UPDATE, UpdateContext } from "../lib/update";
 import type { DnaStatus, RuleLayer, RulesView } from "../lib/protocol";
 import { RpcCode } from "../lib/protocol";
 import { makeEnv, renderWith, rpcError } from "../test/env";
@@ -85,6 +86,21 @@ describe("Rules", () => {
     await userEvent.click(screen.getByRole("button", { name: "Codex" }));
     expect(await screen.findByText("~/.codex/AGENTS.md")).toBeInTheDocument();
     expect(h.calls).toContainEqual(["rules.layers", { task: "t1", agent: "codex" }]);
+  });
+
+  it("an older daemon whose update is installed offers Restart daemon instead", async () => {
+    const h = makeEnv({ "rules.layers": rpcError(RpcCode.METHOD_NOT_FOUND, "unknown method") });
+    const restart = vi.fn();
+    renderWith(
+      h.env,
+      <UpdateContext.Provider value={{ ...NO_UPDATE, outdated: true, restart }}>
+        <Rules at={{ repo: "/r/app" }} />
+      </UpdateContext.Provider>,
+    );
+    expect(await screen.findByText(/This needs the updated daemon/)).toBeInTheDocument();
+    expect(screen.queryByText(/Update Mirante/)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Restart daemon" }));
+    expect(restart).toHaveBeenCalledTimes(1);
   });
 
   it("an older daemon says to update; an error offers Retry", async () => {

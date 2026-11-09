@@ -5,6 +5,7 @@ import { RpcCode } from "../lib/protocol";
 import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { MemoryPanel } from "./MemoryPanel";
+import { EnvContext } from "../env";
 
 const status = { pid: 1, boot_id: "b1", version: "x", live_sessions: 1 };
 const GB = 2 ** 30;
@@ -89,6 +90,70 @@ describe("MemoryPanel", () => {
     expect(sessions.map((r) => r.querySelector(".mem-name")?.textContent)).toEqual(["feat/t3", "feat/t1", "feat/t2", "feat/t4", "feat/t0"]);
     expect(sessions[0]).toHaveClass("mem-hard");
     expect(screen.getByText("feat/s: hibernated automatically: idle under critical pressure")).toBeInTheDocument();
+  });
+
+  describe("notices", () => {
+    const at = (e: ReturnType<typeof ev>, agoMs: number) => ({ ...e, ts_ms: Date.now() - agoMs });
+    const MIN = 60_000;
+    const normal = { level: "normal", total: 16 * GB, free: 8 * GB, swap_used: 0, swap_total: 0, paused: false };
+    const elevated = { ...normal, level: "elevated", free: 512 * 2 ** 20, paused: true };
+    const latest = () => document.querySelector(".mem-latest");
+
+    it("shows only the latest notice of the last 10 minutes, one muted line; the rest under History", async () => {
+      const h = makeEnv();
+      h.load(
+        [task("a")],
+        [
+          at(ev(1, null, "memory.level", { to: "elevated" }), 30 * MIN),
+          at(ev(2, null, "memory.paused"), 29 * MIN),
+          at(ev(3, null, "memory.level", { to: "normal" }), 3 * MIN),
+          at(ev(4, null, "memory.resumed"), 2 * MIN),
+        ],
+      );
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: normal }} />);
+      expect(latest()).toHaveTextContent("new sessions and queued deliveries resumed");
+      expect(latest()).toHaveClass("muted");
+      // One line, not a list of every notice.
+      expect(screen.getAllByText(/new sessions and queued deliveries/).filter((e) => e.closest(".mem-latest"))).toHaveLength(1);
+      const history = screen.getByText("History (4)").closest("details")!;
+      expect(history).not.toHaveAttribute("open");
+      await userEvent.click(screen.getByText("History (4)"));
+      const items = within(within(history).getByRole("list", { name: "Memory notices" })).getAllByRole("listitem");
+      expect(items.map((i) => i.textContent)).toEqual([
+        "new sessions and queued deliveries resumed",
+        "system memory pressure normal",
+        "new sessions and queued deliveries paused (system memory pressure)",
+        "system memory pressure elevated",
+      ]);
+    });
+
+    it("nothing in the last 10 minutes: no latest line, only the History disclosure", () => {
+      const h = makeEnv();
+      h.load([task("a")], [at(ev(1, null, "memory.resumed"), 11 * MIN)]);
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: normal }} />);
+      expect(latest()).toBeNull();
+      expect(screen.getByText("History (1)")).toBeInTheDocument();
+    });
+
+    it("a hibernate suggestion shows only while pressure is still elevated", () => {
+      const h = makeEnv();
+      h.load([task("a")], [at(ev(1, "a", "memory.offer_hibernate", { reason: "memory pressure elevated" }), MIN)]);
+      const { rerender } = renderWith(h.env, <MemoryPanel status={{ ...status, memory: elevated }} />);
+      expect(latest()).toHaveTextContent("feat/a: hibernate suggested: memory pressure elevated");
+      rerender(
+        <EnvContext.Provider value={h.env}>
+          <MemoryPanel status={{ ...status, memory: normal }} />
+        </EnvContext.Provider>,
+      );
+      expect(latest()).toBeNull();
+    });
+
+    it("no notices: no History", () => {
+      const h = makeEnv();
+      h.load([task("a")]);
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: normal }} />);
+      expect(screen.queryByText(/^History/)).toBeNull();
+    });
   });
 
   it("Wake resumes a hibernated session, one request at a time", async () => {

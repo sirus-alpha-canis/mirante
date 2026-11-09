@@ -148,7 +148,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> ExitCode {
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
-        println!("mirante-daemon {}", env!("CARGO_PKG_VERSION"));
+        println!("mirante-daemon {} (build {})", env!("CARGO_PKG_VERSION"), env!("MIRANTE_BUILD"));
         return ExitCode::SUCCESS;
     }
     match run() {

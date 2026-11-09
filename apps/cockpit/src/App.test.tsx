@@ -595,6 +595,81 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Dispatch" })).toBeDisabled();
   });
 
+  describe("the brand is Home", () => {
+    it("the Orb-Dot mark and the wordmark are one Home button, pressed on Home; there is no separate Home tab", async () => {
+      setup();
+      const home = screen.getByRole("button", { name: "Home" });
+      expect(home).toHaveAttribute("aria-pressed", "true");
+      expect(home).toHaveTextContent("Mirante");
+      // The launch splash's mark, still (no orbiting satellites in the bar).
+      expect(home.querySelector("svg.orb.orb-static")).not.toBeNull();
+      expect(within(screen.getByRole("navigation", { name: "Views" })).queryByRole("button", { name: /Home/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Home ⌘1|Home Ctrl\+1/ })).toBeNull();
+      fireEvent.keyDown(window, { key: "g", ...mod });
+      expect(home).toHaveAttribute("aria-pressed", "false");
+      await userEvent.click(home);
+      expect(home).toHaveAttribute("aria-pressed", "true");
+      // ⌘1 still goes Home.
+      fireEvent.keyDown(window, { key: "g", ...mod });
+      fireEvent.keyDown(window, { key: "1", code: "Digit1", ...mod });
+      expect(home).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("says Início in Portuguese", async () => {
+      setup();
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Language" }), "pt");
+      expect(screen.getByRole("button", { name: "Início" })).toHaveAttribute("aria-pressed", "true");
+    });
+  });
+
+  describe("an outdated daemon", () => {
+    const disk = { version: "0.1.0", build: "new.2" };
+
+    it("a daemon older than the binary on disk gets a restart banner; Restart daemon restarts it", async () => {
+      const h = setup({ "daemon.status": { ...STATUS, build: "old.1", auto_resume: true } });
+      vi.mocked(h.env.daemonBinaryBuild).mockResolvedValue(disk);
+      // The check runs once the daemon answers.
+      act(() => h.env.cockpit.dispatch({ type: "disconnected", error: "x", retryMs: 1 }));
+      act(() => h.load([task("a")]));
+      const banner = await screen.findByRole("status", { name: "Mirante update" });
+      expect(banner).toHaveTextContent("Mirante was updated — restart the daemon to use the new version (your sessions come back automatically).");
+      await userEvent.click(within(banner).getByRole("button", { name: "Restart daemon" }));
+      expect(h.env.restartDaemon).toHaveBeenCalledTimes(1);
+    });
+
+    it("a daemon that predates build ids is outdated too; with auto-resume off the banner says sessions end", async () => {
+      const h = makeEnv({ "daemon.status": { ...STATUS, auto_resume: false }, "message.list_queued": [] });
+      vi.mocked(h.env.daemonBinaryBuild).mockResolvedValue(disk);
+      render(<App env={h.env} />);
+      act(() => h.load([task("a")]));
+      const banner = await screen.findByRole("status", { name: "Mirante update" });
+      expect(banner).toHaveTextContent("live sessions end; resume them from their cards");
+    });
+
+    it("the same build, or a binary that cannot tell, shows no banner", async () => {
+      const h = makeEnv({ "daemon.status": { ...STATUS, build: "new.2" }, "message.list_queued": [] });
+      vi.mocked(h.env.daemonBinaryBuild).mockResolvedValue(disk);
+      render(<App env={h.env} />);
+      act(() => h.load([task("a")]));
+      await act(async () => {});
+      await act(async () => {});
+      expect(h.env.daemonBinaryBuild).toHaveBeenCalled();
+      expect(screen.queryByRole("status", { name: "Mirante update" })).toBeNull();
+    });
+
+    it("a failed restart says why, and the button comes back", async () => {
+      const h = makeEnv({ "daemon.status": { ...STATUS, build: "old.1" }, "message.list_queued": [] });
+      vi.mocked(h.env.daemonBinaryBuild).mockResolvedValue(disk);
+      vi.mocked(h.env.restartDaemon).mockRejectedValue(new Error("the old daemon is still running"));
+      render(<App env={h.env} />);
+      act(() => h.load([task("a")]));
+      const banner = await screen.findByRole("status", { name: "Mirante update" });
+      await userEvent.click(within(banner).getByRole("button", { name: "Restart daemon" }));
+      expect(await within(banner).findByText(/Could not restart: the old daemon is still running/)).toBeInTheDocument();
+      expect(within(banner).getByRole("button", { name: "Restart daemon" })).toBeEnabled();
+    });
+  });
+
   describe("language", () => {
     it("switches the interface to Portuguese and back, remembered, with <html lang>", async () => {
       const h = setup({}, [task("n", { status: "needs_you" })]);

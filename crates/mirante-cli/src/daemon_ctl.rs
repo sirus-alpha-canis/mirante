@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mirante_core::claude_launch::daemon_env_to_scrub;
-use mirante_ipc::types::DaemonStatus;
+use mirante_ipc::types::{DaemonBinary, DaemonStatus};
 use mirante_ipc::{logfile, Client, Paths};
 
 /// How long `start_daemon` waits for the socket. The first launch of a freshly built
@@ -257,6 +257,82 @@ pub fn version_warning(daemon: &DaemonStatus, mine: &str) -> Option<String> {
     })
 }
 
+/// How long `mirante-daemon --version` may take (a first launch after a build can be slow
+/// while macOS scans it).
+pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `mirante-daemon 0.1.0 (build <id>)`, or `mirante-daemon 0.1.0` from a binary that
+/// predates build ids.
+pub fn parse_daemon_version(out: &str) -> Option<DaemonBinary> {
+    let line = out.lines().next()?.trim();
+    let rest = line.strip_prefix("mirante-daemon ")?;
+    let (version, build) = match rest.split_once(" (build ") {
+        Some((v, b)) => (v, Some(b.strip_suffix(')')?.trim().to_string())),
+        None => (rest, None),
+    };
+    let version = version.trim();
+    if version.is_empty() || version.contains(' ') {
+        return None;
+    }
+    Some(DaemonBinary { version: version.to_string(), build: build.filter(|b| !b.is_empty()) })
+}
+
+/// Runs `bin --version` (no shell, no stdin, at most `timeout`) and reads what it says.
+/// None when it cannot be run, is too slow, fails, or says something else.
+pub fn binary_version(bin: &Path, timeout: Duration) -> Option<DaemonBinary> {
+    use std::io::Read;
+    let mut child = Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    parse_daemon_version(&out)
+}
+
+/// The running daemon is older than the binary on disk: the binary names a build and the
+/// daemon another one (or none: it predates build ids).
+pub fn daemon_outdated(daemon: &DaemonStatus, disk: &DaemonBinary) -> bool {
+    match &disk.build {
+        Some(b) => daemon.build.as_deref() != Some(b.as_str()),
+        None => false,
+    }
+}
+
+/// `mirante doctor`'s line when the running daemon is older than `bin`.
+pub fn outdated_line(daemon: &DaemonStatus, bin: &Path, disk: &DaemonBinary) -> Option<String> {
+    if !daemon_outdated(daemon, disk) {
+        return None;
+    }
+    let running = match &daemon.build {
+        Some(b) => format!("build {b}"),
+        None => format!("v{}, which predates build ids", daemon.version),
+    };
+    Some(format!(
+        "daemon: the running daemon ({running}) is older than {} (build {}); restart with: mirante daemon restart\n",
+        bin.display(),
+        disk.build.as_deref().unwrap_or("?"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +428,7 @@ mod tests {
             claude_inline_answers: false,
             auto_resume: None,
             auto_resume_forced_off: None,
+            build: None,
         };
         assert_eq!(version_warning(&st("0.1.0", 0), "0.1.0"), None);
         let idle = version_warning(&st("0.0.9", 0), "0.1.0").unwrap();
@@ -359,6 +436,78 @@ mod tests {
         let busy = version_warning(&st("0.0.9", 2), "0.1.0").unwrap();
         assert!(busy.contains("2 live session(s)") && busy.contains("when they are done"));
         assert!(busy.contains("resumes them on their conversations when auto-resume is on"), "{busy}");
+    }
+
+    fn status_with_build(build: Option<&str>) -> DaemonStatus {
+        DaemonStatus {
+            pid: 1,
+            boot_id: "b".into(),
+            version: "0.1.0".into(),
+            live_sessions: 0,
+            memory: None,
+            claude_inline_answers: false,
+            auto_resume: None,
+            auto_resume_forced_off: None,
+            build: build.map(String::from),
+        }
+    }
+
+    #[test]
+    fn the_version_line_gives_the_version_and_the_build() {
+        let b = parse_daemon_version("mirante-daemon 0.1.0 (build 3acbd53aa1b2-dirty.1762700000)\n").unwrap();
+        assert_eq!(b, DaemonBinary { version: "0.1.0".into(), build: Some("3acbd53aa1b2-dirty.1762700000".into()) });
+        // An older binary says no build.
+        assert_eq!(
+            parse_daemon_version("mirante-daemon 0.0.9\n").unwrap(),
+            DaemonBinary { version: "0.0.9".into(), build: None }
+        );
+        assert_eq!(parse_daemon_version("something else"), None);
+        assert_eq!(parse_daemon_version(""), None);
+    }
+
+    #[test]
+    fn a_daemon_is_outdated_only_when_the_binary_names_another_build() {
+        let disk = |b: Option<&str>| DaemonBinary { version: "0.1.0".into(), build: b.map(String::from) };
+        assert!(!daemon_outdated(&status_with_build(Some("a.1")), &disk(Some("a.1"))));
+        assert!(daemon_outdated(&status_with_build(Some("a.1")), &disk(Some("b.2"))));
+        // A daemon that predates build ids, with a binary that has one: older.
+        assert!(daemon_outdated(&status_with_build(None), &disk(Some("b.2"))));
+        // A binary without a build id says nothing either way.
+        assert!(!daemon_outdated(&status_with_build(Some("a.1")), &disk(None)));
+        assert!(!daemon_outdated(&status_with_build(None), &disk(None)));
+    }
+
+    #[test]
+    fn the_doctor_line_says_how_to_restart() {
+        let disk = DaemonBinary { version: "0.1.0".into(), build: Some("b.2".into()) };
+        let bin = Path::new("/x/mirante-daemon");
+        let line = outdated_line(&status_with_build(Some("a.1")), bin, &disk).unwrap();
+        assert!(line.contains("a.1") && line.contains("b.2") && line.contains("/x/mirante-daemon"), "{line}");
+        assert!(line.contains("restart with: mirante daemon restart"), "{line}");
+        let old = outdated_line(&status_with_build(None), bin, &disk).unwrap();
+        assert!(old.contains("predates build ids"), "{old}");
+        assert_eq!(outdated_line(&status_with_build(Some("b.2")), bin, &disk), None);
+    }
+
+    #[test]
+    fn the_binary_is_asked_its_version_without_a_shell_and_with_a_time_limit() {
+        let d = TestDir::new();
+        let p = d.path().join("daemon.sh");
+        mirante_core::test_script::write_sh(
+            &p,
+            "[ \"$1\" = --version ] && echo 'mirante-daemon 0.2.0 (build c.3)'\n",
+            0o755,
+        );
+        assert_eq!(
+            binary_version(&p, Duration::from_secs(10)),
+            Some(DaemonBinary { version: "0.2.0".into(), build: Some("c.3".into()) })
+        );
+        let slow = d.path().join("slow.sh");
+        mirante_core::test_script::write_sh(&slow, "sleep 5\necho 'mirante-daemon 0.2.0 (build c.3)'\n", 0o755);
+        let started = Instant::now();
+        assert_eq!(binary_version(&slow, Duration::from_millis(300)), None);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(binary_version(&d.path().join("missing"), Duration::from_secs(1)), None);
     }
 
     /// A stand-in daemon: a shell script that appends a line to `<home>/launches` and then

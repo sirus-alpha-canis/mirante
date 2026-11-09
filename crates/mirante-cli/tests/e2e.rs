@@ -408,6 +408,34 @@ fn hibernate_wake_and_doctor_from_the_cli() {
     assert!(doctor.contains("orphan processes: none") && doctor.contains("orphan checkouts: none"), "{doctor}");
 }
 
+/// The daemon says its build in `daemon.status` and in `--version`; `mirante doctor` names a
+/// running daemon older than the binary on disk and how to restart it.
+#[test]
+fn doctor_says_when_the_running_daemon_is_older_than_the_binary() {
+    let env = Env::new();
+    env.ok(&["daemon", "start"]);
+    let s: DaemonStatus = env.client().call(method::DAEMON_STATUS, json!({})).unwrap();
+    let out = Command::new(bin("mirante-daemon")).arg("--version").output().unwrap();
+    let line = String::from_utf8_lossy(&out.stdout).into_owned();
+    let build = s.build.clone().expect("daemon.status has a build");
+    assert!(line.contains(&format!("(build {build})")), "{line}");
+    // Same binary: nothing to say.
+    let doctor = env.ok(&["doctor"]);
+    assert!(!doctor.contains("mirante daemon restart"), "{doctor}");
+    // A newer binary on disk (a stand-in that only answers --version).
+    let newer = env.dir.path().join("newer-daemon.sh");
+    mirante_core::test_script::write_sh(&newer, "echo 'mirante-daemon 0.1.0 (build newer.9)'", 0o755);
+    let out =
+        env.cmd(&bin("mirante")).arg("doctor").env("MIRANTE_DAEMON_BIN", &newer).stdin(Stdio::null()).output().unwrap();
+    let doctor = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{doctor}");
+    assert!(
+        doctor.contains(&format!("(build {build}) is older than")) && doctor.contains("(build newer.9)"),
+        "{doctor}"
+    );
+    assert!(doctor.contains("restart with: mirante daemon restart"), "{doctor}");
+}
+
 /// `mirante memory accept|reject` asks on the controlling terminal: without one (here:
 /// `setsid`, like an agent's tool call or a pipe) it refuses before contacting the daemon.
 #[test]
@@ -1180,7 +1208,14 @@ fn every_binary_answers_version_without_side_effects() {
             }
             let out = child.wait_with_output().unwrap();
             assert!(out.status.success(), "{name} {flag}");
-            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{name} {}\n", env!("CARGO_PKG_VERSION")));
+            let said = String::from_utf8_lossy(&out.stdout).into_owned();
+            if name == "mirante-daemon" {
+                // The daemon adds its build (`mirante doctor` and the app compare it).
+                let rest = said.strip_prefix(&format!("{name} {} (build ", env!("CARGO_PKG_VERSION")));
+                assert!(rest.is_some_and(|r| r.ends_with(")\n") && r.len() > 3), "{said}");
+            } else {
+                assert_eq!(said, format!("{name} {}\n", env!("CARGO_PKG_VERSION")));
+            }
         }
     }
     assert!(!env.home.exists(), "nothing was written under MIRANTE_HOME");

@@ -86,9 +86,17 @@ describe("Tauri security baseline", () => {
       "attach_ack",
       "attach_close",
       "daemon_start",
+      // After an update: what the daemon binary on disk says it is (`--version`, no shell,
+      // a time limit), and restarting the daemon (daemon.shutdown, then the same start as
+      // daemon_start; the webview still cannot call daemon.shutdown through the bridge).
+      "daemon_binary_build",
+      "daemon_restart",
       "home_dir",
       "path_kind",
     ]);
+    // Neither takes anything from the webview: the binary is the one the app resolves itself.
+    expect(shell).toContain("async fn daemon_binary_build() -> Option<DaemonBinary>");
+    expect(shell).toContain("async fn daemon_restart(app: AppHandle) -> Result<(), String>");
   });
 
   it("reaches the daemon only through the bridge's allowlist, pinned here too", () => {

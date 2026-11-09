@@ -2,7 +2,7 @@
 // (store/cockpit.ts) or imports this module (and tests mock it).
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n";
-import type { BridgeError, StreamMsg } from "./protocol";
+import type { BridgeError, DaemonBinary, StreamMsg } from "./protocol";
 import { RpcCode } from "./protocol";
 
 export class DaemonError extends Error {
@@ -133,6 +133,26 @@ export async function daemonStart(): Promise<void> {
   } catch (e) {
     // The shell rejects with a plain message: the daemon could not be found or started.
     throw typeof e === "string" ? new DaemonError({ kind: "disconnected", message: e }) : toDaemonError(e);
+  }
+}
+
+/** What the daemon binary the app would start says it is (`--version`); null when it
+ * cannot tell. Never rejects. */
+export async function daemonBinaryBuild(): Promise<DaemonBinary | null> {
+  try {
+    return (await invoke<DaemonBinary | null>("daemon_binary_build")) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Stops the running daemon and starts the one on disk (after an update). Rejects with a message. */
+export async function daemonRestart(): Promise<void> {
+  try {
+    await invoke("daemon_restart");
+  } catch (e) {
+    // The shell rejects with a plain message (stopping or starting failed).
+    throw typeof e === "string" ? new Error(e) : toDaemonError(e);
   }
 }
 

@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
-import { attachAck, attachClose, attachOpen, attachWrite, DaemonError, daemonStart, rpc } from "./daemon";
+import { attachAck, attachClose, attachOpen, attachWrite, DaemonError, daemonBinaryBuild, daemonRestart, daemonStart, rpc } from "./daemon";
 import { RpcCode } from "./protocol";
 
 describe("daemon transport", () => {
@@ -91,5 +91,20 @@ describe("daemon transport", () => {
     const errs = await Promise.all([attachClose(1).catch((x: unknown) => x), daemonStart().catch((x: unknown) => x)]);
     for (const e of errs) expect(e).toBeInstanceOf(DaemonError);
     expect((errs[1] as DaemonError).message).toContain("mirante-daemon not found");
+  });
+
+  it("daemonBinaryBuild asks the shell and never rejects; daemonRestart says why it failed", async () => {
+    invoke.mockImplementation(async () => ({ version: "0.1.0", build: "a.1" }));
+    expect(await daemonBinaryBuild()).toEqual({ version: "0.1.0", build: "a.1" });
+    expect(invoke).toHaveBeenCalledWith("daemon_binary_build");
+    invoke.mockImplementation(async () => {
+      throw "boom";
+    });
+    expect(await daemonBinaryBuild()).toBeNull();
+    invoke.mockImplementation(async () => {
+      throw "the old daemon is still running";
+    });
+    await expect(daemonRestart()).rejects.toThrow("the old daemon is still running");
+    expect(invoke).toHaveBeenCalledWith("daemon_restart");
   });
 });
