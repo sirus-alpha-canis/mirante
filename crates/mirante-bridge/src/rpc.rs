@@ -72,6 +72,10 @@ pub const ALLOWED: &[&str] = &[
     method::SKILL_ACTION,
     // "+ context" in the dispatch form: a repo's file paths matching a query (never contents).
     method::REPO_FILES,
+    // The Brain's "Rules" view: every instruction layer an agent session reads (read-only;
+    // the daemon picks the files from the agent's known locations, never a path the caller
+    // names, and masks secrets).
+    method::RULES_LAYERS,
 ];
 
 /// `session.start` waits for the agent to boot (up to 45 s in the daemon).
@@ -208,6 +212,7 @@ mod tests {
             "skill.review",
             "skill.action",
             "repo.files",
+            "rules.layers",
         ];
         assert_eq!(ALLOWED, expected);
     }

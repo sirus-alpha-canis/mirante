@@ -99,6 +99,9 @@ pub mod method {
     /// `skills tenant|learn|mine` ([`super::SkillRepoParams`] → [`super::RepoOrigin`]).
     /// A person only.
     pub const SKILL_REPO_ORIGIN: &str = "skill.repo_origin";
+    /// Every instruction layer an agent session reads, in load order, for a checkout or a
+    /// task ([`super::RulesParams`] → [`super::RulesView`]). Read-only; a person only.
+    pub const RULES_LAYERS: &str = "rules.layers";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -1259,4 +1262,99 @@ pub struct TaskSkills {
     /// Why no skill applies at all (no origin, unconfirmed origin, no ssh-keygen).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
+}
+
+/// `rules.layers` parameters: a checkout (`repo`) or a task (its worktree, plus what
+/// Mirante adds to its session), and the agent whose layers to list (default: the task's,
+/// else `claude`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+}
+
+/// A file pulled in by an `@path` import (Claude), with its own imports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleImport {
+    /// As written after the `@`.
+    pub spec: String,
+    /// Where it resolved (`~` for the home directory).
+    pub path: String,
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Text (redacted, capped); absent when missing or refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    /// Why it is not shown (outside the allowed places, a cycle, too deep, may hold secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<RuleImport>,
+}
+
+/// One place an agent session takes instructions, settings, skills, memory or a mode from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleLayer {
+    /// `managed`, `user`, `project`, `local`, `nested` or `mirante`.
+    pub scope: String,
+    /// `claude` or `codex`.
+    pub agent: String,
+    /// `instructions`, `settings`, `skills`, `memory` or `mode`.
+    pub kind: String,
+    /// Display path (`~` for the home directory); a description for a Mirante layer.
+    pub path: String,
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Last modified, Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
+    /// Text as the agent reads it (redacted, capped); a settings file's relevant keys; a
+    /// skills folder's `name: description` lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<RuleImport>,
+    /// When and how it applies (load order, on demand, what wins).
+    pub note: String,
+    /// Read at launch (false: on demand, shadowed, or only when a setting picks it).
+    #[serde(default)]
+    pub loaded: bool,
+    /// Skills listed in a skills layer.
+    #[serde(default)]
+    pub skills: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What a session reads at launch, counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesSummary {
+    pub instruction_files: usize,
+    pub instruction_bytes: u64,
+    pub settings_files: usize,
+    pub skills: usize,
+}
+
+/// `rules.layers` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesView {
+    pub agent: String,
+    /// The project root the agent starts in (the checkout, or the task's worktree).
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// The agent's version as researched for these rules (e.g. `2.1.285`).
+    pub researched: String,
+    pub layers: Vec<RuleLayer>,
+    pub summary: RulesSummary,
 }

@@ -145,6 +145,7 @@ describe("Tauri security baseline", () => {
       "SKILL_REVIEW",
       "SKILL_ACTION",
       "REPO_FILES",
+      "RULES_LAYERS",
     ]);
     // Never DNA_PROPOSE: agents propose through MCP; people write notes in their editor.
     expect(block).not.toContain("DNA_PROPOSE");

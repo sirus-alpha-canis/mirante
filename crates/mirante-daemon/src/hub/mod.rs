@@ -30,6 +30,7 @@ pub mod memory;
 pub mod messages;
 pub mod queue;
 pub mod resume;
+pub mod rules;
 pub mod session;
 pub mod skills;
 
@@ -350,6 +351,9 @@ pub struct Hub {
     /// Launches whose agent is being spawned (counted under the hub lock): shutdown waits
     /// for them, so no agent is spawned after the sessions were stopped.
     pub(crate) spawning: std::sync::atomic::AtomicUsize,
+    /// `rules.layers`: where the agents' files are (tests point it at a fake home; else
+    /// the daemon's environment, read per call).
+    pub(crate) rules_homes: Option<crate::rules::Homes>,
 }
 
 /// Removes `<home>/sessions/<task>/` (MCP config, skill bundles, agent logs) of a task that
@@ -545,6 +549,7 @@ impl Hub {
             skill_conf: Mutex::default(),
             skill_sigs: Mutex::default(),
             miner: Mutex::default(),
+            rules_homes: None,
         };
         Ok((hub, rx))
     }

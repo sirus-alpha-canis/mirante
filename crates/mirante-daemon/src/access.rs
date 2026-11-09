@@ -100,6 +100,8 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::SKILL_TASK_SKILLS, Access::Person),
     (method::SKILL_MAY_REVIEW, Access::Person),
     (method::SKILL_REPO_ORIGIN, Access::Person),
+    // Reads the person's own agent configuration (home folder): never an agent's.
+    (method::RULES_LAYERS, Access::Person),
 ];
 
 /// Who may call `m`: its [`ACCESS`] entry, or a person only when it has none.
@@ -207,6 +209,18 @@ mod tests {
         assert_eq!(agents, expected);
         let anyone: Vec<&str> = ACCESS.iter().filter(|(_, a)| *a == Access::Anyone).map(|(m, _)| *m).collect();
         assert_eq!(anyone, [method::DAEMON_STATUS]);
+    }
+
+    /// `rules.layers` shows the person's own agent configuration (their home folder): an
+    /// agent, or a caller Mirante cannot check, never gets it.
+    #[test]
+    fn rules_layers_is_a_persons_only() {
+        assert_eq!(access_of(method::RULES_LAYERS), Access::Person);
+        let agent = Identity::Agent { task: Some("t".into()) };
+        assert_eq!(check(method::RULES_LAYERS, &agent).unwrap_err().code, code::FORBIDDEN);
+        let unverified = Identity::Unverified("x".into());
+        assert_eq!(check(method::RULES_LAYERS, &unverified).unwrap_err().code, code::FORBIDDEN);
+        assert!(check(method::RULES_LAYERS, &Identity::Person).is_ok());
     }
 
     #[test]

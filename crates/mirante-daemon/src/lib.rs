@@ -7,4 +7,5 @@ pub mod driver;
 pub mod hub;
 pub mod memguard;
 pub mod recover;
+pub mod rules;
 pub mod server;
