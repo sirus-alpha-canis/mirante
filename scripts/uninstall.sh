@@ -61,6 +61,14 @@ if [ -x "$prefix/mirante" ]; then
   "$prefix/mirante" daemon stop || true
 fi
 
+# --- The LaunchAgent (mirante daemon install-agent), when it runs this home's daemon.
+agent="$HOME/Library/LaunchAgents/com.mirante.daemon.plist"
+if [ "$(uname -s)" = Darwin ] && [ -f "$agent" ] && grep -qF "<string>$home</string>" "$agent"; then
+  say "Removing the launch agent $agent"
+  launchctl bootout "gui/$(id -u)/com.mirante.daemon" 2>/dev/null || true
+  rm -f "$agent"
+fi
+
 # --- Remove only links that point at a Mirante build (target/release/<name>).
 for b in "${BINS[@]}"; do
   link="$prefix/$b"
@@ -97,6 +105,7 @@ if [ "$purge" = 1 ]; then
     {
       printf '\nThis deletes %s: the task database and history, logs, the skill library\n' "$resolved"
       printf 'and its signing key, and the task worktrees in it (uncommitted work there is lost;\n'
+      # shellcheck disable=SC2016 # literal backticks
       printf 'the branches stay in your repos; run `git worktree prune` in a repo to forget them).\n'
       printf 'Type "delete" to confirm: '
     } >/dev/tty
@@ -116,4 +125,6 @@ cat <<EOF
 Done. Not touched: ~/.claude and ~/.codex (Mirante never edits them), your repos and their
 .mirante/memory notes, and this checkout (delete it yourself; a built Mirante.app lives in
 apps/cockpit/src-tauri/target, and any copy you made in /Applications stays until you remove it).
+On macOS, the "Mirante Local Signing" identity scripts/dev-sign.sh made stays in your login
+keychain (delete it in Keychain Access if you no longer build Mirante).
 EOF

@@ -149,6 +149,14 @@ pub(crate) fn start_daemon_inner(
         return Ok(c);
     }
     let _ = logfile::rotate_if_over(&paths.log(), logfile::LOG_CAP);
+    // The LaunchAgent, when installed for this home: launchd starts the daemon, which is then
+    // its own responsible process for macOS privacy prompts (see `launch_agent`).
+    if let Some(plist) = crate::launch_agent::installed(paths) {
+        // launchd would create a missing log world-readable: create it private first.
+        drop(std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(paths.log())?);
+        crate::launch_agent::start(&crate::launch_agent::Launchctl::gui(), &plist)?;
+        return wait_for_socket(paths, None, started, deadline, timeout, notice);
+    }
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(paths.log())?;
     let mut cmd = daemon_command_with_env(bin, paths, env_names(), extra);
     cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
@@ -157,6 +165,19 @@ pub(crate) fn start_daemon_inner(
         cmd.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
     }
     let mut child = cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", bin.display())))?;
+    wait_for_socket(paths, Some(&mut child), started, deadline, timeout, notice)
+}
+
+/// Waits for the socket of a daemon being started: `child` when this process spawned it
+/// (its early exit is reported), None when launchd did.
+fn wait_for_socket(
+    paths: &Paths,
+    mut child: Option<&mut std::process::Child>,
+    started: Instant,
+    deadline: Instant,
+    timeout: Duration,
+    notice: &dyn Fn(&str),
+) -> io::Result<Client> {
     let mut noticed = false;
     let mut exited = false;
     loop {
@@ -164,7 +185,7 @@ pub(crate) fn start_daemon_inner(
             Ok(c) => return Ok(c),
             Err(e) => e,
         };
-        if !exited {
+        if let (false, Some(child)) = (exited, child.as_deref_mut()) {
             if let Some(status) = child.try_wait()? {
                 let tail = log_tail(paths, 5);
                 if !tail.contains("another mirante-daemon is running") {

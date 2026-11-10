@@ -125,7 +125,12 @@ const COMMANDS: &[Help] = &[
                          restart: stop (ends live sessions) then start, e.g. after an upgrade;
                          the new daemon resumes them unless auto-resume is off
                          (MIRANTE_AUTO_RESUME=off, or the cockpit's setting); then
-                         `mirante app` opens the desktop app (the daemon has no window)",
+                         `mirante app` opens the desktop app (the daemon has no window)
+  daemon install-agent|uninstall-agent
+                         (macOS) have launchd start the daemon, at login and whenever it is
+                         started: its privacy prompts (Documents access) are then its own,
+                         not the app's. Run in your terminal; again after changing PATH or
+                         MIRANTE_* (they are written into the agent)",
     },
     Help {
         names: &["help"],
@@ -336,6 +341,10 @@ pub enum DaemonCmd {
     Stop,
     Restart,
     Status,
+    /// Install the per-user LaunchAgent `com.mirante.daemon` (macOS).
+    InstallAgent,
+    /// Unload and remove it.
+    UninstallAgent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -801,11 +810,13 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             };
             Ok(Cmd::Doctor { kill })
         }
-        "daemon" => match one(&split(rest, none, none)?, "start|stop|restart|status")?.as_str() {
+        "daemon" => match one(&split(rest, none, none)?, "start|stop|restart|status|install-agent|uninstall-agent")?.as_str() {
             "start" => Ok(Cmd::Daemon(DaemonCmd::Start)),
             "stop" => Ok(Cmd::Daemon(DaemonCmd::Stop)),
             "restart" => Ok(Cmd::Daemon(DaemonCmd::Restart)),
             "status" => Ok(Cmd::Daemon(DaemonCmd::Status)),
+            "install-agent" => Ok(Cmd::Daemon(DaemonCmd::InstallAgent)),
+            "uninstall-agent" => Ok(Cmd::Daemon(DaemonCmd::UninstallAgent)),
             other => Err(format!("unknown daemon command {other}")),
         },
         "app" | "open" => {
@@ -987,6 +998,8 @@ mod tests {
         assert_eq!(p("resume --fresh feat").unwrap(), Cmd::Resume { task: "feat".into(), trust: false, fresh: true });
         assert_eq!(p("daemon status").unwrap(), Cmd::Daemon(DaemonCmd::Status));
         assert_eq!(p("daemon restart").unwrap(), Cmd::Daemon(DaemonCmd::Restart));
+        assert_eq!(p("daemon install-agent").unwrap(), Cmd::Daemon(DaemonCmd::InstallAgent));
+        assert_eq!(p("daemon uninstall-agent").unwrap(), Cmd::Daemon(DaemonCmd::UninstallAgent));
         assert_eq!(p("watch").unwrap(), Cmd::Watch);
         assert_eq!(p("hibernate feat").unwrap(), Cmd::Hibernate { task: "feat".into() });
         assert_eq!(p("wake feat --trust").unwrap(), Cmd::Wake { task: "feat".into(), trust: true });

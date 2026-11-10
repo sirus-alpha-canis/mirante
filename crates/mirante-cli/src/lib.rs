@@ -4,6 +4,7 @@ pub mod app;
 pub mod args;
 pub mod confirm;
 pub mod daemon_ctl;
+pub mod launch_agent;
 pub mod memcheck;
 pub mod render;
 pub mod skilllint;

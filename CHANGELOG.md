@@ -6,6 +6,29 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS no longer keeps asking for Documents access.** Local builds were ad-hoc signed,
+  so macOS identified the app and the binaries by their cdhash and forgot every answer at
+  the next build. `scripts/dev-sign.sh` (new; run by `scripts/install.sh` on macOS unless
+  `--no-sign`) creates a self-signed "Mirante Local Signing" identity once in the login
+  keychain and signs the four binaries and Mirante.app with it (hardened runtime): the
+  designated requirement stays the same across rebuilds. The app also stopped running
+  `mirante-daemon --version` every two minutes (the binary usually sits in a checkout under
+  `~/Documents`): it asks at each daemon boot only, and runs the binary once per build of
+  the file (same path, size, mtime and inode: the cached answer).
+
+### Added
+
+- **`mirante daemon install-agent` / `uninstall-agent` (macOS).** An opt-in per-user
+  LaunchAgent, `com.mirante.daemon` (`~/Library/LaunchAgents`): launchd starts the daemon at
+  login and whenever the CLI or the app starts it, so the daemon is its own responsible
+  process and its agents' file access no longer asks in the app's name. The plist holds the
+  daemon path, `MIRANTE_HOME`, the log and PATH, LANG and `MIRANTE_*` only (never tokens).
+  Run in a terminal, never from an agent session; `uninstall-agent` refuses while sessions
+  are live; `scripts/uninstall.sh` removes it. `mirante daemon status` says when it is
+  installed.
+
 ### Changed
 
 - **A calmer cockpit ("Observatório").** Surfaces instead of borders, color only for state

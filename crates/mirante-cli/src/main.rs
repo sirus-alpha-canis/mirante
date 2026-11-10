@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::io::{self, BufRead, Read, Write};
 use std::net::Shutdown;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
 use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd};
-use mirante_cli::{app, confirm, daemon_ctl, memcheck, render, skilllint, term};
+use mirante_cli::{app, confirm, daemon_ctl, launch_agent, memcheck, render, skilllint, term};
 use mirante_core::branch_name::{branch_from_goal, next_free_branch};
 use mirante_core::skills::lint::has_errors;
 
@@ -755,6 +756,77 @@ skills for their own task (skill_propose)."
     }
 }
 
+/// The person's own process, on macOS: the LaunchAgent commands change what starts at login.
+fn agent_preflight() -> Result<(PathBuf, launch_agent::Launchctl), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Err("the launch agent is macOS-only".into());
+    }
+    launch_agent::person_only(&|k| std::env::var(k).ok(), confirm::DevTty::open().is_ok())?;
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or("HOME is not set")?;
+    Ok((launch_agent::plist_path(Path::new(&home)), launch_agent::Launchctl::gui()))
+}
+
+/// `mirante daemon install-agent`: writes the plist for the `mirante-daemon` next to this
+/// CLI and, when no daemon runs, has launchd start it now.
+fn install_agent(paths: &Paths) -> Res {
+    use launch_agent::Launchd;
+    let (plist, launchd) = agent_preflight()?;
+    let bin = daemon_ctl::daemon_bin()?;
+    if !bin.is_file() {
+        return Err(format!("{} not found (set MIRANTE_DAEMON_BIN, or run scripts/install.sh)", bin.display()).into());
+    }
+    paths.ensure_home()?;
+    launch_agent::write_plist(&plist, &bin, paths, &launch_agent::agent_env(std::env::vars()))?;
+    println!("wrote {} (runs {})", plist.display(), bin.display());
+    if Client::connect(&paths.socket()).is_ok() {
+        if launchd.loaded() {
+            println!("a daemon is running: it keeps its settings until it stops (mirante daemon restart)");
+        } else {
+            println!("a daemon started some other way is running: `mirante daemon restart` moves it under launchd");
+        }
+    } else {
+        // Reloaded, so the plist just written is the one launchd reads.
+        launchd.bootout()?;
+        let mut c = daemon_ctl::start_daemon_with_notice(paths, &notice)?;
+        c.set_timeout(Some(Duration::from_secs(10)))?;
+        let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
+        println!("started by launchd: pid {} (v{})", s.pid, s.version);
+    }
+    println!(
+        "It starts at login. macOS now asks once for mirante-daemon's own access to Documents (if your\n\
+         repos are there): allow it. Keep the binary signed the same way (scripts/dev-sign.sh) so the\n\
+         answer sticks across rebuilds. Undo: mirante daemon uninstall-agent"
+    );
+    Ok(())
+}
+
+/// `mirante daemon uninstall-agent`: unloads the job (stopping a daemon it runs, only when
+/// no session is live) and deletes the plist.
+fn uninstall_agent(paths: &Paths) -> Res {
+    use launch_agent::Launchd;
+    let (plist, launchd) = agent_preflight()?;
+    if launchd.loaded() {
+        if let Ok(mut c) = Client::connect(&paths.socket()) {
+            let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
+            if s.live_sessions > 0 {
+                return Err(format!(
+                    "the daemon has {} live session(s) and unloading the agent would stop it: run `mirante daemon stop` first",
+                    s.live_sessions
+                )
+                .into());
+            }
+        }
+        launchd.bootout()?;
+    }
+    match std::fs::remove_file(&plist) {
+        Ok(()) => println!("removed {}", plist.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => println!("no launch agent was installed"),
+        Err(e) => return Err(e.into()),
+    }
+    println!("the daemon now starts from the app or the CLI as before (mirante daemon start)");
+    Ok(())
+}
+
 /// What `daemon stop` says about the sessions it ends: auto-resume brings them back when the
 /// daemon starts again (the running daemon's setting), else `mirante resume`.
 fn stop_note(c: &mut Client) -> &'static str {
@@ -779,21 +851,26 @@ fn run(cmd: Cmd) -> Res {
     let color = term::is_tty(1);
     match cmd {
         Cmd::Help(_) | Cmd::Version => unreachable!("answered before the daemon is involved"),
-        Cmd::Daemon(DaemonCmd::Status) => match Client::connect(&paths.socket()) {
-            // A socket path that cannot exist is a setup error, not "not running".
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e.into()),
-            Ok(mut c) => {
-                let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
-                println!(
-                    "running: pid {} boot {} live sessions {} (v{})",
-                    s.pid, s.boot_id, s.live_sessions, s.version
-                );
-                if let Some(w) = daemon_ctl::version_warning(&s, VERSION) {
-                    eprintln!("{w}");
+        Cmd::Daemon(DaemonCmd::Status) => {
+            match Client::connect(&paths.socket()) {
+                // A socket path that cannot exist is a setup error, not "not running".
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e.into()),
+                Ok(mut c) => {
+                    let s: DaemonStatus = c.call(method::DAEMON_STATUS, json!({}))?;
+                    println!(
+                        "running: pid {} boot {} live sessions {} (v{})",
+                        s.pid, s.boot_id, s.live_sessions, s.version
+                    );
+                    if let Some(w) = daemon_ctl::version_warning(&s, VERSION) {
+                        eprintln!("{w}");
+                    }
                 }
+                Err(_) => println!("not running"),
             }
-            Err(_) => println!("not running"),
-        },
+            if let Some(p) = launch_agent::installed(&paths) {
+                println!("started by launchd: {} (mirante daemon uninstall-agent removes it)", p.display());
+            }
+        }
         Cmd::Daemon(DaemonCmd::Start) => {
             if Client::connect(&paths.socket()).is_ok() {
                 println!("already running");
@@ -826,6 +903,8 @@ fn run(cmd: Cmd) -> Res {
             println!("started: pid {} (v{})", s.pid, s.version);
             hint_the_app(color);
         }
+        Cmd::Daemon(DaemonCmd::InstallAgent) => install_agent(&paths)?,
+        Cmd::Daemon(DaemonCmd::UninstallAgent) => uninstall_agent(&paths)?,
         Cmd::App { no_daemon } => {
             if !cfg!(target_os = "macos") {
                 return Err(app::MACOS_ONLY.into());

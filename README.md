@@ -165,6 +165,13 @@ your shell is slow to start, run `mirante daemon restart` from a terminal instea
 A copied bundle is quarantined on another Mac. For a build you made yourself, clear the
 quarantine with `xattr -dr com.apple.quarantine Mirante.app`.
 
+On macOS, `scripts/install.sh` signs what it builds with a local, self-signed identity
+(`scripts/dev-sign.sh`; see Troubleshooting, "macOS keeps asking … Documents folder"), so
+privacy answers survive rebuilds. To have Tauri sign with an identity of your own, set
+`APPLE_SIGNING_IDENTITY` when building (`APPLE_SIGNING_IDENTITY="Mirante Local Signing"
+pnpm --dir apps/cockpit tauri build --bundles app`); nothing about signing is committed.
+Release builds stay unsigned until there is an Apple Developer ID.
+
 More detail, including the fake daemon for UI work without agents:
 [`apps/cockpit/README.md`](apps/cockpit/README.md).
 
@@ -272,9 +279,36 @@ mirante app                     # open the desktop app (starts the daemon first;
   desktop app. If it says the app is not built or installed, run `scripts/install.sh --app`.
 - **The app does not open on another Mac.** A copied, unsigned bundle is quarantined. For
   a build you made yourself: `xattr -dr com.apple.quarantine Mirante.app`.
-- **After a reboot nothing is running.** There is no login item (launchd agent) yet. The
-  first `mirante` command, or **Start daemon** in the app, starts the daemon, which then
-  resumes the sessions it had (auto-resume).
+- **After a reboot nothing is running.** The first `mirante` command, or **Start daemon**
+  in the app, starts the daemon, which then resumes the sessions it had (auto-resume). To
+  have it start at login, install the launch agent: `mirante daemon install-agent` (macOS;
+  below).
+- **macOS keeps asking "“Mirante” would like to access files in your Documents folder".**
+  Two things make it ask again and again, mostly for checkouts under `~/Documents`:
+  1. *An ad-hoc signed build.* `cargo build` and `tauri build` sign ad hoc, and macOS
+     remembers your answer for that exact build (its cdhash): every rebuild is a new app
+     to it. `scripts/install.sh` now signs the four binaries and the app with a local
+     identity, "Mirante Local Signing" (made once in your login keychain by
+     `scripts/dev-sign.sh`; `--no-sign` skips it), so the answer survives rebuilds. The
+     first signing asks whether `codesign` may use that key: type your login password and
+     click **Always Allow**. After a
+     plain `cargo build --release` or `tauri build`, run `scripts/dev-sign.sh` again.
+     `codesign -d -r- <path>` should say `certificate leaf = H"…"`, not `cdhash H"…"`.
+  2. *The app is answerable for the daemon.* macOS attributes a process's file access to
+     the app that started it: a daemon started by the app's **Start daemon** or **Restart
+     daemon** asks in Mirante's name for every repo its agents work in. Let launchd start
+     it instead: `mirante daemon install-agent` (in your terminal; it also starts the
+     daemon at login; `mirante daemon uninstall-agent` undoes it). The daemon then asks once
+     for itself, as `mirante-daemon`.
+
+  One-time steps: `scripts/install.sh --app` (or `scripts/dev-sign.sh` after a build),
+  `mirante daemon install-agent`, then open the app and click **Allow** once for Mirante,
+  and once for `mirante-daemon` when it asks. Both are listed in **System Settings → Privacy
+  & Security → Files and Folders**, where you can check that **Documents Folder** is on.
+  If an old, denied entry is stuck there, turn it off and on, or remove Mirante with **–**
+  and allow it again. Copying the app to `/Applications` (`--install-app`) also keeps the
+  bundle itself out of `~/Documents`. The app asks the daemon binary its version only when
+  a daemon starts, never on a timer.
 - **Where are the logs?** The daemon's log is `~/.mirante/daemon.log` (rotated to
   `daemon.log.1` past 10 MiB); each task's agent stderr is under
   `~/.mirante/sessions/<task-id>/`; hook events that could not reach the daemon are
