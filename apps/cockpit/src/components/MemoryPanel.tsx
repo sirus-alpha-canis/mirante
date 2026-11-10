@@ -1,10 +1,11 @@
 import { useRef, useState } from "react";
 import { shallow, useEnv, useLive, useSelect } from "../env";
 import { feedText, type FeedMsg, same, type State } from "../store/state";
-import { useT } from "../lib/i18n";
+import { type Key, t as tStatic, useT } from "../lib/i18n";
 import { useNow } from "../lib/useNow";
 import { DaemonError } from "../lib/daemon";
-import { HIBERNATE, isHibernated, mb, pressureText, systemMemory, taskMemory, WAKE } from "../lib/memguard";
+import { HIBERNATE, isHibernated, mb, type Pressure, pressureText, size, type SystemMemory, systemMemory, taskMemory, WAKE } from "../lib/memguard";
+import { Disclosure } from "./Disclosure";
 import type { DaemonStatus, TaskView } from "../lib/protocol";
 
 /** Hibernate (end the process, keep the native session) or wake (resume it). One request at
@@ -115,6 +116,19 @@ export function latestNotice<N extends { ts: number; kind: string }>(newestFirst
 
 const noticeLine = (n: Notice) => `${n.branch ? `${n.branch}: ` : ""}${feedText(n)}`;
 
+const LEVEL_DOT: Record<Pressure, string> = { normal: "dot-ready", elevated: "dot-needs", critical: "dot-danger", unknown: "dot-unknown" };
+
+/** The folded panel's one line: a dot coloured by the pressure level and "normal · 7.0 GB
+ * free" (what the OS calls available, else the strict free pages of an older daemon). */
+export function memorySummary(status: DaemonStatus | null, sys: SystemMemory | null): { dot: string; text: string } {
+  if (!status) return { dot: "dot-unknown", text: tStatic("mem.sumUnknown") };
+  if (!sys) return { dot: "dot-unknown", text: tStatic("mem.sumNotAvailable") };
+  return {
+    dot: LEVEL_DOT[sys.level],
+    text: tStatic("mem.summary", { level: tStatic(`mem.level.${sys.level}` as Key), size: size(sys.available ?? sys.free) }),
+  };
+}
+
 /** The daemon's memory guard: machine pressure, the heaviest sessions, the latest notices. */
 export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; onOpen?(taskId: string): void }) {
   const tt = useT();
@@ -124,9 +138,19 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
   const sys = systemMemory(status);
   const now = useNow(30_000);
   const latest = latestNotice(notices, now, sys?.level === "elevated" || sys?.level === "critical");
+  const sum = memorySummary(status, sys);
   return (
-    <section className="memory" aria-label={t("mem.guard")}>
-      <h2>{t("mem.heading")}</h2>
+    <Disclosure
+      id="memory"
+      className="memory"
+      title={t("mem.heading")}
+      label={t("mem.guard")}
+      summary={
+        <>
+          <span className={`dot ${sum.dot}`} aria-hidden="true" /> {sum.text}
+        </>
+      }
+    >
       {!status ? (
         <p className="muted small">{t("mem.unknown")}</p>
       ) : !sys ? (
@@ -172,6 +196,6 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
           </ul>
         </details>
       )}
-    </section>
+    </Disclosure>
   );
 }

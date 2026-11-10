@@ -160,6 +160,8 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .dot-needs { background: var(--needs); }
 .dot-work { background: var(--work); }
 .dot-ready { background: var(--review); }
+.dot-danger { background: var(--danger); }
+.dot-unknown { background: var(--faint); }
 
 /* The frame: a 36px top bar, the view, a 24px status line. */
 .app { display: flex; flex-direction: column; height: 100%; }
@@ -391,7 +393,17 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .memory { margin-top: 0; }
 .mem-list, .mem-notices { list-style: none; padding: 0 var(--s2); margin: 4px 0; }
 .mem-latest { margin: 4px var(--s2) 2px; }
-.memory > p, .memory > details, .settings > p, .settings > label, .settings > .pause-setting { margin-left: var(--s2); margin-right: var(--s2); }
+.disclosure-body > p, .disclosure-body > details, .disclosure-body > label, .disclosure-body > .pause-setting { margin-left: var(--s2); margin-right: var(--s2); }
+/* A rail section folded to one line: its title, then a live summary (a level dot, a few
+   words). The header is the button; it never opens by itself. */
+.disclosure h2 { margin-left: 0; margin-right: 0; }
+.disclosure-head { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; padding: 2px var(--s2); border: none; border-radius: var(--r); background: none; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; cursor: pointer; }
+.disclosure-head:hover { background: var(--panel-3); }
+.disclosure-chev { flex: none; width: 0; height: 0; border-style: solid; border-width: 4px 0 4px 5px; border-color: transparent transparent transparent currentColor; }
+.disclosure-head[aria-expanded="true"] .disclosure-chev { transform: rotate(90deg); }
+.disclosure-title { flex: none; }
+.disclosure-summary { display: inline-flex; align-items: center; gap: 5px; min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
+.disclosure-summary .dot { width: 7px; height: 7px; }
 .mem-history summary { cursor: pointer; margin: 2px 0; color: var(--muted); }
 .mem-history .mem-notices li { margin: 2px 0; }
 .mem-list li { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 2px 0; }
@@ -462,7 +474,11 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
   .card, .chip, .tile { transition: border-color var(--t) var(--ease); }
   .send, .needs-badge, .health .dot, .pill::before { transition: background-color var(--t) var(--ease), color var(--t) var(--ease); }
   .card .done-actions .btn-primary, .rail-row > .btn-ghost[data-remove] { transition: opacity 120ms var(--ease); }
+  .disclosure-chev { transition: transform var(--t) var(--ease); }
+  .disclosure-body:not([hidden]) { animation: disclosure-in 140ms var(--ease); }
 }
+/* Opening fades the body in; its height never animates (the rail below it just moves). */
+@keyframes disclosure-in { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
@@ -597,7 +613,7 @@ button.skill-chip:hover { color: var(--text); }
 .line-run > .btn { padding: 0; min-height: 0; font-family: var(--mono); font-size: var(--fs-sm); color: var(--muted); }
 .run-lines { margin: 2px 0 4px var(--s4); }
 .settings { margin-top: 0; }
-.settings h2 { font-size: var(--fs-sm); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--faint); margin: var(--s3) var(--s2) var(--s1); }
+.settings h2 { font-size: var(--fs-sm); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--faint); margin: var(--s3) 0 var(--s1); }
 .check { display: flex; gap: 6px; align-items: center; }
 
 /* Detail's task list: search and filters, then projects and states. */

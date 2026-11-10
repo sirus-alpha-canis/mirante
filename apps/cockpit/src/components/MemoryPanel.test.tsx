@@ -6,22 +6,30 @@ import { ev, task } from "../test/fixtures";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { MemoryPanel } from "./MemoryPanel";
 import { EnvContext } from "../env";
+import { setLang } from "../lib/i18n";
+import { disclosureKey } from "./Disclosure";
 
 const status = { pid: 1, boot_id: "b1", version: "x", live_sessions: 1 };
 const GB = 2 ** 30;
+
+/** The panel as a viewer who left it open sees it. */
+const opened = (h: ReturnType<typeof makeEnv>) => {
+  h.env.storage.setItem(disclosureKey("memory"), "1");
+  return h.env;
+};
 
 describe("MemoryPanel", () => {
   it("says when the daemon has no memory guard", () => {
     const h = makeEnv();
     h.load([task("a")]);
-    renderWith(h.env, <MemoryPanel status={status} />);
+    renderWith(opened(h), <MemoryPanel status={status} />);
     expect(screen.getByText(/Memory guard not available/)).toBeInTheDocument();
   });
 
   it("an unknown status (not loaded, or the daemon is away) says unknown, not unavailable", () => {
     const h = makeEnv();
     h.load([task("a")]);
-    renderWith(h.env, <MemoryPanel status={null} />);
+    renderWith(opened(h), <MemoryPanel status={null} />);
     expect(screen.getByText("System memory status unknown.")).toBeInTheDocument();
     expect(screen.queryByText(/not available/)).toBeNull();
   });
@@ -30,7 +38,7 @@ describe("MemoryPanel", () => {
     const h = makeEnv({ "session.hibernate": {} });
     const memory = { bytes: 1, peak: 1, budget: 2, state: "ok" };
     h.load([task("a", { memory, status: "working" })]);
-    renderWith(h.env, <MemoryPanel status={null} />);
+    renderWith(opened(h), <MemoryPanel status={null} />);
     await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
     const confirm = screen.getByRole("group", { name: "Confirm hibernate" });
     expect(confirm).toHaveTextContent("The agent is mid-turn; hibernating ends this turn.");
@@ -45,7 +53,7 @@ describe("MemoryPanel", () => {
   it("an idle session's confirm has no mid-turn warning", async () => {
     const h = makeEnv();
     h.load([task("a", { memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })]);
-    renderWith(h.env, <MemoryPanel status={null} />);
+    renderWith(opened(h), <MemoryPanel status={null} />);
     await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
     expect(screen.getByRole("group", { name: "Confirm hibernate" })).not.toHaveTextContent(/mid-turn/);
   });
@@ -55,7 +63,7 @@ describe("MemoryPanel", () => {
     const memory = { bytes: 3 * GB, peak: 3 * GB, budget: 4 * GB, state: "soft" };
     h.load([task("a", { memory })], [ev(1, "a", "memory.offer_hibernate", { reason: "memory pressure elevated" })]);
     const sys = { level: "elevated", total: 16 * GB, free: 512 * 2 ** 20, swap_used: 0, swap_total: 0, paused: true };
-    renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys }} />);
+    renderWith(opened(h), <MemoryPanel status={{ ...status, memory: sys }} />);
     expect(screen.getByText("System memory tight (little free memory) · new sessions paused until it eases")).toBeInTheDocument();
     expect(screen.getByText("512 MB free of 16.0 GB")).toBeInTheDocument();
     expect(screen.getByText("3072 MB / 4096 MB")).toBeInTheDocument();
@@ -68,7 +76,7 @@ describe("MemoryPanel", () => {
   it("a daemon without hibernate answers METHOD_NOT_FOUND and the UI says so", async () => {
     const h = makeEnv({ "session.hibernate": rpcError(RpcCode.METHOD_NOT_FOUND, "unknown method") });
     h.load([task("a", { memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })]);
-    renderWith(h.env, <MemoryPanel status={status} />);
+    renderWith(opened(h), <MemoryPanel status={status} />);
     await userEvent.click(screen.getByRole("button", { name: "Hibernate" }));
     await userEvent.click(screen.getByRole("button", { name: "Hibernate now" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("memory guard not available in this daemon");
@@ -84,7 +92,7 @@ describe("MemoryPanel", () => {
       ],
       [ev(1, "s", "memory.auto_hibernated", { reason: "idle under critical pressure" })],
     );
-    renderWith(h.env, <MemoryPanel status={null} />);
+    renderWith(opened(h), <MemoryPanel status={null} />);
     const rows = within(screen.getByRole("region", { name: "Memory guard" })).getAllByRole("listitem");
     const sessions = rows.filter((r) => r.closest(".mem-list"));
     expect(sessions.map((r) => r.querySelector(".mem-name")?.textContent)).toEqual(["feat/t3", "feat/t1", "feat/t2", "feat/t4", "feat/t0"]);
@@ -110,7 +118,7 @@ describe("MemoryPanel", () => {
           at(ev(4, null, "memory.resumed"), 2 * MIN),
         ],
       );
-      renderWith(h.env, <MemoryPanel status={{ ...status, memory: normal }} />);
+      renderWith(opened(h), <MemoryPanel status={{ ...status, memory: normal }} />);
       expect(latest()).toHaveTextContent("new sessions and queued deliveries resumed");
       expect(latest()).toHaveClass("muted");
       // One line, not a list of every notice.
@@ -130,7 +138,7 @@ describe("MemoryPanel", () => {
     it("nothing in the last 10 minutes: no latest line, only the History disclosure", () => {
       const h = makeEnv();
       h.load([task("a")], [at(ev(1, null, "memory.resumed"), 11 * MIN)]);
-      renderWith(h.env, <MemoryPanel status={{ ...status, memory: normal }} />);
+      renderWith(opened(h), <MemoryPanel status={{ ...status, memory: normal }} />);
       expect(latest()).toBeNull();
       expect(screen.getByText("History (1)")).toBeInTheDocument();
     });
@@ -138,7 +146,7 @@ describe("MemoryPanel", () => {
     it("a hibernate suggestion shows only while pressure is still elevated", () => {
       const h = makeEnv();
       h.load([task("a")], [at(ev(1, "a", "memory.offer_hibernate", { reason: "memory pressure elevated" }), MIN)]);
-      const { rerender } = renderWith(h.env, <MemoryPanel status={{ ...status, memory: elevated }} />);
+      const { rerender } = renderWith(opened(h), <MemoryPanel status={{ ...status, memory: elevated }} />);
       expect(latest()).toHaveTextContent("feat/a: hibernate suggested: memory pressure elevated");
       rerender(
         <EnvContext.Provider value={h.env}>
@@ -151,7 +159,7 @@ describe("MemoryPanel", () => {
     it("no notices: no History", () => {
       const h = makeEnv();
       h.load([task("a")]);
-      renderWith(h.env, <MemoryPanel status={{ ...status, memory: normal }} />);
+      renderWith(opened(h), <MemoryPanel status={{ ...status, memory: normal }} />);
       expect(screen.queryByText(/^History/)).toBeNull();
     });
   });
@@ -160,7 +168,7 @@ describe("MemoryPanel", () => {
     let release: (v: unknown) => void = () => {};
     const h = makeEnv({ "session.wake": () => new Promise((r) => (release = r)) });
     h.load([task("s", { live: false, boot: null, hibernated: true })]);
-    renderWith(h.env, <MemoryPanel status={null} />);
+    renderWith(opened(h), <MemoryPanel status={null} />);
     expect(screen.getByText("hibernated")).toBeInTheDocument();
     const wake = screen.getByRole("button", { name: "Wake" });
     await userEvent.click(wake);
@@ -168,5 +176,93 @@ describe("MemoryPanel", () => {
     expect(h.calls.filter(([m]) => m === "session.wake")).toEqual([["session.wake", { task: "s" }]]);
     expect(wake).toBeDisabled();
     release({});
+  });
+
+  describe("folded (the default)", () => {
+    const sys = (level: string, over: Record<string, unknown> = {}) => ({ level, total: 16 * GB, free: 2 * GB, available: 7 * GB, swap_used: 0, swap_total: 0, paused: false, ...over });
+    const head = () => screen.getByRole("button", { name: /^System memory/ });
+
+    it("one line: the title and a summary chip; the details hidden until opened", async () => {
+      const h = makeEnv();
+      h.load([task("a", { memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })], [ev(1, "a", "memory.resumed")]);
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("normal") }} />);
+      expect(head()).toHaveAttribute("aria-expanded", "false");
+      expect(head()).toHaveAccessibleName("System memory normal · 7.0 GB free");
+      expect(screen.queryByRole("button", { name: "Hibernate" })).toBeNull();
+      expect(screen.getByText(/^History/)).not.toBeVisible();
+      await userEvent.click(head());
+      expect(head()).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByText("7.0 GB available of 16.0 GB")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Hibernate" })).toBeVisible();
+      expect(screen.getByText("History (1)")).toBeVisible();
+      await userEvent.click(head());
+      expect(screen.queryByRole("button", { name: "Hibernate" })).toBeNull();
+    });
+
+    it.each([
+      ["normal", "dot-ready", "normal"],
+      ["elevated", "dot-needs", "elevated"],
+      ["critical", "dot-danger", "critical"],
+      ["surprising", "dot-unknown", "unknown"],
+    ])("level %s: a %s dot and its word", (level, dot, word) => {
+      const h = makeEnv();
+      h.load([]);
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys(level) }} />);
+      expect(head()).toHaveAccessibleName(`System memory ${word} · 7.0 GB free`);
+      expect(head().querySelector(".dot")).toHaveClass(dot);
+    });
+
+    it("an older daemon's free memory, no status, no guard: each says so", () => {
+      const h = makeEnv();
+      h.load([]);
+      const { rerender } = renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("normal", { available: undefined }) }} />);
+      expect(head()).toHaveAccessibleName("System memory normal · 2.0 GB free");
+      const again = (s: Parameters<typeof MemoryPanel>[0]["status"]) =>
+        rerender(
+          <EnvContext.Provider value={h.env}>
+            <MemoryPanel status={s} />
+          </EnvContext.Provider>,
+        );
+      again(null);
+      expect(head()).toHaveAccessibleName("System memory unknown");
+      again(status);
+      expect(head()).toHaveAccessibleName("System memory not available");
+    });
+
+    it("pressure changes update the summary live, never open the panel", () => {
+      const h = makeEnv();
+      h.load([]);
+      const { rerender } = renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("normal") }} />);
+      rerender(
+        <EnvContext.Provider value={h.env}>
+          <MemoryPanel status={{ ...status, memory: sys("critical", { available: 300 * 2 ** 20, paused: true }) }} />
+        </EnvContext.Provider>,
+      );
+      expect(head()).toHaveAttribute("aria-expanded", "false");
+      expect(head()).toHaveAccessibleName("System memory critical · 300 MB free");
+      expect(head().querySelector(".dot")).toHaveClass("dot-danger");
+    });
+
+    it("remembers being opened", async () => {
+      const h = makeEnv();
+      h.load([]);
+      const { unmount } = renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("normal") }} />);
+      await userEvent.click(head());
+      unmount();
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("normal") }} />);
+      expect(head()).toHaveAttribute("aria-expanded", "true");
+    });
+
+    it("says it in Portuguese", () => {
+      const h = makeEnv();
+      h.load([]);
+      setLang("pt");
+      try {
+        renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("elevated") }} />);
+        expect(screen.getByRole("button", { name: /^Memória do sistema/ })).toHaveAccessibleName("Memória do sistema elevada · 7.0 GB livres");
+      } finally {
+        setLang("en");
+      }
+    });
   });
 });

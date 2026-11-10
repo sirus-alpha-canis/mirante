@@ -173,7 +173,9 @@ ready), no brand accent (the Orb-Dot mark is the identity), type 12/13/15/20. Th
 follows macOS (◐ cycles system → light → dark). A 36px top bar holds the mark (Home), where
 you are (Home › project › task), the views, the daemon's health dot, what needs you (click:
 ⌘J) and ⌘K; a 24px status line at the foot shows the daemon, system memory, what needs
-you and the keys of the current view. Tokens live at the top of `src/styles.css`;
+you and the keys of the current view. At the rail's foot, System memory and Sessions are
+folded to one line each (a level dot and "normal · 7.0 GB free"; "Auto-resume on · Pause
+off"): click a title to open it, and each stays as you left it. Tokens live at the top of `src/styles.css`;
 `styles.test.ts` checks their contrast (WCAG AA) in every theme.
 
 The UI is set in Inter and code and the terminal in JetBrains Mono (both SIL OFL 1.1),

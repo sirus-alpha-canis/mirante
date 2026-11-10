@@ -85,6 +85,9 @@ const projectOptions = () => within(screen.getByRole("listbox", { name: "Project
 /** The agent the form's Agent menu shows. */
 const agentShown = () => screen.getByRole("button", { name: /^Agent:/ }).getAttribute("aria-label")?.replace(/^Agent: /, "");
 
+/** Unfolds the rail's Sessions settings (folded by default). */
+const openSessions = () => userEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
 const daemonStatus = (claude_inline_answers: boolean): DaemonStatus => ({
   pid: 1,
   boot_id: "b1",
@@ -639,8 +642,9 @@ describe("Home (V3 group chat)", () => {
     expect(count("skill.list")).toBe(1);
   });
 
-  it("with MIRANTE_AUTO_RESUME=off the setting is shown off and cannot be changed here", () => {
+  it("with MIRANTE_AUTO_RESUME=off the setting is shown off and cannot be changed here", async () => {
     setup({}, [], [], { ...daemonStatus(false), auto_resume: false, auto_resume_forced_off: true });
+    await openSessions();
     const settings = screen.getByRole("region", { name: "Sessions" });
     const box = within(settings).getByRole("checkbox", { name: "Resume sessions after a daemon restart" });
     expect(box).not.toBeChecked();
@@ -650,6 +654,7 @@ describe("Home (V3 group chat)", () => {
 
   it("the rail says closing the app keeps agents running, and switches auto-resume through the daemon", async () => {
     const h = setup({ "daemon.settings": (p: Record<string, unknown>) => ({ auto_resume: p.auto_resume }) }, [], [], { ...daemonStatus(false), auto_resume: true });
+    await openSessions();
     const settings = screen.getByRole("region", { name: "Sessions" });
     expect(settings).toHaveTextContent("Closing Mirante leaves your agents running");
     const box = within(settings).getByRole("checkbox", { name: "Resume sessions after a daemon restart" });
@@ -666,6 +671,7 @@ describe("Home (V3 group chat)", () => {
       [],
       { ...daemonStatus(false), auto_resume: true, pause_new_sessions_under_pressure: "off" },
     );
+    await openSessions();
     const settings = screen.getByRole("region", { name: "Sessions" });
     const pick = within(settings).getByRole("combobox", { name: "Pause new sessions under memory pressure" });
     expect(pick).toHaveValue("off");
@@ -676,8 +682,9 @@ describe("Home (V3 group chat)", () => {
     await waitFor(() => expect(pick).toHaveValue("critical"));
   });
 
-  it("the pause setting is read-only under MIRANTE_MEMGUARD_PAUSE, and absent for an older daemon", () => {
+  it("the pause setting is read-only under MIRANTE_MEMGUARD_PAUSE, and absent for an older daemon", async () => {
     setup({}, [], [], { ...daemonStatus(false), auto_resume: true, pause_new_sessions_under_pressure: "elevated", pause_forced_by_env: true });
+    await openSessions();
     const settings = screen.getByRole("region", { name: "Sessions" });
     const pick = within(settings).getByRole("combobox", { name: "Pause new sessions under memory pressure" });
     expect(pick).toHaveValue("elevated");
@@ -736,6 +743,7 @@ describe("Home (V3 group chat)", () => {
   it("a session named in the memory panel opens its detail", async () => {
     const h = setup({}, [task("a", { status: "working", memory: { bytes: 1, peak: 1, budget: 2, state: "ok" } })]);
     const panel = screen.getByRole("region", { name: "Memory guard" });
+    await userEvent.click(within(panel).getByRole("button", { name: /^System memory/ }));
     await userEvent.click(within(panel).getByRole("button", { name: "feat/a" }));
     expect(h.opened).toEqual([["a", undefined]]);
   });

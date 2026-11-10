@@ -9,7 +9,7 @@ import { projects } from "../store/select";
 import { same, type State } from "../store/state";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { task } from "../test/fixtures";
-import { LeftRail } from "./LeftRail";
+import { LeftRail, SessionSettings } from "./LeftRail";
 
 type RailProps = Omit<Parameters<typeof LeftRail>[0], "projects" | "registry" | "status" | "selected">;
 
@@ -306,5 +306,65 @@ describe("a folder added before that is no repository", () => {
     await screen.findByText("gol is a folder, not a repository");
     await userEvent.click(screen.getByRole("button", { name: "Remove gol from Projects" }));
     expect(loadRegistry(h.env.storage).repos).toEqual([]);
+  });
+});
+
+describe("the rail's Sessions settings, folded by default", () => {
+  const base = { pid: 1, boot_id: "b1", version: "x", live_sessions: 0 };
+  const head = () => screen.getByRole("button", { name: /^Sessions/ });
+  const mount = (status: Parameters<typeof SessionSettings>[0]["status"], answers: Record<string, unknown> = {}) => {
+    const h = makeEnv(answers);
+    h.load([]);
+    const r = renderWith(h.env, <SessionSettings status={status} />);
+    return { h, ...r };
+  };
+
+  it("one line with a summary; the settings hidden until opened", async () => {
+    mount({ ...base, auto_resume: true, pause_new_sessions_under_pressure: "off" });
+    expect(head()).toHaveAttribute("aria-expanded", "false");
+    expect(head()).toHaveAccessibleName("Sessions Auto-resume on · Pause off");
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    await userEvent.click(head());
+    expect(screen.getByRole("checkbox", { name: "Resume sessions after a daemon restart" })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Pause new sessions under memory pressure" })).toBeVisible();
+    expect(screen.getByText(/Mirante keeps working under pressure/)).toBeVisible();
+    await userEvent.click(head());
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  it.each([
+    [{ auto_resume: false, pause_new_sessions_under_pressure: "critical" as const }, "Auto-resume off · Pause when critical"],
+    [{ auto_resume: true, auto_resume_forced_off: true, pause_new_sessions_under_pressure: "elevated" as const }, "Auto-resume off · Pause when elevated"],
+    [{ auto_resume: true }, "Auto-resume on"],
+    [{}, ""],
+  ])("summarises %o as %s", (over, text) => {
+    mount({ ...base, ...over });
+    expect(head()).toHaveAccessibleName(`Sessions${text ? ` ${text}` : ""}`);
+  });
+
+  it("the summary follows a change made inside", async () => {
+    mount(
+      { ...base, auto_resume: true, pause_new_sessions_under_pressure: "off" },
+      {
+        "daemon.settings": (p: Record<string, unknown>) => ({
+          auto_resume: p.auto_resume ?? true,
+          pause_new_sessions_under_pressure: p.pause_new_sessions_under_pressure ?? "off",
+        }),
+      },
+    );
+    await userEvent.click(head());
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.selectOptions(screen.getByRole("combobox"), "elevated");
+    await userEvent.click(head());
+    expect(head()).toHaveAccessibleName("Sessions Auto-resume off · Pause when elevated");
+  });
+
+  it("remembers being opened", async () => {
+    const { h, unmount } = mount({ ...base, auto_resume: true });
+    await userEvent.click(head());
+    unmount();
+    renderWith(h.env, <SessionSettings status={{ ...base, auto_resume: true }} />);
+    expect(head()).toHaveAttribute("aria-expanded", "true");
   });
 });

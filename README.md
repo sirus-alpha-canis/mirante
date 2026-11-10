@@ -256,9 +256,9 @@ mirante app                     # open the desktop app (starts the daemon first;
   that is working or waits on you; `mirante wake <task>` brings it back). `mirante watch`
   and `mirante doctor` say `pausing: off`.
 - **New dispatches say memory is paused.** You (or `MIRANTE_MEMGUARD_PAUSE`) set the guard
-  to pause: **Pause new sessions under memory pressure** in the app's Sessions section is
-  *Only when critical* or *When elevated*. New sessions and queued deliveries then wait
-  until it eases; set it back to *Off* to keep working. Tune the guard with
+  to pause: **Pause new sessions under memory pressure** in the app's Sessions section
+  (open it at the rail's foot) is *Only when critical* or *When elevated*. New sessions and
+  queued deliveries then wait until it eases; set it back to *Off* to keep working. Tune the guard with
   `MIRANTE_MEM_BUDGET_MB` (per-session budget), `MIRANTE_IDLE_HIBERNATE_MIN` (hibernate
   idle sessions) or turn it off with `MIRANTE_MEMGUARD=off`, then restart the daemon.
 - **"This daemon cannot … Update Mirante to use it."** The daemon running is older than

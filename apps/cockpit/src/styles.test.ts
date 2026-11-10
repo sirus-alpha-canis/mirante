@@ -82,6 +82,16 @@ describe("styles", () => {
     }
   });
 
+  it("a rail disclosure never animates its height, and its fade only without reduced motion", () => {
+    const rules = [...css.matchAll(/[^{}]*disclosure[^{}]*\{[^}]*\}/g)].map((m) => m[0]);
+    expect(rules.length).toBeGreaterThan(0);
+    for (const r of rules) expect(r).not.toMatch(/height[^;]*(transition|animation)|(transition|animation)[^;]*height/);
+    const calm = /@media \(prefers-reduced-motion: no-preference\) \{([\s\S]*?)\n\}/.exec(css)?.[1] ?? "";
+    expect(calm).toMatch(/\.disclosure-body:not\(\[hidden\]\) \{ animation: disclosure-in/);
+    // Outside that block, no disclosure rule moves.
+    expect(css.replace(calm, "")).not.toMatch(/\.disclosure[^{]*\{[^}]*(animation|transition):/);
+  });
+
   it("the launch splash paints the app's reading surface, text and muted, in each theme", () => {
     const splash = (name: string) => [...page.matchAll(new RegExp(`--splash-${name}: (#[0-9a-fA-F]{6});`, "g"))].map((m) => m[1]);
     expect(splash("bg")).toEqual(tokens("--panel"));
