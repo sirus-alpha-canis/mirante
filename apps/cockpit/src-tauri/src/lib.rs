@@ -162,7 +162,8 @@ async fn daemon_start(app: AppHandle) -> Result<(), String> {
 }
 
 /// What the `mirante-daemon` the app would start says it is (`--version`: no shell, a time
-/// limit); null when it cannot tell. The frontend compares its build with `daemon.status`'s.
+/// limit, run once per build of the file); null when it cannot tell. The frontend compares
+/// its build with `daemon.status`'s, at each daemon boot only.
 #[tauri::command]
 async fn daemon_binary_build() -> Option<DaemonBinary> {
     tauri::async_runtime::spawn_blocking(mirante_bridge::daemon::binary_version).await.ok().flatten()

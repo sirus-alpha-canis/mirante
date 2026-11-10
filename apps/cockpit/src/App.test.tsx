@@ -769,6 +769,29 @@ describe("App", () => {
       expect(screen.queryByRole("status", { name: "Mirante update" })).toBeNull();
     });
 
+    it("the binary is asked once per daemon boot, never on a timer", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const h = makeEnv({ "daemon.status": { ...STATUS, build: "new.2" }, "message.list_queued": [] });
+        vi.mocked(h.env.daemonBinaryBuild).mockResolvedValue(disk);
+        render(<App env={h.env} />);
+        act(() => h.load([task("a")]));
+        await act(async () => {});
+        const once = vi.mocked(h.env.daemonBinaryBuild).mock.calls.length;
+        expect(once).toBeGreaterThan(0);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(30 * 60_000);
+        });
+        expect(vi.mocked(h.env.daemonBinaryBuild).mock.calls.length).toBe(once);
+        // A new daemon (another boot_id): asked again.
+        act(() => h.env.cockpit.dispatch({ type: "connected", snapshot: snapshot([task("a")], 0, { boot_id: "b2" }) }));
+        await act(async () => {});
+        expect(vi.mocked(h.env.daemonBinaryBuild).mock.calls.length).toBeGreaterThan(once);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("a failed restart says why, and the button comes back", async () => {
       const h = makeEnv({ "daemon.status": { ...STATUS, build: "old.1" }, "message.list_queued": [] });
       vi.mocked(h.env.daemonBinaryBuild).mockResolvedValue(disk);

@@ -163,14 +163,14 @@ jobs:
         with:
           key: install-release
       - name: scripts/install.sh
-        run: scripts/install.sh --prefix "$RUNNER_TEMP/bin"
+        run: scripts/install.sh --prefix "$RUNNER_TEMP/bin" --no-sign
       - name: mirante --version, daemon status, doctor
         run: |
           "$RUNNER_TEMP/bin/mirante" --version
           "$RUNNER_TEMP/bin/mirante" daemon status | grep running
           "$RUNNER_TEMP/bin/mirante" doctor
       - name: scripts/install.sh again (idempotent)
-        run: scripts/install.sh --prefix "$RUNNER_TEMP/bin"
+        run: scripts/install.sh --prefix "$RUNNER_TEMP/bin" --no-sign
       - name: scripts/try.sh --smoke
         run: env -u MIRANTE_HOME scripts/try.sh --smoke
       - name: scripts/uninstall.sh
@@ -209,7 +209,7 @@ jobs:
         with:
           persist-credentials: false
       - name: shellcheck scripts
-        run: shellcheck --version && shellcheck -S warning scripts/install.sh scripts/uninstall.sh scripts/try.sh
+        run: shellcheck --version && shellcheck -S warning scripts/install.sh scripts/uninstall.sh scripts/try.sh scripts/dev-sign.sh
 
   # Not a gate: the tree is not rustfmt-clean yet. Reports the drift as a warning
   # annotation and stays green. Turn it into a gate once the tree is formatted.

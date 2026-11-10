@@ -3,7 +3,7 @@
 # mirante-hook, mirante-mcp) into a bin directory, then starts the daemon and runs
 # `mirante doctor`. Safe to run again: it rebuilds, relinks and restarts an idle daemon.
 #
-#   scripts/install.sh [--prefix <bin dir>] [--app [--install-app [--yes]]] [--no-start]
+#   scripts/install.sh [--prefix <bin dir>] [--app [--install-app [--yes]]] [--no-start] [--no-sign]
 #
 #   --prefix <dir>  where the links go (default: $PREFIX, else ~/.local/bin)
 #   --app           also build the desktop app (needs Node 22.12+ and pnpm 10)
@@ -11,8 +11,13 @@
 #                   copy there is replaced only after you confirm, or with --yes
 #   --yes           replace an older /Applications/Mirante.app without asking
 #   --no-start      do not start or restart the daemon (and skip doctor)
+#   --sign          (macOS, the default) sign the binaries and the app with a local identity
+#                   (scripts/dev-sign.sh, which creates it once in your login keychain), so
+#                   macOS privacy answers (Documents access) survive rebuilds
+#   --no-sign       leave them ad-hoc signed (macOS then asks again after every build)
 #
-# It never edits your shell profile, ~/.claude or ~/.codex. Undo with scripts/uninstall.sh.
+# It never edits your shell profile, ~/.claude or ~/.codex; on macOS it adds one code-signing
+# identity to your login keychain (not with --no-sign). Undo with scripts/uninstall.sh.
 set -euo pipefail
 
 BINS=(mirante mirante-daemon mirante-hook mirante-mcp)
@@ -24,13 +29,14 @@ die() {
   exit 1
 }
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 prefix="${PREFIX:-$HOME/.local/bin}"
 app=0
 install_app=0
 yes=0
 start=1
+sign=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix)
@@ -57,6 +63,14 @@ while [ $# -gt 0 ]; do
       ;;
     --no-start)
       start=0
+      shift
+      ;;
+    --sign)
+      sign=1
+      shift
+      ;;
+    --no-sign)
+      sign=0
       shift
       ;;
     -h | --help)
@@ -99,6 +113,15 @@ esac
 say "Building ${BINS[*]} (release; the first build takes a few minutes)"
 cargo build --release --locked -p mirante-cli -p mirante-daemon -p mirante-hook -p mirante-mcp
 
+# --- Sign (macOS): a stable identity, so TCC remembers its answers across rebuilds.
+[ "$(uname -s)" = Darwin ] || sign=0
+dev_sign() {
+  [ "$sign" = 1 ] || return 0
+  "$root/scripts/dev-sign.sh" "$@" ||
+    warn "could not sign $* (scripts/dev-sign.sh above): macOS will ask for Documents access again after each build"
+}
+dev_sign "${BINS[@]/#/$root/target/release/}"
+
 # --- Link. Only links are replaced: a real file of the same name is left alone.
 say "Linking into $prefix"
 mkdir -p "$prefix"
@@ -116,6 +139,7 @@ case ":$PATH:" in
   *)
     on_path=0
     warn "$prefix is not on your PATH. Add this to your shell profile (~/.zshrc), then open a new terminal:"
+    # shellcheck disable=SC2016 # a literal $PATH for the profile
     printf '    export PATH="%s:$PATH"\n' "$prefix" >&2
     ;;
 esac
@@ -184,6 +208,8 @@ if [ "$app" = 1 ]; then
   pnpm --dir apps/cockpit tauri build --bundles app
   bundle="$root/apps/cockpit/src-tauri/target/release/bundle/macos/Mirante.app"
   if [ -d "$bundle" ]; then
+    # APPLE_SIGNING_IDENTITY set: Tauri signed it with that identity already.
+    [ -n "${APPLE_SIGNING_IDENTITY:-}" ] || dev_sign "$bundle"
     say "App: $bundle"
     if [ "$install_app" = 1 ]; then
       install_app_bundle "$bundle"

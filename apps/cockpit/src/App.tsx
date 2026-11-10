@@ -30,9 +30,6 @@ import { type Connection, same, type State } from "./store/state";
 export type Mode = "home" | "detail" | "grid" | "brain" | "skills" | "rules";
 
 export const STATUS_POLL_MS = 5000;
-/** How often the daemon binary on disk is asked its build (besides each new daemon boot):
- * an update installed while the app runs is noticed within this. */
-export const BINARY_CHECK_MS = 120_000;
 
 /** A form field with what the person is typing (not the terminal: on macOS ⌘ chords pass
  * through it, and leaving it loses nothing). View chords wait there: switching views would
@@ -305,21 +302,19 @@ export function App({ env: given }: { env: Env }) {
     };
   }, [env, live]);
 
-  // The binary on disk, asked again at each daemon boot (a restart may have run it) and now
-  // and then (an update installed meanwhile).
+  // The binary on disk, asked at each daemon boot only (a restart may have run a new one; an
+  // install restarts an idle daemon). Never on a timer: the binary usually sits in a checkout
+  // under ~/Documents, and each look at it there is a macOS privacy check in the app's name.
+  // The shell runs it once per build (it keeps the answer while the file is unchanged).
   useEffect(() => {
     if (!live) return;
     let stopped = false;
-    const check = () =>
-      void env
-        .daemonBinaryBuild()
-        .catch(() => null)
-        .then((b) => !stopped && setDisk((cur) => (same(cur, b ?? null) ? cur : (b ?? null))));
-    check();
-    const timer = setInterval(check, BINARY_CHECK_MS);
+    void env
+      .daemonBinaryBuild()
+      .catch(() => null)
+      .then((b) => !stopped && setDisk((cur) => (same(cur, b ?? null) ? cur : (b ?? null))));
     return () => {
       stopped = true;
-      clearInterval(timer);
     };
   }, [env, live, bootId]);
   const restart = useCallback(() => {

@@ -58,11 +58,62 @@ pub fn ensure_running(paths: &Paths) -> Result<(), String> {
     mirante_cli::daemon_ctl::start_daemon_with_env(paths, &bin, env).map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// What tells one build of the binary from another without running it: where it is (links
+/// followed), its size, mtime and inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    path: PathBuf,
+    len: u64,
+    mtime: (i64, i64),
+    ino: u64,
+}
+
+/// The binary's [`Fingerprint`]; None when it cannot be read.
+pub fn fingerprint(bin: &Path) -> Option<Fingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(bin).ok()?;
+    Some(Fingerprint { path: bin.to_path_buf(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()), ino: m.ino() })
+}
+
+/// The last answer of `--version`, kept while the binary's [`Fingerprint`] stays the same:
+/// the binary is run once per build, not on every check. Running a program reads it, and a
+/// binary under ~/Documents then costs a macOS privacy check each time.
+#[derive(Default)]
+pub struct VersionCache {
+    last: std::sync::Mutex<Option<(Fingerprint, DaemonBinary)>>,
+}
+
+impl VersionCache {
+    /// `run(bin)` unless the cached answer is for this very file (`stat(bin)` says the same).
+    /// An unknown answer (a slow first launch, a failure) is not kept: the next check asks again.
+    pub fn get(
+        &self,
+        bin: &Path,
+        stat: impl Fn(&Path) -> Option<Fingerprint>,
+        run: impl Fn(&Path) -> Option<DaemonBinary>,
+    ) -> Option<DaemonBinary> {
+        let now = stat(bin)?;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fp, answer)) = last.as_ref() {
+            if *fp == now {
+                return Some(answer.clone());
+            }
+        }
+        let answer = run(bin);
+        *last = answer.clone().map(|a| (now, a));
+        answer
+    }
+}
+
 /// What the binary the app would start says it is (`--version`, no shell, at most
-/// [`mirante_cli::daemon_ctl::VERSION_TIMEOUT`]); None when it cannot tell.
+/// [`mirante_cli::daemon_ctl::VERSION_TIMEOUT`], once per build: [`VersionCache`]); None
+/// when it cannot tell.
 pub fn binary_version() -> Option<DaemonBinary> {
+    static CACHE: std::sync::OnceLock<VersionCache> = std::sync::OnceLock::new();
     let bin = resolve_bin().ok()?;
-    mirante_cli::daemon_ctl::binary_version(&bin, mirante_cli::daemon_ctl::VERSION_TIMEOUT)
+    CACHE.get_or_init(VersionCache::default).get(&bin, fingerprint, |b| {
+        mirante_cli::daemon_ctl::binary_version(b, mirante_cli::daemon_ctl::VERSION_TIMEOUT)
+    })
 }
 
 /// How long the old daemon may take to end its sessions and let go of its lock.
@@ -117,6 +168,42 @@ mod tests {
         .unwrap();
         assert!(again);
         assert_eq!(fake.methods().len(), 1);
+    }
+
+    #[test]
+    fn the_binary_is_run_once_per_build_and_unknown_answers_are_asked_again() {
+        use std::cell::{Cell, RefCell};
+        let d = TestDir::new();
+        let bin = d.path().join("mirante-daemon");
+        std::fs::write(&bin, "v1").unwrap();
+        let runs = Cell::new(0);
+        let answer = RefCell::new(Some(DaemonBinary { version: "0.1.0".into(), build: Some("a.1".into()) }));
+        let run = |_: &Path| {
+            runs.set(runs.get() + 1);
+            answer.borrow().clone()
+        };
+        let cache = VersionCache::default();
+        let first = cache.get(&bin, fingerprint, run);
+        assert_eq!(first.as_ref().and_then(|b| b.build.as_deref()), Some("a.1"));
+        for _ in 0..5 {
+            assert_eq!(cache.get(&bin, fingerprint, run), first);
+        }
+        assert_eq!(runs.get(), 1, "the same file is not run again");
+        // A new build (another size, mtime or inode): run again.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::write(&bin, "v2 longer").unwrap();
+        *answer.borrow_mut() = Some(DaemonBinary { version: "0.1.0".into(), build: Some("b.2".into()) });
+        assert_eq!(cache.get(&bin, fingerprint, run).and_then(|b| b.build), Some("b.2".into()));
+        assert_eq!(runs.get(), 2);
+        // No answer (a slow first launch): not kept, asked again next time.
+        std::fs::write(&bin, "v3 longer still").unwrap();
+        *answer.borrow_mut() = None;
+        assert_eq!(cache.get(&bin, fingerprint, run), None);
+        assert_eq!(cache.get(&bin, fingerprint, run), None);
+        assert_eq!(runs.get(), 4);
+        // A binary that cannot be read is not run.
+        assert_eq!(cache.get(&d.path().join("missing"), fingerprint, run), None);
+        assert_eq!(runs.get(), 4);
     }
 
     #[test]
