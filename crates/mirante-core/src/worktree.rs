@@ -749,6 +749,7 @@ mod tests {
     /// Plants code-execution traps a prompt-injected agent could set in a repository: hooks,
     /// `core.fsmonitor`, a clean/smudge filter, a textconv and external diff driver. Each
     /// trap touches `<marks>/PWNED-<name>` when git runs it.
+    #[cfg(unix)]
     pub(crate) fn plant_git_traps(repo: &Path, marks: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let script = |name: &str| {
@@ -779,6 +780,7 @@ mod tests {
     }
 
     /// The traps [`plant_git_traps`] set off.
+    #[cfg(unix)]
     pub(crate) fn sprung(marks: &Path) -> Vec<String> {
         let mut out: Vec<String> = std::fs::read_dir(marks)
             .unwrap()
@@ -791,6 +793,7 @@ mod tests {
 
     /// Runs git in the test's own name (never through the hardened runner) with every trap
     /// disarmed, so only the code under test can set one off.
+    #[cfg(unix)]
     pub(crate) fn git_disarmed(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .arg("-C")
@@ -803,6 +806,7 @@ mod tests {
         assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_lifecycle_never_runs_code_the_repo_configures() {
         let dir = TempDir::new("wt-traps");

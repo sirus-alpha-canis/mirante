@@ -1195,7 +1195,7 @@ mod store_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod refresh_tests {
     use super::*;
     use crate::dna::check::{cite, rev_parse};

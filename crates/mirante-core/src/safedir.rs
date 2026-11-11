@@ -21,11 +21,17 @@
 //! Residual risk: someone who can rename the opened directory itself into another place on
 //! the same file system makes the operations land there, but that needs write access to the
 //! destination, which then needs no help from Mirante.
+#[cfg_attr(windows, allow(unused_imports))]
 use std::ffi::{CStr, CString};
+#[cfg(unix)]
 use std::fs::File;
+#[cfg_attr(windows, allow(unused_imports))]
 use std::io::{self, ErrorKind, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 /// What can go wrong; each user maps it into its own error type.
@@ -56,11 +62,13 @@ impl From<io::Error> for SafeError {
 
 pub type Result<T> = std::result::Result<T, SafeError>;
 
+#[cfg(unix)]
 fn unsafe_at(p: &str, why: &str) -> SafeError {
     SafeError::Unsafe(format!("{p}: {why}"))
 }
 
 /// A single path component as a C string: not empty, `.`, `..`, no `/`, no NUL.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn cname(name: &str) -> Result<CString> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(SafeError::Unsafe(format!("{name:?} is not a file name")));
@@ -69,6 +77,7 @@ pub fn cname(name: &str) -> Result<CString> {
 }
 
 /// Retries `f` while it fails with `EINTR`; a negative return is the error in `errno`.
+#[cfg(unix)]
 fn cvt(mut f: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
     loop {
         let r = f();
@@ -83,6 +92,7 @@ fn cvt(mut f: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
 }
 
 /// `openat(dir, name, flags | O_CLOEXEC, mode)`.
+#[cfg(unix)]
 fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int, mode: libc::c_uint) -> io::Result<OwnedFd> {
     // SAFETY: `name` is a valid NUL-terminated string; openat does not keep the pointer.
     let fd = cvt(|| unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode) })?;
@@ -91,6 +101,7 @@ fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int, mode: libc::c_uint) -> i
 }
 
 /// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`.
+#[cfg(unix)]
 fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: valid name and an out-pointer to a properly sized `stat`.
@@ -101,15 +112,18 @@ fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
 
 /// Widens a `stat` field losslessly. The field types differ between platforms (`mode_t` is
 /// u16 on macOS and u32 on Linux), so an `as` cast is a no-op on one and a lint on the other.
+#[cfg(unix)]
 fn widen<T: Into<U>, U>(v: T) -> U {
     v.into()
 }
 
+#[cfg(unix)]
 fn file_type(mode: u32) -> u32 {
     mode & widen::<_, u32>(libc::S_IFMT)
 }
 
 /// Opens the directory `name` inside `parent`, never through a symlink.
+#[cfg(unix)]
 fn open_dir_at(parent: RawFd, name: &str, shown: &str) -> Result<Option<OwnedFd>> {
     let c = cname(name)?;
     match open_at(parent, &c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0) {
@@ -127,6 +141,7 @@ fn open_dir_at(parent: RawFd, name: &str, shown: &str) -> Result<Option<OwnedFd>
 }
 
 /// `mkdirat(parent, name, mode)`; an existing entry is fine (the open after it checks it).
+#[cfg(unix)]
 fn mkdir_at(parent: RawFd, name: &str, mode: libc::mode_t) -> Result<bool> {
     let c = cname(name)?;
     // SAFETY: valid name; mkdirat does not keep the pointer.
@@ -147,6 +162,7 @@ pub struct Entry {
     pub mtime_nsec: i64,
 }
 
+#[cfg(unix)]
 impl Entry {
     pub fn is_file(&self) -> bool {
         file_type(self.mode) == widen::<_, u32>(libc::S_IFREG)
@@ -157,6 +173,7 @@ impl Entry {
     }
 }
 
+#[cfg(unix)]
 fn entry(name: String, st: &libc::stat) -> Entry {
     Entry {
         name,
@@ -168,8 +185,10 @@ fn entry(name: String, st: &libc::stat) -> Entry {
 }
 
 /// An exclusive `flock` on a directory descriptor, released on drop.
+#[cfg(unix)]
 pub struct Lock(RawFd);
 
+#[cfg(unix)]
 impl Drop for Lock {
     fn drop(&mut self) {
         // SAFETY: plain syscall on a descriptor the SafeDir owns for the lock's lifetime.
@@ -178,6 +197,7 @@ impl Drop for Lock {
 }
 
 /// A directory opened through descriptors (see the module docs).
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct SafeDir {
     fd: OwnedFd,
@@ -186,8 +206,10 @@ pub struct SafeDir {
 }
 
 /// How deep [`SafeDir::remove_tree`] goes.
+#[cfg(unix)]
 const MAX_DEPTH: usize = 8;
 
+#[cfg(unix)]
 impl SafeDir {
     /// `root` (canonicalized), then each of `segs`, one level at a time. `Ok(None)` when a
     /// level does not exist; with `create`, missing levels are made with `mode` first.
@@ -496,7 +518,7 @@ fn rename_noreplace(dir: RawFd, from: &CStr, to: &CStr) -> io::Result<()> {
     cvt(|| unsafe { libc::renameat2(dir, from.as_ptr(), dir, to.as_ptr(), libc::RENAME_NOREPLACE) }).map(drop)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn rename_noreplace(dir: RawFd, from: &CStr, to: &CStr) -> io::Result<()> {
     // Best effort elsewhere: check, then rename (callers hold the directory's lock).
     if stat_at(dir, to).is_ok() {
@@ -506,7 +528,12 @@ fn rename_noreplace(dir: RawFd, from: &CStr, to: &CStr) -> io::Result<()> {
     cvt(|| unsafe { libc::renameat(dir, from.as_ptr(), dir, to.as_ptr()) }).map(drop)
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{Lock, SafeDir};
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::TempDir;

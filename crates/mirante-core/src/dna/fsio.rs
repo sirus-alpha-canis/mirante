@@ -245,7 +245,7 @@ fn after_open() {
 #[cfg(not(test))]
 fn after_open() {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::dna::sha256_hex;

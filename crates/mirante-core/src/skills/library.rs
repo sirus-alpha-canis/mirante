@@ -322,7 +322,7 @@ pub fn prune(lib: &Path, name: &str, keep: usize, protect: &[u32]) -> Result<Vec
     Ok(removed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::dna::sha256_hex;

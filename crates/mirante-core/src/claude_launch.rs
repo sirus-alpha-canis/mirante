@@ -286,7 +286,7 @@ pub fn launch_spec(input: LaunchInput<'_>) -> LaunchSpec {
             .collect(),
     }
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
