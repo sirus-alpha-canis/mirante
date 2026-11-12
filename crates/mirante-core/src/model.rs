@@ -132,6 +132,47 @@ pub struct Task {
     pub status: Status,
     pub created_at: i64,
     pub updated_at: i64,
+    /// A workspace task (several repos of one folder): the folder the agent runs in, which
+    /// holds one worktree per selected repo. `None` for a single-repo task. `repo_path` and
+    /// `worktree_path` are then the primary repo's (the first selected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// A workspace task: the folder (group) its repos were picked from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_path: Option<String>,
+}
+
+impl Task {
+    /// Where the agent runs: the workspace folder of a workspace task, else the worktree.
+    pub fn cwd(&self) -> &str {
+        self.workspace_path.as_deref().unwrap_or(&self.worktree_path)
+    }
+}
+
+/// One repository of a workspace task (`Store::task_repos`), fixed at creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRepo {
+    /// Its folder name in the workspace (unique within the task).
+    pub name: String,
+    /// The main checkout it was picked as.
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub branch: String,
+    /// The task made the branch (it did not exist before).
+    #[serde(default)]
+    pub created_branch: bool,
+    /// The commit the worktree started on.
+    #[serde(default)]
+    pub head: String,
+}
+
+/// Input for `Store::create_workspace_task`, besides the [`NewTask`] (whose repo and
+/// worktree are the primary's, `repos[0]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWorkspace {
+    pub workspace_path: String,
+    pub group_path: String,
+    pub repos: Vec<TaskRepo>,
 }
 
 /// Input for `Store::create_task`.

@@ -193,6 +193,16 @@ pub fn memory_allow() -> Vec<String> {
     ["memory_search", "memory_get"].iter().map(|t| format!("mcp__{MCP_SERVER}__{t}")).collect()
 }
 
+/// A permission rule that lets Claude read everything under the absolute folder `dir`
+/// (`Read(//abs/path/**)`: `//` anchors at the filesystem root; Claude applies Read rules
+/// to Grep and Glob too) and nothing else. `None` for a relative path or one with a
+/// character the rule syntax gives a meaning to (no rule beats a wrong one).
+pub fn read_only_allow(dir: &Path) -> Option<String> {
+    let s = dir.to_str()?;
+    let plain = s.starts_with('/') && !s.chars().any(|c| c.is_control() || "()*?[]{}!\\\"'".contains(c));
+    plain.then(|| format!("Read(/{}/**)", s.trim_end_matches('/')))
+}
+
 /// The name of the per-session plugin Mirante generates for a task's on-demand skills;
 /// Claude invokes them as `mirante-skills:<name>`.
 pub const PLUGIN_NAME: &str = "mirante-skills";
@@ -552,6 +562,15 @@ mod tests {
                 "{:?}",
                 spec.args
             );
+        }
+    }
+
+    #[test]
+    fn a_read_only_folder_is_one_read_rule_or_none() {
+        assert_eq!(read_only_allow(Path::new("/Users/p/gol")).as_deref(), Some("Read(//Users/p/gol/**)"));
+        assert_eq!(read_only_allow(Path::new("/Users/p/my repos/")).as_deref(), Some("Read(//Users/p/my repos/**)"));
+        for bad in ["gol", "/a/(x)", "/a/*", "/a/b\nc", "/a/\"q"] {
+            assert_eq!(read_only_allow(Path::new(bad)), None, "{bad:?}");
         }
     }
 

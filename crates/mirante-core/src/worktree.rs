@@ -40,6 +40,10 @@ fn run(cmd: Git, args: &[&str]) -> Result<String> {
 /// short on purpose: each entry is a directory whose loss costs nothing (a cache).
 pub const TOOL_DIRS: &[&str] = &[".serena/"];
 
+/// The folder under the root that holds workspace tasks (`crate::workspace`). A repository
+/// with this name cannot hold a single-repo task's worktrees (they would share the folder).
+pub const WORKSPACES: &str = "_workspaces";
+
 /// Changed paths named in a dirty-worktree refusal.
 const DIRTY_LISTED: usize = 10;
 
@@ -186,7 +190,7 @@ pub fn parse_porcelain(text: &str) -> Vec<Worktree> {
 /// Canonical form of `path`, also when it (or its tail) does not exist: `.` and `..` are
 /// resolved lexically, then the deepest existing ancestor is canonicalized (symlinks such
 /// as macOS `/var` -> `/private/var`) and the missing components are appended.
-fn resolve(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve(path: &Path) -> Result<PathBuf> {
     if let Ok(p) = std::fs::canonicalize(path) {
         return Ok(p);
     }
@@ -259,19 +263,47 @@ impl WorktreeManager {
     }
 
     pub fn path_for(&self, repo: &Path, branch: &str) -> Result<PathBuf> {
-        Ok(self.root.join(repo_name(repo)?).join(branch))
+        let name = repo_name(repo)?;
+        if name == WORKSPACES {
+            return Err(CoreError::Git {
+                args: "worktree add".into(),
+                stderr: format!("a repository named {WORKSPACES} shares its folder with workspace tasks: rename it"),
+            });
+        }
+        Ok(self.root.join(name).join(branch))
     }
 
     /// Creates `<root>/<repo>/<branch>`. An existing branch is checked out as is; a new one
     /// starts from `base`, or from the repo's current branch when `base` is `None`.
     pub fn create(&self, repo: &Path, branch: &str, base: Option<&str>) -> Result<Worktree> {
+        let path = self.path_for(repo, branch)?;
+        self.create_at(repo, &path, branch, base)
+    }
+
+    /// The folder workspace tasks live in: `<root>/_workspaces`.
+    pub fn workspaces(&self) -> PathBuf {
+        self.root.join(WORKSPACES)
+    }
+
+    /// The root this manager creates worktrees under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// [`WorktreeManager::create`] at `path`, which must lie under the root.
+    pub fn create_at(&self, repo: &Path, path: &Path, branch: &str, base: Option<&str>) -> Result<Worktree> {
         validate_branch_name(branch)?;
         if let Some(b) = base {
             validate_base(b)?;
         }
+        let root = resolve(&self.root)?;
+        let resolved = resolve(path)?;
+        if resolved == root || !resolved.starts_with(&root) {
+            return Err(CoreError::OutsideRoot { path: path.display().to_string(), root: root.display().to_string() });
+        }
         let lock = self.repo_lock(repo)?;
         let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let path = self.path_for(repo, branch)?;
+        let path = path.to_path_buf();
         if path.exists() {
             return Err(CoreError::Git {
                 args: "worktree add".into(),
@@ -301,6 +333,22 @@ impl WorktreeManager {
         };
         let head = git(&path, &["rev-parse", "HEAD"])?;
         Ok(Worktree { path, branch: Some(branch.to_string()), head, created_branch: !exists })
+    }
+
+    /// Ok when [`WorktreeManager::remove`] would not refuse `path` for uncommitted work (a
+    /// missing directory is fine); else the [`CoreError::DirtyWorktree`] it would give.
+    pub fn check_clean(&self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        match dirt(path)? {
+            Dirt::Clean | Dirt::ToolDirsOnly => Ok(()),
+            Dirt::Changes(all) => {
+                let more = all.len().saturating_sub(DIRTY_LISTED);
+                let changes = all.into_iter().take(DIRTY_LISTED).collect();
+                Err(CoreError::DirtyWorktree { path: path.display().to_string(), changes, more })
+            }
+        }
     }
 
     /// Undoes `create` (e.g. when the task could not be recorded): removes the worktree,
@@ -403,7 +451,7 @@ impl WorktreeManager {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::process::Command;

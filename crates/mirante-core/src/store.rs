@@ -5,9 +5,10 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
+use crate::model::NewWorkspace;
 use crate::model::{
     new_id, now_ms, AgentKind, Conversation, Event, Lifecycle, NewTask, PermissionRequest, PermissionStatus, Session,
-    Status, Task, Turn,
+    Status, Task, TaskRepo, Turn,
 };
 
 /// A page of one task's events, newest first (see [`Store::task_events_page`]).
@@ -25,6 +26,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, include_str!("migrations/0007_skills.sql")),
     (8, include_str!("migrations/0008_skill_signer.sql")),
     (9, include_str!("migrations/0009_task_origin_by_person.sql")),
+    (10, include_str!("migrations/0010_workspace_tasks.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -203,10 +205,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 9);
+        assert_eq!(s.schema_version().unwrap(), 10);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 9);
+        assert_eq!(s.schema_version().unwrap(), 10);
     }
 
     #[test]
@@ -283,8 +285,8 @@ pub(crate) fn insert_event(
     })
 }
 
-const TASK_COLUMNS: &str =
-    "id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status, \
+     created_at, updated_at, workspace_path, group_path";
 
 fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -300,6 +302,8 @@ fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         status: r.get(9)?,
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
+        workspace_path: r.get(12)?,
+        group_path: r.get(13)?,
     })
 }
 
@@ -324,6 +328,19 @@ fn load_task(conn: &Connection, id: &str) -> Result<Task> {
 
 impl Store {
     pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
+        self.insert_task(new, None)
+    }
+
+    /// A workspace task: the task row (its repo and worktree are the primary's,
+    /// `ws.repos[0]`) and one `task_repos` row per repo, in one transaction.
+    pub fn create_workspace_task(&mut self, new: NewTask, ws: NewWorkspace) -> Result<Task> {
+        if ws.repos.is_empty() {
+            return Err(CoreError::Limit("a workspace task needs at least one repo".into()));
+        }
+        self.insert_task(new, Some(ws))
+    }
+
+    fn insert_task(&mut self, new: NewTask, ws: Option<NewWorkspace>) -> Result<Task> {
         let now = now_ms();
         let task = Task {
             id: new_id(),
@@ -338,10 +355,14 @@ impl Store {
             status: Status::Idle,
             created_at: now,
             updated_at: now,
+            workspace_path: ws.as_ref().map(|w| w.workspace_path.clone()),
+            group_path: ws.as_ref().map(|w| w.group_path.clone()),
         };
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            &format!("INSERT INTO tasks ({TASK_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            &format!(
+                "INSERT INTO tasks ({TASK_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            ),
             params![
                 task.id,
                 task.title,
@@ -354,12 +375,56 @@ impl Store {
                 task.lifecycle,
                 task.status,
                 task.created_at,
-                task.updated_at
+                task.updated_at,
+                task.workspace_path,
+                task.group_path
             ],
         )?;
-        insert_event(&tx, &self.boot_id, Some(&task.id), "task_created", &serde_json::to_value(&task)?)?;
+        let mut payload = serde_json::to_value(&task)?;
+        if let Some(ws) = &ws {
+            for (i, r) in ws.repos.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO task_repos (task_id, idx, name, repo_path, worktree_path, branch, created_branch, head) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![task.id, i as i64, r.name, r.repo_path, r.worktree_path, r.branch, r.created_branch, r.head],
+                )?;
+            }
+            payload["repos"] = serde_json::to_value(&ws.repos)?;
+        }
+        insert_event(&tx, &self.boot_id, Some(&task.id), "task_created", &payload)?;
         tx.commit()?;
         Ok(task)
+    }
+
+    /// The repos of a workspace task, primary first; empty for a single-repo task.
+    pub fn task_repos(&self, task_id: &str) -> Result<Vec<TaskRepo>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT name, repo_path, worktree_path, branch, created_branch, head FROM task_repos \
+             WHERE task_id = ?1 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map([task_id], |r| {
+            Ok(TaskRepo {
+                name: r.get(0)?,
+                repo_path: r.get(1)?,
+                worktree_path: r.get(2)?,
+                branch: r.get(3)?,
+                created_branch: r.get(4)?,
+                head: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every checkout the non-archived tasks own: each task's worktree and each workspace
+    /// task's repo worktrees.
+    pub fn owned_worktrees(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree_path FROM tasks WHERE lifecycle != 'archived' \
+             UNION SELECT r.worktree_path FROM task_repos r JOIN tasks t ON t.id = r.task_id \
+             WHERE t.lifecycle != 'archived'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_task(&self, id: &str) -> Result<Task> {
@@ -540,6 +605,79 @@ mod task_tests {
         assert_eq!(s.task_events_after(&a.id, 0).unwrap(), all);
         assert_eq!(s.task_events_after(&a.id, all[1].seq).unwrap(), all[2..].to_vec());
         assert!(s.task_events_after(&a.id, all.last().unwrap().seq).unwrap().is_empty());
+    }
+
+    fn sample_repo(name: &str) -> TaskRepo {
+        TaskRepo {
+            name: name.into(),
+            repo_path: format!("/g/{name}"),
+            worktree_path: format!("/wt/_workspaces/x/{name}"),
+            branch: "mirante/x".into(),
+            created_branch: true,
+            head: "abc".into(),
+        }
+    }
+
+    #[test]
+    fn a_workspace_task_keeps_its_repos_in_order_and_fixed() {
+        let mut s = Store::open_in_memory().unwrap();
+        let single = s.create_task(sample_task("solo")).unwrap();
+        assert_eq!((single.workspace_path.as_deref(), single.cwd()), (None, "/wt/app/solo"));
+        let ws = NewWorkspace {
+            workspace_path: "/wt/_workspaces/x".into(),
+            group_path: "/g".into(),
+            repos: vec![sample_repo("site"), sample_repo("bff")],
+        };
+        let mut new = sample_task("mirante/x");
+        new.repo_path = "/g/site".into();
+        new.worktree_path = "/wt/_workspaces/x/site".into();
+        let t = s.create_workspace_task(new, ws).unwrap();
+        assert_eq!(t.cwd(), "/wt/_workspaces/x");
+        assert_eq!(t.group_path.as_deref(), Some("/g"));
+        assert_eq!(s.get_task(&t.id).unwrap(), t);
+        let names: Vec<String> = s.task_repos(&t.id).unwrap().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["site", "bff"]);
+        assert!(s.task_repos(&single.id).unwrap().is_empty());
+        let created = s.task_events(&t.id).unwrap();
+        assert_eq!(created[0].payload["repos"][1]["name"], "bff");
+        // Fixed: no update goes through.
+        assert!(s.conn.execute("UPDATE task_repos SET name = 'z' WHERE task_id = ?1", [&t.id]).is_err());
+        let mut owned = s.owned_worktrees().unwrap();
+        owned.sort();
+        assert_eq!(owned, ["/wt/_workspaces/x/bff", "/wt/_workspaces/x/site", "/wt/app/solo"]);
+        s.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
+        s.transition_lifecycle(&t.id, Lifecycle::Archived).unwrap();
+        assert_eq!(s.owned_worktrees().unwrap(), ["/wt/app/solo"]);
+        assert_eq!(s.task_repos(&t.id).unwrap().len(), 2, "kept after archive");
+        let empty = NewWorkspace { workspace_path: "/w".into(), group_path: "/g".into(), repos: vec![] };
+        assert!(s.create_workspace_task(sample_task("e"), empty).is_err());
+    }
+
+    #[test]
+    fn a_v9_database_gains_workspace_columns_and_keeps_its_tasks() {
+        let dir = TempDir::new("store-v9");
+        let path = dir.path().join("m.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", false).unwrap();
+            for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 9) {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", v).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute(
+                "INSERT INTO tasks (id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, \
+                 status, created_at, updated_at) VALUES ('t1', 'T', '/r', '/w', 'b', 'claude', 'g', '', 'active', \
+                 'idle', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let t = s.get_task("t1").unwrap();
+        assert_eq!((t.workspace_path, t.group_path, t.worktree_path.as_str()), (None, None, "/w"));
+        assert!(s.task_repos("t1").unwrap().is_empty());
     }
 
     #[test]

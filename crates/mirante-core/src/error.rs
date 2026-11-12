@@ -30,6 +30,13 @@ pub enum CoreError {
     OutsideRoot { path: String, root: String },
     #[error("{}", dirty_message(path, changes, *more))]
     DirtyWorktree { path: String, changes: Vec<String>, more: usize },
+    /// A workspace task's folder or repo selection that cannot be used (`crate::workspace`).
+    #[error("{0}")]
+    InvalidWorkspace(String),
+    /// Archiving a workspace task with uncommitted work in some of its repos (or files left
+    /// in the workspace folder itself): `(repo name, changes, more)` per dirty one.
+    #[error("{}", dirty_workspace_message(dirty))]
+    DirtyWorkspace { dirty: Vec<(String, Vec<String>, usize)> },
     #[error("claude binary not found: {0}")]
     ClaudeNotFound(String),
     /// A bounded queue is full (e.g. pending memory proposals).
@@ -55,5 +62,23 @@ fn dirty_message(path: &str, changes: &[String], more: usize) -> String {
         s.push_str(&format!("\n  … and {more} more"));
     }
     s.push_str("\ncommit them, stash them (git stash -u) or discard them in the worktree, then archive again");
+    s
+}
+
+/// The archive refusal for a workspace task: each dirty repo and what changed in it.
+fn dirty_workspace_message(dirty: &[(String, Vec<String>, usize)]) -> String {
+    let names: Vec<&str> = dirty.iter().map(|(n, _, _)| n.as_str()).collect();
+    let mut s = format!("uncommitted changes in {}:", names.join(", "));
+    for (name, changes, more) in dirty {
+        s.push_str(&format!("\n{name}:"));
+        for c in changes {
+            s.push_str("\n  ");
+            s.push_str(c);
+        }
+        if *more > 0 {
+            s.push_str(&format!("\n  … and {more} more"));
+        }
+    }
+    s.push_str("\ncommit them, stash them (git stash -u) or discard them in each worktree, then archive again; nothing was removed");
     s
 }

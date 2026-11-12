@@ -16,6 +16,7 @@ pub mod skills;
 pub mod status;
 pub mod store;
 pub mod transcript_tail;
+pub mod workspace;
 pub mod worktree;
 
 /// Test-only helper shared with the other crates' tests; not part of the API.
