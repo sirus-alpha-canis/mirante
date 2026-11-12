@@ -57,6 +57,26 @@ pub(crate) fn archive_when_done(st: &mut State, group: &str) {
     }
 }
 
+impl State {
+    /// A group by full id, or by a unique id suffix of at least 4 characters.
+    pub(crate) fn resolve_group(&self, reference: &str) -> Result<TaskGroup> {
+        let r = reference.trim();
+        if let Ok(g) = self.store.get_group(r) {
+            return Ok(g);
+        }
+        if r.len() >= 4 {
+            let mut hits: Vec<TaskGroup> =
+                self.store.list_groups(true)?.into_iter().filter(|g| g.id.ends_with(r)).collect();
+            match hits.len() {
+                1 => return Ok(hits.remove(0)),
+                0 => {}
+                _ => return Err(HubError::Conflict(format!("group id suffix {r} is ambiguous"))),
+            }
+        }
+        Err(HubError::NotFound(format!("no group {r}")))
+    }
+}
+
 impl Hub {
     /// A person's fan-out group. Its children are created with `task.create { group }`.
     pub fn create_group(&self, p: CreateGroup) -> Result<TaskGroup> {
@@ -84,7 +104,8 @@ impl Hub {
         let gid = p.group.take().unwrap_or_default();
         let (group, made) = {
             let st = self.lock();
-            let g = st.store.get_group(&gid)?;
+            let g = st.resolve_group(&gid)?;
+            let gid = g.id.clone();
             if g.archived_at.is_some() {
                 return Err(HubError::Conflict(format!("the group \"{}\" is archived", g.title)));
             }
@@ -112,12 +133,12 @@ impl Hub {
 
     /// The group and its tasks, each with its last answer and diff stat (git runs without
     /// the hub lock).
-    pub fn group_get(&self, id: &str) -> Result<GroupView> {
+    pub fn group_get(&self, reference: &str) -> Result<GroupView> {
         let (group, members) = {
             let st = self.lock();
-            let g = st.store.get_group(id)?;
+            let g = st.resolve_group(reference)?;
             let mut out = Vec::new();
-            for t in st.store.group_members(id)? {
+            for t in st.store.group_members(&g.id)? {
                 let last_answer = st.store.last_answer(&t.id)?;
                 out.push((st.view(t)?, last_answer));
             }
@@ -143,15 +164,16 @@ impl Hub {
     /// Archives every task of the group, then the group. Checked first, before anything is
     /// archived: none may be live or being archived, and none may hold uncommitted work
     /// (each is named). Branches are kept.
-    pub fn group_archive(&self, id: &str) -> Result<GroupView> {
-        let open: Vec<Task> = {
+    pub fn group_archive(&self, reference: &str) -> Result<GroupView> {
+        let (id, open) = {
             let st = self.lock();
-            let g = st.store.get_group(id)?;
+            let g = st.resolve_group(reference)?;
+            let id = g.id.clone();
             if g.archived_at.is_some() {
                 return Err(HubError::Conflict(format!("the group \"{}\" is already archived", g.title)));
             }
             let open: Vec<Task> =
-                st.store.group_members(id)?.into_iter().filter(|t| t.lifecycle != Lifecycle::Archived).collect();
+                st.store.group_members(&id)?.into_iter().filter(|t| t.lifecycle != Lifecycle::Archived).collect();
             let live: Vec<&str> =
                 open.iter().filter(|t| st.live.contains_key(&t.id)).map(|t| t.branch.as_str()).collect();
             if !live.is_empty() {
@@ -163,8 +185,9 @@ impl Hub {
             if let Some(t) = open.iter().find(|t| t.lifecycle == Lifecycle::Archiving) {
                 return Err(HubError::Conflict(format!("task {} is being archived", t.branch)));
             }
-            open
+            (id, open)
         };
+        let id = id.as_str();
         let mut dirty = Vec::new();
         for t in &open {
             let clean = match &t.workspace_path {
@@ -209,7 +232,7 @@ impl Hub {
     pub fn group_synthesize(&self, p: Synthesize) -> Result<Synthesis> {
         let (group, into, siblings, first) = {
             let st = self.lock();
-            let g = st.store.get_group(&p.group)?;
+            let g = st.resolve_group(&p.group)?;
             if g.archived_at.is_some() {
                 return Err(HubError::Conflict(format!("the group \"{}\" is archived", g.title)));
             }

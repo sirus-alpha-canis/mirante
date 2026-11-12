@@ -4,7 +4,7 @@
 # footer, takes bracketed-paste input, and starts and ends a turn per line. A line starting
 # with "ask" raises a permission dialog (PermissionRequest hook + the dialog on screen) and
 # waits for one key, appended to $FAKE_CLAUDE_LOG.keys; a line containing "hold" starts a
-# turn that never ends. Its arguments are appended to $FAKE_CLAUDE_LOG (its working directory
+# turn that never ends; a line containing "reply" writes a finished answer to the transcript. Its arguments are appended to $FAKE_CLAUDE_LOG (its working directory
 # to $FAKE_CLAUDE_LOG.cwd). Like Claude Code it
 # writes a transcript ($FAKE_CLAUDE_LOG.<session>.jsonl, named in every hook): an "ask" line
 # first writes the assistant's tool_use line, then (once the daemon's tailer has had time to
@@ -56,6 +56,11 @@ while IFS= read -r line; do
       hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\"}" ;;
     *hold*)
       prompt "holding" ;;
+    *reply*)
+      # A finished answer in the transcript (two lines, a terminal escape in it).
+      printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Plan ready\nstep \u001b]0;pwned\u0007two"}],"stop_reason":"end_turn"}}' >> "$T"
+      prompt "replied"
+      hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\"}" ;;
     *)
       prompt "echo: $line"
       hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\"}" ;;

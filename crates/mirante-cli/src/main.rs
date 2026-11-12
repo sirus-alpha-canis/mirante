@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mirante_core::model::{PermissionRequest, Status};
+use mirante_core::groups::TaskGroup;
+use mirante_core::model::{GroupKind, PermissionRequest, Status};
 use mirante_ipc::rpc::code;
 use mirante_ipc::types::{
+    CreateGroup, GroupRef, GroupView,
     method, AnswerPermission, AttachParams, AttachResult, BootState, CheckReport, CreateTask, DaemonStatus, DnaGet,
     DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus, DoctorReport,
     EditQueued, KillOrphan, ListParams, NoteAction, NoteSummary, NoteView, OrphanView, PermissionView, ProposalView,
@@ -921,7 +923,91 @@ fn run(cmd: Cmd) -> Res {
                 return Err(format!("open could not open {} ({status})", bundle.display()).into());
             }
         }
-        Cmd::New { repo, agent, branch, base, title, goal, trust, repos } => {
+        Cmd::Fanout { repo, agents, goal, trust, repos } => {
+            let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
+            let picked = match &repos {
+                Some(pick) => picked_repos(&repo, pick)?,
+                None => Vec::new(),
+            };
+            let repo = repo.to_string_lossy().into_owned();
+            let mut c = client(&paths)?;
+            // The group's branch prefix: named after the goal, past the other groups'.
+            let tasks: Vec<TaskView> = c.call(method::TASK_LIST, ListParams { archived: true })?;
+            let taken: Vec<String> = tasks.iter().filter_map(|v| v.group.as_ref().map(|g| g.branch.clone())).collect();
+            let prefix = next_free_branch(&branch_from_goal(&goal), &taken);
+            let g: TaskGroup = c.call(
+                method::GROUP_CREATE,
+                CreateGroup { kind: GroupKind::Compare, goal: goal.clone(), title: None, branch: prefix },
+            )?;
+            println!("group {} ({} agents on one goal)", render::short(&g.id), agents.len());
+            let mut made = Vec::new();
+            for agent in agents {
+                let p = CreateTask {
+                    group: Some(g.id.clone()),
+                    repos: picked.clone(),
+                    repo: repo.clone(),
+                    agent,
+                    branch: String::new(),
+                    base: None,
+                    goal: goal.clone(),
+                    title: None,
+                };
+                match c.call::<TaskView>(method::TASK_CREATE, p) {
+                    Ok(v) => {
+                        println!("  created {} on {} ({})", render::short(&v.task.id), v.task.branch, agent.as_str());
+                        made.push(v);
+                    }
+                    // One child that cannot be made does not undo the others.
+                    Err(e) => eprintln!("  {} not created: {e}", agent.as_str()),
+                }
+            }
+            for v in made {
+                notice(&format!("starting {} on {}…", v.task.agent.as_str(), v.task.branch));
+                let r: StartResult =
+                    c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal.clone()) })?;
+                boot_flow(&mut c, r, trust)?;
+            }
+            println!("compare them: mirante group {}", render::short(&g.id));
+        }
+        Cmd::Group { group } => {
+            let v: GroupView = client(&paths)?.call(method::GROUP_GET, GroupRef { group })?;
+            print!("{}", render::group_detail(&v));
+        }
+        Cmd::GroupArchive { group } => {
+            let v: GroupView = client(&paths)?.call(method::GROUP_ARCHIVE, GroupRef { group })?;
+            println!(
+                "group {} archived with its {} task(s) (branches kept)",
+                render::short(&v.group.id),
+                v.members.len()
+            );
+        }
+        Cmd::New { repo, agent, branch, base, title, goal, trust, repos, group: Some(group) } => {
+            let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
+            let picked = match &repos {
+                Some(pick) => picked_repos(&repo, pick)?,
+                None => Vec::new(),
+            };
+            let mut c = client(&paths)?;
+            let v: TaskView = c.call(
+                method::TASK_CREATE,
+                CreateTask {
+                    group: Some(group),
+                    repos: picked,
+                    repo: repo.to_string_lossy().into_owned(),
+                    agent,
+                    branch: branch.unwrap_or_default(),
+                    base,
+                    goal: goal.clone(),
+                    title,
+                },
+            )?;
+            println!("created {} on {} ({})", render::short(&v.task.id), v.task.branch, v.task.cwd());
+            notice(&format!("starting {}…", agent.as_str()));
+            let r: StartResult =
+                c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal) })?;
+            boot_flow(&mut c, r, trust)?;
+        }
+        Cmd::New { repo, agent, branch, base, title, goal, trust, repos, group: None } => {
             let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
             let picked = match &repos {
                 Some(pick) => picked_repos(&repo, pick)?,

@@ -2,8 +2,8 @@
 use mirante_core::dna::untrusted::line;
 use mirante_core::model::{AgentKind, Lifecycle, PermissionRequest, Status};
 use mirante_ipc::types::{
-    AnchorView, BootState, DoctorReport, MemView, NoteSummary, NoteView, PermissionView, ProposalView, RepoOrigin,
-    SkillProposalView, SkillSummary, SkillView, SystemView, TaskView, TenantView,
+    AnchorView, BootState, DoctorReport, GroupView, MemView, NoteSummary, NoteView, PermissionView, ProposalView,
+    RepoOrigin, SkillProposalView, SkillSummary, SkillView, SystemView, TaskView, TenantView,
 };
 
 /// A proposal as the review prompt shows it: status, title (or the person's new title),
@@ -260,13 +260,43 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         fit("Q", 2),
         "TITLE"
     );
+    // A fan-out group's tasks follow its header line, indented, where its first task is.
+    let mut rows: Vec<(&TaskView, bool)> = Vec::new();
+    let mut shown: Vec<&str> = Vec::new();
+    let mut headers: Vec<(usize, String)> = Vec::new();
     for v in tasks {
+        match &v.group {
+            None => rows.push((v, false)),
+            Some(g) if !shown.contains(&g.id.as_str()) => {
+                shown.push(&g.id);
+                let members: Vec<&TaskView> =
+                    tasks.iter().filter(|t| t.group.as_ref().is_some_and(|x| x.id == g.id)).collect();
+                let kind = match g.kind {
+                    mirante_core::model::GroupKind::Compare => "compare",
+                    mirante_core::model::GroupKind::Fanout => "fan-out",
+                };
+                headers.push((
+                    rows.len(),
+                    format!("group {}  {kind} · {} task(s) · {}\n", short(&g.id), members.len(), line(&g.title, 80)),
+                ));
+                rows.extend(members.into_iter().map(|m| (m, true)));
+            }
+            Some(_) => {}
+        }
+    }
+    for (i, (v, nested)) in rows.into_iter().enumerate() {
+        if let Some((_, h)) = headers.iter().find(|(at, _)| *at == i) {
+            out.push_str(h);
+        }
         let needs = if v.needs_you > 0 { v.needs_you.to_string() } else { String::new() };
         let queued = if v.queued > 0 { v.queued.to_string() } else { String::new() };
         let note = note(v);
         let mut title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
         if let Some(r) = repos_cell(v) {
             title = format!("{title}  ({r})");
+        }
+        if nested {
+            title = format!("↳ {title}");
         }
         out.push_str(&format!(
             "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
@@ -280,6 +310,41 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
             fit(&queued, 2),
             title
         ));
+    }
+    out
+}
+
+/// `mirante group`: the shared goal, then each task with its status, diff stat and last
+/// answer (agent text: one line, controls stripped).
+pub fn group_detail(v: &GroupView) -> String {
+    let g = &v.group;
+    let mut out = format!("group {}  {}\n", short(&g.id), line(&g.title, 120));
+    if g.archived_at.is_some() {
+        out.push_str("  archived\n");
+    }
+    out.push_str(&format!("  goal: {}\n", line(&g.goal, 300)));
+    if v.members.is_empty() {
+        out.push_str("  no tasks\n");
+    }
+    for m in &v.members {
+        let t = &m.view.task;
+        let role = if t.group_role == Some(mirante_core::model::GroupRole::Synth) { " (synthesis)" } else { "" };
+        let state = if t.lifecycle == Lifecycle::Archived { "archived" } else { status_label(t.status) };
+        let needs = if m.view.needs_you > 0 { format!(" · needs you ({})", m.view.needs_you) } else { String::new() };
+        out.push_str(&format!("\n{}  {}  {}  {state}{needs}{role}\n", short(&t.id), t.branch, t.agent.as_str()));
+        if let Some(d) = m.diff {
+            out.push_str(&format!(
+                "  diff: {} file(s) +{} -{}{}\n",
+                d.files,
+                d.added,
+                d.removed,
+                if d.untracked > 0 { format!(", {} untracked", d.untracked) } else { String::new() }
+            ));
+        }
+        match &m.last_answer {
+            Some(a) => out.push_str(&format!("  answer (agent text): {}\n", line(a, 300))),
+            None => out.push_str("  answer: none yet\n"),
+        }
     }
     out
 }

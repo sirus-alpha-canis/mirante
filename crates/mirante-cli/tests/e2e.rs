@@ -1131,6 +1131,41 @@ fn new_names_the_branch_from_the_goal_like_the_cockpit() {
 }
 
 #[test]
+fn fanout_makes_a_group_whose_children_ls_indents_and_group_shows_and_archives() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    let out = env.ok(&["fanout", &repo, "--agents", "claude,claude", "--trust", "reply", "with", "a", "plan"]);
+    assert!(out.contains("on mirante/reply-with-a-plan--1-claude") && out.contains("--2-claude"), "{out}");
+    let a = env.task("mirante/reply-with-a-plan--1-claude");
+    let gid = a.group.as_ref().expect("in a group").id.clone();
+    let ls = env.ok(&["ls"]);
+    assert!(ls.contains(&format!("group {}", &gid[gid.len() - 8..])) && ls.contains("compare · 2 task(s)"), "{ls}");
+    assert_eq!(ls.matches("↳ reply with a plan").count(), 2, "{ls}");
+    // The last answer, as one line with its escape stripped (agent text to a terminal).
+    wait_until("an answer", || env.ok(&["group", &gid]).contains("answer (agent text): Plan ready step"));
+    let shown = env.ok(&["group", &gid[gid.len() - 6..]]);
+    assert!(!shown.contains('\u{1b}') && shown.contains("goal: reply with a plan"), "{shown:?}");
+    // A child of an existing group from the CLI (a comparison: named after its agent).
+    let out = env.ok(&["new", &repo, "--group", &gid, "--agent", "claude", "--trust", "add tests"]);
+    assert!(out.contains("on mirante/reply-with-a-plan--3-claude"), "{out}");
+    // All or nothing: refused while live, naming them.
+    let refused = env.mirante(&["group", "archive", &gid]);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && err.contains("stop these tasks first"), "{err}");
+    assert!(env.task("mirante/reply-with-a-plan--1-claude").task.lifecycle != mirante_core::model::Lifecycle::Archived);
+    for b in [
+        "mirante/reply-with-a-plan--1-claude",
+        "mirante/reply-with-a-plan--2-claude",
+        "mirante/reply-with-a-plan--3-claude",
+    ] {
+        env.ok(&["stop", b]);
+    }
+    let out = env.ok(&["group", "archive", &gid]);
+    assert!(out.contains("archived with its 3 task(s)"), "{out}");
+    assert!(env.ok(&["ls"]).contains("no tasks"));
+}
+
+#[test]
 fn archive_stop_ends_the_session_then_archives() {
     let env = Env::new();
     let repo = env.repo.to_string_lossy().into_owned();

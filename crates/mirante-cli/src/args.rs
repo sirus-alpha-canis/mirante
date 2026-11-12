@@ -19,7 +19,21 @@ const COMMANDS: &[Help] = &[
   new <folder> --repos <a,b,…> | --all --agent claude|codex [--branch <name>] <goal...>
                          one task across several repos of a folder: a worktree per repo named
                          (a folder name or path inside <folder>; --all: every repo in it), one
-                         branch; the folder's other repos are read-only for the agent",
+                         branch; the folder's other repos are read-only for the agent
+  new <repo> --group <group> --agent claude|codex <goal...>
+                         one more child of a fan-out group (branch <group>--<n>-<slug>)",
+    },
+    Help {
+        names: &["fanout"],
+        text: "  fanout <repo> --agents claude,codex[,…] [--repos <a,b,…> | --all] [--trust] <goal...>
+                         one goal on several agents to compare them: a group (no worktree of
+                         its own) and one child task per agent (at most 8), each in its own
+                         worktree on mirante/<slug>--<n>-<agent>, started with the goal",
+    },
+    Help {
+        names: &["group"],
+        text: "  group <group>          a fan-out group: each child's status, diff and last answer
+  group archive <group>  archive every child, then the group (nothing when one is live or dirty)",
     },
     Help { names: &["ls", "list"], text: "  ls [--all]             tasks with status and what needs you (--all: include archived)" },
     Help { names: &["show"], text: "  show <task>            one task in detail" },
@@ -373,6 +387,22 @@ pub enum Cmd {
         trust: bool,
         /// A task across several repos of the folder `repo` (`--repos` / `--all`).
         repos: Option<RepoPick>,
+        /// A child of this fan-out group (`--group`).
+        group: Option<String>,
+    },
+    /// One goal on several agents: a compare group and a child per agent.
+    Fanout {
+        repo: String,
+        agents: Vec<AgentKind>,
+        goal: String,
+        trust: bool,
+        repos: Option<RepoPick>,
+    },
+    Group {
+        group: String,
+    },
+    GroupArchive {
+        group: String,
     },
     Ls {
         all: bool,
@@ -472,6 +502,24 @@ fn split(args: &[String], with_value: &[&str], bools: &[&str]) -> Result<Parsed,
         }
     }
     Ok(p)
+}
+
+/// `--repos <a,b,…>` or `--all`: the repos of a folder a task changes.
+fn repo_pick(p: &Parsed) -> Result<Option<RepoPick>, String> {
+    let all = p.bools.iter().any(|b| b == "--all");
+    match (p.values.get("--repos"), all) {
+        (Some(_), true) => Err("--repos and --all: pass one".into()),
+        (Some(list), false) => {
+            let names: Vec<String> =
+                list.split(',').map(str::trim).filter(|n| !n.is_empty()).map(String::from).collect();
+            if names.is_empty() {
+                return Err("--repos needs at least one repo name".into());
+            }
+            Ok(Some(RepoPick::Named(names)))
+        }
+        (None, true) => Ok(Some(RepoPick::All)),
+        (None, false) => Ok(None),
+    }
 }
 
 fn one(p: &Parsed, what: &str) -> Result<String, String> {
@@ -750,8 +798,43 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         return Ok(Cmd::Help(Some(sub.clone())));
     }
     match sub.as_str() {
+        "fanout" => {
+            let p = split(rest, &["--agents", "--repos"], &["--trust", "--all"])?;
+            let (repo, goal) = task_and_text(&p, "goal").map_err(|e| e.replace("<task>", "<repo>"))?;
+            let list = p.values.get("--agents").ok_or("missing --agents claude,codex")?;
+            let agents = list
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(|a| match a {
+                    "claude" => Ok(AgentKind::Claude),
+                    "codex" => Ok(AgentKind::Codex),
+                    other => Err(format!("unknown agent {other} (claude or codex)")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if agents.len() < 2 {
+                return Err("--agents needs at least two (e.g. claude,codex or claude,claude)".into());
+            }
+            if agents.len() > 8 {
+                return Err("--agents: at most 8 children in one group".into());
+            }
+            Ok(Cmd::Fanout { repo, agents, goal, trust: p.bools.iter().any(|b| b == "--trust"), repos: repo_pick(&p)? })
+        }
+        "group" => {
+            let p = split(rest, none, none)?;
+            match p.positional.as_slice() {
+                [a, g] if a == "archive" => Ok(Cmd::GroupArchive { group: g.clone() }),
+                [g] => Ok(Cmd::Group { group: g.clone() }),
+                [] => Err("missing <group>".into()),
+                _ => Err("usage: group <group> | group archive <group>".into()),
+            }
+        }
         "new" => {
-            let p = split(rest, &["--agent", "--branch", "--base", "--title", "--repos"], &["--trust", "--all"])?;
+            let p = split(
+                rest,
+                &["--agent", "--branch", "--base", "--title", "--repos", "--group"],
+                &["--trust", "--all"],
+            )?;
             let (repo, goal) = task_and_text(&p, "goal").map_err(|e| e.replace("<task>", "<repo>"))?;
             let agent = match p.values.get("--agent").map(String::as_str) {
                 Some("claude") => AgentKind::Claude,
@@ -760,20 +843,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 None => return Err("missing --agent claude|codex".into()),
             };
             let branch = p.values.get("--branch").cloned();
-            let all = p.bools.iter().any(|b| b == "--all");
-            let repos = match (p.values.get("--repos"), all) {
-                (Some(_), true) => return Err("--repos and --all: pass one".into()),
-                (Some(list), false) => {
-                    let names: Vec<String> =
-                        list.split(',').map(str::trim).filter(|n| !n.is_empty()).map(String::from).collect();
-                    if names.is_empty() {
-                        return Err("--repos needs at least one repo name".into());
-                    }
-                    Some(RepoPick::Named(names))
-                }
-                (None, true) => Some(RepoPick::All),
-                (None, false) => None,
-            };
+            let repos = repo_pick(&p)?;
             if repos.is_some() && p.values.contains_key("--base") {
                 return Err(
                     "--base does not apply to --repos/--all: each repo starts from its own current branch".into()
@@ -788,6 +858,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 goal,
                 trust: p.bools.iter().any(|b| b == "--trust"),
                 repos,
+                group: p.values.get("--group").cloned(),
             })
         }
         "ls" | "list" => {
@@ -893,6 +964,7 @@ mod tests {
                 goal: "fix the login".into(),
                 trust: false,
                 repos: None,
+                group: None,
             }
         );
         assert!(matches!(p("new . --agent claude --branch b --trust go").unwrap(), Cmd::New { trust: true, .. }));
@@ -1141,6 +1213,33 @@ mod tests {
         assert_eq!(p("new gol --repos , --agent codex go").unwrap_err(), "--repos needs at least one repo name");
         assert!(p("new gol --all --base main --agent codex go").unwrap_err().contains("--base does not apply"));
         assert!(command_usage("new").unwrap().contains("--repos <a,b,…> | --all"));
+    }
+
+    #[test]
+    fn fanout_takes_two_to_eight_agents_and_group_reads_or_archives() {
+        let f = p("fanout ~/app --agents claude,codex fix the login").unwrap();
+        assert_eq!(
+            f,
+            Cmd::Fanout {
+                repo: "~/app".into(),
+                agents: vec![AgentKind::Claude, AgentKind::Codex],
+                goal: "fix the login".into(),
+                trust: false,
+                repos: None,
+            }
+        );
+        assert!(matches!(
+            p("fanout gol --all --agents claude,claude go").unwrap(),
+            Cmd::Fanout { repos: Some(RepoPick::All), .. }
+        ));
+        assert!(p("fanout . --agents claude go").unwrap_err().contains("at least two"));
+        assert!(p("fanout . --agents claude,gpt go").unwrap_err().contains("unknown agent gpt"));
+        assert!(p("fanout . --agents a,b,c,d,e,f,g,h,i go").is_err());
+        assert_eq!(p("group 1a2b").unwrap(), Cmd::Group { group: "1a2b".into() });
+        assert_eq!(p("group archive 1a2b").unwrap(), Cmd::GroupArchive { group: "1a2b".into() });
+        let Cmd::New { group, .. } = p("new . --group 1a2b --agent codex add tests").unwrap() else { panic!() };
+        assert_eq!(group.as_deref(), Some("1a2b"));
+        assert!(command_usage("fanout").unwrap().contains("--agents claude,codex"));
     }
 
     #[test]
