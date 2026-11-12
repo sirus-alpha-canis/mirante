@@ -139,8 +139,15 @@ out like a workspace (`gol/{A,B,C}`, worktrees of A and B under `_workspaces/x/`
   instructions. `AGENTS.md` in the cwd (not a git repo, `codex exec
   --skip-git-repo-check`): Codex has it too.
 
-Not run live: a full Mirante session (daemon + PTY) with the real agents across two repos;
-the daemon path is covered by the e2e test with the fake Claude.
+- A full run through the release daemon (isolated `MIRANTE_HOME`) with the real Codex:
+  `mirante new <folder> --repos Site-B2C,bff-flight --agent codex "Create NOTE.txt … in
+  both"` → Codex wrote `NOTE.txt` in both worktrees without asking and left `docs` alone;
+  `mirante ls` showed the repos; `archive` refused naming both repos, then (files removed)
+  archived, workspace folder gone, branches kept.
+
+Not run live: a full Mirante session with the real Claude across two repos (its PTY trust
+dialog needs a person); its daemon path is covered by the e2e test with the fake Claude,
+and its file access by the `claude -p` checks above.
 - **Read-only is advisory for Claude in bypass modes.** If the person switches Claude to
   `bypassPermissions`, it can write anywhere; Mirante already warns about that mode.
 - **Workspace scratch files.** Files the agent writes in the workspace folder (not in a repo)
