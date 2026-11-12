@@ -1,4 +1,4 @@
-import { type KeyboardEvent, memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, memo, type PointerEvent, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useLive, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { collapseRepeats, summarizeSteps } from "../lib/feed";
@@ -21,6 +21,9 @@ import { QueueList } from "./QueueList";
 import { SkillsChip } from "./SkillsChip";
 import { TerminalTab } from "./TerminalTab";
 import { TrustCard } from "./TrustCard";
+import { onMac, shortcutFor } from "../lib/shortcuts";
+import { clampWidth, loadPane, type PaneState, type PaneTarget, PANE_MAX, PANE_MIN, savePane } from "../lib/sidepane";
+import { type PaneApi, PaneContext, SidePane } from "./SidePane";
 
 const GROUPS: Column[] = ["needs_you", "working", "review", "idle"];
 const TABS = ["Steps", "Terminal", "Diff", "Memory"] as const;
@@ -270,6 +273,71 @@ function Actions({ t }: { t: TaskView }) {
   );
 }
 
+/** The side pane of `taskId`, loaded from storage when the task changes and saved on
+ * every change. */
+function usePaneState(taskId: string): [PaneState, (update: (p: PaneState) => PaneState) => void] {
+  const { storage } = useEnv();
+  const load = (id: string) => loadPane(storage, id, () => true);
+  const [st, setSt] = useState(() => ({ id: taskId, pane: load(taskId) }));
+  let current = st;
+  if (st.id !== taskId) {
+    current = { id: taskId, pane: load(taskId) };
+    setSt(current);
+  }
+  const ref = useRef(current);
+  ref.current = current;
+  const update = useCallback(
+    (fn: (p: PaneState) => PaneState) => {
+      const { id, pane } = ref.current;
+      const next = fn(pane);
+      if (next === pane) return;
+      ref.current = { id, pane: next };
+      setSt(ref.current);
+      savePane(storage, id, next);
+    },
+    [storage],
+  );
+  return [current.pane, update];
+}
+
+/** The separator between the main view and the pane: drag it, or ←/→ by 2%. */
+function PaneSeparator({ width, swapped, body, onWidth }: { width: number; swapped: boolean; body: React.RefObject<HTMLDivElement | null>; onWidth(w: number): void }) {
+  const tt = useT();
+  const dragging = useRef(false);
+  const onKey = (e: KeyboardEvent) => {
+    const grow = e.key === "ArrowLeft" ? 2 : e.key === "ArrowRight" ? -2 : 0;
+    if (!grow) return;
+    e.preventDefault();
+    onWidth(clampWidth(width + (swapped ? -grow : grow)));
+  };
+  const move = (e: PointerEvent) => {
+    const r = body.current?.getBoundingClientRect();
+    if (!dragging.current || !r || r.width <= 0) return;
+    onWidth(clampWidth(((swapped ? e.clientX - r.left : r.right - e.clientX) / r.width) * 100));
+  };
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={tt("pane.resize")}
+      aria-valuenow={width}
+      aria-valuemin={PANE_MIN}
+      aria-valuemax={PANE_MAX}
+      tabIndex={0}
+      className="pane-sep"
+      onKeyDown={onKey}
+      onPointerDown={(e) => {
+        dragging.current = true;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      }}
+      onPointerMove={move}
+      onPointerUp={() => {
+        dragging.current = false;
+      }}
+    />
+  );
+}
+
 /**
  * V1, the classic detail: tasks by state | one task with Steps / Terminal / Diff / Memory.
  * `initialTab` is the tab it opens on. `focusTerminalNonce`: each new value after mount
@@ -301,6 +369,39 @@ export function Detail({
 }) {
   const [tab, setTab] = useState<Tab>(initialTab ?? "Steps");
   useEffect(() => onTab?.(tab), [tab, onTab]);
+  const [pane, setPane] = usePaneState(taskId);
+  const body = useRef<HTMLDivElement>(null);
+  const openTarget = useCallback(
+    (target: PaneTarget) => {
+      // The task's own terminal is the main view, never the pane's.
+      if (target.k === "terminal" && target.task === taskId) return setTab("Terminal");
+      setPane((p) => ({ ...p, open: true, target }));
+    },
+    [taskId, setPane],
+  );
+  const paneApi = useMemo<PaneApi>(
+    () => ({ taskId, openTarget, openFile: (path, line) => openTarget(line ? { k: "file", path, line } : { k: "file", path }) }),
+    [taskId, openTarget],
+  );
+  const togglePane = useCallback(() => setPane((p) => ({ ...p, open: !p.open })), [setPane]);
+  // ⌘\ (the pane) is this view's chord; the app leaves it here. Off macOS the terminal keeps
+  // Ctrl chords, as with the app's own.
+  const keys = useRef({ togglePane });
+  keys.current = { togglePane };
+  useEffect(() => {
+    const mac = onMac();
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      const a = shortcutFor(e, mac);
+      if (a !== "pane") return;
+      if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
+      // A modal (the command bar) owns the keys while open.
+      if (document.querySelector('[aria-modal="true"]')) return;
+      e.preventDefault();
+      keys.current.togglePane();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   // Before the first snapshot nothing is known: "loading", not "gone".
   const loaded = useSelect((s) => s.bootId !== null);
   // This task's slices only: another task's event does not render the detail.
@@ -372,6 +473,7 @@ export function Detail({
           <p className="muted">{tt(loaded ? "detail.gone" : "detail.loading")}</p>
         </main>
       ) : (
+        <PaneContext.Provider value={paneApi}>
         <main className="detail-main" aria-label={tt("detail.task", { title: t.title })}>
           <header className="detail-head">
             <h1 tabIndex={-1} ref={title}>
@@ -388,6 +490,16 @@ export function Detail({
             {/* One place for rules: the Rules view, scoped to this task. */}
             <button className="btn btn-small btn-ghost" onClick={() => onRules?.(t.id)}>
               {tt("detail.rules")}
+            </button>
+            <button
+              className="btn btn-small btn-ghost"
+              title={tt("pane.reviewTitle")}
+              onClick={() => {
+                setTab("Terminal");
+                setPane((p) => ({ ...p, open: true, target: { k: "diff" } }));
+              }}
+            >
+              {tt("pane.review")}
             </button>
             <Actions key={t.id} t={t} />
           </header>
@@ -411,6 +523,7 @@ export function Detail({
               </button>
             ))}
           </div>
+          <div className={`detail-body${pane.swapped ? " detail-body-swapped" : ""}`} ref={body}>
           <div className="panel-wrap">
             <section role="tabpanel" id="task-panel" aria-labelledby={`tab-${tab}`} className="panel">
               {tab === "Steps" && <StepsPanel taskId={t.id} feed={feed} />}
@@ -431,9 +544,27 @@ export function Detail({
               </div>
             )}
           </div>
+          {pane.open && (
+            <>
+              <PaneSeparator width={pane.width} swapped={pane.swapped} body={body} onWidth={(w) => setPane((p) => ({ ...p, width: w }))} />
+              <div className="pane-slot" style={{ flexBasis: `${pane.width}%` }}>
+                <SidePane
+                  task={t}
+                  target={pane.target}
+                  version={turnsEnded(feed)}
+                  steps={<StepsPanel taskId={t.id} feed={feed} />}
+                  onOpenFile={paneApi.openFile}
+                  onSwap={() => setPane((p) => ({ ...p, swapped: !p.swapped }))}
+                  onClose={() => setPane((p) => ({ ...p, open: false }))}
+                />
+              </div>
+            </>
+          )}
+          </div>
           {!onTerminal && queue}
           <MessageComposer key={t.id} t={t} />
         </main>
+        </PaneContext.Provider>
       )}
     </div>
   );

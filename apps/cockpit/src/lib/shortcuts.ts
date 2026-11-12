@@ -9,7 +9,7 @@
 // Inside the terminal: off macOS the mod key is Ctrl, which the terminal needs (Ctrl+K kills
 // a line, Ctrl+G…), so the caller leaves mod chords there to the terminal. On macOS ⌘ is not
 // a terminal key, so ⌘K opens the command bar even with the terminal focused.
-export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme" | "next" | "skills" | "rules";
+export type ShortcutAction = "palette" | "grid" | "brain" | "home" | "escape" | "theme" | "next" | "skills" | "rules" | "pane" | "open";
 
 type KeyLike = Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey"> & Partial<Pick<KeyboardEvent, "code" | "repeat">>;
 
@@ -26,9 +26,13 @@ const CHORDS: { code: string; action: Exclude<ShortcutAction, "escape">; shift: 
   // What each agent session reads. ⌘R reloads nothing in the app's webview (no menu item
   // binds it), and the app prevents the default, so Ctrl+R off macOS never reloads either.
   { code: "KeyR", action: "rules", shift: false },
+  // In a task's detail: the side pane, and quick-open of the task's files into it. Neither is
+  // a menu item of the app, so both reach the page (⌘P prints nothing: the page prevents it).
+  { code: "Backslash", action: "pane", shift: false },
+  { code: "KeyP", action: "open", shift: false },
 ];
 
-const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ", l: "KeyL", r: "KeyR" };
+const CODE_OF_KEY: Record<string, string> = { k: "KeyK", g: "KeyG", b: "KeyB", "1": "Digit1", j: "KeyJ", l: "KeyL", r: "KeyR", "\\": "Backslash", p: "KeyP" };
 
 export function shortcutFor(e: KeyLike, mac: boolean): ShortcutAction | null {
   if (e.repeat) return null;
@@ -71,6 +75,6 @@ export type ShortcutHints = Record<Exclude<ShortcutAction, "escape"> | "send", s
 
 export function hintsFor(mac: boolean): ShortcutHints {
   return mac
-    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", rules: "⌘R", send: "⌘↵" }
-    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J", skills: "Ctrl+L", rules: "Ctrl+R", send: "Ctrl+↵" };
+    ? { palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", rules: "⌘R", pane: "⌘\\", open: "⌘P", send: "⌘↵" }
+    : { palette: "Ctrl+K", grid: "Ctrl+G", brain: "Ctrl+B", home: "Ctrl+1", theme: "Ctrl+Shift+J", next: "Ctrl+J", skills: "Ctrl+L", rules: "Ctrl+R", pane: "Ctrl+\\", open: "Ctrl+P", send: "Ctrl+↵" };
 }

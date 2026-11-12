@@ -66,7 +66,7 @@ describe("platform", () => {
   });
 
   it("hints name the keys of the platform", () => {
-    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", rules: "⌘R", send: "⌘↵" });
+    expect(hintsFor(true)).toEqual({ palette: "⌘K", grid: "⌘G", brain: "⌘B", home: "⌘1", theme: "⇧⌘J", next: "⌘J", skills: "⌘L", rules: "⌘R", pane: "⌘\\", open: "⌘P", send: "⌘↵" });
     expect(hintsFor(false)).toEqual({
       palette: "Ctrl+K",
       grid: "Ctrl+G",
@@ -76,8 +76,19 @@ describe("platform", () => {
       next: "Ctrl+J",
       skills: "Ctrl+L",
       rules: "Ctrl+R",
+      pane: "Ctrl+\\",
+      open: "Ctrl+P",
       send: "Ctrl+↵",
     });
+  });
+
+  it("⌘\\ toggles the side pane and ⌘P quick-opens a file (Ctrl elsewhere)", () => {
+    const key = (key: string, code: string, o: Partial<KeyboardEvent>) => ({ key, code, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...o });
+    expect(shortcutFor(key("\\", "Backslash", { metaKey: true }), true)).toBe("pane");
+    expect(shortcutFor(key("\\", "Backslash", { ctrlKey: true }), false)).toBe("pane");
+    expect(shortcutFor(key("p", "KeyP", { metaKey: true }), true)).toBe("open");
+    expect(shortcutFor(key("p", "", { ctrlKey: true }), false)).toBe("open");
+    expect(shortcutFor(key("P", "KeyP", { metaKey: true, shiftKey: true }), true)).toBeNull();
   });
 
   it("⌘L (Ctrl+L elsewhere) is the Skills chord", () => {

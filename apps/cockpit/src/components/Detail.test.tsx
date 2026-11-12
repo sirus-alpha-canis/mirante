@@ -30,6 +30,7 @@ import { EnvContext, type Env } from "../env";
 import { makeEnv, renderWith, rpcError } from "../test/env";
 import { Detail } from "./Detail";
 import { FEED_CAP } from "../store/state";
+import { onMac } from "../lib/shortcuts";
 
 // The same element type `renderWith` renders, so a rerender updates instead of remounting.
 const wrap = (env: Env, ui: ReactElement) => <EnvContext.Provider value={env}>{ui}</EnvContext.Provider>;
@@ -436,5 +437,76 @@ describe("Detail (V1 classic)", () => {
     });
     const head = screen.getByRole("main", { name: "Task goal of a" }).querySelector("header") as HTMLElement;
     expect(await within(head).findByRole("button", { name: "Skills 1" })).toBeInTheDocument();
+  });
+
+  describe("side pane", () => {
+    const DIFF = { base: "trunk", merge_base: "abc1234", files: [], untracked: [], patch: "", truncated: false, compare_url: null, pushed: false };
+    const mod = () => (onMac() ? { metaKey: true } : { ctrlKey: true });
+    const togglePane = () => fireEvent.keyDown(window, { key: "\\", code: "Backslash", ...mod() });
+    const pane = () => screen.queryByRole("complementary", { name: "Side pane" });
+
+    it("⌘\\ toggles the pane", () => {
+      setup();
+      expect(pane()).toBeNull();
+      act(() => togglePane());
+      expect(pane()).not.toBeNull();
+      expect(pane()).toHaveTextContent(/Open a file with/);
+      act(() => togglePane());
+      expect(pane()).toBeNull();
+    });
+
+    it("the separator is keyboard-resizable (←/→ by 2%) with aria-valuenow", async () => {
+      setup();
+      act(() => togglePane());
+      const sep = screen.getByRole("separator", { name: "Resize the side pane" });
+      expect(sep).toHaveAttribute("aria-valuenow", "40");
+      sep.focus();
+      await userEvent.keyboard("{ArrowLeft}");
+      expect(sep).toHaveAttribute("aria-valuenow", "42");
+      await userEvent.keyboard("{ArrowRight}{ArrowRight}");
+      expect(sep).toHaveAttribute("aria-valuenow", "38");
+      expect(sep).toHaveAttribute("aria-valuemin", "25");
+      expect(sep).toHaveAttribute("aria-valuemax", "70");
+    });
+
+    it("remembers the pane per task", () => {
+      const h = makeEnv({ "task.diff": DIFF });
+      h.load([task("a", { status: "working" }), task("b", { status: "working" })]);
+      const r = renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+      act(() => togglePane());
+      r.rerender(wrap(h.env, <Detail taskId="b" onSelect={() => {}} />));
+      expect(pane()).toBeNull();
+      r.rerender(wrap(h.env, <Detail taskId="a" onSelect={() => {}} />));
+      expect(pane()).not.toBeNull();
+    });
+
+    it("Review layout puts Terminal left and Diff right", async () => {
+      setup({ "task.diff": DIFF });
+      await userEvent.click(screen.getByRole("button", { name: "Review layout" }));
+      expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+      expect(within(pane()!).getByText("Diff", { selector: ".side-pane-title" })).toBeInTheDocument();
+    });
+
+    it("the same task's terminal is never opened in the pane (Terminal stays main)", () => {
+      const h = makeEnv();
+      h.load([task("a", { status: "working" })]);
+      h.env.storage.setItem("mirante.pane.a", JSON.stringify({ open: true, width: 40, target: { k: "terminal", task: "a" } }));
+      renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+      expect(pane()).toBeNull();
+      expect(screen.getAllByLabelText("Terminal of feat/a")).toHaveLength(1);
+    });
+
+    it("the main terminal stays mounted and attached when the pane opens (one resize, no re-attach)", () => {
+      const h = makeEnv();
+      h.load([task("a", { status: "working" })]);
+      term.mounts = term.unmounts = 0;
+      renderWith(h.env, <Detail taskId="a" onSelect={() => {}} initialTab="Terminal" />);
+      const view = screen.getByLabelText("Terminal of feat/a");
+      act(() => togglePane());
+      act(() => togglePane());
+      act(() => togglePane());
+      expect(screen.getByLabelText("Terminal of feat/a")).toBe(view);
+      expect([term.mounts, term.unmounts]).toEqual([1, 0]);
+    });
   });
 });

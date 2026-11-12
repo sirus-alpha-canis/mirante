@@ -490,6 +490,8 @@ export function App({ env: given }: { env: Env }) {
       if (!a || e.defaultPrevented) return;
       // The command bar is modal: only its own toggle (and its Escape) act while it is open.
       if (palette && a !== "palette" && a !== "escape") return;
+      // A task's detail owns the side pane (⌘\) and quick-open (⌘P).
+      if ((a === "pane" || a === "open") && mode === "detail") return;
       if (a === "escape") {
         // Escape belongs to whatever is being typed in (the terminal, a composer).
         if (!palette && mode === "detail" && !isTypingTarget(e.target)) leave(beforeDetail === "detail" ? "home" : beforeDetail);
@@ -508,6 +510,8 @@ export function App({ env: given }: { env: Env }) {
       e.preventDefault();
       if (a === "next") goNext();
       if (a === "palette") setPalette((p) => !p);
+      // Outside a task there is no pane to open a file in: ⌘P is the command bar.
+      if (a === "open") setPalette(true);
       if (a === "grid") toggleGrid();
       if (a === "brain") toggleBrain();
       if (a === "home") goHome();
