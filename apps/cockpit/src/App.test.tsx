@@ -183,6 +183,17 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /Home/ })).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("⌘P outside a task is the command bar; inside a task it quick-opens the task's files", async () => {
+    setup();
+    fireEvent.keyDown(window, { key: "p", code: "KeyP", ...mod });
+    const input = screen.getByRole("combobox", { name: "Command" });
+    await userEvent.type(input, "goal of z{Enter}");
+    expect(screen.getByRole("button", { name: "Detail" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(window, { key: "p", code: "KeyP", ...mod });
+    expect(screen.getByRole("dialog", { name: "Open a file of this task" })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Command" })).toBeNull();
+  });
+
   it("Escape typed into the composer (or the terminal) stays there", async () => {
     setup();
     fireEvent.keyDown(window, { key: "k", ...mod });

@@ -496,6 +496,24 @@ describe("Detail (V1 classic)", () => {
       expect(screen.getAllByLabelText("Terminal of feat/a")).toHaveLength(1);
     });
 
+    it("⌘P quick-opens a file of the task into the pane; ⌘↵ opens it in the editor", async () => {
+      const h = setup({
+        "task.files": ["src/login.ts"],
+        "task.file": { path: "src/login.ts", abs: "/w/src/login.ts", size: 9, kind: "text", text: "const a = 1;", lang: "ts" },
+      });
+      act(() => void fireEvent.keyDown(window, { key: "p", code: "KeyP", ...mod() }));
+      const input = screen.getByRole("combobox", { name: "File name" });
+      expect(await screen.findByRole("option", { name: "src/login.ts" })).toBeInTheDocument();
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.queryByRole("dialog", { name: "Open a file of this task" })).toBeNull();
+      expect(await within(pane()!).findByText("const")).toHaveClass("tk-kw");
+      expect(h.calls).toContainEqual(["task.file", { task: "a", path: "src/login.ts" }]);
+      act(() => void fireEvent.keyDown(window, { key: "p", code: "KeyP", ...mod() }));
+      await screen.findByRole("option", { name: "src/login.ts" });
+      fireEvent.keyDown(screen.getByRole("combobox", { name: "File name" }), { key: "Enter", ...mod() });
+      await waitFor(() => expect(h.env.openInEditor).toHaveBeenCalledWith("a", "src/login.ts", null, "vscode"));
+    });
+
     it("the main terminal stays mounted and attached when the pane opens (one resize, no re-attach)", () => {
       const h = makeEnv();
       h.load([task("a", { status: "working" })]);

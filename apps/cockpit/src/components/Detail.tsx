@@ -24,6 +24,8 @@ import { TrustCard } from "./TrustCard";
 import { onMac, shortcutFor } from "../lib/shortcuts";
 import { clampWidth, loadPane, type PaneState, type PaneTarget, PANE_MAX, PANE_MIN, savePane } from "../lib/sidepane";
 import { type PaneApi, PaneContext, SidePane } from "./SidePane";
+import { QuickOpen } from "./QuickOpen";
+import { useOpenInEditor } from "./EditorButton";
 
 const GROUPS: Column[] = ["needs_you", "working", "review", "idle"];
 const TABS = ["Steps", "Terminal", "Diff", "Memory"] as const;
@@ -384,20 +386,23 @@ export function Detail({
     [taskId, openTarget],
   );
   const togglePane = useCallback(() => setPane((p) => ({ ...p, open: !p.open })), [setPane]);
-  // ⌘\ (the pane) is this view's chord; the app leaves it here. Off macOS the terminal keeps
-  // Ctrl chords, as with the app's own.
-  const keys = useRef({ togglePane });
-  keys.current = { togglePane };
+  const [quick, setQuick] = useState(false);
+  const editor = useOpenInEditor(taskId);
+  // ⌘\ (the pane) and ⌘P (quick-open) are this view's chords; the app leaves them here.
+  // Off macOS the terminal keeps Ctrl chords, as with the app's own.
+  const keys = useRef({ togglePane, quickOpen: () => setQuick(true) });
+  keys.current = { togglePane, quickOpen: () => setQuick(true) };
   useEffect(() => {
     const mac = onMac();
     const onKey = (e: globalThis.KeyboardEvent) => {
       const a = shortcutFor(e, mac);
-      if (a !== "pane") return;
+      if (a !== "pane" && a !== "open") return;
       if (!mac && e.target instanceof Element && e.target.closest(".xterm")) return;
-      // A modal (the command bar) owns the keys while open.
-      if (document.querySelector('[aria-modal="true"]')) return;
       e.preventDefault();
-      keys.current.togglePane();
+      // A modal (the command bar, quick-open) owns the keys while open.
+      if (document.querySelector('[aria-modal="true"]')) return;
+      if (a === "pane") keys.current.togglePane();
+      else keys.current.quickOpen();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -563,6 +568,14 @@ export function Detail({
           </div>
           {!onTerminal && queue}
           <MessageComposer key={t.id} t={t} />
+          {editor.error && (
+            <p className="error small" role="alert">
+              {editor.error}
+            </p>
+          )}
+          {quick && (
+            <QuickOpen taskId={t.id} onOpen={(path) => paneApi.openFile(path)} onOpenEditor={(path) => editor.open(path)} onClose={() => setQuick(false)} />
+          )}
         </main>
         </PaneContext.Provider>
       )}
