@@ -13,7 +13,7 @@ import {
 import { shallow, useEnv, useLive, useSelect } from "../env";
 import { hintsFor, onMac } from "../lib/shortcuts";
 import { useDismiss } from "../lib/useDismiss";
-import { type Key, t, useT } from "../lib/i18n";
+import { type Key, t, tn, useT } from "../lib/i18n";
 import { DaemonError } from "../lib/daemon";
 import {
   AGENT_OPTIONS,
@@ -30,6 +30,7 @@ import {
   mayHoldSecrets,
   nextFreeBranch,
   parseDispatch,
+  reposInGoal,
   suggest,
   type SuggestionItem,
   withContext,
@@ -47,16 +48,43 @@ export interface ComposerForm {
   edited: string | null;
   /** The repo picked in the form (null: the rail's selection). */
   picked: string | null;
+  /** A folder (a group of projects) picked as the target instead: a task across the repos
+   * checked under the box. */
+  group: string | null;
+  /** The folder's repos the person checked, in the order checked (null: the ones the goal
+   * names). */
+  checked: string[] | null;
 }
 
-export const EMPTY_FORM: ComposerForm = { refs: [], edited: null, picked: null };
+export const EMPTY_FORM: ComposerForm = { refs: [], edited: null, picked: null, group: null, checked: null };
 
-/** The branches `repo`'s tasks use, sorted (a list compared shallowly: a task event that
- * changes no branch renders nothing). */
-function branchesIn(s: State, repo: string | null): string[] {
-  if (!repo) return [];
+/** A folder's projects (a group in the rail and the picker). */
+export interface GroupTarget {
+  name: string;
+  /** The folder. */
+  path: string;
+  /** Its visible projects, by name. */
+  members: Project[];
+}
+
+/** The folders the projects were added from, with their projects. */
+export function groupsOf(projects: Project[]): GroupTarget[] {
+  const by = new Map<string, Project[]>();
+  for (const p of projects) if (p.group) by.set(p.group, [...(by.get(p.group) ?? []), p]);
+  return [...by]
+    .map(([path, members]) => ({ name: repoName(path), path, members: [...members].sort((a, b) => a.name.localeCompare(b.name)) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The branches the tasks of `repos` (or of the folder `folder`) use, sorted (a list
+ * compared shallowly: a task event that changes no branch renders nothing). */
+function branchesIn(s: State, repos: string[], folder: string | null = null): string[] {
+  if (repos.length === 0 && !folder) return [];
+  const want = new Set(repos);
   const out: string[] = [];
-  for (const t of Object.values(s.tasks)) if (t.repo_path === repo) out.push(t.branch);
+  for (const t of Object.values(s.tasks)) {
+    if (want.has(t.repo_path) || (folder && t.group_path === folder) || t.repos?.some((r) => want.has(r.repo_path))) out.push(t.branch);
+  }
   return out.sort();
 }
 
@@ -94,6 +122,47 @@ export function saveAgent(store: KV, agent: AgentKind): void {
   } catch {
     // A private window or blocked storage: the choice just is not remembered.
   }
+}
+
+/** What `task.create` gets: one repo, or a folder (`repo`) and the repos in it (`repos`). */
+type Target = { repo: string; repos?: string[]; agent: AgentKind; branch: string; goal: string };
+
+/** The repos of a folder a task may change: a checkbox each (the goal's are pre-checked
+ * until the person changes one) and "Select all". The others stay read-only for the agent. */
+function RepoChecklist(props: { group: GroupTarget; checked: string[]; onChange(next: string[]): void }) {
+  const t = useT();
+  const { members } = props.group;
+  const on = new Set(props.checked);
+  const all = members.length > 0 && members.every((m) => on.has(m.path));
+  const some = !all && props.checked.length > 0;
+  const toggle = (path: string) =>
+    props.onChange(on.has(path) ? props.checked.filter((p) => p !== path) : [...props.checked, path]);
+  return (
+    <fieldset className="repo-checklist">
+      <legend className="small">{t("dispatch.checklist", { name: props.group.name })}</legend>
+      <label className="repo-check repo-check-all">
+        <input
+          type="checkbox"
+          checked={all}
+          ref={(el) => {
+            if (el) el.indeterminate = some;
+          }}
+          onChange={() => props.onChange(all ? [] : [...props.checked, ...members.map((m) => m.path).filter((p) => !on.has(p))])}
+        />{" "}
+        {t("dispatch.selectAll")}
+      </label>
+      <ul className="repo-check-list">
+        {members.map((m) => (
+          <li key={m.path}>
+            <label className="repo-check" title={m.path}>
+              <input type="checkbox" checked={on.has(m.path)} onChange={() => toggle(m.path)} /> {m.name}
+            </label>
+          </li>
+        ))}
+      </ul>
+      <p className="small muted">{t("dispatch.readOnlyRepos", { name: props.group.name })}</p>
+    </fieldset>
+  );
 }
 
 // How many auto-named branches to try when git already has one (-2, -3…).
@@ -148,32 +217,46 @@ export function DispatchComposer(props: {
   // The repo: picked here, else the rail's selection, else the first project. A new rail
   // selection takes over from what was picked here.
   const picked = form.picked;
-  const setPicked = (p: string | null) => setForm((f) => ({ ...f, picked: p }));
   const railWas = useRef(props.project);
   useEffect(() => {
     if (railWas.current === props.project) return;
     railWas.current = props.project;
-    setForm((f) => (f.picked === null ? f : { ...f, picked: null }));
+    setForm((f) => (f.picked === null && f.group === null ? f : { ...f, picked: null, group: null, checked: null }));
   }, [props.project, setForm]);
   const has = (p: string | null) => !!p && props.projects.some((x) => x.path === p);
   const repo = has(picked) ? picked : has(props.project) ? props.project : (props.projects[0]?.path ?? null);
+  const groups = useMemo(() => groupsOf(props.projects), [props.projects]);
+  const formGroup = groups.find((g) => g.path === form.group) ?? null;
+  const pickGroup = (folder: string) => setForm((f) => ({ ...f, group: folder, checked: null }));
+  const pickRepo = (p: string | null) => setForm((f) => ({ ...f, picked: p, group: null, checked: null }));
 
-  // The @ line: the agent always, the repo and branch when it names them.
+  // The @ line: the agent always, the repo (or folder) and branch when it names them.
   const power = isPowerSyntax(props.value);
-  const parsed = useMemo(() => (power ? parseDispatch(props.value, props.projects) : null), [power, props.value, props.projects]);
+  const parsed = useMemo(() => (power ? parseDispatch(props.value, props.projects, groups) : null), [power, props.value, props.projects, groups]);
   const line = parsed?.ok ? parsed.value : null;
   const lineRepo = line && line.repo !== null ? dispatchRepo(line.repo, repo, props.projects) : null;
-  // Where the task goes: the @ line's project, else the toolbar's.
-  const targetRepo = lineRepo ? (lineRepo.ok ? lineRepo.path : null) : repo;
+  // Where the task goes: the @ line's folder or project, else the toolbar's.
+  const targetGroup = line?.group ? (groups.find((g) => g.name === line.group) ?? null) : lineRepo ? null : formGroup;
+  const targetRepo = targetGroup ? null : lineRepo ? (lineRepo.ok ? lineRepo.path : null) : repo;
   const agent = line?.agent ?? props.agent;
   const goalText = power ? (line?.goal ?? "") : props.value;
+  // A folder: the repos the task may change, the goal's by default.
+  const members = targetGroup?.members ?? [];
+  const memberPaths = members.map((m) => m.path);
+  const checkedOf = (goal: string) => (form.checked ?? reposInGoal(goal, members).map((m) => m.path)).filter((p) => memberPaths.includes(p));
+  const checked = checkedOf(goalText);
 
   // The branch: named after the goal, past the names this repo's tasks already use, unless
   // edited (or typed on the @ line as project/branch).
   const edited = form.edited;
   const setEdited = (b: string | null) => setForm((f) => ({ ...f, edited: b }));
-  const takenIn = (path: string | null) => new Set(branchesIn(cockpit.getState(), path));
-  const selectBranches = useCallback((s: State) => branchesIn(s, targetRepo), [targetRepo]);
+  const takenIn = (paths: string[], folder: string | null = null) => new Set(branchesIn(cockpit.getState(), paths, folder));
+  const memberKey = memberPaths.join("\n");
+  const targetFolder = targetGroup?.path ?? null;
+  const selectBranches = useCallback(
+    (s: State) => (targetFolder ? branchesIn(s, memberKey.split("\n"), targetFolder) : branchesIn(s, targetRepo ? [targetRepo] : [])),
+    [targetRepo, targetFolder, memberKey],
+  );
   const branches = useSelect(selectBranches, shallow);
   const taken = useMemo(() => new Set(branches), [branches]);
   const auto = nextFreeBranch(branchFromGoal(goalText), taken);
@@ -187,10 +270,10 @@ export function DispatchComposer(props: {
   const detach = (key: string) => setForm((f) => ({ ...f, refs: f.refs.filter((x) => contextKey(x) !== key) }));
   const repoLabel = (path: string | null) => props.projects.find((x) => x.path === path)?.name ?? path ?? t("dispatch.anotherRepo");
 
-  /** task.create; an auto-named branch git already has moves on to -2, -3… */
-  const create = async (target: { repo: string; agent: AgentKind; branch: string; goal: string }, renames: boolean) => {
+  /** task.create; an auto-named branch git already has (in any of the repos) moves on to -2, -3… */
+  const create = async (target: Target, renames: boolean) => {
     if (!renames) return { v: await rpc<TaskView>(M.taskCreate, target), branch: target.branch };
-    const tried = takenIn(target.repo);
+    const tried = target.repos ? takenIn(target.repos, target.repo) : takenIn([target.repo]);
     let b = target.branch;
     for (let n = 0; ; n++) {
       try {
@@ -208,12 +291,37 @@ export function DispatchComposer(props: {
     if (inFlight.current || !live) return;
     const sent = props.value;
     const sentRefs = refs;
-    let target: { repo: string; agent: AgentKind; branch: string; goal: string };
+    let target: Target;
     let renames = false;
+    // A folder: its checked repos (refused when none); files and notes picked in a project
+    // name nothing there.
+    const across = (g: GroupTarget, goal: string, b: string): Target | string => {
+      const repos = (form.checked ?? reposInGoal(goal, g.members).map((m) => m.path)).filter((p) => g.members.some((m) => m.path === p));
+      if (repos.length === 0) return t("dispatch.pickRepos", { name: g.name });
+      const other = foreignRepo(sentRefs, null);
+      if (other) return t("dispatch.foreignRefs", { from: repoLabel(other), to: g.name });
+      return { repo: g.path, repos, agent: props.agent, branch: b, goal: withContext(goal, sentRefs) };
+    };
+    const lineGroup = (p: { group: string | null; repo: string | null }) =>
+      p.group !== null ? (groups.find((g) => g.name === p.group) ?? null) : p.repo === null ? formGroup : null;
     if (power) {
-      const p = parseDispatch(sent, props.projects);
+      const p = parseDispatch(sent, props.projects, groups);
       if (!p.ok) return setError(p.error);
       if (props.projects.length === 0) return setError(t("dispatch.noRepo"));
+      const g = lineGroup(p.value);
+      if (g) {
+        let b = p.value.branch;
+        if (b === "") {
+          renames = edited === null;
+          b = edited ?? nextFreeBranch(branchFromGoal(p.value.goal), takenIn(g.members.map((m) => m.path), g.path));
+          const bad = branchProblem(b);
+          if (bad) return setError(bad);
+        }
+        const made = across(g, p.value.goal, b);
+        if (typeof made === "string") return setError(made);
+        target = { ...made, agent: p.value.agent };
+        return void send(target, renames, sent);
+      }
       const r = dispatchRepo(p.value.repo, repo, props.projects);
       if (!r.ok) {
         if ("pick" in r) repoChip.current?.focus();
@@ -230,11 +338,20 @@ export function DispatchComposer(props: {
       let b = p.value.branch;
       if (b === "") {
         renames = edited === null;
-        b = edited ?? nextFreeBranch(branchFromGoal(p.value.goal), takenIn(r.path));
+        b = edited ?? nextFreeBranch(branchFromGoal(p.value.goal), takenIn([r.path]));
         const bad = branchProblem(b);
         if (bad) return setError(bad);
       }
       target = { repo: r.path, agent: p.value.agent, branch: b, goal: withContext(p.value.goal, sentRefs) };
+    } else if (formGroup) {
+      const goal = sent.trim();
+      if (!goal) return setError(t("dispatch.noGoal"));
+      const bad = branchProblem(branch);
+      if (bad) return setError(bad);
+      const made = across(formGroup, goal, branch);
+      if (typeof made === "string") return setError(made);
+      target = made;
+      renames = edited === null;
     } else {
       const goal = sent.trim();
       if (!goal) return setError(t("dispatch.noGoal"));
@@ -253,6 +370,10 @@ export function DispatchComposer(props: {
       target = { repo, agent: props.agent, branch, goal: withContext(goal, sentRefs) };
       renames = edited === null;
     }
+    await send(target, renames, sent);
+  };
+
+  const send = async (target: Target, renames: boolean, sent: string) => {
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -264,7 +385,7 @@ export function DispatchComposer(props: {
       // Clear only what was dispatched: text typed meanwhile is the user's next message.
       if (latest.current === sent) {
         props.onChange("");
-        setForm((f) => ({ ...f, edited: null, refs: [] }));
+        setForm((f) => ({ ...f, edited: null, refs: [], checked: null }));
       }
       props.onDispatched?.(v.id);
       // Boot can take up to 45 s; progress arrives as events, so do not wait here.
@@ -295,7 +416,7 @@ export function DispatchComposer(props: {
   const [focused, setFocused] = useState(false);
   // The text Escape closed the list on: it stays closed until the text changes.
   const [dismissed, setDismissed] = useState<string | null>(null);
-  const sugg = focused && dismissed !== props.value ? suggest(props.value, caret, props.projects) : null;
+  const sugg = focused && dismissed !== props.value ? suggest(props.value, caret, props.projects, groups) : null;
   const suggKey = sugg ? `${sugg.kind}:${sugg.from}:${sugg.items.map((i) => i.label).join(",")}` : "";
   const [activeAt, setActiveAt] = useState({ key: "", i: 0 });
   const active = sugg && activeAt.key === suggKey ? Math.min(activeAt.i, sugg.items.length - 1) : 0;
@@ -442,14 +563,29 @@ export function DispatchComposer(props: {
       {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
       {/* The context as plain-text tokens: each opens its picker. */}
       <div className="composer-tokens" role="group" aria-label={t("dispatch.options")}>
-        <ContextPicker repo={targetRepo} onAttach={attach} attached={refs} />
+        <ContextPicker repo={targetGroup ? null : targetRepo} onAttach={attach} attached={refs} />
         <AgentPicker value={agent} onPick={pickAgent} />
         <span className="sep" aria-hidden="true">
           ·
         </span>
-        <RepoPicker projects={props.projects} value={repo} buttonRef={repoChip} onPick={setPicked} />
+        <RepoPicker projects={props.projects} value={repo} group={formGroup?.path ?? null} buttonRef={repoChip} onPick={pickRepo} onPickGroup={pickGroup} />
         <span id="dispatch-branch" className="composer-tokens">
-          {power ? (
+          {targetGroup && (power ? line : hasGoal) ? (
+            <span className="composer-tokens" aria-label={t("dispatch.target")}>
+              <span className="sep" aria-hidden="true">
+                →
+              </span>{" "}
+              <span className="token token-static">{targetGroup.name}</span>{" "}
+              <span className="sep" aria-hidden="true">
+                ·
+              </span>{" "}
+              <span className="token token-static">{tn(checked.length, "dispatch.reposOne", "dispatch.reposMany")}</span>{" "}
+              <span className="sep" aria-hidden="true">
+                ·
+              </span>{" "}
+              {branchChip}
+            </span>
+          ) : power ? (
             line && targetRepo ? (
               <span className="composer-tokens" aria-label={t("dispatch.target")}>
                 <span className="sep" aria-hidden="true">
@@ -477,6 +613,13 @@ export function DispatchComposer(props: {
           {hints.send}
         </span>
       </div>
+      {targetGroup && (
+        <RepoChecklist
+          group={targetGroup}
+          checked={checked}
+          onChange={(next) => setForm((f) => ({ ...f, checked: next }))}
+        />
+      )}
       {error && (
         <p id="dispatch-error" className="error" role="alert">
           {error}
@@ -797,11 +940,20 @@ function pickerRows(projects: Project[], query: string, folded: Set<string>): Pi
 }
 
 /** The form's repository: a chip ("Repository shop ▾") that opens the Projects as a list,
- * grouped like the rail (a folder's projects under its name, folded with a click), with a
- * search focused at open. ↑/↓ move, Enter picks (or folds a group), ←/→ fold and unfold;
+ * grouped like the rail (a folder's projects under its name, folded with its arrow), with a
+ * search focused at open. ↑/↓ move, Enter picks (a folder's row picks the folder: a task
+ * across its repos), ←/→ fold and unfold;
  * Escape, a press outside or focus leaving close it (`useDismiss`). Hidden projects are not
  * here (the caller passes the visible ones). */
-function RepoPicker(props: { projects: Project[]; value: string | null; buttonRef?: Ref<HTMLButtonElement>; onPick(path: string): void }) {
+function RepoPicker(props: {
+  projects: Project[];
+  value: string | null;
+  /** The folder picked as the target (its group row is the chosen one), or null. */
+  group: string | null;
+  buttonRef?: Ref<HTMLButtonElement>;
+  onPick(path: string): void;
+  onPickGroup(folder: string): void;
+}) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -811,7 +963,9 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
   const listId = `${id}-list`;
   const searchId = `${id}-search`;
   const optionId = (i: number) => `${id}-opt-${i}`;
-  const chosen = props.projects.find((p) => p.path === props.value);
+  const chosenGroup = props.group ? groupsOf(props.projects).find((g) => g.path === props.group) : undefined;
+  const chosen = chosenGroup ? undefined : props.projects.find((p) => p.path === props.value);
+  const chosenName = chosenGroup ? t("dispatch.group", { name: chosenGroup.name, n: chosenGroup.members.length }) : chosen?.name;
   const rows = open ? pickerRows(props.projects, query, folded) : [];
   const at = Math.min(active, Math.max(rows.length - 1, 0));
   const wrap = useRef<HTMLSpanElement>(null);
@@ -839,8 +993,10 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
   );
   const show = () => {
     setQuery("");
-    // The keyboard starts on the chosen project.
-    const start = pickerRows(props.projects, "", folded).findIndex((r) => r.kind === "project" && r.p.path === props.value);
+    // The keyboard starts on the chosen folder or project.
+    const start = pickerRows(props.projects, "", folded).findIndex((r) =>
+      props.group ? r.kind === "group" && r.folder === props.group : r.kind === "project" && r.p.path === props.value,
+    );
     setActive(Math.max(start, 0));
     setOpen(true);
   };
@@ -852,14 +1008,12 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
       else next.delete(folder);
       return next;
     });
+  // A folder's row picks the folder (a task across its repos); its arrow folds it.
   const choose = (i: number) => {
     const r = rows[i];
     if (!r) return;
-    if (r.kind === "group") {
-      setActive(i);
-      return fold(r.folder);
-    }
-    props.onPick(r.p.path);
+    if (r.kind === "group") props.onPickGroup(r.folder);
+    else props.onPick(r.p.path);
     close();
     button.current?.focus();
   };
@@ -888,12 +1042,12 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
-        title={chosen?.path ?? t("dispatch.pickRepoTitle")}
+        title={chosenGroup?.path ?? chosen?.path ?? t("dispatch.pickRepoTitle")}
         disabled={empty}
         onClick={() => (open ? close() : show())}
       >
         <span className="sr-only">{t("dispatch.repository")}</span>{" "}
-        <span className="token-name">{chosen?.name ?? t(empty ? "dispatch.noProjects" : "dispatch.pickProject")}</span>
+        <span className="token-name">{chosenName ?? t(empty ? "dispatch.noProjects" : "dispatch.pickProject")}</span>
       </button>
       {open && (
         <div className="popover repo-popover">
@@ -927,28 +1081,42 @@ function RepoPicker(props: { projects: Project[]; value: string | null; buttonRe
                   key={`g:${r.folder}`}
                   id={optionId(i)}
                   role="option"
-                  aria-selected={false}
+                  aria-selected={r.folder === props.group}
                   aria-expanded={r.open}
                   className={`picker-group${i === at ? " active" : ""}`}
-                  title={r.folder}
+                  title={t("dispatch.pickGroupTitle", { path: r.folder })}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => choose(i)}
                 >
-                  <span aria-hidden="true">{r.open ? "▾" : "▸"}</span> <span className="picker-name">{t("dispatch.group", { name: r.name, n: r.count })}</span>
+                  <span
+                    className="picker-fold"
+                    aria-hidden="true"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActive(i);
+                      fold(r.folder);
+                    }}
+                  >
+                    {r.open ? "▾" : "▸"}
+                  </span>{" "}
+                  <span className="picker-name">{t("dispatch.group", { name: r.name, n: r.count })}</span>
+                  <span className="picker-check" aria-hidden="true">
+                    {r.folder === props.group ? "✓" : ""}
+                  </span>
                 </li>
               ) : (
                 <li
                   key={r.p.path}
                   id={optionId(i)}
                   role="option"
-                  aria-selected={r.p.path === props.value}
+                  aria-selected={!props.group && r.p.path === props.value}
                   className={`picker-project${r.nested ? " nested" : ""}${i === at ? " active" : ""}`}
                   title={r.p.path}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => choose(i)}
                 >
                   <span className="picker-check" aria-hidden="true">
-                    {r.p.path === props.value ? "✓" : ""}
+                    {!props.group && r.p.path === props.value ? "✓" : ""}
                   </span>
                   <span className="picker-name">{r.p.name}</span>
                 </li>

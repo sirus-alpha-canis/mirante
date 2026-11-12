@@ -378,6 +378,11 @@ export function Detail({
               {t.title}
             </h1>
             <TaskBadges t={t} />
+            {t.repos && t.repos.length > 0 && (
+              <span className="detail-repos small muted" aria-label={tt("detail.repos")} title={t.workspace_path ?? undefined}>
+                {repoName(t.group_path ?? "")}: {t.repos.map((r) => r.name).join(", ")}
+              </span>
+            )}
             <StatusPill column={columnOf(t, feed)} />
             <SkillsChip key={`skills-${t.id}`} task={t.id} />
             {/* One place for rules: the Rules view, scoped to this task. */}

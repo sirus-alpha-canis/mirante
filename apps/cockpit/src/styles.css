@@ -305,6 +305,12 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .perm-compact { padding: 0; }
 .done { margin-top: var(--s2); display: flex; justify-content: space-between; align-items: center; gap: var(--s2); flex-wrap: wrap; color: var(--muted); font-size: var(--fs-sm); }
 .done-actions { display: flex; gap: 6px; align-items: center; }
+.done-repo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.done-repo { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.diff-repo-nav { display: flex; gap: var(--s2); flex-wrap: wrap; margin-bottom: var(--s2); }
+.diff-repo { margin-bottom: var(--s3); }
+.diff-repo-name { font-size: var(--fs-sm); margin: 0 0 4px; overflow-wrap: anywhere; }
+.detail-repos { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 40ch; }
 /* One primary action per card; the secondary one shows on hover or focus. */
 .card .done-actions .btn-primary { order: 2; background: none; color: var(--muted); font-weight: 400; opacity: 0; }
 .card:hover .done-actions .btn-primary, .card:focus-within .done-actions .btn-primary { opacity: 1; }
@@ -379,6 +385,14 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .picker-group { font-weight: 600; font-size: var(--fs-sm); color: var(--muted); }
 .picker-check { width: 1em; flex: none; color: var(--text); }
 .picker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.picker-group .picker-name { flex: 1; }
+.picker-fold { width: 1em; flex: none; cursor: pointer; }
+/* A task across a folder's repos: which ones it may change. */
+.repo-checklist { border: none; margin: var(--s2) 0 0; padding: 0; min-width: 0; }
+.repo-checklist legend { color: var(--muted); padding: 0; margin-bottom: 4px; }
+.repo-check-list { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; max-height: 9.5em; overflow: auto; }
+.repo-check { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.repo-check-all { font-weight: 600; }
 .pause-setting { margin-top: 6px; }
 .pause-setting select { border: none; border-radius: var(--r); padding: 1px 4px; background: var(--panel-2); font-size: var(--fs-sm); max-width: 100%; }
 

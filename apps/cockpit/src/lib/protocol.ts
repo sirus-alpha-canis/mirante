@@ -38,6 +38,20 @@ export interface TaskView {
   permission_mode?: string | null;
   /** `task.create`'s answer only: the origin fixed for the task's skills. */
   origin?: CreatedOrigin | null;
+  /** A task across several repos of a folder: where the agent runs (absent otherwise). */
+  workspace_path?: string | null;
+  /** That task's folder (its group in the rail). */
+  group_path?: string | null;
+  /** That task's repos, primary first (absent for a single-repo task). */
+  repos?: TaskRepo[];
+}
+
+/** `mirante_core::model::TaskRepo`: one repo of a task across several. */
+export interface TaskRepo {
+  name: string;
+  repo_path: string;
+  worktree_path: string;
+  branch: string;
 }
 
 /** `mirante_ipc::types::CreatedOrigin`. */
@@ -128,6 +142,15 @@ export interface TaskDiff {
   truncated: boolean;
   compare_url: string | null;
   pushed: boolean;
+  /** A task across several repos: one section per repo, primary first (the fields above
+   * are then the primary's). Absent for a single-repo task. */
+  repos?: RepoDiff[];
+}
+
+/** One repo's section of a [`TaskDiff`]. */
+export interface RepoDiff extends Omit<TaskDiff, "repos"> {
+  name: string;
+  repo: string;
 }
 
 /** The cockpit shell's `scan_repos` (not the daemon): the git checkouts in a folder. */

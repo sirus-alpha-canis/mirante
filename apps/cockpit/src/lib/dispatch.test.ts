@@ -14,6 +14,7 @@ import {
   matchProjects,
   nextFreeBranch,
   parseDispatch,
+  reposInGoal,
   resolveRepo,
   suggest,
 } from "./dispatch";
@@ -25,40 +26,70 @@ const known = [
 ];
 const parse = (input: string) => parseDispatch(input, known);
 
+describe("a folder (group) as the target", () => {
+  const groups = [{ name: "gol" }];
+  it("@agent <folder> <goal> names the group; a project of that name wins", () => {
+    expect(parseDispatch("@claude gol change Site-B2C", known, groups)).toEqual({
+      ok: true,
+      value: { agent: "claude", repo: null, group: "gol", branch: "", goal: "change Site-B2C" },
+    });
+    expect(parseDispatch("@codex GOL/feat/x go", known, groups)).toEqual({
+      ok: true,
+      value: { agent: "codex", repo: null, group: "gol", branch: "feat/x", goal: "go" },
+    });
+    expect(parseDispatch("@claude shop go", known, [{ name: "shop" }])).toMatchObject({ ok: true, value: { repo: "shop", group: null } });
+    expect(parseDispatch("@claude gol go", known)).toMatchObject({ ok: true, value: { group: null, goal: "gol go" } });
+  });
+
+  it("pre-checks the repos the goal names, whole words only, in the goal's order", () => {
+    const members = [{ name: "api" }, { name: "bff-flight" }, { name: "Site-B2C" }, { name: "site" }];
+    const names = (goal: string) => reposInGoal(goal, members).map((m) => m.name);
+    expect(names("Here are Site-B2C and bff-flight that you need to change")).toEqual(["Site-B2C", "bff-flight"]);
+    expect(names("make it rapid; the site-b2c checkout")).toEqual(["Site-B2C"]);
+    expect(names("the site and the API")).toEqual(["site", "api"]);
+    expect(names("nothing named here")).toEqual([]);
+  });
+
+  it("suggests folders after the agent, after the projects", () => {
+    const s = suggest("@claude g", 9, [{ name: "shop", path: "/r/shop" }], [{ name: "gol", path: "/w/gol" }]);
+    expect(s?.items.map((i) => i.label)).toEqual(["gol"]);
+  });
+});
+
 describe("parseDispatch", () => {
   it("@agent then the goal: the repo is the toolbar's, the branch is named by Mirante (the founder's input)", () => {
     const input = "@claude Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente";
     expect(parse(input)).toEqual({
       ok: true,
-      value: { agent: "claude", repo: null, branch: "", goal: "Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente" },
+      value: { agent: "claude", repo: null, group: null, branch: "", goal: "Ao buscar um voo na cultura Colombia, o preço aparece em reais indevidamente" },
     });
-    expect(parse("@codex corrigir o login")).toEqual({ ok: true, value: { agent: "codex", repo: null, branch: "", goal: "corrigir o login" } });
+    expect(parse("@codex corrigir o login")).toEqual({ ok: true, value: { agent: "codex", repo: null, group: null, branch: "", goal: "corrigir o login" } });
   });
 
   it("@agent, a known project name (any case), then the goal: that repo, branch named by Mirante", () => {
-    expect(parse("@claude shop fix the login")).toEqual({ ok: true, value: { agent: "claude", repo: "shop", branch: "", goal: "fix the login" } });
-    expect(parse("@codex site-b2c corrigir o preço")).toEqual({ ok: true, value: { agent: "codex", repo: "Site-B2C", branch: "", goal: "corrigir o preço" } });
+    expect(parse("@claude shop fix the login")).toEqual({ ok: true, value: { agent: "claude", repo: "shop", group: null, branch: "", goal: "fix the login" } });
+    expect(parse("@codex site-b2c corrigir o preço")).toEqual({ ok: true, value: { agent: "codex", repo: "Site-B2C", group: null, branch: "", goal: "corrigir o preço" } });
   });
 
   it("@agent project/branch goal: as before, a branch with slashes and a multi-word goal", () => {
     expect(parse("@claude shop/feat/login add a login page")).toEqual({
       ok: true,
-      value: { agent: "claude", repo: "shop", branch: "feat/login", goal: "add a login page" },
+      value: { agent: "claude", repo: "shop", group: null, branch: "feat/login", goal: "add a login page" },
     });
     expect(parse("  @Codex   API/fix-42   fix the\nflaky test ")).toEqual({
       ok: true,
-      value: { agent: "codex", repo: "api", branch: "fix-42", goal: "fix the\nflaky test" },
+      value: { agent: "codex", repo: "api", group: null, branch: "fix-42", goal: "fix the\nflaky test" },
     });
     // "shop/" with nothing after the slash: the branch is named from the goal.
-    expect(parse("@claude shop/ fix the login")).toEqual({ ok: true, value: { agent: "claude", repo: "shop", branch: "", goal: "fix the login" } });
+    expect(parse("@claude shop/ fix the login")).toEqual({ ok: true, value: { agent: "claude", repo: "shop", group: null, branch: "", goal: "fix the login" } });
   });
 
   it("a word with a slash that names no project is just part of the goal", () => {
-    expect(parse("@claude a/b testing on the checkout")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "a/b testing on the checkout" } });
-    expect(parse("@claude web/x do it")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "web/x do it" } });
-    expect(parse("@claude /main do it")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "/main do it" } });
+    expect(parse("@claude a/b testing on the checkout")).toEqual({ ok: true, value: { agent: "claude", repo: null, group: null, branch: "", goal: "a/b testing on the checkout" } });
+    expect(parse("@claude web/x do it")).toEqual({ ok: true, value: { agent: "claude", repo: null, group: null, branch: "", goal: "web/x do it" } });
+    expect(parse("@claude /main do it")).toEqual({ ok: true, value: { agent: "claude", repo: null, group: null, branch: "", goal: "/main do it" } });
     // A project name only counts as the second word, whole.
-    expect(parse("@claude shopping list")).toEqual({ ok: true, value: { agent: "claude", repo: null, branch: "", goal: "shopping list" } });
+    expect(parse("@claude shopping list")).toEqual({ ok: true, value: { agent: "claude", repo: null, group: null, branch: "", goal: "shopping list" } });
   });
 
   it("never asks for a repo or a branch", () => {

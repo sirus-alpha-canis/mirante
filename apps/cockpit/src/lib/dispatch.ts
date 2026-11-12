@@ -1,5 +1,6 @@
 // The one-line syntax: "@claude <goal>", optionally with a project ("@claude shop <goal>")
-// or a project and branch ("@claude shop/feat/login <goal>"). The person never has to name
+// or a project and branch ("@claude shop/feat/login <goal>"), or a folder of projects (a
+// group: "@claude gol <goal>", a task across the repos picked under the box). The person never has to name
 // a repo or a branch: with no project the toolbar's repository is used, and with no branch
 // Mirante names one after the goal (mirante/<slug>, -2, -3… when taken). A word with a "/"
 // counts as project/branch only when the part before the "/" is a known project; anything
@@ -12,6 +13,9 @@ export interface Dispatch {
   agent: AgentKind;
   /** The project named on the line (its name as registered), or null: the toolbar's. */
   repo: string | null;
+  /** The folder (a group of projects) named on the line instead ("@claude gol <goal>"): its
+   * name. A project of that name wins. */
+  group: string | null;
   /** The branch typed after "project/", or "": named after the goal. */
   branch: string;
   goal: string;
@@ -57,7 +61,7 @@ function knownName(word: string, projects: readonly { name: string }[]): string 
   return projects.find((p) => p.name.toLowerCase() === lower)?.name ?? null;
 }
 
-export function parseDispatch(input: string, projects: readonly { name: string }[]): Parsed {
+export function parseDispatch(input: string, projects: readonly { name: string }[], groups: readonly { name: string }[] = []): Parsed {
   const text = input.trim();
   const m = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text);
   if (!text.startsWith("@") || !m) return { ok: false, error: t("dispatch.parseAgent", { help: dispatchHelp() }) };
@@ -65,13 +69,21 @@ export function parseDispatch(input: string, projects: readonly { name: string }
   if (!agent) return { ok: false, error: t("dispatch.parseUnknownAgent", { agent: m[1] }) };
   let rest = (m[2] ?? "").trim();
   let repo: string | null = null;
+  let group: string | null = null;
   let branch = "";
   const w = /^(\S+)(?:\s+([\s\S]*))?$/.exec(rest);
   if (w) {
     const word = w[1];
     const slash = word.indexOf("/");
     const name = knownName(slash < 0 ? word : word.slice(0, slash), projects);
-    if (name !== null) {
+    const folder = name === null ? knownName(slash < 0 ? word : word.slice(0, slash), groups) : null;
+    if (folder !== null) {
+      group = folder;
+      branch = slash < 0 ? "" : word.slice(slash + 1);
+      const bad = branch === "" ? null : branchProblem(branch);
+      if (bad) return { ok: false, error: bad };
+      rest = (w[2] ?? "").trim();
+    } else if (name !== null) {
       repo = name;
       branch = slash < 0 ? "" : word.slice(slash + 1);
       const bad = branch === "" ? null : branchProblem(branch);
@@ -80,7 +92,29 @@ export function parseDispatch(input: string, projects: readonly { name: string }
     }
   }
   if (!rest) return { ok: false, error: t("dispatch.parseGoal") };
-  return { ok: true, value: { agent, repo, branch, goal: rest } };
+  return { ok: true, value: { agent, repo, group, branch, goal: rest } };
+}
+
+/** The members whose name the goal mentions (ignoring case; a whole word: "Site-B2C" in
+ * "change Site-B2C and bff", not "api" in "rapid"), in the order the goal names them. */
+export function reposInGoal<P extends { name: string }>(goal: string, members: readonly P[]): P[] {
+  const text = goal.toLowerCase();
+  const word = /[\p{L}\p{N}_-]/u;
+  const at = (name: string): number => {
+    const n = name.toLowerCase();
+    if (!n) return -1;
+    for (let i = text.indexOf(n); i >= 0; i = text.indexOf(n, i + 1)) {
+      const before = text[i - 1] ?? " ";
+      const after = text[i + n.length] ?? " ";
+      if (!word.test(before) && !word.test(after)) return i;
+    }
+    return -1;
+  };
+  return members
+    .map((p) => ({ p, i: at(p.name) }))
+    .filter((x) => x.i >= 0)
+    .sort((a, b) => a.i - b.i)
+    .map((x) => x.p);
 }
 
 /** The repository a dispatch goes to: the project named on the @ line, else the one picked in
@@ -174,7 +208,7 @@ export interface Suggestions {
 
 /** Agents while the first word ("@cl") is typed; projects while the second ("@claude sh")
  * is, before any "/". Nothing anywhere else: never inside the goal. */
-export function suggest(text: string, caret: number, projects: { name: string; path: string }[]): Suggestions | null {
+export function suggest(text: string, caret: number, projects: { name: string; path: string }[], groups: { name: string; path: string }[] = []): Suggestions | null {
   const before = text.slice(0, caret);
   const word = (re: RegExp) => caret + (re.exec(text.slice(caret))?.[0].length ?? 0);
   const agent = /^(\s*)@(\w*)$/.exec(before);
@@ -190,7 +224,11 @@ export function suggest(text: string, caret: number, projects: { name: string; p
     const to = word(/^[^\s/]*/);
     // A "/branch" or the goal already after it keeps its separator; else a space (a branch is optional).
     const sep = text[to] === "/" || /\s/.test(text[to] ?? "") ? "" : " ";
-    const items = matchProjects(repo[2], projects).map((p) => ({ label: p.name, detail: p.path, insert: p.name + sep }));
+    const items = [...matchProjects(repo[2], projects), ...matchProjects(repo[2], groups).filter((g) => !projects.some((p) => p.name === g.name))].map((p) => ({
+      label: p.name,
+      detail: p.path,
+      insert: p.name + sep,
+    }));
     return items.length ? { kind: "repo", from: repo[1].length, to, items } : null;
   }
   return null;

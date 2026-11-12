@@ -43,6 +43,16 @@ function setup(answers = {}, tasks = [task("a", { status: "working" }), task("b"
 }
 
 describe("Detail (V1 classic)", () => {
+  it("a task across a folder's repos names them in the header", () => {
+    const repos = ["Site-B2C", "bff-flight"].map((name) => ({ name, repo_path: `/w/gol/${name}`, worktree_path: `/m/_workspaces/x/${name}`, branch: "mirante/x" }));
+    const h = makeEnv();
+    h.load([task("a", { group_path: "/w/gol", workspace_path: "/m/_workspaces/x", repos })]);
+    renderWith(h.env, <Detail taskId="a" onSelect={vi.fn()} />);
+    const head = screen.getByLabelText("Repositories");
+    expect(head).toHaveTextContent("gol: Site-B2C, bff-flight");
+    expect(head).toHaveAttribute("title", "/m/_workspaces/x");
+  });
+
   it("Rules this agent received opens the Rules view for this task", async () => {
     const h = makeEnv();
     h.load([task("a", { status: "working" })]);

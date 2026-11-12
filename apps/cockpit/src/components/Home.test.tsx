@@ -217,13 +217,13 @@ describe("Home (V3 group chat)", () => {
     expect(group).toHaveAttribute("aria-expanded", "true");
     expect(projectOptions()).toEqual(["gol (2)", "api", "site", "shop"]);
     expect(screen.queryByRole("option", { name: "old" })).toBeNull();
-    // A click on the group folds it; Enter on it unfolds it again.
-    await userEvent.click(group);
+    // Its arrow folds it; ←/→ fold and unfold from the keyboard.
+    await userEvent.click(group.querySelector(".picker-fold")!);
     expect(projectOptions()).toEqual(["gol (2)", "shop"]);
     expect(screen.getByRole("listbox", { name: "Projects" })).toBeInTheDocument();
     const search = screen.getByRole("combobox", { name: "Search projects" });
     expect(search).toHaveAttribute("aria-activedescendant", screen.getByRole("option", { name: /gol/ }).id);
-    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard("{ArrowRight}");
     expect(projectOptions()).toEqual(["gol (2)", "api", "site", "shop"]);
     await userEvent.keyboard("{ArrowLeft}");
     expect(projectOptions()).toEqual(["gol (2)", "shop"]);
@@ -232,6 +232,76 @@ describe("Home (V3 group chat)", () => {
     expect(projectOptions()).toEqual(["gol (1)", "site"]);
     await userEvent.keyboard("{ArrowDown}{Enter}");
     expect(repoChip()).toHaveTextContent("Repository site");
+  });
+
+  /** A rail with the folder /w/gol (Site-B2C, bff-flight, docs) and /repos/shop. */
+  function gol(answers = {}, tasks: ReturnType<typeof task>[] = []) {
+    const h = makeEnv(answers);
+    h.load(tasks);
+    const repos = ["/w/gol/Site-B2C", "/w/gol/bff-flight", "/w/gol/docs", "/repos/shop"];
+    h.env.storage.setItem(REPOS_KEY, JSON.stringify(repos));
+    h.env.storage.setItem(GROUPS_KEY, JSON.stringify({ "/w/gol/Site-B2C": "/w/gol", "/w/gol/bff-flight": "/w/gol", "/w/gol/docs": "/w/gol" }));
+    renderWith(h.env, <Harness env={h.env} registry={repos} />);
+    return h;
+  }
+  const checklist = () => screen.getByRole("group", { name: /Repositories of gol this task may change/ });
+  const box = (name: string | RegExp) => within(checklist()).getByRole("checkbox", { name });
+
+  it("a folder is a target: its row picks it, the goal's repos are pre-checked, the task goes to the checked ones", async () => {
+    const h = gol({ "task.create": task("new", { branch: "mirante/x" }), "session.start": { boot: "booting" } }, [
+      task("old", { repo_path: "/w/gol/bff-flight", branch: "mirante/here-are-site-b2c-and-bff-flight-to" }),
+    ]);
+    await userEvent.click(repoChip());
+    await userEvent.click(screen.getByRole("option", { name: /gol \(3\)/ }));
+    expect(repoChip()).toHaveTextContent("Repository gol (3)");
+    // Nothing named yet: nothing checked.
+    expect(within(checklist()).getAllByRole("checkbox").filter((c) => (c as HTMLInputElement).checked)).toEqual([]);
+    await userEvent.type(screen.getByLabelText("Goal"), "Here are Site-B2C and bff-flight to change");
+    expect(box("Site-B2C")).toBeChecked();
+    expect(box("bff-flight")).toBeChecked();
+    expect(box("docs")).not.toBeChecked();
+    expect(box("Select all")).toHaveProperty("indeterminate", true);
+    // The hint: the folder, how many repos, the branch (past the one a task of the folder uses).
+    const hint = screen.getByLabelText("Where the agent will work");
+    expect(hint).toHaveTextContent("→ gol · 2 repos · ⎇ mirante/here-are-site-b2c-and-bff-flight-to-2");
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "session.start"]));
+    expect(sent(h)[0][1]).toEqual({
+      repo: "/w/gol",
+      repos: ["/w/gol/Site-B2C", "/w/gol/bff-flight"],
+      agent: "claude",
+      branch: "mirante/here-are-site-b2c-and-bff-flight-to-2",
+      base: "HEAD",
+      goal: "Here are Site-B2C and bff-flight to change",
+    });
+  });
+
+  it("the checklist: select all, untick one, and nothing checked is refused before any call", async () => {
+    const h = gol({ "task.create": task("new"), "session.start": { boot: "booting" } });
+    await userEvent.click(repoChip());
+    await userEvent.click(screen.getByRole("option", { name: /gol \(3\)/ }));
+    await userEvent.type(screen.getByLabelText("Goal"), "tidy the readmes");
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    expect(screen.getByRole("alert")).toHaveTextContent("Check the repositories of gol this task may change.");
+    expect(sent(h)).toEqual([]);
+    await userEvent.click(box("Select all"));
+    expect(box("docs")).toBeChecked();
+    expect(screen.getByLabelText("Where the agent will work")).toHaveTextContent("3 repos");
+    await userEvent.click(box("bff-flight"));
+    expect(screen.getByLabelText("Where the agent will work")).toHaveTextContent("2 repos");
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    await waitFor(() => expect(sent(h)[0]?.[1]).toMatchObject({ repo: "/w/gol", repos: ["/w/gol/docs", "/w/gol/Site-B2C"] }));
+  });
+
+  it("@agent <folder> on the one-line syntax targets the folder; a project picked again leaves it", async () => {
+    const h = gol({ "task.create": task("new"), "session.start": { boot: "booting" } });
+    await userEvent.type(screen.getByLabelText("Goal"), "@codex gol fix docs please");
+    expect(box("docs")).toBeChecked();
+    expect(screen.getByLabelText("Where the agent will work")).toHaveTextContent("→ gol · 1 repo ·");
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    await waitFor(() =>
+      expect(sent(h)[0]?.[1]).toMatchObject({ repo: "/w/gol", repos: ["/w/gol/docs"], agent: "codex", goal: "fix docs please" }),
+    );
   });
 
   it("a long project name is cut in the chip, its full path in the tooltip", async () => {

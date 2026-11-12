@@ -44,6 +44,57 @@ export function DoneCard({ taskId, version, onOpen }: { taskId: string; version:
       </div>
     );
   const url = d.diff.compare_url;
+  const open = (u: string) => {
+    setOpenError(false);
+    openUrl(u).catch(() => setOpenError(true));
+  };
+  // A task across several repos: one line per repo ("Site-B2C: 3 files changed, +40 −2"),
+  // each with its own Open PR.
+  if (d.diff.repos?.length) {
+    return (
+      <div className="done done-repos" role="group" aria-label={t("diff.turnFinished")}>
+        <ul className="done-repo-list">
+          {d.diff.repos.map((r) => (
+            <li key={r.repo} className="done-repo" aria-label={r.name}>
+              <span>
+                <strong title={r.repo}>{r.name}</strong>:{" "}
+                <DiffCounts
+                  diff={r}
+                  against={
+                    <>
+                      {t("diff.vs")} <code>{r.base}</code>
+                    </>
+                  }
+                  quiet
+                />
+              </span>
+              {r.compare_url && (
+                <button
+                  className="btn btn-small"
+                  disabled={!r.pushed}
+                  aria-label={t("diff.openPrFor", { name: r.name })}
+                  title={t(r.pushed ? "diff.prTitle" : "diff.pushFirstTitle")}
+                  onClick={() => open(r.compare_url!)}
+                >
+                  {t("diff.openPr")}
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+        <span className="done-actions">
+          <button className="btn" onClick={onOpen}>
+            {t("diff.review")}
+          </button>
+          {openError && (
+            <span className="error" role="alert">
+              {t("diff.browserFailed")}
+            </span>
+          )}
+        </span>
+      </div>
+    );
+  }
   return (
     <div className="done" role="group" aria-label={t("diff.turnFinished")}>
       <span>
@@ -66,10 +117,7 @@ export function DoneCard({ taskId, version, onOpen }: { taskId: string; version:
             className="btn btn-primary"
             disabled={!d.diff.pushed}
             title={t(d.diff.pushed ? "diff.prTitle" : "diff.pushFirstTitle")}
-            onClick={() => {
-              setOpenError(false);
-              openUrl(url).catch(() => setOpenError(true));
-            }}
+            onClick={() => open(url)}
           >
             {t("diff.openPr")}
           </button>

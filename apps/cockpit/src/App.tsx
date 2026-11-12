@@ -367,7 +367,7 @@ export function App({ env: given }: { env: Env }) {
   useEffect(() => {
     if (formProject.current === current) return;
     formProject.current = current;
-    setForm((f) => (f.picked === null ? f : { ...f, picked: null }));
+    setForm((f) => (f.picked === null && f.group === null ? f : { ...f, picked: null, group: null, checked: null }));
   }, [current]);
 
   // A remembered (or open) detail whose task is gone, once the daemon's tasks are known:
