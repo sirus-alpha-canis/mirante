@@ -15,7 +15,11 @@ const COMMANDS: &[Help] = &[
         names: &["new"],
         text: "  new <repo> --agent claude|codex [--branch <name>] [--base <ref>] [--title <t>] [--trust] <goal...>
                          create a worktree + task and start the agent with <goal>; the branch
-                         defaults to mirante/<words-of-the-goal> (-2, -3… when taken)",
+                         defaults to mirante/<words-of-the-goal> (-2, -3… when taken)
+  new <folder> --repos <a,b,…> | --all --agent claude|codex [--branch <name>] <goal...>
+                         one task across several repos of a folder: a worktree per repo named
+                         (a folder name or path inside <folder>; --all: every repo in it), one
+                         branch; the folder's other repos are read-only for the agent",
     },
     Help { names: &["ls", "list"], text: "  ls [--all]             tasks with status and what needs you (--all: include archived)" },
     Help { names: &["show"], text: "  show <task>            one task in detail" },
@@ -141,7 +145,7 @@ const COMMANDS: &[Help] = &[
 
 const TERMS: &str = "\
 <task> is a task id, a unique id suffix (4+ chars) or the branch name.
-<repo> is a git checkout (. for the current directory's).
+<repo> is a git checkout (. for the current directory's); <folder> holds several.
 <scope> is personal, org:<host>/<owner>[/…] or repo:<host>/<path>.
 <perm> is a permission id or a unique suffix.";
 
@@ -347,6 +351,15 @@ pub enum DaemonCmd {
     UninstallAgent,
 }
 
+/// Which repos of a folder a task may change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoPick {
+    /// Folder names or paths inside it, in order (the first is the primary).
+    Named(Vec<String>),
+    /// Every git checkout in the folder.
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     New {
@@ -358,6 +371,8 @@ pub enum Cmd {
         title: Option<String>,
         goal: String,
         trust: bool,
+        /// A task across several repos of the folder `repo` (`--repos` / `--all`).
+        repos: Option<RepoPick>,
     },
     Ls {
         all: bool,
@@ -736,7 +751,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
     }
     match sub.as_str() {
         "new" => {
-            let p = split(rest, &["--agent", "--branch", "--base", "--title"], &["--trust"])?;
+            let p = split(rest, &["--agent", "--branch", "--base", "--title", "--repos"], &["--trust", "--all"])?;
             let (repo, goal) = task_and_text(&p, "goal").map_err(|e| e.replace("<task>", "<repo>"))?;
             let agent = match p.values.get("--agent").map(String::as_str) {
                 Some("claude") => AgentKind::Claude,
@@ -745,6 +760,25 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 None => return Err("missing --agent claude|codex".into()),
             };
             let branch = p.values.get("--branch").cloned();
+            let all = p.bools.iter().any(|b| b == "--all");
+            let repos = match (p.values.get("--repos"), all) {
+                (Some(_), true) => return Err("--repos and --all: pass one".into()),
+                (Some(list), false) => {
+                    let names: Vec<String> =
+                        list.split(',').map(str::trim).filter(|n| !n.is_empty()).map(String::from).collect();
+                    if names.is_empty() {
+                        return Err("--repos needs at least one repo name".into());
+                    }
+                    Some(RepoPick::Named(names))
+                }
+                (None, true) => Some(RepoPick::All),
+                (None, false) => None,
+            };
+            if repos.is_some() && p.values.contains_key("--base") {
+                return Err(
+                    "--base does not apply to --repos/--all: each repo starts from its own current branch".into()
+                );
+            }
             Ok(Cmd::New {
                 repo,
                 agent,
@@ -753,6 +787,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 title: p.values.get("--title").cloned(),
                 goal,
                 trust: p.bools.iter().any(|b| b == "--trust"),
+                repos,
             })
         }
         "ls" | "list" => {
@@ -857,6 +892,7 @@ mod tests {
                 title: None,
                 goal: "fix the login".into(),
                 trust: false,
+                repos: None,
             }
         );
         assert!(matches!(p("new . --agent claude --branch b --trust go").unwrap(), Cmd::New { trust: true, .. }));
@@ -1090,7 +1126,21 @@ mod tests {
 
     #[test]
     fn new_names_the_branch_itself_when_none_is_given() {
-        assert!(matches!(p("new . --agent claude fix the login").unwrap(), Cmd::New { branch: None, .. }));
+        assert!(matches!(p("new . --agent claude fix the login").unwrap(), Cmd::New { branch: None, repos: None, .. }));
+    }
+
+    #[test]
+    fn new_across_a_folder_names_its_repos_or_takes_all() {
+        let named = p("new ~/gol --repos Site-B2C,bff-flight --agent claude change both").unwrap();
+        let Cmd::New { repo, repos, goal, .. } = named else { panic!() };
+        assert_eq!(repo, "~/gol");
+        assert_eq!(repos, Some(RepoPick::Named(vec!["Site-B2C".into(), "bff-flight".into()])));
+        assert_eq!(goal, "change both");
+        assert!(matches!(p("new gol --all --agent codex go").unwrap(), Cmd::New { repos: Some(RepoPick::All), .. }));
+        assert_eq!(p("new gol --all --repos a --agent codex go").unwrap_err(), "--repos and --all: pass one");
+        assert_eq!(p("new gol --repos , --agent codex go").unwrap_err(), "--repos needs at least one repo name");
+        assert!(p("new gol --all --base main --agent codex go").unwrap_err().contains("--base does not apply"));
+        assert!(command_usage("new").unwrap().contains("--repos <a,b,…> | --all"));
     }
 
     #[test]

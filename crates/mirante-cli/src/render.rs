@@ -264,7 +264,10 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         let needs = if v.needs_you > 0 { v.needs_you.to_string() } else { String::new() };
         let queued = if v.queued > 0 { v.queued.to_string() } else { String::new() };
         let note = note(v);
-        let title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
+        let mut title = if note.is_empty() { v.task.title.clone() } else { format!("{}  [{note}]", v.task.title) };
+        if let Some(r) = repos_cell(v) {
+            title = format!("{title}  ({r})");
+        }
         out.push_str(&format!(
             "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
             fit(short(&v.task.id), 8),
@@ -383,6 +386,17 @@ pub fn perms_table(perms: &[PermissionView]) -> String {
     out
 }
 
+/// A workspace task's folder and repos, e.g. "gol: Site-B2C, bff-flight"; `None` for a
+/// single-repo task.
+pub fn repos_cell(v: &TaskView) -> Option<String> {
+    if v.repos.is_empty() {
+        return None;
+    }
+    let group = v.task.group_path.as_deref().map(|g| g.rsplit('/').next().unwrap_or(g)).unwrap_or("");
+    let names: Vec<&str> = v.repos.iter().map(|r| r.name.as_str()).collect();
+    Some(line(&format!("{group}: {}", names.join(", ")), 200))
+}
+
 pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
     let t = &v.task;
     let mut out = format!(
@@ -399,6 +413,12 @@ pub fn task_detail(v: &TaskView, perms: &[PermissionRequest]) -> String {
         t.repo_path,
         t.goal.lines().next().unwrap_or("")
     );
+    if let Some(ws) = &t.workspace_path {
+        out.push_str(&format!("  workspace: {ws} (the agent runs here)\n"));
+        for r in &v.repos {
+            out.push_str(&format!("    {}: {} (from {})\n", line(&r.name, 80), r.worktree_path, r.repo_path));
+        }
+    }
     out.push_str(&format!("  mode:      {} ({})\n", mode_label(t.agent), mode_help(t.agent)));
     if let Some(sb) = &v.sandbox {
         out.push_str(&format!("  sandbox:   {sb} (effective, as the agent reported it)\n"));
@@ -695,6 +715,32 @@ mod tests {
             origin: None,
             repos: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_task_across_repos_shows_its_folder_and_repos() {
+        let mut v = view(Status::Working, 0, None);
+        assert_eq!(repos_cell(&v), None);
+        v.task.group_path = Some("/src/gol".into());
+        v.task.workspace_path = Some("/m/worktrees/_workspaces/login".into());
+        v.repos = ["Site-B2C", "bff-flight"]
+            .iter()
+            .map(|n| mirante_core::model::TaskRepo {
+                name: n.to_string(),
+                repo_path: format!("/src/gol/{n}"),
+                worktree_path: format!("/m/worktrees/_workspaces/login/{n}"),
+                branch: "mirante/login".into(),
+                created_branch: true,
+                head: String::new(),
+            })
+            .collect();
+        assert!(tasks_table(&[v.clone()], false).contains("Fix the login  (gol: Site-B2C, bff-flight)"));
+        let d = task_detail(&v, &[]);
+        assert!(d.contains("workspace: /m/worktrees/_workspaces/login (the agent runs here)"), "{d}");
+        assert!(
+            d.contains("    bff-flight: /m/worktrees/_workspaces/login/bff-flight (from /src/gol/bff-flight)"),
+            "{d}"
+        );
     }
 
     #[test]

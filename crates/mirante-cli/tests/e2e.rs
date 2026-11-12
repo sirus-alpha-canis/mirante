@@ -1307,3 +1307,83 @@ fn daemon_start_and_restart_hint_at_the_app_only_on_a_terminal() {
         assert!(tty.contains("open the cockpit with: mirante app"), "{args:?}: {tty}");
     }
 }
+
+/// `git -C dir args` with a test identity; panics on failure.
+fn git_in(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+}
+
+#[test]
+fn a_task_across_two_repos_of_a_folder_with_a_fake_claude() {
+    let env = Env::new();
+    // A folder holding three repos, like a company's checkouts.
+    let gol = env.dir.path().join("gol");
+    for name in ["Site-B2C", "bff-flight", "docs"] {
+        let r = gol.join(name);
+        std::fs::create_dir_all(&r).unwrap();
+        git_in(&r, &["init", "-q", "-b", "main"]);
+        git_in(&r, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+    let gol = std::fs::canonicalize(gol).unwrap();
+    env.ok(&["daemon", "start"]);
+    let g = gol.to_string_lossy().into_owned();
+    let out =
+        env.ok(&["new", &g, "--repos", "Site-B2C,bff-flight", "--agent", "claude", "change", "Site-B2C", "and", "bff"]);
+    assert!(out.contains("across Site-B2C, bff-flight") && out.contains("ready"), "{out}");
+    let v = env.task("mirante/change-site-b2c-and-bff");
+    let ws = PathBuf::from(v.task.workspace_path.clone().expect("a workspace task"));
+    assert_eq!(ws, env.home.join("worktrees/_workspaces/change-site-b2c-and-bff"));
+    // The agent runs in the workspace, which names both worktrees and the read-only repo.
+    let cwd = std::fs::read_to_string(env.log.with_extension("log.cwd")).unwrap();
+    assert_eq!(cwd.trim(), std::fs::canonicalize(&ws).unwrap().to_string_lossy(), "{cwd}");
+    let text = std::fs::read_to_string(ws.join("MIRANTE_WORKSPACE.md")).unwrap();
+    assert!(text.contains("**Site-B2C**") && text.contains("**bff-flight**"), "{text}");
+    assert!(text.contains(&format!("- docs: `{}`", gol.join("docs").display())), "{text}");
+    // Claude may read the folder's repos without asking.
+    let settings = Paths::new(&env.home).session_dir(&v.task.id).join("claude-settings.json");
+    let settings = std::fs::read_to_string(settings).unwrap();
+    assert!(settings.contains(&format!("Read(/{g}/**)")), "{settings}");
+    // ls: the folder and its repos.
+    let ls = env.ok(&["ls"]);
+    assert!(ls.contains("(gol: Site-B2C, bff-flight)"), "{ls}");
+
+    // What the agent did: a commit in one repo, a new file in the other.
+    let site = PathBuf::from(&v.repos[0].worktree_path);
+    std::fs::write(site.join("login.ts"), "x\n").unwrap();
+    git_in(&site, &["add", "."]);
+    git_in(&site, &["commit", "-q", "-m", "login"]);
+    let bff = PathBuf::from(&v.repos[1].worktree_path);
+    std::fs::write(bff.join("wip.ts"), "y\n").unwrap();
+    let d: Value = env.client().call(method::TASK_DIFF, json!({ "task": v.task.id })).unwrap();
+    assert_eq!(d["repos"][0]["name"], "Site-B2C");
+    assert_eq!(d["repos"][0]["files"][0]["path"], "login.ts");
+    assert_eq!(d["repos"][1]["untracked"], json!(["wip.ts"]));
+
+    // Archive: refused while bff-flight holds uncommitted work, then done.
+    env.ok(&["stop", &v.task.id]);
+    let out = env.mirante(&["archive", &v.task.id]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("bff-flight") && err.contains("wip.ts"), "{err}");
+    assert!(site.exists() && bff.exists());
+    std::fs::remove_file(bff.join("wip.ts")).unwrap();
+    assert!(env.ok(&["archive", &v.task.id]).contains("archived"));
+    assert!(!ws.exists());
+    // Branches kept in both repos.
+    for name in ["Site-B2C", "bff-flight"] {
+        let out = Command::new("git").arg("-C").arg(gol.join(name)).args(["branch", "--list"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("mirante/change-site-b2c-and-bff"), "{name}");
+    }
+    // A second task picks a free name in every selected repo.
+    let out = env.ok(&["new", &g, "--all", "--agent", "claude", "change", "Site-B2C", "and", "bff"]);
+    assert!(
+        out.contains("mirante/change-site-b2c-and-bff-2") && out.contains("across Site-B2C, bff-flight, docs"),
+        "{out}"
+    );
+}

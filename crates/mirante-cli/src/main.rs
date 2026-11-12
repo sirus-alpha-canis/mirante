@@ -921,12 +921,16 @@ fn run(cmd: Cmd) -> Res {
                 return Err(format!("open could not open {} ({status})", bundle.display()).into());
             }
         }
-        Cmd::New { repo, agent, branch, base, title, goal, trust } => {
+        Cmd::New { repo, agent, branch, base, title, goal, trust, repos } => {
             let repo = std::fs::canonicalize(&repo).map_err(|e| format!("repo {repo}: {e}"))?;
+            let picked = match &repos {
+                Some(pick) => picked_repos(&repo, pick)?,
+                None => Vec::new(),
+            };
             let repo = repo.to_string_lossy().into_owned();
             let mut c = client(&paths)?;
             let create = |branch: String, base: Option<String>| CreateTask {
-                repos: Vec::new(),
+                repos: picked.clone(),
                 repo: repo.clone(),
                 agent,
                 branch,
@@ -934,11 +938,32 @@ fn run(cmd: Cmd) -> Res {
                 goal: goal.clone(),
                 title: title.clone(),
             };
+            // The branches already used where this task goes: its repo, or (across a folder)
+            // each picked repo and the folder's other tasks.
+            let mine = |v: &TaskView| {
+                v.task.repo_path == repo
+                    || picked.contains(&v.task.repo_path)
+                    || v.task.group_path.as_deref() == Some(repo.as_str())
+                    || v.repos.iter().any(|r| picked.contains(&r.repo_path))
+            };
             let v: TaskView = match branch {
                 Some(branch) => c.call(method::TASK_CREATE, create(branch, base))?,
-                None => new_auto_branch(&mut c, &repo, &goal, base, create)?,
+                None => new_auto_branch(&mut c, mine, &goal, base, create)?,
             };
-            println!("created {} on {} ({})", render::short(&v.task.id), v.task.branch, v.task.worktree_path);
+            match v.task.workspace_path.as_deref() {
+                Some(ws) => {
+                    let names: Vec<&str> = v.repos.iter().map(|r| r.name.as_str()).collect();
+                    println!(
+                        "created {} on {} across {} ({ws})",
+                        render::short(&v.task.id),
+                        v.task.branch,
+                        names.join(", ")
+                    );
+                }
+                None => {
+                    println!("created {} on {} ({})", render::short(&v.task.id), v.task.branch, v.task.worktree_path)
+                }
+            }
             notice(&format!("starting {} (its first launch can take a while)…", agent.as_str()));
             let r: StartResult =
                 c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal) })?;
@@ -1067,14 +1092,13 @@ const MAX_RENAMES: usize = 50;
 /// it out.
 fn new_auto_branch(
     c: &mut Client,
-    repo: &str,
+    mine: impl Fn(&TaskView) -> bool,
     goal: &str,
     base: Option<String>,
     create: impl Fn(String, Option<String>) -> CreateTask,
 ) -> Result<TaskView, Box<dyn Error>> {
     let tasks: Vec<TaskView> = c.call(method::TASK_LIST, ListParams { archived: true })?;
-    let mut taken: Vec<String> =
-        tasks.into_iter().filter(|v| v.task.repo_path == repo).map(|v| v.task.branch).collect();
+    let mut taken: Vec<String> = tasks.into_iter().filter(|v| mine(v)).map(|v| v.task.branch).collect();
     let name = branch_from_goal(goal);
     let base = base.unwrap_or_else(|| "HEAD".to_string());
     for _ in 0..=MAX_RENAMES {
@@ -1089,6 +1113,29 @@ fn new_auto_branch(
         }
     }
     Err(format!("every name from {name} to {name}-{} is taken: pass --branch <name>", MAX_RENAMES + 1).into())
+}
+
+/// The checkouts `pick` names in `folder` (canonical paths, in order): each name is a folder
+/// name or path inside it (the daemon checks every one again); `--all`, every git checkout
+/// in the folder.
+fn picked_repos(folder: &std::path::Path, pick: &args::RepoPick) -> Result<Vec<String>, Box<dyn Error>> {
+    let out: Vec<std::path::PathBuf> = match pick {
+        args::RepoPick::All => {
+            let all = mirante_core::workspace::group_checkouts(folder);
+            if all.is_empty() {
+                return Err(format!("no git checkout in {}", folder.display()).into());
+            }
+            all
+        }
+        args::RepoPick::Named(names) => names
+            .iter()
+            .map(|n| {
+                let p = folder.join(n);
+                std::fs::canonicalize(&p).map_err(|e| format!("{n}: not found in {} ({e})", folder.display()))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(out.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
 }
 
 /// The message a person reads: without the daemon's internal error codes unless `verbose`.

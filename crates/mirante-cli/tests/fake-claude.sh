@@ -4,7 +4,8 @@
 # footer, takes bracketed-paste input, and starts and ends a turn per line. A line starting
 # with "ask" raises a permission dialog (PermissionRequest hook + the dialog on screen) and
 # waits for one key, appended to $FAKE_CLAUDE_LOG.keys; a line containing "hold" starts a
-# turn that never ends. Its arguments are appended to $FAKE_CLAUDE_LOG. Like Claude Code it
+# turn that never ends. Its arguments are appended to $FAKE_CLAUDE_LOG (its working directory
+# to $FAKE_CLAUDE_LOG.cwd). Like Claude Code it
 # writes a transcript ($FAKE_CLAUDE_LOG.<session>.jsonl, named in every hook): an "ask" line
 # first writes the assistant's tool_use line, then (once the daemon's tailer has had time to
 # read it) raises the dialog, and writes the tool_result after the answer.
@@ -20,6 +21,7 @@ for a in "$@"; do
   prev=$a
 done
 echo "$*" >> "$FAKE_CLAUDE_LOG"
+pwd -P >> "$FAKE_CLAUDE_LOG.cwd"
 T="$FAKE_CLAUDE_LOG.$SID.jsonl"
 n=0
 # A dialog's box border (U+2500), drawn at column 0 across the screen.
