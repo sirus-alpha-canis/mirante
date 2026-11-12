@@ -6,6 +6,7 @@ import capabilities from "../src-tauri/capabilities/default.json";
 import conf from "../src-tauri/tauri.conf.json";
 import shell from "../src-tauri/src/lib.rs?raw";
 import scanner from "../src-tauri/src/scan.rs?raw";
+import editorRs from "../src-tauri/src/editor.rs?raw";
 import picker from "./main.tsx?raw";
 import css from "./styles.css?raw";
 import page from "../index.html?raw";
@@ -115,10 +116,35 @@ describe("Tauri security baseline", () => {
       // Add project given a folder: the git checkouts in it (read-only, two levels deep,
       // capped; see scan.rs).
       "scan_repos",
+      // Open in editor: which editors are installed (fixed app locations, nothing from the
+      // webview), and opening a task's file (see editor.rs and the test below).
+      "editors_available",
+      "open_in_editor",
     ]);
     // Neither takes anything from the webview: the binary is the one the app resolves itself.
     expect(shell).toContain("async fn daemon_binary_build() -> Option<DaemonBinary>");
     expect(shell).toContain("async fn daemon_restart(app: AppHandle) -> Result<(), String>");
+  });
+
+  it("open_in_editor: a closed editor list, a daemon-checked path, no shell, no $EDITOR", () => {
+    expect(shell).toMatch(/async fn open_in_editor\(\s*app: AppHandle,\s*task: String,\s*path: String,\s*line: Option<u32>,\s*editor: String,?\s*\) -> Result<\(\), String>/);
+    expect(shell).toContain("fn editors_available(app: AppHandle) -> Vec<editor::Editor>");
+    // The absolute path comes from the daemon (task.file with stat, through the bridge's
+    // allowlist), never from the webview.
+    expect(shell).toMatch(/editor::plan\(&editor, &task, &path, line, [\s\S]*?"stat": true[\s\S]*?bridge_rpc::call\(&socket, method::TASK_FILE, params\)/);
+    // URLs go through the opener crate's Rust API; everything else is /usr/bin/open with a
+    // cleared environment. No other program, no shell.
+    expect(shell).toContain("tauri_plugin_opener::open_url(");
+    expect(shell).toContain('Command::new("/usr/bin/open")');
+    expect(shell).toContain(".env_clear()");
+    const commands = [...(shell + editorRs).matchAll(/Command::new\(([^)]*)\)/g)].map((m) => m[1]);
+    expect(commands).toEqual(['"/usr/bin/open"']);
+    const code = editorRs.slice(0, editorRs.indexOf("#[cfg(test)]"));
+    expect(code).not.toMatch(/std::process|env::var|"sh"|"-c"|bash/);
+    // The editors, spelled out: nothing else parses.
+    expect([...code.matchAll(/^\s+"(\w+)" => Editor::/gm)].map((m) => m[1])).toEqual(["vscode", "cursor", "zed", "sublime", "xcode", "default"]);
+    // The default editor is the text editor (`open -t`), never "whatever opens this file type".
+    expect(code).toContain('Editor::Default => open(&["-t"])');
   });
 
   it("scan_repos only reads: no shell or process, symlinks never followed, input checked, bounded", () => {

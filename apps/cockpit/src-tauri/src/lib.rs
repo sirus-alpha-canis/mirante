@@ -1,10 +1,11 @@
-//! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, plus three
-//! small path helpers for adding a project (the home directory, what is at a path, and the
-//! git checkouts in a folder: see `scan`). No state of
+//! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, three small
+//! path helpers for adding a project (the home directory, what is at a path, and the git
+//! checkouts in a folder: see `scan`), and "Open in editor" (see `editor`). No state of
 //! its own beyond the running stream and open attachments; the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
 //! plugin (github.com only, see `capabilities/default.json`), never in the window itself,
 //! and never in a window of their own: `window.open` / `target=_blank` are denied.
+mod editor;
 mod scan;
 
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use base64::Engine;
 use mirante_bridge::attach::{Attachments, Opened};
 use mirante_bridge::stream::{self, Stream, StreamMsg};
 use mirante_bridge::{rpc as bridge_rpc, BridgeError};
-use mirante_ipc::types::DaemonBinary;
+use mirante_ipc::types::{method, DaemonBinary};
 use mirante_ipc::Paths;
 use serde::Serialize;
 use serde_json::Value;
@@ -219,6 +220,53 @@ async fn scan_repos(path: String) -> Result<scan::Scan, String> {
     tauri::async_runtime::spawn_blocking(move || scan::scan(&path, scan::LIMITS)).await.map_err(|e| e.to_string())?
 }
 
+/// The editors installed here, for "Open in editor" (fixed app locations; see `editor`).
+#[tauri::command]
+fn editors_available(app: AppHandle) -> Vec<editor::Editor> {
+    editor::installed(app.path().home_dir().ok().as_deref())
+}
+
+/// Opens a task's worktree file in an editor (see `editor`): the webview names the task, a
+/// relative path, a line and an editor id; the daemon names the checked absolute path.
+#[tauri::command]
+async fn open_in_editor(
+    app: AppHandle,
+    task: String,
+    path: String,
+    line: Option<u32>,
+    editor: String,
+) -> Result<(), String> {
+    let socket = app.state::<Cockpit>().socket.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let launch = editor::plan(&editor, &task, &path, line, |task, path| {
+            let params = serde_json::json!({ "task": task, "path": path, "stat": true });
+            let file = bridge_rpc::call(&socket, method::TASK_FILE, params).map_err(|e| e.to_string())?;
+            file.get("abs")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "the daemon named no file".to_string())
+        })?;
+        match launch {
+            editor::Launch::Url(url) => tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string()),
+            editor::Launch::Open(args) => {
+                let status = std::process::Command::new("/usr/bin/open")
+                    .args(&args)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .status()
+                    .map_err(|e| e.to_string())?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("open exited with {status}"))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 pub fn run() {
     let paths = Paths::from_env().expect("cannot locate ~/.mirante (is HOME set?)");
     let socket = paths.socket();
@@ -279,7 +327,9 @@ pub fn run() {
             daemon_restart,
             home_dir,
             path_kind,
-            scan_repos
+            scan_repos,
+            editors_available,
+            open_in_editor
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::Destroyed = event {
@@ -300,7 +350,12 @@ mod tests {
 
     #[test]
     fn the_app_origin_is_the_only_place_the_window_may_go() {
-        for ok in ["tauri://localhost/", "tauri://localhost/index.html#/task/t1", "http://tauri.localhost/", "https://tauri.localhost/x"] {
+        for ok in [
+            "tauri://localhost/",
+            "tauri://localhost/index.html#/task/t1",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/x",
+        ] {
             assert!(is_app_url(&url(ok), false), "{ok}");
         }
         for bad in [
