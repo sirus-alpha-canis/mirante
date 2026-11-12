@@ -189,8 +189,9 @@ More detail, including the fake daemon for UI work without agents:
   files, memory notes or skills. You can
   also start the text with `@claude` or `@codex`: `@claude fix the login` uses the selected
   repository and names the branch for you; `@claude shop fix the login` picks a project by
-  name; `@claude shop/feat/login fix the login` also names the branch. You never have to
-  type a branch. ⌘↵ dispatches.
+  name; `@claude shop/feat/login fix the login` also names the branch; `@claude gol fix
+  …` targets a folder of projects (see [Work across several repos](#work-across-several-repos)).
+  You never have to type a branch. ⌘↵ dispatches.
 - **Home** is an inbox across all projects: what needs you first, then what is ready to
   review, then what is working. The Mirante logo at the top left (or **⌘1**) brings you
   back to it. **⌘J** jumps to the next task that needs you.
@@ -220,6 +221,7 @@ characters) or the branch name. Without `--branch`, `new` names the branch
 
 ```bash
 mirante new . --agent claude --branch feat/login "add a login page"
+mirante new ~/src/gol --repos Site-B2C,bff-flight --agent claude "change both"   # or --all
 mirante ls                      # tasks, status, what needs you
 mirante watch                   # live board; rings the bell when a task needs you
 mirante attach feat/login       # live terminal (Claude) or event stream (Codex); Ctrl-] detaches
@@ -385,6 +387,38 @@ killing one is your call (`mirante doctor --kill <pid>` asks first). Stress test
 sessions it ended on their native conversations, one at a time while memory allows. Stopped
 and hibernated tasks are never resumed this way. To turn it off, use the cockpit's setting
 or `MIRANTE_AUTO_RESUME=off`.
+
+## Work across several repos
+
+Add a folder that holds several repositories (Projects → **Choose…** on the folder: it
+shows as a group, e.g. "gol (25)"). Then pick the group itself as the target: its row in
+the **Repository** picker (the arrow only folds it), or `@claude gol <goal>`. A checklist
+of the folder's repositories appears under the field. The ones your goal names are
+pre-checked ("Here are Site-B2C and bff-flight that you need to change"), and **Select
+all** checks every one. The hint shows where it goes: `→ gol · 2 repos · ⎇ mirante/<slug>`.
+
+- Each checked repository gets its own worktree, all on one branch, under
+  `~/.mirante/worktrees/_workspaces/<slug>/<repo>/`. The agent runs in that workspace
+  folder. `MIRANTE_WORKSPACE.md` there lists each repository (worktree, branch, base, main
+  checkout) and the folder's other repositories, which are **read-only**: the agent may read
+  them (Claude has a read rule for the folder; Codex reads anywhere) but its writes stay
+  inside the workspace (Codex's sandbox; Claude asks you first, as for any edit).
+- The workspace folder is not a git repository: nothing written there is committed.
+- **Diff** and the card after each turn show one section per repository ("Site-B2C: 3 files
+  changed, +40 −2"), each with its own **Open PR**.
+- **Archive** removes every worktree and keeps every branch. It refuses while any
+  repository has uncommitted work (or the agent left files in the workspace folder
+  itself), naming each one, and removes nothing.
+- Skills and repo memory follow the first checked repository. When the checked
+  repositories belong to different clients (git origin owners), the task gets neither, and
+  its steps say why.
+- Codex, as for any task, asks you before `git commit`: a worktree's commits are written
+  into the main checkout's `.git`, outside its sandbox.
+
+CLI: `mirante new ~/src/gol --repos Site-B2C,bff-flight --agent claude "<goal>"` (names or
+paths inside the folder; `--all` for every repository in it). `mirante ls` shows
+`(gol: Site-B2C, bff-flight)` after the title. Design:
+[`docs/plans/2026-11-12-multi-repo-tasks.md`](docs/plans/2026-11-12-multi-repo-tasks.md).
 
 ## Repo memory (DNA)
 

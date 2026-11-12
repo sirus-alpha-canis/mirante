@@ -118,8 +118,29 @@ repository": a clear failure, nothing created.
 
 - **Codex commits.** In a linked worktree `git commit` writes into the main repository's
   `.git` (outside every writable root), exactly as for single-repo tasks today: Codex asks
-  the person (an approval card). Unchanged by this feature; verified with
-  `codex sandbox macos` (see the report in the commit / CHANGELOG).
+  the person (an approval card). Unchanged by this feature, and on purpose: adding each
+  repo's `.git` as a writable root would let the agent rewrite the repository config and
+  hooks the hardened git runner guards against.
+
+## Verified live (2026-11-12, Codex 0.167.0, Claude Code 2.1.285)
+
+In a throwaway folder under `$HOME` (not `/tmp`, which Codex's sandbox always allows) laid
+out like a workspace (`gol/{A,B,C}`, worktrees of A and B under `_workspaces/x/`):
+
+- `codex sandbox -P :workspace -C _workspaces/x` (the `workspace-write` policy Mirante
+  sets): writes into `A/`, `B/` and a new `B/src/deep/` succeed; writes into the read-only
+  repo `gol/C` and into A's main checkout are refused; reading `gol/C` works; `git add` in
+  `A/` fails on `gol/A/.git/worktrees/A/index.lock` (the commit caveat above).
+- `claude -p` in `_workspaces/x` with `acceptEdits`: Write into `A/hello.txt` and
+  `B/sub/hello.txt` succeeds, into `gol/C/hello.txt` is denied. With the
+  `Read(//…/gol/**)` rule in `--settings`, reading `gol/C/NOTES.md` works in `default`
+  mode; without it the read is denied.
+- `CLAUDE.md` = `@MIRANTE_WORKSPACE.md` in the cwd: Claude has the file's text in its
+  instructions. `AGENTS.md` in the cwd (not a git repo, `codex exec
+  --skip-git-repo-check`): Codex has it too.
+
+Not run live: a full Mirante session (daemon + PTY) with the real agents across two repos;
+the daemon path is covered by the e2e test with the fake Claude.
 - **Read-only is advisory for Claude in bypass modes.** If the person switches Claude to
   `bypassPermissions`, it can write anywhere; Mirante already warns about that mode.
 - **Workspace scratch files.** Files the agent writes in the workspace folder (not in a repo)

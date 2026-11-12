@@ -20,6 +20,19 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ### Added
 
+- **Tasks across several repositories of a folder.** A folder added to Projects (a group,
+  e.g. "gol (25)") is now a dispatch target: its row in the Repository picker, or
+  `@claude gol <goal>`. A checklist under the field picks the repositories the task may
+  change (the ones the goal names are pre-checked; Select all). Each gets a worktree on one
+  branch under `~/.mirante/worktrees/_workspaces/<slug>/`, where the agent runs;
+  `MIRANTE_WORKSPACE.md` (also as `AGENTS.md`, and imported by `CLAUDE.md`) lists them and
+  the folder's other repositories as read-only (Claude gets a read rule for the folder).
+  `task.create` takes `repos` (the folder in `repo`), `task.diff` returns one section per
+  repository; the Diff tab and the turn card show them with an Open PR each; archive
+  removes every worktree or refuses naming each dirty one. Repositories of different
+  clients get no skills and no repo memory. CLI: `mirante new <folder> --repos a,b` or
+  `--all`; `mirante ls` shows "(gol: Site-B2C, bff-flight)". Store migration 0010.
+
 - **`mirante daemon install-agent` / `uninstall-agent` (macOS).** An opt-in per-user
   LaunchAgent, `com.mirante.daemon` (`~/Library/LaunchAgents`): launchd starts the daemon at
   login and whenever the CLI or the app starts it, so the daemon is its own responsible
