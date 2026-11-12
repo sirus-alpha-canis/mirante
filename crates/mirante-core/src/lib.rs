@@ -18,6 +18,7 @@ pub mod store;
 pub mod transcript_tail;
 pub mod workspace;
 pub mod worktree;
+pub mod worktree_file;
 
 /// Test-only helper shared with the other crates' tests; not part of the API.
 #[doc(hidden)]
