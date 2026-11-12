@@ -798,6 +798,9 @@ mod tests {
             updated_at: 2,
             workspace_path: None,
             group_path: None,
+            group_id: None,
+            group_role: None,
+            parent_id: None,
         };
         let v = TaskView {
             task,

@@ -95,6 +95,26 @@ pub enum AgentKind {
 }
 text_enum!(AgentKind, "agent", { Claude => "claude", Codex => "codex" });
 
+/// What a task is in its fan-out group: one of the children the person fanned out to, or
+/// the task the person asked to synthesize their results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRole {
+    Child,
+    Synth,
+}
+text_enum!(GroupRole, "group_role", { Child => "child", Synth => "synth" });
+
+/// How a fan-out group was made: one goal on several agents (`compare`), or one child per
+/// part of the goal (`fanout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupKind {
+    Fanout,
+    Compare,
+}
+text_enum!(GroupKind, "group_kind", { Fanout => "fanout", Compare => "compare" });
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionStatus {
@@ -140,6 +160,15 @@ pub struct Task {
     /// A workspace task: the folder (group) its repos were picked from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_path: Option<String>,
+    /// A task of a fan-out group (`crate::groups`): the group, fixed at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Its role in that group (set exactly when `group_id` is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_role: Option<GroupRole>,
+    /// An agent-initiated child's parent task (reserved; nothing sets it yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 impl Task {

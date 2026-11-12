@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use crate::error::{CoreError, Result};
 use crate::model::NewWorkspace;
 use crate::model::{
-    new_id, now_ms, AgentKind, Conversation, Event, Lifecycle, NewTask, PermissionRequest, PermissionStatus, Session,
-    Status, Task, TaskRepo, Turn,
+    new_id, now_ms, AgentKind, Conversation, Event, GroupKind, GroupRole, Lifecycle, NewTask, PermissionRequest,
+    PermissionStatus, Session, Status, Task, TaskRepo, Turn,
 };
 
 /// A page of one task's events, newest first (see [`Store::task_events_page`]).
@@ -16,7 +16,7 @@ const TASK_EVENTS_PAGE: &str = "SELECT seq, boot_id, task_id, kind, payload, ts_
      WHERE task_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3";
 
 /// Embedded, ordered schema migrations. `PRAGMA user_version` records the last applied one.
-const MIGRATIONS: &[(i64, &str)] = &[
+pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/0001_init.sql")),
     (2, include_str!("migrations/0002_permission_answered_once.sql")),
     (3, include_str!("migrations/0003_lifecycle_archiving.sql")),
@@ -27,6 +27,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, include_str!("migrations/0008_skill_signer.sql")),
     (9, include_str!("migrations/0009_task_origin_by_person.sql")),
     (10, include_str!("migrations/0010_workspace_tasks.sql")),
+    (11, include_str!("migrations/0011_task_groups.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -72,13 +73,13 @@ macro_rules! sql_text_enum {
         }
     )+};
 }
-sql_text_enum!(Status, Lifecycle, AgentKind, PermissionStatus);
+sql_text_enum!(Status, Lifecycle, AgentKind, PermissionStatus, GroupRole, GroupKind);
 
 /// Single owner of Mirante's durable state. Every mutation runs in one transaction that
 /// also appends its audit event, so state and trail never diverge.
 pub struct Store {
     pub(crate) conn: Connection,
-    boot_id: String,
+    pub(crate) boot_id: String,
 }
 
 impl Store {
@@ -205,10 +206,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 10);
+        assert_eq!(s.schema_version().unwrap(), 11);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 10);
+        assert_eq!(s.schema_version().unwrap(), 11);
     }
 
     #[test]
@@ -285,10 +286,10 @@ pub(crate) fn insert_event(
     })
 }
 
-const TASK_COLUMNS: &str = "id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status, \
-     created_at, updated_at, workspace_path, group_path";
+pub(crate) const TASK_COLUMNS: &str = "id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status, \
+     created_at, updated_at, workspace_path, group_path, group_id, group_role, parent_id";
 
-fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+pub(crate) fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
         title: r.get(1)?,
@@ -304,6 +305,9 @@ fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         updated_at: r.get(11)?,
         workspace_path: r.get(12)?,
         group_path: r.get(13)?,
+        group_id: r.get(14)?,
+        group_role: r.get(15)?,
+        parent_id: r.get(16)?,
     })
 }
 
@@ -320,7 +324,7 @@ fn event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     })
 }
 
-fn load_task(conn: &Connection, id: &str) -> Result<Task> {
+pub(crate) fn load_task(conn: &Connection, id: &str) -> Result<Task> {
     conn.query_row(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"), [id], task_from_row)
         .optional()?
         .ok_or_else(|| CoreError::NotFound { kind: "task", id: id.to_string() })
@@ -328,7 +332,24 @@ fn load_task(conn: &Connection, id: &str) -> Result<Task> {
 
 impl Store {
     pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
-        self.insert_task(new, None)
+        self.insert_task(new, None, None)
+    }
+
+    /// A task in the fan-out group `group` (single-repo, or across repos with `ws`). In the
+    /// same transaction: the group must exist and not be archived, and a `Child` is refused
+    /// once the group has [`crate::groups::MAX_CHILDREN`] children that are not archived.
+    /// `group_child_added` lands on the task with it.
+    pub fn create_group_task(
+        &mut self,
+        new: NewTask,
+        ws: Option<NewWorkspace>,
+        group: &str,
+        role: GroupRole,
+    ) -> Result<Task> {
+        if ws.as_ref().is_some_and(|w| w.repos.is_empty()) {
+            return Err(CoreError::Limit("a workspace task needs at least one repo".into()));
+        }
+        self.insert_task(new, ws, Some((group, role)))
     }
 
     /// A workspace task: the task row (its repo and worktree are the primary's,
@@ -337,10 +358,10 @@ impl Store {
         if ws.repos.is_empty() {
             return Err(CoreError::Limit("a workspace task needs at least one repo".into()));
         }
-        self.insert_task(new, Some(ws))
+        self.insert_task(new, Some(ws), None)
     }
 
-    fn insert_task(&mut self, new: NewTask, ws: Option<NewWorkspace>) -> Result<Task> {
+    fn insert_task(&mut self, new: NewTask, ws: Option<NewWorkspace>, group: Option<(&str, GroupRole)>) -> Result<Task> {
         let now = now_ms();
         let task = Task {
             id: new_id(),
@@ -357,11 +378,18 @@ impl Store {
             updated_at: now,
             workspace_path: ws.as_ref().map(|w| w.workspace_path.clone()),
             group_path: ws.as_ref().map(|w| w.group_path.clone()),
+            group_id: group.map(|(g, _)| g.to_string()),
+            group_role: group.map(|(_, r)| r),
+            parent_id: None,
         };
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((g, role)) = group {
+            crate::groups::check_room(&tx, g, role)?;
+        }
         tx.execute(
             &format!(
-                "INSERT INTO tasks ({TASK_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                "INSERT INTO tasks ({TASK_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 ?15, ?16, ?17)"
             ),
             params![
                 task.id,
@@ -377,7 +405,10 @@ impl Store {
                 task.created_at,
                 task.updated_at,
                 task.workspace_path,
-                task.group_path
+                task.group_path,
+                task.group_id,
+                task.group_role,
+                task.parent_id
             ],
         )?;
         let mut payload = serde_json::to_value(&task)?;
@@ -392,6 +423,9 @@ impl Store {
             payload["repos"] = serde_json::to_value(&ws.repos)?;
         }
         insert_event(&tx, &self.boot_id, Some(&task.id), "task_created", &payload)?;
+        if let Some((g, role)) = group {
+            insert_event(&tx, &self.boot_id, Some(&task.id), "group_child_added", &json!({ "group": g, "role": role }))?;
+        }
         tx.commit()?;
         Ok(task)
     }

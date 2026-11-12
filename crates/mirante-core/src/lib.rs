@@ -8,6 +8,7 @@ pub mod delivery;
 pub mod dna;
 pub mod error;
 pub mod git;
+pub mod groups;
 pub mod hook;
 pub mod model;
 pub mod redact;
