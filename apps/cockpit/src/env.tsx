@@ -1,6 +1,7 @@
 // What components need from the outside world, injected so tests can fake it.
 import { createContext, useContext } from "react";
 import type { Note } from "./lib/notify";
+import type { EditorId } from "./lib/daemon";
 import type { DaemonBinary, RepoScan } from "./lib/protocol";
 import type { Cockpit } from "./store/cockpit";
 import { useCockpitSelect } from "./store/cockpit";
@@ -27,6 +28,10 @@ export interface Env {
   pathKind(path: string): Promise<PathKind>;
   /** The git checkouts in a folder (or that the folder is one). */
   scanRepos(path: string): Promise<RepoScan>;
+  /** The editors installed here ("default" is the system's text editor). */
+  editors(): Promise<EditorId[]>;
+  /** Opens a task's worktree file (relative path) in an editor; rejects with a message. */
+  openInEditor(task: string, path: string, line: number | null, editor: EditorId): Promise<void>;
   /** Calls `fn` with the task of a notification the person clicked; returns the unsubscribe. */
   onNoteClick?(fn: (taskId: string) => void): () => void;
 }

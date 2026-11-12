@@ -658,3 +658,35 @@ button.skill-chip:hover { color: var(--text); }
 .rule-body summary { cursor: pointer; font-size: var(--fs-sm); color: var(--muted); }
 .rule-text { font-family: var(--mono); font-size: var(--fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; background: var(--panel); border-radius: var(--r); padding: 6px var(--s2); margin: 4px 0; }
 .rule-imports { list-style: none; margin: 4px 0 0 var(--s3); padding: 0 0 0 var(--s2); border-left: 2px solid var(--panel-3); display: grid; gap: 4px; }
+
+/* Side pane: a worktree file (FileView), its Markdown preview, quick-open. Colors are the
+   Observatório tokens (no new palette): keywords --work, strings --review, numbers --needs,
+   comments --faint. */
+.code-view { margin: 0; font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.5; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s2) 0; overflow: auto; }
+.code-line { display: flex; white-space: pre; padding-right: var(--s3); }
+.code-line-mark { background: var(--needs-bg); }
+.code-ln { flex: none; width: 4.5ch; padding-right: var(--s2); text-align: right; color: var(--faint); user-select: none; }
+.code-text { flex: 1; }
+.tk-kw { color: var(--work); }
+.tk-str { color: var(--review); }
+.tk-num { color: var(--needs); }
+.tk-com { color: var(--faint); font-style: italic; }
+.file-note { display: flex; flex-direction: column; gap: var(--s2); align-items: flex-start; }
+.file-tools { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s2); }
+.file-image img { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: var(--r); }
+.editor-button { display: inline-flex; gap: var(--s1); align-items: center; flex-wrap: wrap; }
+.editor-select { font: inherit; font-size: var(--fs-sm); }
+.markdown { line-height: 1.55; overflow-wrap: anywhere; }
+.markdown h1, .markdown h2, .markdown h3 { margin: var(--s4) 0 var(--s2); line-height: 1.25; }
+.markdown h1 { font-size: var(--fs-lg); }
+.markdown h2 { font-size: var(--fs-md); }
+.markdown code { font-family: var(--mono); font-size: 0.92em; background: var(--panel-3); border-radius: var(--r-sm); padding: 0 3px; }
+.markdown pre.md-code { font-family: var(--mono); font-size: var(--fs-sm); background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s2) var(--s3); overflow: auto; white-space: pre; }
+.markdown pre.md-code code { background: none; padding: 0; }
+.markdown blockquote { margin: var(--s2) 0; padding-left: var(--s3); border-left: 3px solid var(--line); color: var(--muted); }
+.markdown hr { border: 0; border-top: 1px solid var(--line); margin: var(--s4) 0; }
+.md-table { border-collapse: collapse; margin: var(--s2) 0; }
+.md-table th, .md-table td { border: 1px solid var(--line); padding: 2px var(--s2); text-align: left; }
+.md-img { max-width: 100%; height: auto; }
+.md-img-alt { font-style: italic; }
+.md-link { color: var(--work); text-decoration: underline; }

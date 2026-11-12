@@ -175,3 +175,25 @@ export async function scanRepos(path: string): Promise<RepoScan> {
 export async function pathKind(path: string): Promise<"dir" | "file" | "missing"> {
   return await invoke<"dir" | "file" | "missing">("path_kind", { path });
 }
+
+/** An editor the shell can open a worktree file in (`open_in_editor`). */
+export type EditorId = "vscode" | "cursor" | "zed" | "sublime" | "xcode" | "default";
+
+/** The editors installed on this machine (`editors_available`: fixed app locations, read-only). */
+export async function editorsAvailable(): Promise<EditorId[]> {
+  try {
+    return await invoke<EditorId[]>("editors_available");
+  } catch {
+    return ["default"];
+  }
+}
+
+/** Opens a task's file in `editor`. The shell asks the daemon for the file's checked absolute
+ * path (`task.file` with `stat`); the webview never names one. Rejects with a message. */
+export async function openInEditor(task: string, path: string, line: number | null, editor: EditorId): Promise<void> {
+  try {
+    await invoke("open_in_editor", { task, path, line, editor });
+  } catch (e) {
+    throw e instanceof Error ? e : new Error(typeof e === "string" ? e : JSON.stringify(e));
+  }
+}
