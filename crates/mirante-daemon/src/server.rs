@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
 use mirante_ipc::types::{
-    method, AttachParams, AttachResult, DnaContextParams, ListParams, QueueRef, QueuedRef, SubscribeParams, TaskRef,
+    method, AttachParams, AttachResult, DnaContextParams, GroupRef, ListParams, QueueRef, QueuedRef, SubscribeParams,
+    TaskRef,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -337,6 +338,10 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::REPO_FILES => out(hub.repo_files(&params(p)?)),
         method::TASK_FILES => out(hub.task_files(&params(p)?)),
         method::TASK_FILE => out(hub.task_file(&params(p)?)),
+        method::GROUP_CREATE => out(hub.create_group(params(p)?)),
+        method::GROUP_GET => out(hub.group_get(&params::<GroupRef>(p)?.group)),
+        method::GROUP_ARCHIVE => out(hub.group_archive(&params::<GroupRef>(p)?.group)),
+        method::GROUP_SYNTHESIZE => out(hub.group_synthesize(params(p)?)),
         method::RULES_LAYERS => out(hub.rules_layers(params(p)?)),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),
@@ -497,6 +502,7 @@ mod tests {
             .call(
                 method::TASK_CREATE,
                 CreateTask {
+                    group: None,
                     repos: Vec::new(),
                     repo: k.repo.to_string_lossy().into_owned(),
                     agent: AgentKind::Codex,

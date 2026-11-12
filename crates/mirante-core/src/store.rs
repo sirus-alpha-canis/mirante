@@ -286,7 +286,8 @@ pub(crate) fn insert_event(
     })
 }
 
-pub(crate) const TASK_COLUMNS: &str = "id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status, \
+pub(crate) const TASK_COLUMNS: &str =
+    "id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, status, \
      created_at, updated_at, workspace_path, group_path, group_id, group_role, parent_id";
 
 pub(crate) fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -361,7 +362,12 @@ impl Store {
         self.insert_task(new, Some(ws), None)
     }
 
-    fn insert_task(&mut self, new: NewTask, ws: Option<NewWorkspace>, group: Option<(&str, GroupRole)>) -> Result<Task> {
+    fn insert_task(
+        &mut self,
+        new: NewTask,
+        ws: Option<NewWorkspace>,
+        group: Option<(&str, GroupRole)>,
+    ) -> Result<Task> {
         let now = now_ms();
         let task = Task {
             id: new_id(),
@@ -424,7 +430,13 @@ impl Store {
         }
         insert_event(&tx, &self.boot_id, Some(&task.id), "task_created", &payload)?;
         if let Some((g, role)) = group {
-            insert_event(&tx, &self.boot_id, Some(&task.id), "group_child_added", &json!({ "group": g, "role": role }))?;
+            insert_event(
+                &tx,
+                &self.boot_id,
+                Some(&task.id),
+                "group_child_added",
+                &json!({ "group": g, "role": role }),
+            )?;
         }
         tx.commit()?;
         Ok(task)

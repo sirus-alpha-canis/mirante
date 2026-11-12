@@ -187,6 +187,13 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
             Ok(json!({"path": path, "abs": format!("/tmp/fake-worktree/{path}"), "size": text.len(),
                       "kind": "text", "text": text, "lang": "markdown"}))
         }
+        method::GROUP_CREATE => Ok(json!({"id": "g1", "kind": p["kind"], "title": p["goal"], "goal": p["goal"],
+            "branch": p["branch"], "created_at": 1})),
+        method::GROUP_GET | method::GROUP_ARCHIVE => Ok(json!({"group": {"id": p["group"], "kind": "compare",
+            "title": "demo", "goal": "demo", "branch": "mirante/demo", "created_at": 1}, "members": []})),
+        method::GROUP_SYNTHESIZE => {
+            Ok(json!({"text": "Operator request: synthesize (fake daemon).", "expect": "fake"}))
+        }
         _ => Ok(json!({})),
     }
 }

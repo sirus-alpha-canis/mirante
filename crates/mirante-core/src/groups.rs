@@ -140,11 +140,10 @@ impl Store {
         if g.archived_at.is_some() {
             return Err(CoreError::Limit(format!("the group \"{}\" is already archived", g.title)));
         }
-        let open: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE group_id = ?1 AND lifecycle != 'archived'",
-            [id],
-            |r| r.get(0),
-        )?;
+        let open: i64 =
+            tx.query_row("SELECT COUNT(*) FROM tasks WHERE group_id = ?1 AND lifecycle != 'archived'", [id], |r| {
+                r.get(0)
+            })?;
         if open > 0 {
             return Err(CoreError::Limit(format!(
                 "the group \"{}\" still has {open} task(s) that are not archived",
@@ -354,7 +353,10 @@ mod tests {
         // A plain task has neither.
         let solo = s.create_task(task("solo")).unwrap();
         assert_eq!((solo.group_id, solo.group_role, solo.parent_id), (None, None, None));
-        assert!(matches!(s.create_group_task(task("x"), None, "nope", GroupRole::Child), Err(CoreError::NotFound { .. })));
+        assert!(matches!(
+            s.create_group_task(task("x"), None, "nope", GroupRole::Child),
+            Err(CoreError::NotFound { .. })
+        ));
     }
 
     #[test]
@@ -410,7 +412,8 @@ mod tests {
             created_branch: true,
             head: "abc".into(),
         };
-        let ws = NewWorkspace { workspace_path: "/wt/_workspaces/x".into(), group_path: "/g".into(), repos: vec![repo] };
+        let ws =
+            NewWorkspace { workspace_path: "/wt/_workspaces/x".into(), group_path: "/g".into(), repos: vec![repo] };
         let t = s.create_group_task(task("mirante/fix-login--1-claude"), Some(ws), &g.id, GroupRole::Child).unwrap();
         assert_eq!(t.group_path.as_deref(), Some("/g"));
         assert_eq!(s.task_repos(&t.id).unwrap().len(), 1);
@@ -452,8 +455,10 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let t = s.create_task(task("a")).unwrap();
         assert_eq!(s.last_answer(&t.id).unwrap(), None);
-        s.append_event(Some(&t.id), "step", &json!({"type": "agent_message", "text": "done one", "final": true})).unwrap();
-        s.append_event(Some(&t.id), "step", &json!({"type": "agent_message", "text": "thinking", "final": false})).unwrap();
+        s.append_event(Some(&t.id), "step", &json!({"type": "agent_message", "text": "done one", "final": true}))
+            .unwrap();
+        s.append_event(Some(&t.id), "step", &json!({"type": "agent_message", "text": "thinking", "final": false}))
+            .unwrap();
         s.append_event(Some(&t.id), "step", &json!({"type": "command", "command": "ls"})).unwrap();
         assert_eq!(s.last_answer(&t.id).unwrap().as_deref(), Some("done one"));
         // Codex: no `final`, every message is complete.

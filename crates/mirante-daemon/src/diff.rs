@@ -11,7 +11,7 @@ use std::process::Stdio;
 
 use mirante_core::git::Git;
 use mirante_core::model::TaskRepo;
-use mirante_ipc::types::{DiffFile, RepoDiff, TaskDiff};
+use mirante_ipc::types::{DiffFile, DiffStat, RepoDiff, TaskDiff};
 
 /// Largest patch returned; the rest is cut (`truncated: true`).
 pub const PATCH_CAP: usize = 512 * 1024;
@@ -195,6 +195,46 @@ pub fn workspace_diff(repos: &[TaskRepo]) -> Result<TaskDiff, String> {
     let mut top = sections.first().map(|s| s.diff.clone()).ok_or("a workspace task without repos")?;
     top.repos = sections;
     Ok(top)
+}
+
+/// The counts of [`task_diff`] without its patch: files changed, lines added and removed
+/// (binary files count as files only), untracked files.
+pub fn diff_stat(repo: &Path, worktree: &Path) -> Result<DiffStat, String> {
+    let base = match git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(b) => b.trim().to_string(),
+        Err(_) => git(repo, &["rev-parse", "HEAD"])?.trim().to_string(),
+    };
+    let merge_base = git(worktree, &["merge-base", "--end-of-options", "HEAD", &base])?.trim().to_string();
+    let wt = Git::new(worktree);
+    let numstat = wt.clone().args(["diff", "--numstat", "-z"]).args(DIFF_OPTS).args([
+        "--end-of-options",
+        merge_base.as_str(),
+        "--",
+    ]);
+    let (bytes, cut) = read_capped(&numstat, LIST_CAP)?;
+    let files = parse_numstat(&records(&bytes, cut).0);
+    let others = wt.clone().args(["ls-files", "-z", "--others", "--exclude-standard"]);
+    let (bytes, cut) = read_capped(&others, LIST_CAP)?;
+    Ok(DiffStat {
+        files: files.len() as u64,
+        added: files.iter().filter_map(|f| f.added).sum(),
+        removed: files.iter().filter_map(|f| f.removed).sum(),
+        untracked: records(&bytes, cut).0.len() as u64,
+    })
+}
+
+/// [`diff_stat`] over every repo of a workspace task, summed.
+pub fn workspace_stat(repos: &[TaskRepo]) -> Result<DiffStat, String> {
+    let mut total = DiffStat::default();
+    for r in repos {
+        let d =
+            diff_stat(Path::new(&r.repo_path), Path::new(&r.worktree_path)).map_err(|e| format!("{}: {e}", r.name))?;
+        total.files += d.files;
+        total.added += d.added;
+        total.removed += d.removed;
+        total.untracked += d.untracked;
+    }
+    Ok(total)
 }
 
 /// [`task_diff`] with the patch cut at `cap` bytes.

@@ -101,7 +101,7 @@ impl Hub {
         check_message(&m.text)?;
         // Only Mirante labels a message as the person's (spec §5): an agent's message that
         // carries the label would pass itself off as theirs.
-        let operator = by == "person";
+        let operator = by == "person" || by == super::groups::BY_SYNTHESIS;
         if !operator && mirante_core::delivery::has_operator_label(&m.text) {
             return Err(HubError::Invalid("a message from an agent cannot carry the human operator's label".into()));
         }

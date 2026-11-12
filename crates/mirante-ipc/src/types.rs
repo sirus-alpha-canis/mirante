@@ -1,6 +1,7 @@
 //! Method names and their parameter / result types. A task may be referenced by its full
 //! id, its branch name, or a unique suffix of its id (at least 4 characters).
-use mirante_core::model::{AgentKind, PermissionRequest, Task, TaskRepo};
+use mirante_core::groups::TaskGroup;
+use mirante_core::model::{AgentKind, GroupKind, PermissionRequest, Task, TaskRepo};
 use serde::{Deserialize, Serialize};
 
 pub mod method {
@@ -54,6 +55,20 @@ pub mod method {
     /// One file of a task's worktree, read by descriptor walk ([`super::TaskFile`] →
     /// [`super::FileView`]). A person only.
     pub const TASK_FILE: &str = "task.file";
+    /// A person's fan-out group: a shared goal its children are created into
+    /// ([`super::CreateGroup`] → `TaskGroup`). No worktree, no session. A person only.
+    pub const GROUP_CREATE: &str = "group.create";
+    /// A group and its tasks with each one's last answer and diff stat
+    /// ([`super::GroupRef`] → [`super::GroupView`]). A person only.
+    pub const GROUP_GET: &str = "group.get";
+    /// Archives every task of a group, then the group: refused before anything is archived
+    /// when one of them is live or holds uncommitted work ([`super::GroupRef`] →
+    /// [`super::GroupView`]). A person only.
+    pub const GROUP_ARCHIVE: &str = "group.archive";
+    /// The children's results, fenced as data, for a new task in the group or for one of
+    /// its children; a preview first ([`super::Synthesize`] → [`super::Synthesis`]). A
+    /// person only.
+    pub const GROUP_SYNTHESIZE: &str = "group.synthesize";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -204,6 +219,9 @@ pub struct TaskView {
     /// single-repo task, and from older daemons).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<TaskRepo>,
+    /// A task of a fan-out group: the group (absent otherwise, and from older daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TaskGroup>,
 }
 
 /// The origin `task.create` fixed for a task (its skills follow it).
@@ -365,6 +383,86 @@ pub struct CreateTask {
     pub goal: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// A child of this fan-out group (its id). An empty `branch` is then named by the
+    /// daemon (`<group branch>--<n>-<slug>`) and the task starts from the repo's `HEAD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// `group.create`: the shared goal of a fan-out and its children's branch prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateGroup {
+    pub kind: GroupKind,
+    pub goal: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The children's branches start with it (`<branch>--<n>-<slug>`); no ref of this
+    /// name is made.
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRef {
+    pub group: String,
+}
+
+/// A task's changes at a glance (committed and uncommitted against its base, plus
+/// untracked files).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiffStat {
+    pub files: u64,
+    pub added: u64,
+    pub removed: u64,
+    pub untracked: u64,
+}
+
+/// One task of a group, with what a person reads first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub view: TaskView,
+    /// Its newest finished answer (redacted and capped when it was recorded). Agent text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_answer: Option<String>,
+    /// `None` once archived (no worktree) or when git could not tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffStat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupView {
+    pub group: TaskGroup,
+    /// Not archived first, then by creation.
+    pub members: Vec<GroupMember>,
+}
+
+/// `group.synthesize`. `into`: one of the group's children (a task reference) receives the
+/// request as a queued operator message; absent, a new task in the group (role `synth`,
+/// `agent`, the first child's repo or folder) gets it as its goal. `preview`: only the text
+/// and its `expect` hash; the call that acts must pass that `expect` back (refused when the
+/// results changed meanwhile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Synthesize {
+    pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub into: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    #[serde(default)]
+    pub preview: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Synthesis {
+    pub text: String,
+    pub expect: String,
+    /// The synthesizer made (not started: the caller starts it with `text`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
+    /// The child it was sent to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<SendResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,6 +914,7 @@ mod tests {
             permission_mode: Some("auto".into()),
             origin: None,
             repos: Vec::new(),
+            group: None,
         };
         let j = serde_json::to_value(&v).unwrap();
         assert!(j.get("repos").is_none() && j.get("workspace_path").is_none(), "single-repo: as before");

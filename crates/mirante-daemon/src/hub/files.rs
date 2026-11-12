@@ -530,6 +530,7 @@ mod tests {
         let g = std::fs::canonicalize(g).unwrap();
         k.hub
             .create_task(mirante_ipc::types::CreateTask {
+                group: None,
                 repo: g.to_string_lossy().into_owned(),
                 repos: ["one", "two"].iter().map(|n| g.join(n).to_string_lossy().into_owned()).collect(),
                 agent: mirante_core::model::AgentKind::Claude,

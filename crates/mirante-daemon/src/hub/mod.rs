@@ -27,6 +27,7 @@ use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 pub mod dna;
 pub(crate) mod evidence;
 pub mod files;
+pub mod groups;
 pub mod memory;
 pub mod messages;
 pub mod queue;
@@ -452,6 +453,10 @@ impl State {
                 Some(_) => self.store.task_repos(&task.id)?,
                 None => Vec::new(),
             },
+            group: match &task.group_id {
+                Some(g) => Some(self.store.get_group(g)?),
+                None => None,
+            },
             task,
         })
     }
@@ -607,14 +612,28 @@ impl Hub {
     /// runs, against the origin pinned for the checkout: only a person's first task pins it
     /// (see `Store::skill_create_origin`).
     pub fn create_task_from(&self, caller: &dna::Caller, p: CreateTask) -> Result<TaskView> {
+        if p.group.is_some() {
+            return self.create_group_child(caller, p);
+        }
+        self.create_in(caller, p, None)
+    }
+
+    /// [`Hub::create_task_from`], into `group` when given (checked again, with the child
+    /// cap, in the store's transaction).
+    pub(crate) fn create_in(
+        &self,
+        caller: &dna::Caller,
+        p: CreateTask,
+        group: Option<groups::Member>,
+    ) -> Result<TaskView> {
         if p.goal.trim().is_empty() {
             return Err(HubError::Invalid("the goal is empty".into()));
         }
         if !p.repos.is_empty() {
-            return self.create_workspace_task(caller, p);
+            return self.create_workspace_task(caller, p, group);
         }
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
-        let by_person = self.identify(caller) == dna::Identity::Person;
+        let by_person = self.identify(caller) == dna::Identity::Person && group.as_ref().is_none_or(|g| g.by_person);
         // Before anything is made: a folder that cannot hold a worktree, or an agent that
         // cannot be found, leaves no branch or checkout behind.
         if let Some(why) = mirante_core::worktree::checkout_problem(&repo) {
@@ -638,7 +657,11 @@ impl Hub {
             goal: p.goal,
         };
         let mut st = self.lock();
-        match st.store.create_task(new) {
+        let made = match &group {
+            Some(g) => st.store.create_group_task(new, None, &g.group, g.role),
+            None => st.store.create_task(new),
+        };
+        match made {
             Ok(task) => {
                 let fixed = fix_origin(&mut st, &task, &repo, checkout.as_deref(), &origin, &tenant, by_person);
                 let mut v = st.view(task)?;
@@ -672,11 +695,16 @@ impl Hub {
     /// The primary (first) repo fixes the task's origin; when the selected repos belong to
     /// different tenants no origin is recorded (no skills) and the repo memory is not given
     /// either (`workspace_tenants` says so).
-    fn create_workspace_task(&self, caller: &dna::Caller, p: CreateTask) -> Result<TaskView> {
+    fn create_workspace_task(
+        &self,
+        caller: &dna::Caller,
+        p: CreateTask,
+        fanout: Option<groups::Member>,
+    ) -> Result<TaskView> {
         let root = self.worktrees.root().to_path_buf();
         let group = workspace::validate_group(&p.repo, &root)?;
         let selected = workspace::validate_selection(&group, &p.repos, &root)?;
-        let by_person = self.identify(caller) == dna::Identity::Person;
+        let by_person = self.identify(caller) == dna::Identity::Person && fanout.as_ref().is_none_or(|g| g.by_person);
         self.check_agent_for_create(p.agent)?;
         let tenants = self.tenants_of(selected.iter().map(|s| s.repo.as_path()));
         let primary = &selected[0].repo;
@@ -698,7 +726,11 @@ impl Hub {
             repos: made.repos.clone(),
         };
         let mut st = self.lock();
-        match st.store.create_workspace_task(new, ws) {
+        let made_task = match &fanout {
+            Some(g) => st.store.create_group_task(new, Some(ws), &g.group, g.role),
+            None => st.store.create_workspace_task(new, ws),
+        };
+        match made_task {
             Ok(task) => {
                 let fixed = if tenants.len() > 1 {
                     let reason = mixed_tenants_reason(&tenants);
@@ -853,6 +885,9 @@ impl Hub {
         let t = st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
         if let Err(e) = remove_session_dir(&self.paths, &task.id) {
             st.log_error(Some(&task.id), "removing the archived task's session files", &e);
+        }
+        if let Some(g) = &t.group_id {
+            groups::archive_when_done(&mut st, g);
         }
         let v = st.view(t)?;
         st.publish();
@@ -1024,6 +1059,7 @@ pub(crate) mod testkit {
         pub fn create(&self, agent: AgentKind, branch: &str) -> TaskView {
             self.hub
                 .create_task(CreateTask {
+                    group: None,
                     repos: Vec::new(),
                     repo: self.repo.to_string_lossy().into_owned(),
                     agent,
@@ -1050,6 +1086,7 @@ mod tests {
 
     fn create_in(k: &Kit, repo: &Path, branch: &str) -> Result<TaskView> {
         k.hub.create_task(CreateTask {
+            group: None,
             repos: Vec::new(),
             repo: repo.to_string_lossy().into_owned(),
             agent: AgentKind::Codex,
@@ -1265,6 +1302,7 @@ mod tests {
     fn create_rejects_an_empty_goal_and_rolls_back_the_worktree_on_failure() {
         let k = Kit::new();
         let bad = CreateTask {
+            group: None,
             repos: Vec::new(),
             repo: k.repo.to_string_lossy().into_owned(),
             agent: AgentKind::Codex,
@@ -1275,6 +1313,7 @@ mod tests {
         };
         assert!(matches!(k.hub.create_task(bad), Err(HubError::Invalid(_))));
         let missing = CreateTask {
+            group: None,
             repos: Vec::new(),
             repo: "/definitely/not/here".into(),
             agent: AgentKind::Codex,
@@ -1499,6 +1538,7 @@ mod workspace_tests {
 
     fn create(k: &Kit, g: &Path, names: &[&str], branch: &str, base: Option<&str>) -> Result<TaskView> {
         k.hub.create_task(CreateTask {
+            group: None,
             repo: g.to_string_lossy().into_owned(),
             repos: names.iter().map(|n| g.join(n).to_string_lossy().into_owned()).collect(),
             agent: AgentKind::Claude,
@@ -1607,6 +1647,7 @@ mod workspace_tests {
         assert_eq!(code_of(create(&k, &g, &["docs"], "mirante/a", Some("main"))).code, code::INVALID_PARAMS);
         // A group that is a file, a relative group.
         let mut p = CreateTask {
+            group: None,
             repo: "gol".into(),
             repos: vec![g.join("docs").to_string_lossy().into_owned()],
             agent: AgentKind::Claude,

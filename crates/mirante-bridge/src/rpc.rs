@@ -77,6 +77,13 @@ pub const ALLOWED: &[&str] = &[
     // no symlinks, no `.git`, capped; secrets hidden until revealed).
     method::TASK_FILES,
     method::TASK_FILE,
+    // Fan-out groups: the composer makes one and its children (`task.create { group }`),
+    // the group view reads each child's last answer and diff stat, archives them all or
+    // none, and previews then sends a synthesis (agents' answers fenced as data).
+    method::GROUP_CREATE,
+    method::GROUP_GET,
+    method::GROUP_ARCHIVE,
+    method::GROUP_SYNTHESIZE,
     // The Brain's "Rules" view: every instruction layer an agent session reads (read-only;
     // the daemon picks the files from the agent's known locations, never a path the caller
     // names, and masks secrets).
@@ -219,6 +226,10 @@ mod tests {
             "repo.files",
             "task.files",
             "task.file",
+            "group.create",
+            "group.get",
+            "group.archive",
+            "group.synthesize",
             "rules.layers",
         ];
         assert_eq!(ALLOWED, expected);

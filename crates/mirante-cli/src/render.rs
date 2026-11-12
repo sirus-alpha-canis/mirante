@@ -717,6 +717,7 @@ mod tests {
             permission_mode: None,
             origin: None,
             repos: Vec::new(),
+            group: None,
         }
     }
 

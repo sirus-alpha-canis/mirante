@@ -1667,6 +1667,7 @@ pub(crate) mod tests {
         let t = k
             .hub
             .create_task(mirante_ipc::types::CreateTask {
+                group: None,
                 repos: Vec::new(),
                 repo: k.repo.join("sub").to_string_lossy().into_owned(),
                 agent: AgentKind::Claude,

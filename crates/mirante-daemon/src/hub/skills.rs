@@ -1773,6 +1773,7 @@ pub(crate) mod tests {
 
     pub fn create_in(k: &Kit, caller: &Caller, branch: &str, goal: &str) -> mirante_core::model::Task {
         let p = CreateTask {
+            group: None,
             repos: Vec::new(),
             repo: k.repo.to_string_lossy().into_owned(),
             agent: AgentKind::Claude,
@@ -1882,6 +1883,7 @@ pub(crate) mod tests {
         set_origin(&k.repo, "git@github.com:acme/app.git");
         // A person's first task pins the origin, and task.create says which.
         let p = CreateTask {
+            group: None,
             repos: Vec::new(),
             repo: k.repo.to_string_lossy().into_owned(),
             agent: AgentKind::Claude,
@@ -2786,6 +2788,7 @@ pub(crate) mod tests {
 
     fn task_in(k: &Kit, repo: &Path, branch: &str, goal: &str) -> mirante_core::model::Task {
         let p = CreateTask {
+            group: None,
             repos: Vec::new(),
             repo: repo.to_string_lossy().into_owned(),
             agent: AgentKind::Codex,
