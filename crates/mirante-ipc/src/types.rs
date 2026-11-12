@@ -1,6 +1,6 @@
 //! Method names and their parameter / result types. A task may be referenced by its full
 //! id, its branch name, or a unique suffix of its id (at least 4 characters).
-use mirante_core::model::{AgentKind, PermissionRequest, Task};
+use mirante_core::model::{AgentKind, PermissionRequest, Task, TaskRepo};
 use serde::{Deserialize, Serialize};
 
 pub mod method {
@@ -193,6 +193,10 @@ pub struct TaskView {
     /// `task.create` only: the origin fixed for the task's skills.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<CreatedOrigin>,
+    /// A workspace task: each repository it may change, primary first (absent for a
+    /// single-repo task, and from older daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<TaskRepo>,
 }
 
 /// The origin `task.create` fixed for a task (its skills follow it).
@@ -339,7 +343,14 @@ pub struct ListParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTask {
+    /// The repository's checkout; for a task across several repositories (`repos` set), the
+    /// folder that holds them (a group).
     pub repo: String,
+    /// A workspace task: the checkouts inside `repo` the task may change (absolute paths,
+    /// the first is the primary). Each gets a worktree on `branch`; the folder's other
+    /// repositories are named to the agent as read-only. Empty: a single-repo task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
     pub agent: AgentKind,
     pub branch: String,
     #[serde(default)]
@@ -559,6 +570,21 @@ pub struct TaskDiff {
     /// not exist locally (never pushed, or not fetched).
     #[serde(default)]
     pub ahead: Option<u64>,
+    /// A workspace task: one section per repository, primary first (the fields above are
+    /// then the primary's). Absent for a single-repo task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<RepoDiff>,
+}
+
+/// One repository's section of a workspace task's [`TaskDiff`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoDiff {
+    /// Its folder name in the workspace.
+    pub name: String,
+    /// Its main checkout.
+    pub repo: String,
+    #[serde(flatten)]
+    pub diff: TaskDiff,
 }
 
 /// Most events one `task.events` call returns.
@@ -697,6 +723,8 @@ mod tests {
             status: Status::NeedsYou,
             created_at: 1,
             updated_at: 2,
+            workspace_path: None,
+            group_path: None,
         };
         let v = TaskView {
             task,
@@ -711,13 +739,43 @@ mod tests {
             hibernated: false,
             permission_mode: Some("auto".into()),
             origin: None,
+            repos: Vec::new(),
         };
         let j = serde_json::to_value(&v).unwrap();
+        assert!(j.get("repos").is_none() && j.get("workspace_path").is_none(), "single-repo: as before");
         assert_eq!(j["id"], "t1");
         assert_eq!(j["status"], "needs_you");
         assert_eq!(j["boot"], "ready");
         assert_eq!(j["permission_mode"], "auto");
         assert_eq!(serde_json::from_value::<TaskView>(j).unwrap(), v);
+    }
+
+    #[test]
+    fn a_workspace_diff_has_one_flat_section_per_repo() {
+        let one = |base: &str| TaskDiff {
+            base: base.into(),
+            merge_base: "m".into(),
+            files: vec![DiffFile { path: "a".into(), added: Some(1), removed: Some(0) }],
+            untracked: vec![],
+            files_truncated: false,
+            patch: String::new(),
+            truncated: false,
+            compare_url: None,
+            pushed: false,
+            ahead: None,
+            repos: vec![],
+        };
+        let mut d = one("main");
+        d.repos = vec![RepoDiff { name: "site".into(), repo: "/g/site".into(), diff: one("main") }];
+        let j = serde_json::to_value(&d).unwrap();
+        assert_eq!(j["repos"][0]["name"], "site");
+        assert_eq!(j["repos"][0]["files"][0]["path"], "a", "flattened");
+        assert_eq!(serde_json::from_value::<TaskDiff>(j).unwrap(), d);
+        let old: TaskDiff =
+            serde_json::from_value(json!({"base": "main", "merge_base": "m", "files": [], "untracked": [],
+            "patch": "", "truncated": false, "compare_url": null, "pushed": false}))
+            .unwrap();
+        assert!(old.repos.is_empty());
     }
 
     #[test]
@@ -748,7 +806,13 @@ mod tests {
     fn optional_fields_default() {
         let c: CreateTask =
             serde_json::from_value(json!({"repo": "/r", "agent": "claude", "branch": "b", "goal": "g"})).unwrap();
-        assert_eq!((c.base, c.title), (None, None));
+        assert_eq!((c.base.clone(), c.title.clone(), c.repos.len()), (None, None, 0));
+        assert!(serde_json::to_value(&c).unwrap().get("repos").is_none(), "an older daemon sees the same call");
+        let w: CreateTask = serde_json::from_value(
+            json!({"repo": "/g", "repos": ["/g/a", "/g/b"], "agent": "codex", "branch": "b", "goal": "g"}),
+        )
+        .unwrap();
+        assert_eq!(w.repos, ["/g/a", "/g/b"]);
         let s: StartSession = serde_json::from_value(json!({"task": "t"})).unwrap();
         assert_eq!(s.prompt, None);
         let l: ListParams = serde_json::from_value(json!({})).unwrap();

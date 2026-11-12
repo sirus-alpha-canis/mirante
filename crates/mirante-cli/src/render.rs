@@ -679,6 +679,8 @@ mod tests {
                 status,
                 created_at: 0,
                 updated_at: 0,
+                workspace_path: None,
+                group_path: None,
             },
             live: true,
             boot: Some(BootState::Ready),
@@ -691,6 +693,7 @@ mod tests {
             hibernated: false,
             permission_mode: None,
             origin: None,
+            repos: Vec::new(),
         }
     }
 

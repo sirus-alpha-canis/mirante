@@ -71,6 +71,7 @@ impl Rig {
         let v = self
             .hub
             .create_task(CreateTask {
+                repos: Vec::new(),
                 repo: self.repo.to_string_lossy().into_owned(),
                 agent,
                 branch: branch.into(),

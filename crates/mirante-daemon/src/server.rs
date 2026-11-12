@@ -495,6 +495,7 @@ mod tests {
             .call(
                 method::TASK_CREATE,
                 CreateTask {
+                    repos: Vec::new(),
                     repo: k.repo.to_string_lossy().into_owned(),
                     agent: AgentKind::Codex,
                     branch: "rpc".into(),

@@ -654,6 +654,7 @@ fn memory_enable_ls_accept_round_trip_through_the_daemon() {
 
     // A task to cite from (no session needed): committed code in its worktree.
     let create = CreateTask {
+        repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
         agent: AgentKind::Claude,
         branch: "mem".into(),
@@ -737,6 +738,7 @@ fn memory_review_from_an_agent_is_refused_before_the_prompt() {
     let repo = env.repo.clone();
     env.ok_in(&repo, &["memory", "enable"]);
     let create = CreateTask {
+        repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
         agent: AgentKind::Claude,
         branch: "mem".into(),
@@ -792,6 +794,7 @@ fn an_agent_tree_reaches_its_memory_server_but_no_lifecycle_method() {
     let repo = env.repo.clone();
     env.ok_in(&repo, &["memory", "enable"]);
     let create = CreateTask {
+        repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
         agent: AgentKind::Claude,
         branch: "agent".into(),
@@ -862,6 +865,7 @@ fn an_agent_proposes_a_skill_through_the_skills_server() {
     git(&["remote", "add", "origin", "https://x-access-token:ghp_secret@github.com/Acme/App.git"]);
     env.ok(&["daemon", "start"]);
     let create = |branch: &str| CreateTask {
+        repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
         agent: AgentKind::Codex,
         branch: branch.into(),
@@ -1043,6 +1047,7 @@ fn skills_tenant_and_mine_follow_the_pinned_origin() {
     let (ok, out) = run(&["skills", "mine"]);
     assert!(!ok && out.contains("no task"), "{out}");
     let create = CreateTask {
+        repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
         agent: AgentKind::Codex,
         branch: "b1".into(),

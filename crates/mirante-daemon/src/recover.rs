@@ -139,10 +139,20 @@ impl Hub {
     /// Finishes an archive a crash interrupted (git work under the hub lock is fine here:
     /// no client is served before recovery ends).
     fn finish_archive(&self, st: &mut State, task: &Task, report: &mut Recovery) -> Result<()> {
-        let path = Path::new(&task.worktree_path);
+        // A workspace task: every repo worktree and the folder (`path` is the folder).
+        let (path, removed) = match &task.workspace_path {
+            Some(ws) => {
+                let repos = st.store.task_repos(&task.id)?;
+                (Path::new(ws), mirante_core::workspace::remove(&self.worktrees, Path::new(ws), &repos))
+            }
+            None => {
+                let path = Path::new(&task.worktree_path);
+                (path, self.worktrees.remove(Path::new(&task.repo_path), path))
+            }
+        };
         // A missing directory only leaves git metadata to prune; that failing (the repo
         // itself moved) does not bring the worktree back, so the archive still completes.
-        match self.worktrees.remove(Path::new(&task.repo_path), path) {
+        match removed {
             Err(e) if path.exists() => {
                 st.store.transition_lifecycle(&task.id, Lifecycle::Active)?;
                 st.event(Some(&task.id), "archive_abandoned", json!({ "error": e.to_string() }))?;
@@ -163,9 +173,9 @@ impl Hub {
     fn report_orphans(&self, st: &mut State, report: &mut Recovery) -> Result<()> {
         let owned: Vec<PathBuf> = st
             .store
-            .list_tasks(false)?
+            .owned_worktrees()?
             .into_iter()
-            .map(|t| std::fs::canonicalize(&t.worktree_path).unwrap_or_else(|_| PathBuf::from(&t.worktree_path)))
+            .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p)))
             .collect();
         let mut orphans: Vec<String> = self
             .worktrees

@@ -926,6 +926,7 @@ fn run(cmd: Cmd) -> Res {
             let repo = repo.to_string_lossy().into_owned();
             let mut c = client(&paths)?;
             let create = |branch: String, base: Option<String>| CreateTask {
+                repos: Vec::new(),
                 repo: repo.clone(),
                 agent,
                 branch,

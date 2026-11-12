@@ -166,6 +166,8 @@ pub struct FakeFactory {
     pub withdrawn: Mutex<Vec<Vec<String>>>,
     /// When set, `check_agent` fails with this message.
     pub missing_agent: Mutex<Option<String>>,
+    /// Every spawn request's working directory (`Task::cwd`), in order.
+    pub cwds: Mutex<Vec<String>>,
 }
 
 impl FakeFactory {
@@ -193,6 +195,7 @@ impl DriverFactory for Arc<FakeFactory> {
         self.skill_mcps.lock().unwrap().push(req.skills_mcp.clone());
         self.skills.lock().unwrap().push(req.skills.clone());
         self.withdrawn.lock().unwrap().push(req.withdrawn.clone());
+        self.cwds.lock().unwrap().push(req.task.cwd().to_string());
         if self.fail.load(Ordering::SeqCst) {
             return Err(DriverError::Failed("spawn refused".into()));
         }

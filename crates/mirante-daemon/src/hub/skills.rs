@@ -1509,7 +1509,10 @@ impl Hub {
         }
         let origin = match &r.origin {
             None => {
-                r.unavailable = Some("this task has no recorded origin (it predates skills): create a new task".into());
+                r.unavailable = Some(match self.workspace_mixed(task) {
+                    Some(why) => why,
+                    None => "this task has no recorded origin (it predates skills): create a new task".into(),
+                });
                 return Ok(r);
             }
             Some(o) => o.clone(),
@@ -1770,6 +1773,7 @@ pub(crate) mod tests {
 
     pub fn create_in(k: &Kit, caller: &Caller, branch: &str, goal: &str) -> mirante_core::model::Task {
         let p = CreateTask {
+            repos: Vec::new(),
             repo: k.repo.to_string_lossy().into_owned(),
             agent: AgentKind::Claude,
             branch: branch.into(),
@@ -1878,6 +1882,7 @@ pub(crate) mod tests {
         set_origin(&k.repo, "git@github.com:acme/app.git");
         // A person's first task pins the origin, and task.create says which.
         let p = CreateTask {
+            repos: Vec::new(),
             repo: k.repo.to_string_lossy().into_owned(),
             agent: AgentKind::Claude,
             branch: "b".into(),
@@ -2781,6 +2786,7 @@ pub(crate) mod tests {
 
     fn task_in(k: &Kit, repo: &Path, branch: &str, goal: &str) -> mirante_core::model::Task {
         let p = CreateTask {
+            repos: Vec::new(),
             repo: repo.to_string_lossy().into_owned(),
             agent: AgentKind::Codex,
             branch: branch.into(),

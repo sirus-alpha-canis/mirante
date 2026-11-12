@@ -386,6 +386,10 @@ impl Hub {
     /// still starts without memory (memory is not worth blocking a task) and a
     /// `dna.unavailable` event says why.
     pub(crate) fn memory_server_for(&self, task: &mirante_core::model::Task) -> Option<PathBuf> {
+        // A workspace task across clients: no repo's memory reaches it (see `workspace_tenants`).
+        if self.workspace_mixed(task).is_some() {
+            return None;
+        }
         let Ok(repo) = self.checkout(&task.repo_path) else {
             return None;
         };
@@ -1663,6 +1667,7 @@ pub(crate) mod tests {
         let t = k
             .hub
             .create_task(mirante_ipc::types::CreateTask {
+                repos: Vec::new(),
                 repo: k.repo.join("sub").to_string_lossy().into_owned(),
                 agent: AgentKind::Claude,
                 branch: "from-sub".into(),

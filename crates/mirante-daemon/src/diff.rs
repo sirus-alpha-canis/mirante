@@ -10,10 +10,13 @@ use std::path::Path;
 use std::process::Stdio;
 
 use mirante_core::git::Git;
-use mirante_ipc::types::{DiffFile, TaskDiff};
+use mirante_core::model::TaskRepo;
+use mirante_ipc::types::{DiffFile, RepoDiff, TaskDiff};
 
 /// Largest patch returned; the rest is cut (`truncated: true`).
 pub const PATCH_CAP: usize = 512 * 1024;
+/// A workspace task's sections share [`PATCH_CAP`], each getting at least this much.
+pub const SECTION_PATCH_MIN: usize = 64 * 1024;
 /// Most entries in `files` and in `untracked` (`files_truncated: true` past it).
 pub const FILES_CAP: usize = 2000;
 /// Most bytes read from one file listing (numstat, ls-files) before it is cut.
@@ -174,6 +177,28 @@ pub fn github_compare_url(remote: &str, base: &str, branch: &str) -> Option<Stri
 /// current branch, which is the base `task.create` uses by default (a detached checkout
 /// falls back to its commit).
 pub fn task_diff(repo: &Path, worktree: &Path, branch: &str) -> Result<TaskDiff, String> {
+    task_diff_capped(repo, worktree, branch, PATCH_CAP)
+}
+
+/// A workspace task's diff: one section per repo (primary first), each patch cut at an
+/// equal share of [`PATCH_CAP`] (at least [`SECTION_PATCH_MIN`]). The top-level fields are
+/// the primary's, so a client that knows no sections still shows something true. A repo git
+/// cannot read fails the whole diff, naming it.
+pub fn workspace_diff(repos: &[TaskRepo]) -> Result<TaskDiff, String> {
+    let cap = (PATCH_CAP / repos.len().max(1)).max(SECTION_PATCH_MIN);
+    let mut sections = Vec::with_capacity(repos.len());
+    for r in repos {
+        let diff = task_diff_capped(Path::new(&r.repo_path), Path::new(&r.worktree_path), &r.branch, cap)
+            .map_err(|e| format!("{}: {e}", r.name))?;
+        sections.push(RepoDiff { name: r.name.clone(), repo: r.repo_path.clone(), diff });
+    }
+    let mut top = sections.first().map(|s| s.diff.clone()).ok_or("a workspace task without repos")?;
+    top.repos = sections;
+    Ok(top)
+}
+
+/// [`task_diff`] with the patch cut at `cap` bytes.
+pub fn task_diff_capped(repo: &Path, worktree: &Path, branch: &str, cap: usize) -> Result<TaskDiff, String> {
     let base = match git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         Ok(b) => b.trim().to_string(),
         Err(_) => git(repo, &["rev-parse", "HEAD"])?.trim().to_string(),
@@ -193,8 +218,8 @@ pub fn task_diff(repo: &Path, worktree: &Path, branch: &str) -> Result<TaskDiff,
 
     // `--default-prefix`: git's `a/` `b/` whatever `diff.noprefix` / `diff.mnemonicPrefix` say.
     let patch = wt.clone().arg("diff").args(DIFF_OPTS).arg("--default-prefix").args(against);
-    let (bytes, truncated) = read_capped(&patch, PATCH_CAP)?;
-    let patch = text_within(bytes, PATCH_CAP);
+    let (bytes, truncated) = read_capped(&patch, cap)?;
+    let patch = text_within(bytes, cap);
 
     let compare_url =
         git(repo, &["remote", "get-url", "origin"]).ok().and_then(|u| github_compare_url(u.trim(), &base, branch));
@@ -216,6 +241,7 @@ pub fn task_diff(repo: &Path, worktree: &Path, branch: &str) -> Result<TaskDiff,
         compare_url,
         pushed: ahead == Some(0),
         ahead,
+        repos: Vec::new(),
     })
 }
 

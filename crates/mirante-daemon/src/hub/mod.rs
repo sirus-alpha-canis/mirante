@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use mirante_core::model::{AgentKind, Event, Lifecycle, NewTask, Status, Task};
+use mirante_core::model::{AgentKind, Event, Lifecycle, NewTask, NewWorkspace, Status, Task};
 use mirante_core::status::StatusEngine;
 use mirante_core::store::Store;
+use mirante_core::workspace;
 use mirante_core::worktree::WorktreeManager;
 use mirante_core::CoreError;
 use mirante_ipc::rpc::{code, RpcError};
@@ -93,7 +94,9 @@ impl From<HubError> for RpcError {
     fn from(e: HubError) -> Self {
         let c = match &e {
             HubError::Core(CoreError::NotFound { .. }) | HubError::NotFound(_) => code::NOT_FOUND,
-            HubError::Core(CoreError::InvalidBranch { .. }) | HubError::Invalid(_) => code::INVALID_PARAMS,
+            HubError::Core(CoreError::InvalidBranch { .. } | CoreError::InvalidWorkspace(_)) | HubError::Invalid(_) => {
+                code::INVALID_PARAMS
+            }
             HubError::Core(
                 CoreError::TaskBusy(_)
                 | CoreError::InvalidTransition { .. }
@@ -101,6 +104,7 @@ impl From<HubError> for RpcError {
                 | CoreError::SessionEnded(_)
                 | CoreError::Git { .. }
                 | CoreError::DirtyWorktree { .. }
+                | CoreError::DirtyWorkspace { .. }
                 | CoreError::OutsideRoot { .. },
             )
             | HubError::Core(CoreError::Limit(_))
@@ -444,6 +448,10 @@ impl State {
             hibernated: self.mem.hibernated.contains(&task.id),
             permission_mode: live.and_then(|l| l.permission_mode.clone()),
             origin: None,
+            repos: match task.workspace_path {
+                Some(_) => self.store.task_repos(&task.id)?,
+                None => Vec::new(),
+            },
             task,
         })
     }
@@ -602,6 +610,9 @@ impl Hub {
         if p.goal.trim().is_empty() {
             return Err(HubError::Invalid("the goal is empty".into()));
         }
+        if !p.repos.is_empty() {
+            return self.create_workspace_task(caller, p);
+        }
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
         let by_person = self.identify(caller) == dna::Identity::Person;
         // Before anything is made: a folder that cannot hold a worktree, or an agent that
@@ -609,12 +620,7 @@ impl Hub {
         if let Some(why) = mirante_core::worktree::checkout_problem(&repo) {
             return Err(HubError::Invalid(why));
         }
-        if let Err(why) = self.factory.check_agent(p.agent) {
-            return Err(HubError::Invalid(format!(
-                "{why}\n(the daemon looks for the agent with its own environment: set the variable in \
-                 your shell profile, then run `mirante daemon restart`)"
-            )));
-        }
+        self.check_agent_for_create(p.agent)?;
         let (checkout, origin, tenant) = self.origin_info(&repo);
         // Worktree first, then the task row (rolled back below if the row fails). A crash in
         // between leaves a checkout no task owns: recovery reports it as an orphan and never
@@ -634,36 +640,9 @@ impl Hub {
         let mut st = self.lock();
         match st.store.create_task(new) {
             Ok(task) => {
-                // No origin row: the task gets no skills (fail closed); the task itself stands.
-                // A checkout git cannot name (no common dir) is never pinned.
-                let (fixed, pinned_now) = match &checkout {
-                    None => {
-                        let e = HubError::Conflict(format!(
-                            "git could not read the common dir of {}: no origin recorded, no skills",
-                            repo.display()
-                        ));
-                        st.log_error(Some(&task.id), "task origin", &e);
-                        (None, false)
-                    }
-                    Some(checkout) => {
-                        let pinned = |st: &State| st.store.skill_repo_origin(checkout).ok().flatten().is_some();
-                        let before = pinned(&st);
-                        match st.store.skill_create_origin(&task.id, checkout, &origin, &tenant, by_person) {
-                            Ok(o) => (Some(o), !before && pinned(&st)),
-                            Err(e) => {
-                                st.log_error(Some(&task.id), "task origin", &e);
-                                (None, false)
-                            }
-                        }
-                    }
-                };
+                let fixed = fix_origin(&mut st, &task, &repo, checkout.as_deref(), &origin, &tenant, by_person);
                 let mut v = st.view(task)?;
-                v.origin = fixed.map(|o| mirante_ipc::types::CreatedOrigin {
-                    origin: o.origin,
-                    tenant: o.tenant,
-                    observed: o.observed,
-                    pinned: pinned_now,
-                });
+                v.origin = fixed;
                 st.publish();
                 Ok(v)
             }
@@ -676,6 +655,92 @@ impl Hub {
                 Err(e.into())
             }
         }
+    }
+
+    fn check_agent_for_create(&self, agent: AgentKind) -> Result<()> {
+        self.factory.check_agent(agent).map_err(|why| {
+            HubError::Invalid(format!(
+                "{why}\n(the daemon looks for the agent with its own environment: set the variable in \
+                 your shell profile, then run `mirante daemon restart`)"
+            ))
+        })
+    }
+
+    /// A task across several repositories of the folder `p.repo` (a group): every path is
+    /// checked first ([`workspace::validate_selection`]), then one worktree per selected repo
+    /// is made on `p.branch` ([`workspace::create`]), then the task row with its repos.
+    /// The primary (first) repo fixes the task's origin; when the selected repos belong to
+    /// different tenants no origin is recorded (no skills) and the repo memory is not given
+    /// either (`workspace_tenants` says so).
+    fn create_workspace_task(&self, caller: &dna::Caller, p: CreateTask) -> Result<TaskView> {
+        let root = self.worktrees.root().to_path_buf();
+        let group = workspace::validate_group(&p.repo, &root)?;
+        let selected = workspace::validate_selection(&group, &p.repos, &root)?;
+        let by_person = self.identify(caller) == dna::Identity::Person;
+        self.check_agent_for_create(p.agent)?;
+        let tenants = self.tenants_of(selected.iter().map(|s| s.repo.as_path()));
+        let primary = &selected[0].repo;
+        let (checkout, origin, tenant) = self.origin_info(primary);
+        // git is slow: no hub lock held while the worktrees are created.
+        let made = workspace::create(&self.worktrees, &group, &selected, &p.branch, p.base.as_deref())?;
+        let title = p.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| title_from_goal(&p.goal));
+        let new = NewTask {
+            title,
+            repo_path: made.repos[0].repo_path.clone(),
+            worktree_path: made.repos[0].worktree_path.clone(),
+            branch: p.branch,
+            agent: p.agent,
+            goal: p.goal,
+        };
+        let ws = NewWorkspace {
+            workspace_path: made.workspace.to_string_lossy().into_owned(),
+            group_path: group.to_string_lossy().into_owned(),
+            repos: made.repos.clone(),
+        };
+        let mut st = self.lock();
+        match st.store.create_workspace_task(new, ws) {
+            Ok(task) => {
+                let fixed = if tenants.len() > 1 {
+                    let reason = mixed_tenants_reason(&tenants);
+                    if let Err(e) =
+                        st.event(Some(&task.id), "workspace_tenants", json!({ "tenants": tenants, "reason": reason }))
+                    {
+                        st.log_error(Some(&task.id), "workspace tenants", &e);
+                    }
+                    None
+                } else {
+                    fix_origin(&mut st, &task, primary, checkout.as_deref(), &origin, &tenant, by_person)
+                };
+                let mut v = st.view(task)?;
+                v.origin = fixed;
+                st.publish();
+                Ok(v)
+            }
+            Err(e) => {
+                drop(st);
+                if let Err(undo) = workspace::discard(&self.worktrees, &made) {
+                    self.lock().log_error(None, "task.create rollback", &undo);
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// The distinct tenants (normalized origin owners) of `repos`, sorted.
+    pub(crate) fn tenants_of<'a>(&self, repos: impl Iterator<Item = &'a Path>) -> Vec<String> {
+        let mut out: Vec<String> = repos.map(|r| self.origin_info(r).2).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// A workspace task whose repos belong to different tenants: why skills and repo memory
+    /// are off for it. `None` for a single-repo task or one tenant.
+    pub(crate) fn workspace_mixed(&self, task: &Task) -> Option<String> {
+        task.workspace_path.as_ref()?;
+        let repos = self.lock().store.task_repos(&task.id).ok()?;
+        let tenants = self.tenants_of(repos.iter().map(|r| Path::new(r.repo_path.as_str())));
+        (tenants.len() > 1).then(|| mixed_tenants_reason(&tenants))
     }
 
     pub fn list_tasks(&self, archived: bool) -> Result<Vec<TaskView>> {
@@ -694,8 +759,25 @@ impl Hub {
         if t.lifecycle == Lifecycle::Archived {
             return Err(HubError::Conflict(format!("task {} is archived; its worktree is gone", t.branch)));
         }
+        if t.workspace_path.is_some() {
+            let repos = self.lock().store.task_repos(&t.id)?;
+            return crate::diff::workspace_diff(&repos).map_err(HubError::Conflict);
+        }
         crate::diff::task_diff(Path::new(&t.repo_path), Path::new(&t.worktree_path), &t.branch)
             .map_err(HubError::Conflict)
+    }
+
+    /// Removes `task`'s checkouts: its worktree, or every worktree of a workspace task and
+    /// its folder (refused before anything goes when any of them holds uncommitted work).
+    /// Branches are kept.
+    pub(crate) fn remove_checkouts(&self, task: &Task) -> std::result::Result<(), CoreError> {
+        match &task.workspace_path {
+            Some(ws) => {
+                let repos = self.lock().store.task_repos(&task.id)?;
+                workspace::remove(&self.worktrees, Path::new(ws), &repos)
+            }
+            None => self.worktrees.remove(Path::new(&task.repo_path), Path::new(&task.worktree_path)),
+        }
     }
 
     /// A page of the task's audit trail, oldest first (see [`TaskEventsParams`]). Clients
@@ -757,7 +839,7 @@ impl Hub {
             st.publish();
             t
         };
-        let removed = self.worktrees.remove(Path::new(&task.repo_path), Path::new(&task.worktree_path));
+        let removed = self.remove_checkouts(&task);
         let mut st = self.lock();
         if let Err(e) = removed {
             let undo = st.store.transition_lifecycle(&task.id, Lifecycle::Active);
@@ -834,6 +916,53 @@ impl Hub {
     }
 }
 
+/// Fixes `task`'s origin against the one pinned for its checkout (only a person's first task
+/// pins it; see `Store::skill_create_origin`). No origin row: the task gets no skills (fail
+/// closed); the task itself stands. A checkout git cannot name (no common dir) is never pinned.
+fn fix_origin(
+    st: &mut State,
+    task: &Task,
+    repo: &Path,
+    checkout: Option<&str>,
+    origin: &str,
+    tenant: &str,
+    by_person: bool,
+) -> Option<mirante_ipc::types::CreatedOrigin> {
+    let Some(checkout) = checkout else {
+        let e = HubError::Conflict(format!(
+            "git could not read the common dir of {}: no origin recorded, no skills",
+            repo.display()
+        ));
+        st.log_error(Some(&task.id), "task origin", &e);
+        return None;
+    };
+    let pinned = |st: &State| st.store.skill_repo_origin(checkout).ok().flatten().is_some();
+    let before = pinned(st);
+    match st.store.skill_create_origin(&task.id, checkout, origin, tenant, by_person) {
+        Ok(o) => {
+            let pinned_now = !before && pinned(st);
+            Some(mirante_ipc::types::CreatedOrigin {
+                origin: o.origin,
+                tenant: o.tenant,
+                observed: o.observed,
+                pinned: pinned_now,
+            })
+        }
+        Err(e) => {
+            st.log_error(Some(&task.id), "task origin", &e);
+            None
+        }
+    }
+}
+
+/// Why a workspace task across `tenants` gets no skills and no repo memory.
+pub(crate) fn mixed_tenants_reason(tenants: &[String]) -> String {
+    format!(
+        "skills and repo memory are off for this task: its repositories belong to different clients ({})",
+        tenants.join(", ")
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod testkit {
     use std::path::PathBuf;
@@ -895,6 +1024,7 @@ pub(crate) mod testkit {
         pub fn create(&self, agent: AgentKind, branch: &str) -> TaskView {
             self.hub
                 .create_task(CreateTask {
+                    repos: Vec::new(),
                     repo: self.repo.to_string_lossy().into_owned(),
                     agent,
                     branch: branch.into(),
@@ -920,6 +1050,7 @@ mod tests {
 
     fn create_in(k: &Kit, repo: &Path, branch: &str) -> Result<TaskView> {
         k.hub.create_task(CreateTask {
+            repos: Vec::new(),
             repo: repo.to_string_lossy().into_owned(),
             agent: AgentKind::Codex,
             branch: branch.into(),
@@ -1134,6 +1265,7 @@ mod tests {
     fn create_rejects_an_empty_goal_and_rolls_back_the_worktree_on_failure() {
         let k = Kit::new();
         let bad = CreateTask {
+            repos: Vec::new(),
             repo: k.repo.to_string_lossy().into_owned(),
             agent: AgentKind::Codex,
             branch: "b1".into(),
@@ -1143,6 +1275,7 @@ mod tests {
         };
         assert!(matches!(k.hub.create_task(bad), Err(HubError::Invalid(_))));
         let missing = CreateTask {
+            repos: Vec::new(),
             repo: "/definitely/not/here".into(),
             agent: AgentKind::Codex,
             branch: "b1".into(),
@@ -1323,5 +1456,187 @@ mod tests {
         let e: RpcError = HubError::Driver(DriverError::NativeGone("no rollout".into())).into();
         assert_eq!(e.code, code::CONFLICT);
         assert!(e.message.contains("conversation is gone"), "{}", e.message);
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::testkit::Kit;
+    use super::*;
+    use mirante_ipc::rpc::code;
+    use mirante_ipc::types::{CreateTask, StartSession};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+    }
+
+    /// `<test dir>/gol` holding `Site-B2C`, `bff-flight` and `docs`, each with `origin` at
+    /// `owners[i]`'s GitHub (or none).
+    fn group(k: &Kit, owners: [Option<&str>; 3]) -> PathBuf {
+        let g = k.dir.path().join("gol");
+        for (name, owner) in ["Site-B2C", "bff-flight", "docs"].into_iter().zip(owners) {
+            let r = g.join(name);
+            std::fs::create_dir_all(&r).unwrap();
+            git(&r, &["init", "-q", "-b", "main"]);
+            std::fs::write(r.join("README.md"), format!("{name}\n")).unwrap();
+            git(&r, &["add", "."]);
+            git(&r, &["commit", "-q", "-m", "init"]);
+            if let Some(o) = owner {
+                git(&r, &["remote", "add", "origin", &format!("git@github.com:{o}/{name}.git")]);
+            }
+        }
+        std::fs::canonicalize(g).unwrap()
+    }
+
+    fn create(k: &Kit, g: &Path, names: &[&str], branch: &str, base: Option<&str>) -> Result<TaskView> {
+        k.hub.create_task(CreateTask {
+            repo: g.to_string_lossy().into_owned(),
+            repos: names.iter().map(|n| g.join(n).to_string_lossy().into_owned()).collect(),
+            agent: AgentKind::Claude,
+            branch: branch.into(),
+            base: base.map(String::from),
+            goal: "change Site-B2C and bff-flight".into(),
+            title: None,
+        })
+    }
+
+    #[test]
+    fn a_task_across_repos_runs_in_its_workspace_with_one_worktree_per_selected_repo() {
+        let k = Kit::new();
+        let g = group(&k, [Some("gol-sa"), Some("gol-sa"), Some("gol-sa")]);
+        let v = create(&k, &g, &["Site-B2C", "bff-flight"], "mirante/login", Some("HEAD")).unwrap();
+        let ws = PathBuf::from(v.task.workspace_path.clone().expect("a workspace task"));
+        assert_eq!(v.task.group_path.as_deref(), Some(g.to_str().unwrap()));
+        assert_eq!(ws, k.hub.paths().worktrees().join("_workspaces/login"));
+        let names: Vec<&str> = v.repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Site-B2C", "bff-flight"]);
+        // The primary is the task's repo and worktree: DNA, rules and skills read it.
+        assert_eq!(v.task.repo_path, g.join("Site-B2C").to_str().unwrap());
+        assert_eq!(v.task.worktree_path, v.repos[0].worktree_path);
+        assert!(v.origin.is_some(), "one client: the primary fixes the origin");
+        let text = std::fs::read_to_string(ws.join("MIRANTE_WORKSPACE.md")).unwrap();
+        assert!(text.contains("**bff-flight**") && text.contains("docs"), "{text}");
+        // Listed and fetched with its repos.
+        assert_eq!(k.hub.get_task(&v.task.id).unwrap().repos, v.repos);
+        assert_eq!(k.hub.list_tasks(false).unwrap()[0].repos.len(), 2);
+        // The agent runs in the workspace.
+        k.hub.start_session(StartSession { task: v.task.id.clone(), prompt: None }, false).unwrap();
+        assert_eq!(*k.factory.cwds.lock().unwrap(), [ws.to_string_lossy().into_owned()]);
+        k.hub.stop(&v.task.id).unwrap();
+
+        // The diff: one section per repo.
+        let site = Path::new(&v.repos[0].worktree_path);
+        std::fs::write(site.join("login.ts"), "a\nb\n").unwrap();
+        git(site, &["add", "."]);
+        git(site, &["commit", "-q", "-m", "login"]);
+        std::fs::write(Path::new(&v.repos[1].worktree_path).join("wip.txt"), "x\n").unwrap();
+        let d = k.hub.task_diff(&v.task.id).unwrap();
+        assert_eq!(d.repos.len(), 2);
+        assert_eq!((d.repos[0].name.as_str(), d.repos[0].diff.files.len()), ("Site-B2C", 1));
+        assert_eq!(d.repos[1].diff.untracked, ["wip.txt"]);
+        assert_eq!(d.files, d.repos[0].diff.files, "the top level is the primary's");
+        assert!(d.repos[0]
+            .diff
+            .compare_url
+            .as_deref()
+            .unwrap()
+            .contains("gol-sa/Site-B2C/compare/main...mirante/login"));
+        assert!(d.repos[1].diff.compare_url.as_deref().unwrap().contains("gol-sa/bff-flight/compare/"));
+
+        // Archive: refused while bff-flight is dirty, naming it; nothing removed.
+        let e = k.hub.archive(&v.task.id).unwrap_err();
+        assert_eq!(RpcError::from(e).code, code::CONFLICT);
+        let msg = k.hub.lock().store.task_events(&v.task.id).unwrap().last().unwrap().payload["error"].to_string();
+        assert!(msg.contains("bff-flight") && !msg.contains("Site-B2C,"), "{msg}");
+        assert_eq!(k.hub.get_task(&v.task.id).unwrap().task.lifecycle, Lifecycle::Active);
+        assert!(site.exists());
+        std::fs::remove_file(Path::new(&v.repos[1].worktree_path).join("wip.txt")).unwrap();
+        let a = k.hub.archive(&v.task.id).unwrap();
+        assert_eq!(a.task.lifecycle, Lifecycle::Archived);
+        assert!(!ws.exists());
+        for r in &v.repos {
+            let out =
+                Command::new("git").arg("-C").arg(&r.repo_path).args(["branch", "--list", "mirante/login"]).output();
+            assert!(String::from_utf8_lossy(&out.unwrap().stdout).contains("mirante/login"), "branch kept");
+        }
+        assert!(k.hub.task_diff(&v.task.id).is_err(), "archived");
+    }
+
+    #[test]
+    fn repos_of_different_clients_get_no_skills_and_no_repo_memory() {
+        let k = Kit::new();
+        let g = group(&k, [Some("gol-sa"), Some("acme"), None]);
+        *k.factory.mcp_bin.lock().unwrap() = Some(PathBuf::from("/bin/true"));
+        let v = create(&k, &g, &["Site-B2C", "bff-flight"], "mirante/x", Some("HEAD")).unwrap();
+        assert!(v.origin.is_none());
+        let ev = k.hub.lock().store.task_events(&v.task.id).unwrap();
+        let e = ev.iter().find(|e| e.kind == "workspace_tenants").expect("said why");
+        assert!(e.payload["reason"].as_str().unwrap().contains("different clients"), "{}", e.payload);
+        assert!(k.hub.workspace_mixed(&v.task).is_some());
+        // Even with the primary's memory on, none is given.
+        let site =
+            mirante_ipc::types::DnaRef { repo: Some(g.join("Site-B2C").to_string_lossy().into_owned()), task: None };
+        k.hub.dna_enable(&site, &dna::Caller::Person).unwrap();
+        assert_eq!(k.hub.memory_server_for(&v.task), None);
+        // One client: memory follows the primary as for any task.
+        let same = create(&k, &g, &["Site-B2C"], "mirante/y", Some("HEAD")).unwrap();
+        assert!(k.hub.workspace_mixed(&same.task).is_none());
+        assert_eq!(k.hub.memory_server_for(&same.task), Some(PathBuf::from("/bin/true")));
+    }
+
+    #[test]
+    fn every_path_is_checked_and_a_taken_branch_is_named_for_the_rename() {
+        let k = Kit::new();
+        let g = group(&k, [None, None, None]);
+        let code_of = |r: Result<TaskView>| RpcError::from(r.unwrap_err());
+        // Outside the folder, through a symlink.
+        std::os::unix::fs::symlink(&k.repo, g.join("sneaky")).unwrap();
+        let e = code_of(create(&k, &g, &["sneaky"], "mirante/a", None));
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        assert!(e.message.contains("not inside"), "{}", e.message);
+        // A base other than HEAD.
+        assert_eq!(code_of(create(&k, &g, &["docs"], "mirante/a", Some("main"))).code, code::INVALID_PARAMS);
+        // A group that is a file, a relative group.
+        let mut p = CreateTask {
+            repo: "gol".into(),
+            repos: vec![g.join("docs").to_string_lossy().into_owned()],
+            agent: AgentKind::Claude,
+            branch: "mirante/a".into(),
+            base: None,
+            goal: "g".into(),
+            title: None,
+        };
+        assert_eq!(RpcError::from(k.hub.create_task(p.clone()).unwrap_err()).code, code::INVALID_PARAMS);
+        p.repo = g.join("docs/README.md").to_string_lossy().into_owned();
+        assert_eq!(RpcError::from(k.hub.create_task(p).unwrap_err()).code, code::INVALID_PARAMS);
+        // The branch exists in one repo: refused in the words the clients rename on.
+        git(&g.join("docs"), &["branch", "mirante/b"]);
+        let e = code_of(create(&k, &g, &["Site-B2C", "docs"], "mirante/b", Some("HEAD")));
+        assert_eq!(e.code, code::INVALID_PARAMS);
+        assert!(e.message.contains("branch already exists in docs"), "{}", e.message);
+        assert!(!k.hub.paths().worktrees().join("_workspaces/b").exists());
+        assert!(k.hub.list_tasks(true).unwrap().is_empty(), "nothing was made");
+    }
+
+    #[test]
+    fn recovery_counts_every_repo_worktree_as_owned_and_finishes_an_interrupted_archive() {
+        let k = Kit::new();
+        let g = group(&k, [None, None, None]);
+        let v = create(&k, &g, &["Site-B2C", "docs"], "mirante/r", None).unwrap();
+        let r = k.hub.recover().unwrap();
+        assert!(r.orphan_worktrees.is_empty(), "{:?}", r.orphan_worktrees);
+        k.hub.lock().store.transition_lifecycle(&v.task.id, Lifecycle::Archiving).unwrap();
+        let r = k.hub.recover().unwrap();
+        assert_eq!(r.archives_finished, 1);
+        assert!(!Path::new(v.task.workspace_path.as_deref().unwrap()).exists());
     }
 }

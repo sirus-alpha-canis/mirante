@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
 use mirante_core::claude_launch::{
-    launch_spec, mcp_json, memory_allow, settings_json, AlwaysOn, LaunchInput, AGENT_ENV, MCP_SERVER, SKILLS_SERVER,
-    SKILLS_SERVER_ARGS, TASK_ENV,
+    launch_spec, mcp_json, memory_allow, read_only_allow, settings_json, AlwaysOn, LaunchInput, AGENT_ENV, MCP_SERVER,
+    SKILLS_SERVER, SKILLS_SERVER_ARGS, TASK_ENV,
 };
 use mirante_core::model::AgentKind;
 use mirante_ipc::paths::HOME_ENV;
@@ -138,7 +138,10 @@ pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(
     let dir = req.paths.session_dir(&req.task.id);
     let settings = dir.join("claude-settings.json");
     let hook = hook.to_string_lossy();
-    let allow = if req.mcp.is_some() { memory_allow() } else { Vec::new() };
+    let mut allow = if req.mcp.is_some() { memory_allow() } else { Vec::new() };
+    // A workspace task reads its folder's other repositories without asking (writes outside
+    // the workspace still ask: Claude runs in manual mode).
+    allow.extend(req.task.group_path.as_deref().and_then(|g| read_only_allow(Path::new(g))));
     let mcp = if req.mcp.is_some() || req.skills_mcp.is_some() {
         let path = dir.join("mcp.json");
         let json = mcp_json(req.mcp.as_deref(), req.skills_mcp.as_deref(), &req.task.id, req.paths.home());
@@ -307,7 +310,7 @@ pub fn claude_spec(
 ) -> std::io::Result<(PtySpec, Option<String>)> {
     let spec = launch_spec(LaunchInput {
         claude_bin: claude,
-        worktree: Path::new(&req.task.worktree_path),
+        worktree: Path::new(req.task.cwd()),
         settings_path: settings,
         task_id: &req.task.id,
         session_id: &req.session_id,
@@ -432,7 +435,7 @@ impl RealFactory {
             .map_err(DriverError::Failed)?;
         let d = CodexDriver::spawn(
             &bin,
-            &req.task.worktree_path,
+            req.task.cwd(),
             req.resume.as_deref(),
             ChildEnv { remove: &env_remove, set: &env_set, args: &extra_args, first_turn },
             &log,
@@ -545,6 +548,8 @@ mod tests {
                 status: Status::Idle,
                 created_at: 0,
                 updated_at: 0,
+                workspace_path: None,
+                group_path: None,
             },
             session_id: "sess-42".into(),
             resume: resume.map(String::from),

@@ -165,9 +165,9 @@ impl State {
     fn orphan_checkouts(&self, all: Vec<PathBuf>) -> Result<Vec<String>> {
         let owned: Vec<PathBuf> = self
             .store
-            .list_tasks(false)?
+            .owned_worktrees()?
             .into_iter()
-            .map(|t| std::fs::canonicalize(&t.worktree_path).unwrap_or_else(|_| PathBuf::from(&t.worktree_path)))
+            .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p)))
             .collect();
         let mut out: Vec<String> =
             all.into_iter().filter(|p| !owned.contains(p)).map(|p| p.to_string_lossy().into_owned()).collect();
