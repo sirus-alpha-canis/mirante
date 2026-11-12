@@ -1195,7 +1195,7 @@ mod store_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod refresh_tests {
     use super::*;
     use crate::dna::check::{cite, rev_parse};
@@ -1272,6 +1272,7 @@ mod refresh_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn refresh_skips_symlinks_dirs_and_non_md() {
         let r = repo_with_memory(&[("good", "GOOD")]);
         let dir = r.path().join(".mirante/memory");
@@ -1294,6 +1295,7 @@ mod refresh_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn refresh_of_a_repo_without_memory_is_empty_but_a_symlinked_dir_is_refused() {
         let r = TempDir::new("dna-none");
         plain(r.path(), &["init", "-q", "-b", "main"]);

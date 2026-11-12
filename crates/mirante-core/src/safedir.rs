@@ -68,12 +68,67 @@ fn unsafe_at(p: &str, why: &str) -> SafeError {
 }
 
 /// A single path component as a C string: not empty, `.`, `..`, no `/`, no NUL.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 pub fn cname(name: &str) -> Result<CString> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(SafeError::Unsafe(format!("{name:?} is not a file name")));
     }
     CString::new(name).map_err(|_| SafeError::Unsafe(format!("{name:?} contains NUL")))
+}
+
+/// A single path component as a C string (Windows naming rules).
+#[cfg(windows)]
+pub fn cname(name: &str) -> Result<CString> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || name == "."
+        || name == ".."
+        || name.ends_with('.')
+        || name.ends_with(' ')
+    {
+        return Err(SafeError::Unsafe(format!("{name:?} is not a file name")));
+    }
+    let utf16_len = name.encode_utf16().count();
+    if utf16_len > 255 {
+        return Err(SafeError::Unsafe(format!("{name:?} is not a file name")));
+    }
+    if windows_reserved_name(name) {
+        return Err(SafeError::Unsafe(format!("{name:?} is not a file name")));
+    }
+    CString::new(name).map_err(|_| SafeError::Unsafe(format!("{name:?} contains NUL")))
+}
+
+#[cfg(windows)]
+fn windows_reserved_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    let upper = base.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 /// Retries `f` while it fails with `EINTR`; a negative return is the error in `errno`.

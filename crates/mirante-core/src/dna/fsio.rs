@@ -245,7 +245,7 @@ fn after_open() {
 #[cfg(not(test))]
 fn after_open() {}
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::dna::sha256_hex;
@@ -269,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn refuses_symlinked_memory_dirs() {
         let d = TempDir::new("dna-sym");
         let outside = TempDir::new("dna-out");
@@ -294,8 +295,11 @@ mod tests {
         for bad in ["../a", "a/b", "A", "", ".hidden"] {
             assert!(create_note(d.path(), bad, "x").is_err(), "{bad}");
         }
-        std::os::unix::fs::symlink("/etc/hosts", note_path(d.path(), "b")).unwrap();
-        assert!(create_note(d.path(), "b", "x").is_err()); // dangling or real symlink: refused
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hosts", note_path(d.path(), "b")).unwrap();
+            assert!(create_note(d.path(), "b", "x").is_err()); // dangling or real symlink: refused
+        }
         assert_eq!(std::fs::read_to_string(note_path(d.path(), "a")).unwrap(), "one");
         // No temp files are left behind.
         let names: Vec<String> = std::fs::read_dir(memory_dir(d.path()).unwrap())
@@ -318,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_refuses_symlinks_and_oversize() {
         let d = repo_dir();
         init(d.path()).unwrap();
@@ -334,6 +339,7 @@ mod tests {
 
     /// Swaps `.mirante/memory` for a symlink to `outside` (the real one moved aside to
     /// `.mirante/kept`) right after the next open.
+    #[cfg(unix)]
     fn swap_after_open(repo: &Path, outside: &Path) {
         let (repo, outside) = (repo.to_path_buf(), outside.to_path_buf());
         AFTER_OPEN.with(|h| {
@@ -345,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_dir_swapped_for_a_symlink_mid_write_is_never_written_through() {
         let d = repo_dir();
         let outside = TempDir::new("dna-swap-out");
