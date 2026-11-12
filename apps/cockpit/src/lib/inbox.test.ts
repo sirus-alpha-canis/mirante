@@ -94,3 +94,40 @@ describe("elapsed", () => {
     expect(elapsed(50 * 3_600_000)).toBe("2 d");
   });
 });
+
+describe("fan-out groups in the inbox", () => {
+  const g = { id: "g1", kind: "compare" as const, title: "fix login", goal: "fix login", branch: "mirante/fix-login", created_at: 1 };
+  const member = (id: string, over: Parameters<typeof task>[1] = {}) => task(id, { group_id: "g1", group_role: "child", group: g, ...over });
+
+  it("a child needing you is listed under Needs you; the others fold under one group row", () => {
+    const s = state([
+      member("c1", { status: "needs_you", updated_at: 30 }),
+      member("c2", { status: "working", updated_at: 20 }),
+      member("c3", { status: "working", updated_at: 25 }),
+      task("solo", { status: "working", updated_at: 10 }),
+    ]);
+    const sec = inboxSections(s);
+    expect(sec.needs_you.flatMap((x) => x.ids)).toEqual(["c1"]);
+    // One row for the group, at its newest member's change; never its tasks one by one.
+    expect(sec.working.flatMap((x) => x.ids)).toEqual(["group:g1", "solo"]);
+  });
+
+  it("the group row sits in the most urgent section its other members are in", () => {
+    const s = state(
+      [member("c1", { status: "idle" }), member("c2", { status: "working" })],
+      [ev(1, "c1", "turn_started"), ev(2, "c1", "turn_ended")],
+    );
+    const sec = inboxSections(s);
+    expect(sec.review.flatMap((x) => x.ids)).toEqual(["group:g1"]);
+    expect(sec.working.flatMap((x) => x.ids)).toEqual([]);
+  });
+
+  it("focus order keeps siblings adjacent, the group with the oldest wait first", () => {
+    const s = state([
+      member("c1", { status: "needs_you", updated_at: 50 }),
+      task("solo", { status: "needs_you", updated_at: 20 }),
+      member("c2", { status: "needs_you", updated_at: 10 }),
+    ]);
+    expect(needingOrder(s)).toEqual(["c2", "c1", "solo"]);
+  });
+});

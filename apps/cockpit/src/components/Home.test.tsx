@@ -1094,3 +1094,32 @@ describe("the form's menus close like menus", () => {
     expect(list()).toBeNull();
   });
 });
+
+describe("Home: fan-out groups", () => {
+  const g = { id: "g1", kind: "compare" as const, title: "fix login", goal: "fix login", branch: "mirante/fix-login", created_at: 1 };
+  const kids = [
+    task("c1", { status: "working", group_id: "g1", group_role: "child", group: g, branch: "mirante/fix-login--1-claude", title: "fix login" }),
+    task("c2", { status: "working", group_id: "g1", group_role: "child", group: g, agent: "codex", branch: "mirante/fix-login--2-codex", title: "fix login" }),
+  ];
+
+  it("folds a group's children under one row with its rollup, and expands or collapses it (remembered)", async () => {
+    const h = setup({}, kids);
+    const row = screen.getByRole("article", { name: "Fan-out fix login" });
+    expect(within(row).getByText("2 children: 2 working")).toBeInTheDocument();
+    expect(within(row).queryAllByRole("article")).toHaveLength(0);
+    await userEvent.click(within(row).getByRole("button", { name: "Show its tasks" }));
+    expect(within(row).getAllByRole("article")).toHaveLength(2);
+    expect(h.env.storage.getItem("mirante.fanout.g1")).toBe("1");
+    await userEvent.click(within(row).getByRole("button", { name: "Hide its tasks" }));
+    expect(within(row).queryAllByRole("article")).toHaveLength(0);
+    await userEvent.click(within(row).getByRole("button", { name: "fix login" }));
+    expect(h.opened[0][0]).toBe("c1");
+  });
+
+  it("a child needing you is a card under Needs you, with its group named", () => {
+    setup({}, [{ ...kids[0], status: "needs_you", needs_you: 1 }, kids[1]]);
+    const needs = screen.getByRole("region", { name: /Needs you/ });
+    expect(within(needs).getByText("in fan-out fix login")).toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "Fan-out fix login" })).toBeInTheDocument();
+  });
+});

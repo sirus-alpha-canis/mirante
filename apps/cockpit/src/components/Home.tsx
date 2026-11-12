@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { shallow, useEnv, useSelect } from "../env";
+import { groupOfKey, kindLabel, loadOpen, membersOf, rollupOf, rollupText, saveOpen } from "../lib/groups";
 import { inboxOf, inboxSections, type ProjectGroup, type Section, sameSections, waitingLongerThan } from "../lib/inbox";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import type { Registry } from "../lib/repos";
@@ -50,6 +51,53 @@ const TaskEntry = memo(function TaskEntry(props: { id: string; card: boolean; on
   return props.card ? <AgentCard t={task} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} /> : <WorkingRow t={task} onOpen={props.onOpen} />;
 });
 
+/** A fan-out group's ids (its tasks not archived), compared shallowly. */
+const NO_IDS: string[] = [];
+
+/** A fan-out group in one row: its title, kind and rollup; folded by default (remembered),
+ * unfolded it lists its tasks. "Open" goes to the member that needs the person, else the
+ * first: every member's Detail shows the group's panel. */
+const GroupRow = memo(function GroupRow(props: { id: string; onOpen(taskId: string, tab?: "Terminal"): void }) {
+  const env = useEnv();
+  const t = useT();
+  const group = useSelect(useCallback((s: State) => Object.values(s.tasks).find((x) => x.group_id === props.id)?.group ?? null, [props.id]));
+  const ids = useSelect(
+    useCallback((s: State) => {
+      const m = membersOf(s.tasks, props.id).map((x) => x.id);
+      return m.length ? m : NO_IDS;
+    }, [props.id]),
+    shallow,
+  );
+  const columns = useSelect(selectColumns, shallow);
+  const [open, setOpen] = useState(() => loadOpen(env.storage, props.id));
+  if (!group || ids.length === 0) return null;
+  const rollup = rollupOf(ids, columns);
+  const first = ids.find((id) => columns[id] === "needs_you") ?? ids[0];
+  const toggle = () => {
+    setOpen(!open);
+    saveOpen(env.storage, props.id, !open);
+  };
+  return (
+    <article className="row group-row" aria-label={t("group.row", { title: group.title })} data-group={props.id}>
+      <button className="link-btn group-fold" aria-expanded={open} aria-label={t(open ? "group.collapse" : "group.expand")} onClick={toggle}>
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+      </button>
+      <button className="link row-title" onClick={() => props.onOpen(first)}>
+        {group.title}
+      </button>
+      <span className="tag">{kindLabel(group)}</span>
+      <span className="muted small">{rollupText(rollup)}</span>
+      {open && (
+        <div className="group-members">
+          {ids.map((id) => (
+            <TaskEntry key={id} id={id} card={false} onOpen={props.onOpen} inlineAnswers={false} />
+          ))}
+        </div>
+      )}
+    </article>
+  );
+});
+
 function Groups(props: {
   groups: ProjectGroup[];
   section: Section;
@@ -64,9 +112,14 @@ function Groups(props: {
           <h3 className="inbox-project">
             <ProjectChip path={g.path} />
           </h3>
-          {g.ids.map((id) => (
-            <TaskEntry key={id} id={id} card={card} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} />
-          ))}
+          {g.ids.map((id) => {
+            const gid = groupOfKey(id);
+            return gid ? (
+              <GroupRow key={id} id={gid} onOpen={props.onOpen} />
+            ) : (
+              <TaskEntry key={id} id={id} card={card} onOpen={props.onOpen} inlineAnswers={props.inlineAnswers} />
+            );
+          })}
         </div>
       ))}
     </>
@@ -123,6 +176,7 @@ export const Home = memo(function Home(props: {
   }, [all, hiddenKey]);
   const inlineAnswers = props.status?.claude_inline_answers ?? false;
   const count = (k: Section) => sections[k].reduce((n, g) => n + g.ids.length, 0);
+  // (A fan-out group's row counts as one entry.)
   const total = count("needs_you") + count("review") + count("working") + count("idle");
   // Every task's column (for the announcement below): renders when one changes, not per event.
   const columns = useSelect(selectColumns, shallow);

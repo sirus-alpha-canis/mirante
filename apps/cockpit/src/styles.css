@@ -617,6 +617,11 @@ button.skill-chip:hover { color: var(--text); }
 .row .pill { order: -1; margin: 0; font-size: 0; gap: 0; }
 .row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%; font-weight: 500; }
 .row .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* A fan-out group folds its children under one row (Home); unfolded, they follow it indented. */
+.group-row { flex-wrap: wrap; }
+.group-fold { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0 2px; }
+.group-members { flex-basis: 100%; padding-left: var(--s4, 16px); border-left: 1px solid var(--line, var(--panel-3)); }
+.card-crumb { margin: 2px 0 0; }
 .nudge { margin: 0; color: var(--needs); font-size: var(--fs-sm); font-weight: 600; }
 .answer { margin-top: 6px; display: flex; gap: 6px; align-items: flex-start; }
 .answer-text { margin: 0; white-space: pre-wrap; word-break: break-word; flex: 1; color: var(--muted); }

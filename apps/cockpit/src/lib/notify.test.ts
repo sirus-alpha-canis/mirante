@@ -35,6 +35,19 @@ describe("notification text", () => {
   });
 });
 
+describe("fan-out groups", () => {
+  it("children of one group turning needs-you together give one notification", () => {
+    const g = { id: "g1", kind: "compare" as const, title: "fix login", goal: "x", branch: "mirante/x", created_at: 1 };
+    const c = (id: string) => task(id, { status: "needs_you", group_id: "g1", group: g });
+    expect(notificationsFor([c("a"), c("b"), task("solo")])).toEqual([
+      { title: "fix login: 2 children need you", body: "feat/a, feat/b", taskId: "a" },
+      { title: "feat/solo needs you", body: "goal of solo", taskId: "solo" },
+    ]);
+    // One child alone is an ordinary notification.
+    expect(notificationsFor([c("a")])[0].title).toBe("feat/a needs you");
+  });
+});
+
 describe("createNotifier", () => {
   function api(granted: boolean, answer: "granted" | "denied" = "denied") {
     return {

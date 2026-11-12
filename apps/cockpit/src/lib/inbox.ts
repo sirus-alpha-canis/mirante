@@ -38,7 +38,8 @@ export interface ProjectGroup {
 
 /** Everything Home and "Próximo" read, worked out in one pass. */
 export interface Inbox {
-  /** Each section's task ids grouped by project. */
+  /** Each section's task ids grouped by project (a fan-out group's other members fold into
+   * one `group:<id>` entry). */
   sections: Record<Section, ProjectGroup[]>;
   /** The ids needing the person, longest wait first (the focus-mode order). */
   needing: string[];
@@ -82,19 +83,43 @@ function computeInbox(s: Slices): Inbox {
     if (col === "needs_you") waits.set(t.id, oldest.get(t.id) ?? t.updated_at);
   }
   const wait = (t: TaskView) => waits.get(t.id) ?? t.updated_at;
-  by.needs_you.sort((a, b) => wait(a) - wait(b) || a.id.localeCompare(b.id));
+  // Siblings of a fan-out group stay adjacent: the group goes where its oldest wait puts it.
+  const groupWait = new Map<string, number>();
+  for (const t of by.needs_you) if (t.group_id) groupWait.set(t.group_id, Math.min(groupWait.get(t.group_id) ?? Infinity, wait(t)));
+  const outer = (t: TaskView) => (t.group_id ? (groupWait.get(t.group_id) ?? wait(t)) : wait(t));
+  by.needs_you.sort((a, b) => outer(a) - outer(b) || (a.group_id ?? a.id).localeCompare(b.group_id ?? b.id) || wait(a) - wait(b) || a.id.localeCompare(b.id));
   for (const k of ["review", "working", "idle"] as const) by[k].sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id));
-  const group = (ts: TaskView[]): ProjectGroup[] => {
+  // A group's members that do not need the person fold into one row (`group:<id>`), in the
+  // most urgent of their sections, where its newest member sorts.
+  const rank: Record<Section, number> = { needs_you: 0, review: 1, working: 2, idle: 3 };
+  const home = new Map<string, Section>();
+  for (const k of ["review", "working", "idle"] as const) {
+    for (const t of by[k]) if (t.group_id && !home.has(t.group_id)) home.set(t.group_id, k);
+  }
+  for (const [gid, k] of home) for (const k2 of ["review", "working", "idle"] as const) if (rank[k2] < rank[k] && by[k2].some((t) => t.group_id === gid)) home.set(gid, k2);
+  const group = (ts: TaskView[], section: Section): ProjectGroup[] => {
     const m = new Map<string, ProjectGroup>();
+    const placed = new Set<string>();
     for (const t of ts) {
+      let id = t.id;
+      if (t.group_id && section !== "needs_you") {
+        if (home.get(t.group_id) !== section || placed.has(t.group_id)) continue;
+        placed.add(t.group_id);
+        id = `group:${t.group_id}`;
+      }
       const g = m.get(t.repo_path) ?? { path: t.repo_path, name: repoName(t.repo_path), color: projectColor(t.repo_path), ids: [] };
-      g.ids.push(t.id);
+      g.ids.push(id);
       m.set(t.repo_path, g);
     }
     return [...m.values()].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
   };
   return {
-    sections: { needs_you: group(by.needs_you), review: group(by.review), working: group(by.working), idle: group(by.idle) },
+    sections: {
+      needs_you: group(by.needs_you, "needs_you"),
+      review: group(by.review, "review"),
+      working: group(by.working, "working"),
+      idle: group(by.idle, "idle"),
+    },
     needing: by.needs_you.map((t) => t.id),
     waits,
     columns,

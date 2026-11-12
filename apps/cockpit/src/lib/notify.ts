@@ -36,7 +36,29 @@ export function notificationFor(t: TaskView): Note {
 
 /** What to show for the tasks that just started needing the user, all at once. */
 export function notificationsFor(tasks: TaskView[]): Note[] {
-  if (tasks.length <= SUMMARY_OVER) return tasks.map(notificationFor);
+  // Children of one fan-out group count as one item: "<group>: 2 children need you".
+  const items: (TaskView | TaskView[])[] = [];
+  const byGroup = new Map<string, TaskView[]>();
+  for (const t of tasks) {
+    if (!t.group_id) {
+      items.push(t);
+      continue;
+    }
+    const list = byGroup.get(t.group_id);
+    if (list) list.push(t);
+    else {
+      const fresh = [t];
+      byGroup.set(t.group_id, fresh);
+      items.push(fresh);
+    }
+  }
+  const one = (i: TaskView | TaskView[]): Note => {
+    if (!Array.isArray(i)) return notificationFor(i);
+    if (i.length === 1) return notificationFor(i[0]);
+    const title = tr("notify.group", { title: i[0].group?.title ?? i[0].branch, n: i.length });
+    return { title: clean(title), body: clean(i.map((t) => t.branch).join(", ")), taskId: i[0].id };
+  };
+  if (items.length <= SUMMARY_OVER) return items.map(one);
   return [{ title: tr("notify.many", { n: tasks.length }), body: clean(tasks.map((t) => t.branch).join(", ")) }];
 }
 

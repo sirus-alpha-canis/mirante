@@ -84,6 +84,12 @@ export const AgentCard = memo(function AgentCard({
         </button>
         <StatusPill column={col} />
       </header>
+      {t.group && (
+        <p className="card-crumb small muted">
+          <span aria-hidden="true">↳ </span>
+          {tt("group.breadcrumb", { title: t.group.title })}
+        </p>
+      )}
       {/* Who and where, muted on one line. */}
       <div className="card-meta">
         <ProjectChip path={t.repo_path} />

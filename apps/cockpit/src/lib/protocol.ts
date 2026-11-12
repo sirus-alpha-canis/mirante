@@ -44,6 +44,56 @@ export interface TaskView {
   group_path?: string | null;
   /** That task's repos, primary first (absent for a single-repo task). */
   repos?: TaskRepo[];
+  /** A task of a fan-out group (absent otherwise, and from older daemons). */
+  group_id?: string | null;
+  /** Its role there: one of the children, or the task that synthesizes their results. */
+  group_role?: GroupRole | null;
+  /** The group itself (fixed: its goal, kind and branch prefix). */
+  group?: TaskGroup | null;
+}
+
+export type GroupRole = "child" | "synth";
+export type GroupKind = "fanout" | "compare";
+
+/** `mirante_core::groups::TaskGroup`: a person's fan-out. No worktree, no session. */
+export interface TaskGroup {
+  id: string;
+  kind: GroupKind;
+  title: string;
+  /** The shared goal, in the person's words. */
+  goal: string;
+  /** The children's branches are `<branch>--<n>-<slug>`. */
+  branch: string;
+  created_at: number;
+  archived_at?: number | null;
+}
+
+/** `mirante_ipc::types::DiffStat`. */
+export interface DiffStat {
+  files: number;
+  added: number;
+  removed: number;
+  untracked: number;
+}
+
+/** `group.get`: each task with its last finished answer (agent text) and diff stat. */
+export interface GroupMember {
+  view: TaskView;
+  last_answer?: string | null;
+  diff?: DiffStat | null;
+}
+
+export interface GroupView {
+  group: TaskGroup;
+  members: GroupMember[];
+}
+
+/** `group.synthesize`: the request text and its `expect` (pass it back to act). */
+export interface Synthesis {
+  text: string;
+  expect: string;
+  task?: TaskView | null;
+  sent?: SendResult | null;
 }
 
 /** `mirante_core::model::TaskRepo`: one repo of a task across several. */
@@ -597,6 +647,10 @@ export const M = {
   repoFiles: "repo.files",
   taskFiles: "task.files",
   taskFile: "task.file",
+  groupCreate: "group.create",
+  groupGet: "group.get",
+  groupArchive: "group.archive",
+  groupSynthesize: "group.synthesize",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
   dnaStatus: "dna.status",

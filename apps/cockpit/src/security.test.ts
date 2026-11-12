@@ -226,6 +226,10 @@ describe("Tauri security baseline", () => {
       "REPO_FILES",
       "TASK_FILES",
       "TASK_FILE",
+      "GROUP_CREATE",
+      "GROUP_GET",
+      "GROUP_ARCHIVE",
+      "GROUP_SYNTHESIZE",
       "RULES_LAYERS",
     ]);
     // Never DNA_PROPOSE: agents propose through MCP; people write notes in their editor.
