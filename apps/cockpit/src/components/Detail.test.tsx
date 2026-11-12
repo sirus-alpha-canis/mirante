@@ -514,6 +514,25 @@ describe("Detail (V1 classic)", () => {
       await waitFor(() => expect(h.env.openInEditor).toHaveBeenCalledWith("a", "src/login.ts", null, "vscode"));
     });
 
+    it("a Read/Edit step's path is a button that opens the file at the pane", async () => {
+      const wt = "/Users/me/.mirante/worktrees/shop/feat-a";
+      const h = makeEnv({ "task.file": { path: "src/a.ts", abs: `${wt}/src/a.ts`, size: 3, kind: "text", text: "let x", lang: "ts" } });
+      h.load(
+        [task("a", { status: "working", worktree_path: wt })],
+        [
+          ev(1, "a", "step", { type: "tool", tool: "Read", summary: `${wt}/src/a.ts`, ok: true }),
+          ev(2, "a", "step", { type: "tool", tool: "Edit", summary: "/etc/hosts", ok: true }),
+          ev(3, "a", "step", { type: "tool", tool: "Grep", summary: "src/a.ts", ok: true }),
+        ],
+      );
+      renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+      await userEvent.click(screen.getByRole("button", { name: /read 1 file/i }));
+      const buttons = screen.getAllByRole("button", { name: /in the side pane/ });
+      expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual(["Open src/a.ts in the side pane"]);
+      await userEvent.click(buttons[0]);
+      expect(await within(pane()!).findByText("let")).toHaveClass("tk-kw");
+    });
+
     it("the main terminal stays mounted and attached when the pane opens (one resize, no re-attach)", () => {
       const h = makeEnv();
       h.load([task("a", { status: "working" })]);

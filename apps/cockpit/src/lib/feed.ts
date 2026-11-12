@@ -49,6 +49,17 @@ function bucket(i: FeedItem): Bucket {
   return "other";
 }
 
+/** The file a Read or Edit step worked on (as the agent named it: its first word when it
+ * looks like a path), else null. */
+export function stepFile(i: FeedItem): string | null {
+  if (i.kind !== "tool") return null;
+  const b = bucket(i);
+  const { tool, what } = toolOf(i);
+  if (!((b === "read" && tool !== "LS") || b === "edit")) return null;
+  const first = what.trim().split(/\s+/)[0] ?? "";
+  return /[/.]/.test(first) ? first : null;
+}
+
 /** "read 14 files, ran 3 commands": what a run of tool steps did. Files are counted once
  * each; searches, commands and other tools per call. */
 export function describeRun(items: FeedItem[]): string {

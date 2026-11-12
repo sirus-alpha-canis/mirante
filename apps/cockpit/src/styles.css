@@ -703,3 +703,4 @@ button.skill-chip:hover { color: var(--text); }
 .pane-terminal { position: relative; height: 100%; min-height: 320px; }
 .quick-open .quick-path { font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .quick-open .quick-hint { margin: var(--s2) var(--s3) 0; }
+.step-open { margin-left: var(--s1); padding: 0 4px; line-height: 1; }

@@ -23,7 +23,8 @@ import { TerminalTab } from "./TerminalTab";
 import { TrustCard } from "./TrustCard";
 import { onMac, shortcutFor } from "../lib/shortcuts";
 import { clampWidth, loadPane, type PaneState, type PaneTarget, PANE_MAX, PANE_MIN, savePane } from "../lib/sidepane";
-import { type PaneApi, PaneContext, SidePane } from "./SidePane";
+import { SidePane } from "./SidePane";
+import { type PaneApi, PaneContext } from "./paneContext";
 import { QuickOpen } from "./QuickOpen";
 import { useOpenInEditor } from "./EditorButton";
 

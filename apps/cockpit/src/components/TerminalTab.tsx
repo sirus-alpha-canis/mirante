@@ -8,6 +8,9 @@ import { t, useT } from "../lib/i18n";
 import type { State } from "../store/state";
 import { attachAck, attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
 import { openableLink } from "../lib/links";
+import { detectPaths, fileUrlTarget, toWorktreeRel } from "../lib/paths";
+import type { FileView } from "../lib/protocol";
+import { usePane } from "./paneContext";
 import { M, type TaskView } from "../lib/protocol";
 
 /** Window size changes settle for this long before one `session.resize` goes out. */
@@ -58,6 +61,10 @@ export { openableLink };
  *   github.com or a localhost port (see `openableLink`; anything else says to copy it), and
  *   only on a ⌘/Ctrl click so a stray click on spoofed link text does nothing. Hovering one
  *   shows the real target, whatever the link's text claims.
+ * - OSC 8 `file://` links (Claude prints them with FORCE_HYPERLINK) never reach the opener:
+ *   one on this machine (no host, or localhost) opens in the side pane when it is a file of
+ *   the task's worktree (`onFile`); one naming another host says to copy it. Non-http
+ *   protocols are let through to `activate` only for this; any other is refused there.
  * - No clipboard addon is loaded, so OSC 52 cannot write the clipboard.
  * - Title changes (OSC 0/2) are not subscribed, so nothing reaches the window title.
  */
@@ -65,18 +72,22 @@ function linkHandler(
   openUrl: (url: string) => Promise<void>,
   onHover: (uri: string | null) => void,
   onNote: (note: string) => void,
+  onFile: (path: string, line?: number) => void,
 ): ILinkHandler {
   return {
-    allowNonHttpProtocols: false,
+    allowNonHttpProtocols: true,
     activate(event, uri) {
       if (!(event.metaKey || event.ctrlKey)) return;
+      const file = fileUrlTarget(uri);
+      if (file === "other-host") return onNote(t("term.fileOther"));
+      if (file) return onFile(file.path, file.line);
       let url: URL;
       try {
         url = new URL(uri);
       } catch {
         return;
       }
-      if (url.protocol !== "http:" && url.protocol !== "https:") return;
+      if (url.protocol !== "http:" && url.protocol !== "https:") return onNote(t("term.linkBlocked"));
       if (!openableLink(url)) return onNote(t("term.linkBlocked"));
       openUrl(url.href).catch(() => onNote(t("term.linkFailed")));
     },
@@ -129,6 +140,12 @@ const selectLive = (s: State) => s.connection.state === "live";
 function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolean }) {
   const { rpc, openUrl } = useEnv();
   const t = useT();
+  // File paths open in the Detail's side pane (none outside a task's Detail).
+  const pane = usePane();
+  const paneRef = useRef(pane);
+  paneRef.current = pane;
+  const taskRef = useRef(task);
+  taskRef.current = task;
   const bootId = useSelect(selectBoot);
   const connected = useSelect(selectLive);
   const host = useRef<HTMLDivElement>(null);
@@ -172,7 +189,49 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
         (n) => {
           if (!closed) setNote(n);
         },
+        (path, line) => openPath(path, line),
       ),
+    });
+    /** A clicked path: a file of the task's worktree opens in the side pane (the daemon
+     * checks it first); anything else is a note, never an error. */
+    const openPath = (raw: string, line?: number) => {
+      const p = paneRef.current;
+      if (closed || !p) return;
+      const rel = toWorktreeRel(raw, taskRef.current);
+      if (!rel) return setNote(t("file.notInWorktree", { path: raw }));
+      rpc<FileView>(M.taskFile, { task: task.id, path: rel, stat: true }).then(
+        () => {
+          if (!closed) p.openFile(rel, line);
+        },
+        () => {
+          if (!closed) setNote(t("file.notInWorktree", { path: rel }));
+        },
+      );
+    };
+    // Bare paths in the output (`src/a.rs:12:3`, `/abs/x.ts#L7`): links on a ⌘/Ctrl click.
+    term.registerLinkProvider({
+      provideLinks(y, done) {
+        if (!paneRef.current) return done(undefined);
+        const text = term.buffer.active.getLine(y - 1)?.translateToString(true) ?? "";
+        const found = detectPaths(text);
+        if (found.length === 0) return done(undefined);
+        done(
+          found.map((f) => ({
+            range: { start: { x: f.start + 1, y }, end: { x: f.end, y } },
+            text: f.text,
+            decorations: { underline: true, pointerCursor: true },
+            activate: (e: MouseEvent) => {
+              if (e.metaKey || e.ctrlKey) openPath(f.path, f.line);
+            },
+            hover: () => {
+              if (!closed) setHovered(f.text);
+            },
+            leave: () => {
+              if (!closed) setHovered(null);
+            },
+          })),
+        );
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

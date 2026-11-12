@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { shallow, useSelect } from "../env";
-import { lastAnswer } from "../lib/feed";
+import { lastAnswer, stepFile } from "../lib/feed";
+import { toWorktreeRel } from "../lib/paths";
 import { agentModeLabel } from "../lib/labels";
 import type { TaskView } from "../lib/protocol";
 import { columnOf, pendingPerms, turnsEnded } from "../store/select";
@@ -13,15 +14,32 @@ import { PermissionCard } from "./PermissionCard";
 import { ProjectChip } from "./ProjectChip";
 import { SkillsCount } from "./SkillsChip";
 import { TrustCard } from "./TrustCard";
+import { usePane } from "./paneContext";
 
 /** One feed line; `count` > 1 when identical lines in a row were folded into it. */
+/** Inside a task's Detail: a Read/Edit step's file, opened in the side pane. */
+function StepFileButton({ path }: { path: string }) {
+  const pane = usePane();
+  const t = useT();
+  const task = useSelect((s) => (pane ? s.tasks[pane.taskId] : undefined));
+  const rel = task ? toWorktreeRel(path, task) : null;
+  if (!pane || !rel) return null;
+  return (
+    <button type="button" className="btn btn-small btn-ghost step-open" aria-label={t("step.openFile", { path: rel })} title={t("step.openFile", { path: rel })} onClick={() => pane.openFile(rel)}>
+      ↗
+    </button>
+  );
+}
+
 export const FeedLine = memo(function FeedLine({ item, count = 1 }: { item: FeedItem; count?: number }) {
   const t = useT();
   const who = item.kind === "message" ? t(item.mode === "queue" ? "card.youQueued" : "card.youSteer") : null;
+  const file = stepFile(item);
   return (
     <li className={`line line-${item.kind} ${item.ok === false ? "line-failed" : ""} ${item.warn ? "line-warn" : ""}`}>
       {who && <span className="who">{who}</span>}
       <span className="text">{feedText(item)}</span>
+      {file && <StepFileButton path={file} />}
       {count > 1 && (
         <span className="repeat" aria-label={t("card.times", { n: count })}>
           ×{count}

@@ -2,7 +2,8 @@
 // another task's terminal, a memory note, a skill). Its header names the target and offers
 // "Open in editor" (files), Swap and Close. Bodies reuse the views that exist elsewhere
 // (FileView, DiffTab, NoteView, SkillPanel); a target a later batch fills says so.
-import { createContext, type ReactNode, useContext } from "react";
+import type { ReactNode } from "react";
+import { PaneContext } from "./paneContext";
 import { useSelect } from "../env";
 import { useT } from "../lib/i18n";
 import { hintsFor, onMac } from "../lib/shortcuts";
@@ -15,19 +16,7 @@ import { NoteView } from "./NoteView";
 import { SkillPanel } from "./Skills";
 import { TerminalTab } from "./TerminalTab";
 
-/** What anything inside a task's Detail may ask of its side pane. */
-export interface PaneApi {
-  taskId: string;
-  openFile(path: string, line?: number): void;
-  openTarget(target: PaneTarget): void;
-}
-
-export const PaneContext = createContext<PaneApi | null>(null);
-
-/** The side pane of the task being shown, or null outside a task's Detail. */
-export function usePane(): PaneApi | null {
-  return useContext(PaneContext);
-}
+export { type PaneApi, PaneContext, usePane } from "./paneContext";
 
 function useTitle(target: PaneTarget | null): string {
   const t = useT();
@@ -60,7 +49,10 @@ function OtherTerminal({ id }: { id: string }) {
   if (!other) return <p className="muted small">{t("pane.unavailable")}</p>;
   return (
     <div className="pane-terminal">
-      <TerminalTab key={other.id} t={other} active />
+      {/* Its paths are another task's files: not opened in this task's pane. */}
+      <PaneContext.Provider value={null}>
+        <TerminalTab key={other.id} t={other} active />
+      </PaneContext.Provider>
     </div>
   );
 }

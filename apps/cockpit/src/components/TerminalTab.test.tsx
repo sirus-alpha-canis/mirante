@@ -32,6 +32,9 @@ const h = vi.hoisted(() => ({
   contextLoss: null as (() => void) | null,
   webglDisposed: false,
   ro: null as (() => void) | null,
+  /** The link provider the terminal registered, and the text of its buffer's lines. */
+  provider: null as null | { provideLinks(y: number, cb: (links: { text: string; range: unknown; activate(e: object, text: string): void }[] | undefined) => void): void },
+  lines: [] as string[],
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -73,6 +76,11 @@ vi.mock("@xterm/xterm", () => ({
     reset() {
       h.log.push("reset");
     }
+    registerLinkProvider(p: typeof h.provider) {
+      h.provider = p;
+      return { dispose() {} };
+    }
+    buffer = { active: { getLine: (y: number) => ({ translateToString: () => h.lines[y] ?? "" }) } };
     dispose() {
       h.disposed = true;
     }
@@ -116,6 +124,7 @@ import type { TaskView } from "../lib/protocol";
 import { makeEnv } from "../test/env";
 import { snapshot, task } from "../test/fixtures";
 import { fontsPending, TerminalTab } from "./TerminalTab";
+import { type PaneApi, PaneContext } from "./paneContext";
 import css from "../styles.css?raw";
 
 /** The declarations of `selector`'s one-line rule in styles.css. */
@@ -146,17 +155,21 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function mount(t: TaskView, active?: boolean) {
-  const { env, calls } = makeEnv();
+function mount(t: TaskView, active?: boolean, pane: PaneApi | null = null, answers: Record<string, unknown> = {}) {
+  const { env, calls } = makeEnv(answers);
   const r = render(
     <EnvContext.Provider value={env}>
-      <TerminalTab t={t} active={active} />
+      <PaneContext.Provider value={pane}>
+        <TerminalTab t={t} active={active} />
+      </PaneContext.Provider>
     </EnvContext.Provider>,
   );
   const rerender = (next: TaskView, nextActive?: boolean) =>
     r.rerender(
       <EnvContext.Provider value={env}>
-        <TerminalTab t={next} active={nextActive} />
+        <PaneContext.Provider value={pane}>
+          <TerminalTab t={next} active={nextActive} />
+        </PaneContext.Provider>
       </EnvContext.Provider>,
     );
   return { ...r, env, calls, rerender };
@@ -171,6 +184,8 @@ describe("TerminalTab", () => {
     h.term = null;
     h.disposed = false;
     h.options = null;
+    h.provider = null;
+    h.lines = [];
     h.attachOpen.mockReset();
     h.attachWrite.mockReset();
     h.attachWrite.mockImplementation(async () => {});
@@ -345,7 +360,8 @@ describe("TerminalTab", () => {
     const { env } = mount(task("a"));
     await waitFor(() => expect(h.onData).not.toBeNull());
     const link = h.options!.linkHandler as LinkHandler;
-    expect(link.allowNonHttpProtocols).toBe(false);
+    // On, so OSC 8 file:// links reach `activate` (they open in the side pane, never the opener).
+    expect(link.allowNonHttpProtocols).toBe(true);
     link.activate({}, "https://github.com/o/r/pull/1");
     expect(env.openUrl).not.toHaveBeenCalled();
     link.activate({ metaKey: true }, "javascript:alert(1)");
@@ -355,6 +371,63 @@ describe("TerminalTab", () => {
     link.activate({ ctrlKey: true }, "http://localhost:5173/app");
     link.activate({ metaKey: true }, "http://127.0.0.1:8080/");
     expect(vi.mocked(env.openUrl).mock.calls).toEqual([["https://github.com/o/r/pull/1"], ["http://localhost:5173/app"], ["http://127.0.0.1:8080/"]]);
+  });
+
+  describe("file paths", () => {
+    const WT = "/Users/me/.mirante/worktrees/shop/feat-a";
+    const paneApi = () => ({ taskId: "a", openFile: vi.fn(), openTarget: vi.fn() });
+    const stat = { "task.file": { path: "x", abs: "/x", size: 1, kind: "text" } };
+    const linksOf = (y: number) => {
+      let got: { text: string; activate(e: object, text: string): void }[] | undefined;
+      h.provider!.provideLinks(y, (l) => (got = l));
+      return got ?? [];
+    };
+
+    it("⌘-click on a detected path opens the pane, plain click does nothing", async () => {
+      h.attachOpen.mockResolvedValue({ id: 6, input: true });
+      h.lines = ["error[E0308]: mismatched types --> src/main.rs:12:5", "see https://github.com/o/r/blob/main/a.ts"];
+      const pane = paneApi();
+      const r = mount(task("a", { worktree_path: WT }), true, pane, stat);
+      await waitFor(() => expect(h.provider).not.toBeNull());
+      const [l] = linksOf(1);
+      expect(l.text).toBe("src/main.rs:12:5");
+      expect(linksOf(2)).toEqual([]);
+      l.activate({}, l.text);
+      expect(r.calls).toEqual([]);
+      await act(async () => l.activate({ metaKey: true }, l.text));
+      expect(r.calls).toContainEqual(["task.file", { task: "a", path: "src/main.rs", stat: true }]);
+      expect(pane.openFile).toHaveBeenCalledWith("src/main.rs", 12);
+    });
+
+    it("a path outside the worktree, or one the daemon refuses, is a note, not an error", async () => {
+      h.attachOpen.mockResolvedValue({ id: 6, input: true });
+      h.lines = ["read /etc/hosts and gone.rs"];
+      const pane = paneApi();
+      mount(task("a", { worktree_path: WT }), true, pane, { "task.file": { kind: "rpc", code: 1, message: "gone" } });
+      await waitFor(() => expect(h.provider).not.toBeNull());
+      const [abs, missing] = linksOf(1);
+      await act(async () => abs.activate({ metaKey: true }, abs.text));
+      expect(screen.getByRole("status")).toHaveTextContent("/etc/hosts is not a file in this task's worktree");
+      await act(async () => missing.activate({ metaKey: true }, missing.text));
+      expect(screen.getByRole("status")).toHaveTextContent("gone.rs is not a file in this task's worktree");
+      expect(pane.openFile).not.toHaveBeenCalled();
+    });
+
+    it("OSC 8 file:// with empty or localhost host maps into the pane; other hosts say copy", async () => {
+      h.attachOpen.mockResolvedValue({ id: 6, input: true });
+      const pane = paneApi();
+      const { env } = mount(task("a", { worktree_path: WT }), true, pane, stat);
+      await waitFor(() => expect(h.onData).not.toBeNull());
+      const link = h.options!.linkHandler as LinkHandler;
+      await act(async () => link.activate({ metaKey: true }, `file://${WT}/src/a%20b.ts#L3`));
+      expect(pane.openFile).toHaveBeenCalledWith("src/a b.ts", 3);
+      await act(async () => link.activate({ ctrlKey: true }, `file://localhost${WT}/b.ts`));
+      expect(pane.openFile).toHaveBeenLastCalledWith("b.ts", undefined);
+      await act(async () => link.activate({ metaKey: true }, "file://evil.example/etc/passwd"));
+      expect(screen.getByRole("status")).toHaveTextContent("points to another machine");
+      expect(env.openUrl).not.toHaveBeenCalled();
+      expect(pane.openFile).toHaveBeenCalledTimes(2);
+    });
   });
 
   it("a link the app may not open says to copy it (not a silent no-op)", async () => {

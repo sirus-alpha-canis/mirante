@@ -47,9 +47,11 @@ pub const TERMINAL_ENV: [&str; 3] = ["TMUX", "TMUX_PANE", "TERM_PROGRAM_VERSION"
 pub const PROTECTED_PREFIXES: [&str; 4] = ["ANTHROPIC_", "OPENAI_", "CODEX_", "CLAUDE_CODE_OAUTH"];
 pub const PROTECTED_ENV: [&str; 1] = ["CLAUDE_CONFIG_DIR"];
 
-/// What the agent's PTY is: Mirante's own terminal emulation.
-pub const AGENT_TERM_ENV: [(&str, &str); 3] =
-    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "mirante")];
+/// What the agent's PTY is: Mirante's own terminal emulation. `FORCE_HYPERLINK`: Claude
+/// prints file references as OSC 8 `file://` links (it does not for an unknown terminal),
+/// which the cockpit opens in the task's side pane, never through the opener.
+pub const AGENT_TERM_ENV: [(&str, &str); 4] =
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "mirante"), ("FORCE_HYPERLINK", "1")];
 
 /// Hook events registered without a matcher, and tool events registered with `"*"`.
 /// `StopFailure` (a turn ended by an API error) and `PostToolUseFailure` (a tool call that
@@ -456,6 +458,7 @@ mod tests {
                 ("TERM", "xterm-256color"),
                 ("COLORTERM", "truecolor"),
                 ("TERM_PROGRAM", "mirante"),
+                ("FORCE_HYPERLINK", "1"),
             ]
         );
         assert!(!spec.env_remove.iter().any(|k| spec.env_set.iter().any(|(s, _)| s == k)));
