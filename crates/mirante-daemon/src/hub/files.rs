@@ -1,3 +1,6 @@
+//! `task.files` / `task.file`: a task's worktree files and one file's contents, for the
+//! cockpit's side pane and quick-open (person only; see `task_file`).
+//!
 //! `repo.files`: a repository's files matching what a person typed, for the cockpit's
 //! "+ context" picker (attach a file to a goal by path). git runs hardened (see
 //! `mirante_core::git`), without the hub lock and with a time limit; only paths come back,
@@ -12,7 +15,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use mirante_core::git::Git;
-use mirante_ipc::types::RepoFiles;
+use mirante_core::model::{Lifecycle, TaskRepo};
+use mirante_core::workspace;
+use mirante_core::worktree_file as wf;
+use mirante_ipc::types::{FileImage, FileKind, FileView, RepoFiles, TaskFile, TaskFiles};
 
 use super::{Hub, HubError, Result};
 
@@ -117,6 +123,159 @@ impl Hub {
             .filter_map(|s| std::str::from_utf8(s).ok())
             .filter_map(regular_file);
         Ok(best(paths, &p.query, p.limit.unwrap_or(FILES_DEFAULT).clamp(1, FILES_MAX)))
+    }
+}
+
+/// The root a task path is read under, and the path's levels below it.
+struct Resolved<'a> {
+    root: std::path::PathBuf,
+    segs: Vec<&'a str>,
+}
+
+impl Hub {
+    /// A live (not archived) task and, for a workspace task, its repositories.
+    fn files_task(&self, reference: &str) -> Result<(mirante_core::model::Task, Vec<TaskRepo>)> {
+        let st = self.lock();
+        let t = st.resolve(reference)?;
+        if t.lifecycle == Lifecycle::Archived {
+            return Err(HubError::NotFound(format!("task {} is archived; its worktree is gone", t.branch)));
+        }
+        let repos = if t.workspace_path.is_some() { st.store.task_repos(&t.id)? } else { Vec::new() };
+        Ok((t, repos))
+    }
+
+    /// Files of a task's worktree (tracked and untracked, never ignored, never under
+    /// `.git`) matching `p.query`; a workspace task's are `<repo>/…`, plus the workspace's
+    /// own files. git runs hardened, without the hub lock and with a time limit.
+    pub fn task_files(&self, p: &TaskFiles) -> Result<Vec<String>> {
+        let (t, repos) = self.files_task(&p.task)?;
+        let limit = p.limit.unwrap_or(FILES_DEFAULT).clamp(1, FILES_MAX);
+        let mut all = Vec::new();
+        match &t.workspace_path {
+            None => all.extend(self.worktree_files(Path::new(&t.worktree_path))?),
+            Some(ws) => {
+                for r in &repos {
+                    let files = self.worktree_files(Path::new(&r.worktree_path))?;
+                    all.extend(files.into_iter().map(|f| format!("{}/{f}", r.name)));
+                }
+                for own in workspace::OWN_FILES {
+                    if std::fs::symlink_metadata(Path::new(ws).join(own)).is_ok_and(|m| m.is_file()) {
+                        all.push(own.to_string());
+                    }
+                }
+            }
+        }
+        // git lists untracked files first: a stable order before ranking.
+        all.sort();
+        all.dedup();
+        all.truncate(SCAN_MAX);
+        Ok(best(all, &p.query, limit))
+    }
+
+    /// One worktree's files: tracked regular files (by their index mode: never a symlink or
+    /// a submodule) and untracked, not ignored ones that are regular files on disk.
+    fn worktree_files(&self, wt: &Path) -> Result<Vec<String>> {
+        let limit = self.git_read_limit;
+        let run = |args: &[&str]| -> Result<Vec<u8>> {
+            let out =
+                Git::new(wt).args(args).output_timeout(limit).map_err(|e| HubError::Conflict(format!("git: {e}")))?;
+            if !out.status.success() {
+                return Err(HubError::Conflict(format!(
+                    "git ls-files in {}: {}",
+                    wt.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            Ok(out.stdout)
+        };
+        let names = |b: &[u8]| -> Vec<String> {
+            b.split(|c| *c == 0)
+                .filter(|s| !s.is_empty())
+                .take(SCAN_MAX)
+                .filter_map(|s| std::str::from_utf8(s).ok().map(str::to_string))
+                .collect()
+        };
+        let tracked = run(&["ls-files", "-z", "-s"])?;
+        // `<mode> <object> <stage>\t<path>`, the same shape `regular_file` reads.
+        let mut out: Vec<String> = names(&tracked).iter().filter_map(|e| regular_file(e)).collect();
+        out.dedup();
+        let untracked = run(&["ls-files", "-z", "-o", "--exclude-standard"])?;
+        out.extend(
+            names(&untracked)
+                .into_iter()
+                .filter(|p| std::fs::symlink_metadata(wt.join(p)).is_ok_and(|m| m.file_type().is_file())),
+        );
+        Ok(out)
+    }
+
+    /// Where `path` lives for task `t`: its worktree, or for a workspace task the selected
+    /// repo its first level names (or one of the workspace's own files).
+    fn resolve_file<'a>(t: &mirante_core::model::Task, repos: &[TaskRepo], segs: Vec<&'a str>) -> Result<Resolved<'a>> {
+        let Some(ws) = &t.workspace_path else {
+            return Ok(Resolved { root: t.worktree_path.clone().into(), segs });
+        };
+        if segs.len() == 1 && workspace::OWN_FILES.contains(&segs[0]) {
+            return Ok(Resolved { root: ws.into(), segs });
+        }
+        match repos.iter().find(|r| r.name == segs[0]) {
+            Some(r) if segs.len() > 1 => {
+                Ok(Resolved { root: r.worktree_path.clone().into(), segs: segs[1..].to_vec() })
+            }
+            _ => Err(HubError::Invalid(format!(
+                "{}: not a file of the task's repositories ({})",
+                segs.join("/"),
+                repos.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+            ))),
+        }
+    }
+
+    /// One file of the task's worktree, read by descriptor walk (see
+    /// `mirante_core::worktree_file`): never through a symlink, never under `.git`, capped,
+    /// sniffed. A file that may hold secrets is not read until `reveal`.
+    pub fn task_file(&self, p: &TaskFile) -> Result<FileView> {
+        let segs = wf::check_rel(&p.path).map_err(|e| HubError::Invalid(e.to_string()))?;
+        let (t, repos) = self.files_task(&p.task)?;
+        let at = Self::resolve_file(&t, &repos, segs)?;
+        let read = wf::read_in(&at.root, &at.segs, wf::CAPS).map_err(|e| match e {
+            wf::FileError::Missing(m) => HubError::NotFound(format!("{m} does not exist")),
+            other => HubError::Invalid(other.to_string()),
+        })?;
+        // Joined only now, after a read through descriptors succeeded.
+        let root = std::fs::canonicalize(&at.root).map_err(|e| HubError::NotFound(e.to_string()))?;
+        let abs = at.segs.iter().fold(root, |a, s| a.join(s)).to_string_lossy().into_owned();
+        let mut v = FileView {
+            path: p.path.clone(),
+            abs,
+            size: read.size,
+            kind: FileKind::Binary,
+            text: None,
+            truncated: false,
+            image: None,
+            lang: None,
+        };
+        if may_hold_secrets(&p.path) && !p.reveal {
+            v.kind = FileKind::SecretHidden;
+            return Ok(v);
+        }
+        match read.kind {
+            wf::Kind::Text { text, truncated, lang } => {
+                v.kind = FileKind::Text;
+                v.lang = lang.map(str::to_string);
+                if !p.stat {
+                    v.text = Some(text);
+                    v.truncated = truncated;
+                }
+            }
+            wf::Kind::Image { mime, bytes } => {
+                v.kind = FileKind::Image;
+                if !p.stat {
+                    v.image = Some(FileImage { mime: mime.into(), b64: wf::base64(&bytes) });
+                }
+            }
+            wf::Kind::Binary => v.kind = FileKind::Binary,
+            wf::Kind::TooLarge => v.kind = FileKind::TooLarge,
+        }
+        Ok(v)
     }
 }
 
@@ -230,5 +389,156 @@ mod tests {
         for p in ["src/env.rs", "docs/identity.md", "keyboard.ts", "README"] {
             assert!(!may_hold_secrets(p), "{p}");
         }
+    }
+
+    // ---- task.files / task.file (the cockpit's side pane) ----
+
+    fn tf(k: &Kit, task: &str, path: &str, reveal: bool) -> Result<FileView> {
+        k.hub.task_file(&TaskFile { task: task.into(), path: path.into(), reveal, stat: false })
+    }
+
+    #[test]
+    fn task_files_lists_tracked_and_untracked_not_ignored_in_the_worktree() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        let wt = std::path::Path::new(&t.worktree_path);
+        std::fs::write(wt.join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(wt.join("ignored.log"), "x").unwrap();
+        std::fs::write(wt.join("new_untracked.rs"), "x").unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", wt.join("new_link")).unwrap();
+        let got = k.hub.task_files(&TaskFiles { task: t.id.clone(), query: String::new(), limit: None }).unwrap();
+        assert!(got.contains(&"README".to_string()), "{got:?}");
+        assert!(got.contains(&"new_untracked.rs".to_string()), "{got:?}");
+        assert!(got.contains(&".gitignore".to_string()), "{got:?}");
+        assert!(!got.iter().any(|p| p == "ignored.log" || p == "new_link" || p.starts_with(".git/")), "{got:?}");
+        let q = k.hub.task_files(&TaskFiles { task: t.id, query: "untr".into(), limit: Some(1) }).unwrap();
+        assert_eq!(q, ["new_untracked.rs"]);
+    }
+
+    #[test]
+    fn task_files_for_a_workspace_task_prefix_each_repo_name() {
+        let k = Kit::new();
+        let t = ws_task(&k);
+        let got = k.hub.task_files(&TaskFiles { task: t.id.clone(), query: "readme".into(), limit: None }).unwrap();
+        assert_eq!(got, ["one/README.md", "two/README.md"]);
+        let own = k.hub.task_files(&TaskFiles { task: t.id, query: "MIRANTE_WORK".into(), limit: None }).unwrap();
+        assert_eq!(own, ["MIRANTE_WORKSPACE.md"]);
+    }
+
+    #[test]
+    fn task_file_reads_inside_the_worktree_and_returns_its_abs_path() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        let wt = std::fs::canonicalize(&t.worktree_path).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let v = tf(&k, &t.id, "src/main.rs", false).unwrap();
+        assert_eq!(v.kind, FileKind::Text);
+        assert_eq!(v.text.as_deref(), Some("fn main() {}\n"));
+        assert_eq!(v.lang.as_deref(), Some("rust"));
+        assert_eq!(v.abs, wt.join("src/main.rs").to_string_lossy());
+        assert_eq!(v.size, 13);
+        // stat: the path, no contents.
+        let s =
+            k.hub.task_file(&TaskFile { task: t.id.clone(), path: "src/main.rs".into(), reveal: false, stat: true });
+        let s = s.unwrap();
+        assert_eq!((s.kind, s.text, s.abs), (FileKind::Text, None, v.abs));
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend([1u8, 2, 3]);
+        std::fs::write(wt.join("logo.png"), &png).unwrap();
+        let img = tf(&k, &t.id, "logo.png", false).unwrap();
+        assert_eq!(img.kind, FileKind::Image);
+        assert_eq!(img.image.unwrap().mime, "image/png");
+    }
+
+    #[test]
+    fn task_file_reads_a_workspace_repo_and_the_workspace_files() {
+        let k = Kit::new();
+        let t = ws_task(&k);
+        let v = tf(&k, &t.id, "two/README.md", false).unwrap();
+        assert_eq!(v.text.as_deref(), Some("two\n"));
+        assert!(v.abs.ends_with("/two/README.md"), "{}", v.abs);
+        assert_eq!(tf(&k, &t.id, "MIRANTE_WORKSPACE.md", false).unwrap().kind, FileKind::Text);
+        // Not a selected repo, nor one of the workspace's own files.
+        for bad in ["three/README.md", "stray.txt", "two"] {
+            assert!(tf(&k, &t.id, bad, false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn task_file_refuses_traversal_symlink_and_dot_git() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        let wt = std::path::Path::new(&t.worktree_path);
+        std::os::unix::fs::symlink("/etc", wt.join("etc")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", wt.join("hosts")).unwrap();
+        for bad in ["../app/README", "/etc/hosts", "etc/hosts", "hosts", ".git", ".git/HEAD", "a/../README"] {
+            let r = tf(&k, &t.id, bad, false);
+            assert!(r.is_err(), "{bad}: {r:?}");
+        }
+        let r = tf(&k, &t.id, "hosts", false);
+        assert!(matches!(r, Err(HubError::Invalid(ref m)) if m.contains("symlink")), "{r:?}");
+        let r = tf(&k, &t.id, "missing.rs", false);
+        assert!(matches!(r, Err(HubError::NotFound(_))), "{r:?}");
+    }
+
+    #[test]
+    fn secret_looking_files_are_hidden_until_reveal() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        std::fs::write(std::path::Path::new(&t.worktree_path).join(".env"), "TOKEN=abc\n").unwrap();
+        let hidden = tf(&k, &t.id, ".env", false).unwrap();
+        assert_eq!((hidden.kind, hidden.text), (FileKind::SecretHidden, None));
+        let shown = tf(&k, &t.id, ".env", true).unwrap();
+        assert_eq!(shown.text.as_deref(), Some("TOKEN=abc\n"));
+    }
+
+    #[test]
+    fn an_archived_task_has_no_files() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        k.hub.archive(&t.id).unwrap();
+        assert!(matches!(tf(&k, &t.id, "README", false), Err(HubError::NotFound(_))));
+        let l = k.hub.task_files(&TaskFiles { task: t.id, query: String::new(), limit: None });
+        assert!(matches!(l, Err(HubError::NotFound(_))), "{l:?}");
+    }
+
+    #[test]
+    fn agents_are_refused_task_file_and_task_files() {
+        use crate::access::check;
+        use crate::hub::dna::Identity;
+        use mirante_ipc::rpc::code;
+        use mirante_ipc::types::method;
+        let agent = Identity::Agent { task: Some("t".into()) };
+        for m in [method::TASK_FILE, method::TASK_FILES] {
+            assert_eq!(check(m, &agent).unwrap_err().code, code::FORBIDDEN, "{m}");
+            assert!(check(m, &Identity::Person).is_ok());
+        }
+    }
+
+    /// A workspace task over `one` and `two` of a folder that also holds `three`.
+    fn ws_task(k: &Kit) -> mirante_core::model::Task {
+        let g = k.dir.path().join("grp");
+        for name in ["one", "two", "three"] {
+            let r = g.join(name);
+            std::fs::create_dir_all(&r).unwrap();
+            git(&r, &["init", "-q", "-b", "main"]);
+            std::fs::write(r.join("README.md"), format!("{name}\n")).unwrap();
+            git(&r, &["add", "."]);
+            git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        }
+        let g = std::fs::canonicalize(g).unwrap();
+        k.hub
+            .create_task(mirante_ipc::types::CreateTask {
+                repo: g.to_string_lossy().into_owned(),
+                repos: ["one", "two"].iter().map(|n| g.join(n).to_string_lossy().into_owned()).collect(),
+                agent: mirante_core::model::AgentKind::Claude,
+                branch: "ws".into(),
+                base: None,
+                goal: "g".into(),
+                title: None,
+            })
+            .unwrap()
+            .task
     }
 }

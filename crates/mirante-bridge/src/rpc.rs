@@ -72,6 +72,11 @@ pub const ALLOWED: &[&str] = &[
     method::SKILL_ACTION,
     // "+ context" in the dispatch form: a repo's file paths matching a query (never contents).
     method::REPO_FILES,
+    // The side pane and quick-open: a task's worktree paths matching a query, and one file
+    // of it (the daemon resolves the path inside the task's worktrees by descriptor walk:
+    // no symlinks, no `.git`, capped; secrets hidden until revealed).
+    method::TASK_FILES,
+    method::TASK_FILE,
     // The Brain's "Rules" view: every instruction layer an agent session reads (read-only;
     // the daemon picks the files from the agent's known locations, never a path the caller
     // names, and masks secrets).
@@ -212,6 +217,8 @@ mod tests {
             "skill.review",
             "skill.action",
             "repo.files",
+            "task.files",
+            "task.file",
             "rules.layers",
         ];
         assert_eq!(ALLOWED, expected);

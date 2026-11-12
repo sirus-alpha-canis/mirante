@@ -47,6 +47,13 @@ pub mod method {
     /// A repository's files whose path matches a query, for attaching them to a goal
     /// ([`super::RepoFiles`] → `Vec<String>`, relative paths). A person only.
     pub const REPO_FILES: &str = "repo.files";
+    /// A task's worktree files (tracked and untracked, not ignored) whose path matches a
+    /// query, for the cockpit's quick-open ([`super::TaskFiles`] → `Vec<String>`, relative
+    /// to where the agent runs). A person only.
+    pub const TASK_FILES: &str = "task.files";
+    /// One file of a task's worktree, read by descriptor walk ([`super::TaskFile`] →
+    /// [`super::FileView`]). A person only.
+    pub const TASK_FILE: &str = "task.file";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -654,6 +661,72 @@ pub struct RepoFiles {
     /// Default 30, at most 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+/// `task.files` parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskFiles {
+    pub task: String,
+    #[serde(default)]
+    pub query: String,
+    /// Default 30, at most 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `task.file` parameters: `path` is relative to where the agent runs (the worktree, or a
+/// workspace task's folder: `<repo>/…`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskFile {
+    pub task: String,
+    pub path: String,
+    /// Read a file that may hold secrets (`.env`, keys) anyway: the person clicked Reveal.
+    #[serde(default)]
+    pub reveal: bool,
+    /// Check that it is a file of the worktree and return its absolute path, without its
+    /// contents (the shell's "open in editor", a clicked path).
+    #[serde(default)]
+    pub stat: bool,
+}
+
+/// What `task.file` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Text,
+    Binary,
+    Image,
+    TooLarge,
+    /// A file that may hold secrets, not read until the person reveals it.
+    SecretHidden,
+}
+
+/// An image file, for a `data:` URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileImage {
+    pub mime: String,
+    pub b64: String,
+}
+
+/// `task.file`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileView {
+    /// As asked (relative).
+    pub path: String,
+    /// Where it is on disk (checked by the daemon; joined only after a successful read).
+    pub abs: String,
+    pub size: u64,
+    pub kind: FileKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The text was cut at the display cap.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<FileImage>,
+    /// The highlighter's language, from the file name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 /// `daemon.settings` parameters: each one given is changed (and persisted).

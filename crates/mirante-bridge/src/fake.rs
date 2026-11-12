@@ -176,6 +176,17 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
             let demo = ["README.md", "src/lib.rs", "src/login.rs", "src/session.rs", "docs/design.md", "Cargo.toml"];
             Ok(json!(demo.iter().filter(|f| f.to_lowercase().contains(&q)).collect::<Vec<_>>()))
         }
+        method::TASK_FILES => {
+            let q = p["query"].as_str().unwrap_or("").to_lowercase();
+            let demo = ["README.md", "src/lib.rs", "src/login.rs", "docs/design.md", ".env"];
+            Ok(json!(demo.iter().filter(|f| f.to_lowercase().contains(&q)).collect::<Vec<_>>()))
+        }
+        method::TASK_FILE => {
+            let path = p["path"].as_str().unwrap_or("");
+            let text = format!("# {path}\n\nA demo file from the fake daemon.\n");
+            Ok(json!({"path": path, "abs": format!("/tmp/fake-worktree/{path}"), "size": text.len(),
+                      "kind": "text", "text": text, "lang": "markdown"}))
+        }
         _ => Ok(json!({})),
     }
 }

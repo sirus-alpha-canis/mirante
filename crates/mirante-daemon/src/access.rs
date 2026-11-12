@@ -70,6 +70,9 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::DAEMON_KILL_ORPHAN, Access::Person),
     (method::DAEMON_SETTINGS, Access::Person),
     (method::REPO_FILES, Access::Person),
+    // A task's worktree files and their contents (the cockpit's side pane): never an agent's.
+    (method::TASK_FILES, Access::Person),
+    (method::TASK_FILE, Access::Person),
     (method::DNA_STATUS, Access::Person),
     (method::DNA_ENABLE, Access::Person),
     (method::DNA_DISABLE, Access::Person),

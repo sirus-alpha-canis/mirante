@@ -335,6 +335,8 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::DAEMON_DOCTOR => out(hub.doctor()),
         method::DAEMON_SETTINGS => out(hub.settings(params(p)?)),
         method::REPO_FILES => out(hub.repo_files(&params(p)?)),
+        method::TASK_FILES => out(hub.task_files(&params(p)?)),
+        method::TASK_FILE => out(hub.task_file(&params(p)?)),
         method::RULES_LAYERS => out(hub.rules_layers(params(p)?)),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),

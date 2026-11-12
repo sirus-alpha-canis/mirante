@@ -595,6 +595,8 @@ export const M = {
   daemonStatus: "daemon.status",
   daemonSettings: "daemon.settings",
   repoFiles: "repo.files",
+  taskFiles: "task.files",
+  taskFile: "task.file",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
   dnaStatus: "dna.status",
@@ -624,6 +626,19 @@ export const M = {
   skillAction: "skill.action",
   rulesLayers: "rules.layers",
 } as const;
+
+/** `task.file`: what the daemon read (`FileView`). */
+export type FileKind = "text" | "binary" | "image" | "too_large" | "secret_hidden";
+export interface FileView {
+  path: string;
+  abs: string;
+  size: number;
+  kind: FileKind;
+  text?: string;
+  truncated?: boolean;
+  image?: { mime: string; b64: string };
+  lang?: string;
+}
 
 /** `rules.layers`: a file pulled in by an `@path` import (Claude), with its own imports. */
 export interface RuleImport {
