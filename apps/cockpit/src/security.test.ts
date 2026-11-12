@@ -135,6 +135,15 @@ describe("Tauri security baseline", () => {
     expect(scanner).toContain("pub const LIMITS: Limits = Limits { depth: 2, max_dirs: 500, max_repos: 200, time: Duration::from_secs(3) };");
   });
 
+  it("no component renders raw HTML: no dangerouslySetInnerHTML anywhere in src", () => {
+    const sources = import.meta.glob(["./**/*.tsx", "./**/*.ts", "!./**/*.test.ts", "!./**/*.test.tsx"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+    expect(Object.keys(sources).length).toBeGreaterThan(20);
+    for (const [name, text] of Object.entries(sources)) {
+      expect(text, name).not.toContain("dangerouslySetInnerHTML");
+      expect(text, name).not.toMatch(/\.innerHTML\s*=|insertAdjacentHTML|outerHTML\s*=/);
+    }
+  });
+
   it("reaches the daemon only through the bridge's allowlist, pinned here too", () => {
     // `mirante_bridge::rpc::ALLOWED`, as written in the source (constant names).
     const block = /pub const ALLOWED: &\[&str\] = &\[([\s\S]*?)\];/.exec(bridgeRpc)?.[1] ?? "";

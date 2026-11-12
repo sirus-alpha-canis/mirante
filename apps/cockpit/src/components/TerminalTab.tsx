@@ -7,6 +7,7 @@ import { useEnv, useSelect } from "../env";
 import { t, useT } from "../lib/i18n";
 import type { State } from "../store/state";
 import { attachAck, attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
+import { openableLink } from "../lib/links";
 import { M, type TaskView } from "../lib/protocol";
 
 /** Window size changes settle for this long before one `session.resize` goes out. */
@@ -48,14 +49,8 @@ export function fontsPending(doc: Document = document): Promise<void> | null {
  * the last one the note offers Reconnect. */
 export const REATTACH_MS = [500, 1000, 2000, 5000];
 
-/** Where a terminal link may go: what the opener capability allows (github.com pages, and
- * a local dev server on an explicit port), never with credentials in the URL. */
-export function openableLink(url: URL): boolean {
-  if (url.username || url.password) return false;
-  if (url.protocol === "https:") return url.hostname === "github.com" && url.port === "";
-  if (url.protocol === "http:") return (url.hostname === "localhost" || url.hostname === "127.0.0.1") && /^\d{1,5}$/.test(url.port);
-  return false;
-}
+/** Where a terminal link may go (see `lib/links`). */
+export { openableLink };
 
 /**
  * Terminal output is untrusted. Only the features below are on:
