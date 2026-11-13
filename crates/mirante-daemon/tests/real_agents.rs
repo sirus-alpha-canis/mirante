@@ -22,7 +22,9 @@ use mirante_daemon::driver::real::RealFactory;
 use mirante_daemon::hub::{Hub, HubError};
 use mirante_daemon::server;
 use mirante_ipc::test_dir::TestDir;
-use mirante_ipc::types::{AnswerPermission, AttachParams, BootState, CreateTask, SendMessage, SendMode, StartSession, TrustAnswer};
+use mirante_ipc::types::{
+    AnswerPermission, AttachParams, BootState, CreateTask, SendMessage, SendMode, StartSession, TrustAnswer,
+};
 use mirante_ipc::Paths;
 
 struct Rig {
@@ -71,6 +73,7 @@ impl Rig {
         let v = self
             .hub
             .create_task(CreateTask {
+                group: None,
                 repos: Vec::new(),
                 repo: self.repo.to_string_lossy().into_owned(),
                 agent,
