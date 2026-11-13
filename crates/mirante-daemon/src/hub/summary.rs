@@ -13,7 +13,7 @@
 //! given that way run even with `--setting-sources ""`). Before the first summary of each
 //! Claude version, a probe run of the same invocation (stream-json, "Reply OK.") must show
 //! no tool, no MCP server, no slash command and no skill offered; the verdict is kept per
-//! version and summaries are refused when it fails. Codex is never used: no invocation of it
+//! binary (path, version, size, modification time, in the store) and summaries are refused when it fails. Codex is never used: no invocation of it
 //! was reliably tool-less (S2: NO-GO). The result is agent text: redacted, capped, shown as
 //! text.
 use std::io::Read;
@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mirante_core::agent_bin::{self, Agent, Lookup};
-use mirante_core::model::{new_id, now_ms, Task};
+use mirante_core::model::{new_id, Task};
 use mirante_core::threads::{summary_request, ThreadLink, MAX_SUMMARY};
 use mirante_ipc::types::SummariesSetting;
 use serde_json::{json, Value};
@@ -37,8 +37,9 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_BUDGET_USD: &str = "0.10";
 /// The model a summary uses (≈ $0.01 a summary in S2).
 pub const MODEL: &str = "haiku";
-/// Where the probe's verdict per Claude version is kept (in Mirante's home).
-pub const PROBE_FILE: &str = "summaries-probe.json";
+/// Most bytes of arguments one run is handed (the prompt rides in argv; the system's
+/// `ARG_MAX` is 1 MiB on macOS, environment included): a longer request is refused.
+pub const ARGS_MAX: usize = 256 * 1024;
 /// The settings key (`none` | `claude`).
 pub const SETTINGS_KEY: &str = "summaries";
 /// Most stdout a run may produce that is read.
@@ -107,11 +108,19 @@ pub fn clean_env(bin: &Path) -> Vec<(String, String)> {
     env
 }
 
-/// Runs `bin args` in `cwd` with [`clean_env`], stdin closed, killed after `timeout`.
-/// Returns stdout (at most [`OUTPUT_MAX`] bytes), or why it failed.
+/// Runs `bin args` in `cwd` with [`clean_env`], stdin closed, in a process group of its
+/// own that is killed whole after `timeout` (a child it started cannot outlive it). Refused
+/// before it starts when the arguments pass [`ARGS_MAX`]. Returns stdout (at most
+/// [`OUTPUT_MAX`] bytes), or why it failed.
 fn run(bin: &Path, args: &[String], cwd: &Path, timeout: Duration) -> std::result::Result<String, String> {
+    use std::os::unix::process::CommandExt;
+    let size: usize = args.iter().map(|a| a.len() + 1).sum();
+    if size > ARGS_MAX {
+        return Err(format!("the request is {size} bytes; at most {ARGS_MAX} are handed to Claude"));
+    }
     let mut child = Command::new(bin)
         .args(args)
+        .process_group(0)
         .current_dir(cwd)
         .env_clear()
         .envs(clean_env(bin))
@@ -137,6 +146,11 @@ fn run(bin: &Path, args: &[String], cwd: &Path, timeout: Duration) -> std::resul
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) if Instant::now() >= deadline => {
+                // The whole group: its own children too (their pipes would hold the reads).
+                if let Ok(pgid) = i32::try_from(child.id()) {
+                    // SAFETY: plain syscall; the group is the child's own (`process_group(0)`).
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("stopped after {} s", timeout.as_secs()));
@@ -233,23 +247,27 @@ impl Hub {
         agent_bin::resolve(Agent::Claude, &Lookup::from_env(Agent::Claude)).map(|r| r.path).map_err(HubError::Invalid)
     }
 
-    /// Whether the tool-less probe passed for `version` (run once per version, recorded).
+    /// Whether the tool-less probe passed for this binary (`version`, and the file as it is
+    /// on disk: canonical path, size, modification time). Run once per binary, the verdict
+    /// kept in the store, never in a file an agent could write.
     fn probe(&self, bin: &Path, version: &str, root: &Path) -> Result<bool> {
-        let file = self.paths.home().join(PROBE_FILE);
-        let kept = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        if let Some(k) = kept.filter(|k| k["version"] == version) {
-            return Ok(k["ok"] == true);
+        use std::os::unix::fs::MetadataExt;
+        let canon = std::fs::canonicalize(bin).map_err(|e| HubError::Conflict(format!("{}: {e}", bin.display())))?;
+        let meta = std::fs::metadata(&canon).map_err(|e| HubError::Conflict(format!("{}: {e}", canon.display())))?;
+        let key = canon.to_string_lossy().into_owned();
+        let (size, mtime) = (i64::try_from(meta.size()).unwrap_or(i64::MAX), meta.mtime());
+        if let Some(ok) = self.lock().store.summary_probe(&key, version, size, mtime)? {
+            return Ok(ok);
         }
         let dir = Scratch::new(root).map_err(|e| HubError::Conflict(format!("summary folder: {e}")))?;
         let system = "Reply with the single word OK. You have no tools.";
         let out = run(bin, &claude_args(system, "Reply OK.", "stream-json"), &dir.0, SUMMARY_TIMEOUT)
             .map_err(|e| HubError::Conflict(format!("the tool-less check of Claude {version} did not run: {e}")))?;
         let ok = probe_passed(&out);
-        let record = json!({ "version": version, "ok": ok, "at": now_ms() });
-        if let Err(e) = std::fs::write(&file, record.to_string()) {
-            self.lock().log_error(None, "recording the summary probe", &e);
-        }
         let mut st = self.lock();
+        if let Err(e) = st.store.set_summary_probe(&key, version, size, mtime, ok) {
+            st.log_error(None, "recording the summary probe", &e);
+        }
         let _ = st.event(None, "summaries_probe", json!({ "version": version, "ok": ok }));
         st.publish();
         Ok(ok)
@@ -374,6 +392,47 @@ mod tests {
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.iter().all(|k| ["PATH", "LANG", "HOME", "USER"].contains(k)), "{keys:?}");
         assert_eq!(env[0].1, "/opt/homebrew/bin:/usr/bin:/bin");
+    }
+
+    /// Review M1: a request too long for argv is refused before anything runs.
+    #[test]
+    fn a_request_past_the_argument_cap_never_runs() {
+        let dir = std::env::temp_dir().join(format!("mirante-summary-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("echo-ran");
+        let mark = dir.join("ran");
+        mirante_core::test_script::write_sh(&bin, &format!("touch '{}'", mark.display()), 0o755);
+        let e = run(&bin, &["x".repeat(ARGS_MAX + 1)], &dir, Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("at most"), "{e}");
+        assert!(!mark.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review M1: on timeout the run's whole process group goes, its children too.
+    #[test]
+    fn a_hung_runs_children_are_killed_with_it() {
+        let dir = std::env::temp_dir().join(format!("mirante-summary-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("spawns");
+        let pidfile = dir.join("child.pid");
+        mirante_core::test_script::write_sh(
+            &bin,
+            &format!("sleep 60 & echo $! > '{}'; wait", pidfile.display()),
+            0o755,
+        );
+        let t = Instant::now();
+        assert!(run(&bin, &[], &dir, Duration::from_millis(500)).unwrap_err().contains("stopped after"));
+        assert!(t.elapsed() < Duration::from_secs(10), "the child's open pipe did not hold the run");
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        // SAFETY: signal 0 only checks whether the process exists. An orphan is reaped by
+        // launchd shortly after it dies: allow it a moment.
+        let alive = || unsafe { libc::kill(pid, 0) } == 0;
+        let until = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the child {pid} outlived the run");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -223,10 +223,17 @@ impl State {
         // delivered, and `message.edit` / `remove` / `reorder` refuse it (CONFLICT).
         let next = l.queue.pop_front().expect("not empty");
         l.requeue_at = 0;
-        let wire = match &owed {
+        let mut owed = owed;
+        let mut wire = match &owed {
             Some(o) => super::threads::with_block(&o.block, &next.text, next.operator),
             None => next.wire(),
         };
+        // The typist sees the message with its block: checked as `message.send` checks it.
+        // A block the typist would refuse stays owed; the message goes without it.
+        if l.agent == AgentKind::Claude && owed.is_some() && crate::driver::paste::typed_message(&wire).is_err() {
+            owed = None;
+            wire = next.wire();
+        }
         match driver.send(&wire) {
             Ok(()) => {
                 if let Some(o) = &owed {
@@ -530,6 +537,8 @@ impl State {
                     }
                     // A queued message comes back under its id (editable again); a steer
                     // joins the queue as a new message.
+                    // Whether it may carry a thread's block is the original's (a synthesis
+                    // request is labelled as the operator's, yet never carries one).
                     let back = match l.last_sent.take() {
                         Some(q) if q.text == text => {
                             l.left_queue.remove(&q.id);
@@ -537,7 +546,8 @@ impl State {
                         }
                         other => {
                             l.last_sent = other;
-                            queue::Queued::from_operator(text.clone(), operator, operator)
+                            let context = l.sent_direct.take().is_some_and(|d| d.text == text && d.context);
+                            queue::Queued::from_operator(text.clone(), operator, context)
                         }
                     };
                     id = Some(back.id.clone());
@@ -1998,18 +2008,6 @@ mod tests {
         assert!(k.pending(&t.id).is_empty());
     }
 
-    #[test]
-    fn the_turn_end_settles_every_remaining_card_as_denied() {
-        let k = Kit::new();
-        let t = two_dialogs(&k);
-        k.emit(DriverEvent::Transcript(json!({"type": "system", "subtype": "turn_duration"})));
-        assert_eq!(status(&k, &t), Status::Idle);
-        assert!(k.pending(&t).is_empty());
-        let s = settled(&k, &t);
-        assert_eq!(s.len(), 2);
-        assert!(s.iter().all(|(_, a)| *a == json!(PermissionStatus::Denied)));
-    }
-
     /// Review I5: a background agent's dialog keeps the task `NeedsYou` past the main
     /// turn's end; the main agent's card is settled all the same (it would block every
     /// inline answer), and the side card is settled once that agent moves on, even when its
@@ -2053,6 +2051,18 @@ mod tests {
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "next"}));
         assert!(k.pending(&t.id).is_empty());
         assert_eq!(status(&k, &t.id), Status::Working);
+    }
+
+    #[test]
+    fn the_turn_end_settles_every_remaining_card_as_denied() {
+        let k = Kit::new();
+        let t = two_dialogs(&k);
+        k.emit(DriverEvent::Transcript(json!({"type": "system", "subtype": "turn_duration"})));
+        assert_eq!(status(&k, &t), Status::Idle);
+        assert!(k.pending(&t).is_empty());
+        let s = settled(&k, &t);
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|(_, a)| *a == json!(PermissionStatus::Denied)));
     }
 
     #[test]

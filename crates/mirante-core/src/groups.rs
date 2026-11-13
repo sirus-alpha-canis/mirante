@@ -222,9 +222,11 @@ pub struct Sibling {
     pub answer: Option<String>,
 }
 
-/// What a synthesis reads, as a short hash: the shared goal, who receives it, and each
-/// sibling's id, status and answer. A preview hands it out; the send that follows is
-/// refused when the results changed meanwhile.
+/// What a synthesis reads, as a short hash: the group, who receives it, each sibling's id,
+/// and the request's whole text as [`synthesis_prompt`] renders it (titles, agents,
+/// branches, worktrees, states, answers, the goal) with its random marker left out. A
+/// preview hands it out; the send that follows is refused when anything the person was
+/// shown changed meanwhile.
 pub fn results_hash(group: &TaskGroup, into: Option<&str>, siblings: &[Sibling]) -> String {
     let mut h = Sha256::new();
     let mut part = |s: &str| {
@@ -232,14 +234,11 @@ pub fn results_hash(group: &TaskGroup, into: Option<&str>, siblings: &[Sibling])
         h.update(s.as_bytes());
     };
     part(&group.id);
-    part(&group.goal);
     part(into.unwrap_or(""));
     for s in siblings {
         part(&s.id);
-        part(s.status.as_str());
-        part(s.lifecycle.as_str());
-        part(s.answer.as_deref().unwrap_or("\u{0}none"));
     }
+    part(&synthesis_prompt(group, siblings, into.is_some(), ""));
     h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -549,5 +548,17 @@ mod tests {
         let mut c = a.clone();
         c[0].status = Status::Working;
         assert_ne!(h, results_hash(&g, None, &c));
+        // Review M2: whatever the text shows is covered too.
+        let changed: [fn(&mut Sibling); 4] = [
+            |s| s.title = "renamed".into(),
+            |s| s.branch = "other".into(),
+            |s| s.agent = AgentKind::Claude,
+            |s| s.worktree = "/elsewhere".into(),
+        ];
+        for f in changed {
+            let mut d = a.clone();
+            f(&mut d[0]);
+            assert_ne!(h, results_hash(&g, None, &d));
+        }
     }
 }

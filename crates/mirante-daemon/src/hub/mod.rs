@@ -153,6 +153,10 @@ pub(crate) struct Live {
     pub(crate) left_queue: HashSet<String>,
     /// The queued message last handed to the driver (its id, if the driver hands it back).
     pub(crate) last_sent: Option<queue::Queued>,
+    /// The message last handed to the driver directly (a steer, or a queue send to an idle
+    /// agent), with who sent it: a delivery handed back keeps whether it may carry a
+    /// thread's block (a synthesis request never does).
+    pub(crate) sent_direct: Option<queue::Queued>,
     /// Where the next handed-back message goes: after the ones handed back before it (so a
     /// run of them keeps its original order), ahead of everything queued since. Reset when
     /// the queue is next delivered from.
@@ -299,6 +303,7 @@ impl Live {
             queue: VecDeque::new(),
             left_queue: HashSet::new(),
             last_sent: None,
+            sent_direct: None,
             requeue_at: 0,
             perm_keys: HashMap::new(),
             dialogs: HashMap::new(),

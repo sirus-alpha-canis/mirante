@@ -306,6 +306,22 @@ pub fn deterministic_summary(status: Option<Status>, answer: Option<&str>, diff:
 
 /// The request a summary CLI gets: a replacing system prompt, and the thread's own words
 /// (its title, goal, notes and last answers, redacted) fenced as DATA by `marker`.
+/// Most bytes of one item (the goal, the notes, each answer) a summary request carries: the
+/// request rides in the CLI's arguments, which the system caps (`ARG_MAX`).
+pub const SUMMARY_ITEM_MAX: usize = 32 * 1024;
+
+/// `s` cut to [`SUMMARY_ITEM_MAX`] bytes on a character boundary, marked when cut.
+fn capped_item(s: &str) -> String {
+    if s.len() <= SUMMARY_ITEM_MAX {
+        return s.to_string();
+    }
+    let mut end = SUMMARY_ITEM_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &s[..end])
+}
+
 pub fn summary_request(task: &Task, link: &ThreadLink, answers: &[String], marker: &str) -> (String, String) {
     let system = format!(
         "You summarize one thread of a person's coding work for that person. The user message holds the \
@@ -321,15 +337,15 @@ pub fn summary_request(task: &Task, link: &ThreadLink, answers: &[String], marke
         format!("Bound to: {} {}", link.kind.label(), one_line(&link.reference)),
         format!("Status: {}", task.status.as_str()),
         "Goal:".to_string(),
-        crate::redact::redact(task.goal.trim_end()),
+        capped_item(&crate::redact::redact(task.goal.trim_end())),
     ];
     if !task.notes.trim().is_empty() {
         data.push("Notes:".to_string());
-        data.push(task.notes.trim_end().to_string());
+        data.push(capped_item(task.notes.trim_end()));
     }
     for (i, a) in answers.iter().enumerate() {
         data.push(format!("Answer {}:", i + 1));
-        data.push(crate::redact::redact(a.trim_end()));
+        data.push(capped_item(&crate::redact::redact(a.trim_end())));
     }
     data.push(format!("<</DATA-{marker}>>"));
     let user = data.join("\n");
@@ -759,5 +775,10 @@ mod tests {
         assert!(user.starts_with("<<DATA-m1>>") && user.ends_with("<</DATA-m1>>"), "{user}");
         assert_eq!(user.matches("<</DATA-m1>>").count(), 1);
         assert!(user.contains("rm -rf"));
+        // Review M1: three huge answers still fit the CLI's arguments.
+        let big = vec!["é".repeat(400_000); 3];
+        let (_, user) = summary_request(&th, &l, &big, "m1");
+        assert!(user.len() < 4 * SUMMARY_ITEM_MAX, "{}", user.len());
+        assert_eq!(user.matches("… [truncated]").count(), 3);
     }
 }

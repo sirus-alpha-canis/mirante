@@ -271,7 +271,7 @@ mod tests {
     use mirante_core::model::AgentKind;
     use mirante_core::threads::{LinkKind, MoveMode, Moved, ThreadLink};
     use mirante_ipc::types::{CreateTask, SendMessage, SendMode, StartSession};
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     fn pr(n: u32) -> ThreadLink {
         ThreadLink {
@@ -536,6 +536,31 @@ mod tests {
         assert!(again.starts_with("<mirante-thread") && again.ends_with("review it"), "{again}");
     }
 
+    /// Review M3: a synthesis request handed back by the driver keeps what it was: labelled
+    /// as the operator's, never carrying the thread's block.
+    #[test]
+    fn an_aborted_synthesis_request_never_picks_up_the_block() {
+        let k = Kit::new();
+        let th = create(&k, None, pr(12), "n", "t-synth").unwrap();
+        let id = th.task.id.clone();
+        start(&k, &id, None, false);
+        assert!(k.hub.lock().thread_owed(&id).unwrap().is_some(), "the block is owed");
+        let text = "Operator request: synthesize the results";
+        k.hub
+            .send_by(
+                SendMessage { task: id.clone(), text: text.into(), mode: SendMode::Queue },
+                super::super::groups::BY_SYNTHESIS,
+            )
+            .unwrap();
+        let wire = k.factory.driver.wire.lock().unwrap().last().cloned().unwrap();
+        assert!(!wire.contains("<mirante-thread"), "{wire}");
+        k.emit(crate::driver::DriverEvent::DeliveryAborted { text: wire, reason: "dialog".into() });
+        k.emit(crate::driver::DriverEvent::DialogClosed);
+        let again = k.factory.driver.wire.lock().unwrap().last().cloned().unwrap();
+        assert!(!again.contains("<mirante-thread") && again.ends_with(text), "{again}");
+        assert!(k.hub.lock().thread_owed(&id).unwrap().is_some(), "still owed to the person's next message");
+    }
+
     #[test]
     fn a_final_answer_refreshes_the_deterministic_summary() {
         let k = Kit::new();
@@ -608,10 +633,21 @@ esac"#,
         summaries_on(&k);
         let e = with().unwrap_err().to_string();
         assert!(e.contains("did not pass the tool-less check"), "{e}");
-        let probe: Value =
-            serde_json::from_str(&std::fs::read_to_string(k.hub.paths().home().join("summaries-probe.json")).unwrap())
-                .unwrap();
-        assert_eq!((probe["version"].as_str(), probe["ok"].as_bool()), (Some("2.1.285 (Claude Code)"), Some(false)));
+        // Review M1: the verdict is in the store, keyed by the binary as it is on disk; no
+        // file in Mirante's home an agent could forge.
+        assert!(!k.hub.paths().home().join("summaries-probe.json").exists());
+        let bin = std::fs::canonicalize(k.hub.paths().home().join("fakebin/claude")).unwrap();
+        let meta = std::fs::metadata(&bin).unwrap();
+        let verdict = {
+            use std::os::unix::fs::MetadataExt;
+            k.hub.lock().store.summary_probe(
+                bin.to_str().unwrap(),
+                "2.1.285 (Claude Code)",
+                meta.size() as i64,
+                meta.mtime(),
+            )
+        };
+        assert_eq!(verdict.unwrap(), Some(false));
         let runs = std::fs::read_to_string(&log).unwrap().matches("cwd=").count();
         assert!(with().is_err());
         // The verdict is kept per version: no second probe, still no summary.
@@ -623,6 +659,9 @@ esac"#,
         assert!(k.hub.get_task(&th.task.id).unwrap().thread.unwrap().summary.is_none());
         // Codex is not a choice at all.
         assert!(serde_json::from_value::<Summarize>(json!({"task": "x", "with": "codex"})).is_err());
+        // A changed binary (same version string) is checked again.
+        fake_claude(&k, "[]");
+        assert!(with().is_ok(), "the new binary passed its own check");
     }
 
     #[test]

@@ -233,7 +233,7 @@ env -i HOME USER PATH=/opt/homebrew/bin:/usr/bin:/bin LANG=en_US.UTF-8 /opt/home
 - `init`: `tools: []`, `mcp_servers: []`, `slash_commands: []`, `skills: []`, model `claude-haiku-4-5-20251001`. This is what Mirante's probe requires (`hub::summary::probe_passed`).
 - `result`: `success`, 1 turn, 3.3 s, **$0.0120**, no permission denials. The text summarized the thread and said it ignored the embedded instruction; no marker file appeared.
 - No `~/.claude/projects/<cwd>` entry was created (`--no-session-persistence` holds).
-- Verdict: unchanged. Shipped as `summaries ∈ {none, claude}` (default `none`); Codex stays NO-GO and is not offered. Each run is a person's click after the cost estimate ("≈ $0.01–0.03 of your Claude usage"); the probe runs once per Claude version and is kept in `<MIRANTE_HOME>/summaries-probe.json`.
+- Verdict: unchanged. Shipped as `summaries ∈ {none, claude}` (default `none`); Codex stays NO-GO and is not offered. Each run is a person's click after the cost estimate ("≈ $0.01–0.03 of your Claude usage"); the probe runs once per Claude binary (canonical path, version, size, modification time) and its verdict is kept in the store (`summary_probes`, migration 14; earlier builds kept it in `<MIRANTE_HOME>/summaries-probe.json`, which is no longer read).
 
 ## Side effects of the spikes (for the record)
 - `~/.claude/projects/-private-tmp-thr-spike-repo/` and `…-s2-cwd/` (an empty `memory/` dir) were created and then **deleted**. `/private/tmp/claude-501/-private-tmp-thr-spike-repo/` (the `tasks/*.output` symlinks) was deleted too. Evidence copies are in `/tmp/thr-spike/evidence/`.

@@ -161,6 +161,7 @@ impl Hub {
             return Ok(SendResult { delivered: SendMode::Queue, queued });
         }
         l.driver.clone().expect("ready implies a driver").send(&wire)?;
+        l.sent_direct = Some(super::queue::Queued::from_operator(m.text.clone(), operator, person));
         if l.agent == AgentKind::Claude && task.status == Status::Working {
             l.steers.push(wire);
         }
