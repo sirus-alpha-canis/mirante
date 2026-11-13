@@ -238,7 +238,7 @@ async fn open_in_editor(
 ) -> Result<(), String> {
     let socket = app.state::<Cockpit>().socket.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let launch = editor::plan(&editor, &task, &path, line, |task, path| {
+        let (launch, abs) = editor::plan(&editor, &task, &path, line, |task, path| {
             let params = serde_json::json!({ "task": task, "path": path, "stat": true });
             let file = bridge_rpc::call(&socket, method::TASK_FILE, params).map_err(|e| e.to_string())?;
             file.get("abs")
@@ -246,6 +246,8 @@ async fn open_in_editor(
                 .map(str::to_owned)
                 .ok_or_else(|| "the daemon named no file".to_string())
         })?;
+        // The agent may have swapped the file since the daemon checked it.
+        editor::recheck_file(&abs)?;
         match launch {
             editor::Launch::Url(url) => tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string()),
             editor::Launch::Open(args) => {

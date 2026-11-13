@@ -19,6 +19,18 @@
 //!
 //! `/usr/bin/open` runs with a cleared environment (PATH only). `$EDITOR` is never read: it
 //! is a terminal program and could be anything.
+//!
+//! The daemon's check and the open are two steps: the agent could swap the file between
+//! them. Right before anything is launched, the path is looked at again
+//! ([`recheck_file`]): still a regular file, reached through no symlink. A folder is never
+//! handed over: Xcode opens a `.xcodeproj` folder as a project, Zed or Sublime a folder
+//! as a workspace, with whatever settings and tasks the agent put in it.
+//!
+//! VS Code and Cursor open a `vscode://file/…` path in a window; a file is not a trusted
+//! folder by that, so their Workspace Trust (Restricted Mode for a folder they do not
+//! know yet: no tasks, no debug configurations, no workspace settings that run code) still
+//! applies when the person later opens the worktree as a folder. Keep
+//! `security.workspace.trust.enabled` on: Mirante cannot check it.
 use std::path::{Path, PathBuf};
 
 /// An editor the person may pick (the webview sends its id).
@@ -136,21 +148,36 @@ pub fn launch_for(editor: Editor, abs: &str, line: Option<u32>) -> Result<Launch
 
 /// The whole decision, given how to ask the daemon for the file's checked absolute path
 /// (`stat`: task, relative path → abs). The editor and the path are checked before the
-/// daemon is asked; its answer is checked again before anything is launched.
+/// daemon is asked; its answer is checked again before anything is launched. Returns the
+/// launch and the file's path, for [`recheck_file`] right before the launch.
 pub fn plan(
     editor: &str,
     task: &str,
     path: &str,
     line: Option<u32>,
     stat: impl FnOnce(&str, &str) -> Result<String, String>,
-) -> Result<Launch, String> {
+) -> Result<(Launch, PathBuf), String> {
     let editor = Editor::parse(editor).ok_or_else(|| format!("unknown editor {editor:?}"))?;
     if task.is_empty() || task.len() > 200 || task.chars().any(char::is_control) {
         return Err("no such task".into());
     }
     checked_rel(path)?;
     let abs = stat(task, path)?;
-    launch_for(editor, &abs, line)
+    let launch = launch_for(editor, &abs, line)?;
+    Ok((launch, checked_abs(&abs)?))
+}
+
+/// Right before the launch: `abs` is still a regular file and no level of it is a symlink
+/// (its canonical path is itself). A folder, a link, a missing file: refused.
+pub fn recheck_file(abs: &Path) -> Result<(), String> {
+    let m = std::fs::symlink_metadata(abs).map_err(|e| format!("{}: {e}", abs.display()))?;
+    if !m.file_type().is_file() {
+        return Err(format!("{} is not a regular file any more: not opened", abs.display()));
+    }
+    match std::fs::canonicalize(abs) {
+        Ok(c) if c == abs => Ok(()),
+        _ => Err(format!("{} is reached through a symlink now: not opened", abs.display())),
+    }
 }
 
 /// The editors installed here, in a stable order; the default text editor always.
@@ -218,11 +245,37 @@ mod tests {
             asked.push((t.to_string(), p.to_string()));
             Ok("/wt/src/a.rs".into())
         });
-        assert_eq!(r.unwrap(), Launch::Url("vscode://file/wt/src/a.rs:4".into()));
+        assert_eq!(r.unwrap().0, Launch::Url("vscode://file/wt/src/a.rs:4".into()));
         assert_eq!(asked, [("t1".to_string(), "src/a.rs".to_string())]);
         assert!(plan("vscode", "t1", "a.rs", None, |_, _| Ok("a.rs".into())).is_err());
         assert!(plan("vscode", "t1", "a.rs", None, |_, _| Err("no task t1".into())).unwrap_err().contains("no task"));
         assert!(plan("vscode", "t\n1", "a.rs", None, |_, _| panic!("never asked")).is_err());
+    }
+
+    /// Review M6: what the daemon checked is looked at again right before the launch.
+    #[test]
+    fn a_file_swapped_after_the_check_is_not_opened() {
+        let dir = std::env::temp_dir().join(format!("mirante-recheck-{}", std::process::id()));
+        let dir = {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::canonicalize(&dir).unwrap()
+        };
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "x").unwrap();
+        assert!(recheck_file(&file).is_ok());
+        // Swapped for a folder (an Xcode project, a workspace).
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        assert!(recheck_file(&file).unwrap_err().contains("not a regular file"));
+        std::fs::remove_dir(&file).unwrap();
+        // Swapped for a symlink, or reached through one.
+        std::fs::write(dir.join("real.rs"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.rs"), &file).unwrap();
+        assert!(recheck_file(&file).is_err());
+        std::os::unix::fs::symlink(&dir, dir.join("via")).unwrap();
+        assert!(recheck_file(&dir.join("via/real.rs")).unwrap_err().contains("symlink"));
+        assert!(recheck_file(&dir.join("gone.rs")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
