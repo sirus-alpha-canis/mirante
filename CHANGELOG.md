@@ -20,6 +20,50 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ### Added
 
+- **Threads, fan-out and side panels** (`docs/plans/2026-11-12-threads-fanout-side-panels.md`;
+  checklist and results in `docs/dogfood/threads.md`).
+  - **A side pane in a task's Detail** (⌘\\, resizable, remembered per task): a worktree file
+    (highlighted by Mirante's own small highlighter; Markdown as a safe preview where raw HTML
+    stays text and only GitHub/localhost links open), the Diff, Steps, another task's terminal
+    or diff, a memory note, a skill, one of Claude's own agents, a thread's notes. **⌘P**
+    quick-opens the task's files; paths in Read/Edit steps and ⌘-click on `path:line` or an
+    OSC 8 `file://` link in the terminal open there (Claude runs with `FORCE_HYPERLINK=1`).
+    **Open in editor**: VS Code or Cursor at the line, Zed, Sublime Text or Xcode (those
+    installed), or the default text editor. Files are read by the daemon only (`task.files`,
+    `task.file`, person-only): no symlink, no `.git`, capped, images by magic bytes (never
+    SVG), `.env` and keys behind Reveal. The webview's capabilities and CSP are unchanged.
+  - **Fan-out groups.** `@claude @codex <goal>` or `@claude ×3 <goal>` compares agents on one
+    goal; a goal with bullets offers "Fan out to N". A group is a lightweight row (no
+    worktree, no session) with up to 8 children named `<prefix>--<n>-<agent|slug>`; Home folds
+    it into one row, ⌘J and notifications group it, and each member shows its siblings
+    (status, last answer, diff stat, Steer, Terminal and Diff in the pane, permission cards).
+    **Synthesize…** previews the siblings' answers fenced as data and sends them to a new task
+    or into a child only if they did not change meanwhile. Archive is all or nothing. CLI:
+    `mirante fanout <repo> --agents a,b <goal>`, `mirante group <g>`, `mirante group archive
+    <g>`, `mirante new … --group <g>`. Store migration 0011.
+  - **Claude's own agents, read-only.** A Claude task's Detail lists the subagents Claude starts
+    (type, description, running/done, tool calls, latest text) from its hooks
+    (`SubagentStart` now included) and side transcripts; a subagent's permission card says
+    "from subagent <type>". Nothing steers them.
+  - **Threads.** "New thread from this" on a message or answer makes a task bound to a PR,
+    issue, branch or that message, with its own conversation, worktree (from the parent's
+    branch) and notes (8 KiB, redacted). The notes and link reach the agent in the
+    conversation as a fenced `<mirante-thread>` block: at start, after a resume, and once
+    after each edit. A queued message is moved, a delivered one copied. The parent shows one
+    compact card per thread; a second thread on the same object is refused, naming the open
+    one. Summaries: Mirante's own (status, last answer, diff stat), or, only on a click and
+    only when Settings → Thread summaries is `claude`, your Claude CLI run tool-less (no
+    tools, MCP, hooks or settings; checked once per Claude binary; about $0.01). Codex is not
+    offered. No CLI for threads yet. Store migrations 0012 and 0014.
+  - **Agents may propose sub-tasks; a person decides each one.** Off by default per task
+    (Detail's Orchestration switch or `mirante spawn on <task>`, from the next session). The
+    agent gets `mirante-orchestrator` (`task_spawn`, always asked by Claude; `task_children`
+    and `task_result`, read-only, other agents' text wrapped as data). Each proposal is a card
+    (Edit, Create child, Reject; or `mirante spawn ls|accept|reject`, which needs the typed word
+    at a terminal and refuses an agent's environment). A child starts in manual mode, one
+    level deep, its goal never mined. No budget: nothing is created without you. Store
+    migration 0013.
+
 - **Tasks across several repositories of a folder.** A folder added to Projects (a group,
   e.g. "gol (25)") is now a dispatch target: its row in the Repository picker, or
   `@claude gol <goal>`. A checklist under the field picks the repositories the task may
@@ -32,6 +76,12 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
   removes every worktree or refuses naming each dirty one. Repositories of different
   clients get no skills and no repo memory. CLI: `mirante new <folder> --repos a,b` or
   `--all`; `mirante ls` shows "(gol: Site-B2C, bff-flight)". Store migration 0010.
+  The folder is the agent's working directory, so Mirante never follows a `<repo>` swapped
+  for a symlink (reads, diffs, archive and removal refuse it), refuses `/`, your home or a
+  folder holding Mirante's own as a projects folder, gives Claude one read rule per
+  read-only repo of the task's client (none when the clients are mixed) with `.env`, keys
+  and `.git` denied, and puts back the text it wrote in `MIRANTE_WORKSPACE.md`/`AGENTS.md`/
+  `CLAUDE.md` at each session start (migration 0014).
 
 - **`mirante daemon install-agent` / `uninstall-agent` (macOS).** An opt-in per-user
   LaunchAgent, `com.mirante.daemon` (`~/Library/LaunchAgents`): launchd starts the daemon at
