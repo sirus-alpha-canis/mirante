@@ -20,6 +20,12 @@
 //! - Side-agent events (`agent_id` present, `SubagentStart`/`SubagentStop`; transcript
 //!   `isSidechain` / `agentId` / `parentToolUseID`) never open or close a turn. A side
 //!   agent's `PermissionRequest` still means `NeedsYou`: its dialog blocks the session.
+//!   Background agents (Claude's default, FINDINGS-threads S1) outlive the main turn: the
+//!   dialog of an agent between its `SubagentStart` and `SubagentStop` survives the main
+//!   turn's end, and that agent's `SubagentStop` clears it.
+//! - A `<task-notification>` (a background agent finished) starts a main-agent turn in both
+//!   sources: its `UserPromptSubmit` and its transcript line (`origin.kind`
+//!   `task-notification`). It is Claude resuming on its own, not the person's prompt.
 //! - A permission dialog is cleared only by the asking agent's `PostToolUse` or
 //!   `PostToolUseFailure` (matched by `tool_use_id` when both carry one), by
 //!   [`Input::PermissionAnswered`], or by the turn end. `PreToolUse` never clears it:
@@ -35,7 +41,7 @@
 //!   `<local-command-stdout>` / `-stderr>` line; any `SessionStart`; a turn end, a prompt,
 //!   the idle `Notification`). Each source writes its start before its end, so whatever the
 //!   interleaving, the last marker delivered is an end.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -91,6 +97,8 @@ impl Pending {
 
 /// How many recent turns of each source the engine remembers for alignment.
 const HISTORY: usize = 8;
+/// Most side agents the engine tracks as running at once.
+const MAX_SIDE_AGENTS: usize = 64;
 
 /// A `UserPromptSubmit` that arrived while the hook stream was inside a turn. It is a steer
 /// (absorbed at the next tool boundary), a queued prompt (run as the next turn), or, when
@@ -220,6 +228,9 @@ pub struct StatusEngine {
     t_closed: VecDeque<TxTurn>,
     /// A compaction runs (see the module rules): `Working` even with no turn open.
     compacting: bool,
+    /// Side agents between their `SubagentStart` and `SubagentStop` (or seen asking after
+    /// the main turn): background agents outlive the main turn, and so do their dialogs.
+    side_running: HashSet<String>,
 }
 
 impl Default for StatusEngine {
@@ -248,6 +259,7 @@ impl StatusEngine {
             t_command: false,
             t_closed: VecDeque::new(),
             compacting: false,
+            side_running: HashSet::new(),
         }
     }
 
@@ -303,7 +315,9 @@ impl StatusEngine {
     /// then `NeedsYou` while a dialog is open, else `Working` inside a turn, else `Idle`.
     fn settle(&mut self, was_open: bool, cause: String) -> Option<Transition> {
         if was_open && !self.turn_open() {
-            self.pending.clear();
+            // A running background agent's dialog is still on screen (S1).
+            let running = &self.side_running;
+            self.pending.retain(|p| p.agent.as_ref().is_some_and(|a| running.contains(a)));
         }
         let to = if !self.pending.is_empty() {
             Status::NeedsYou
@@ -325,6 +339,7 @@ impl StatusEngine {
         self.main_dialog = false;
         self.compacting = false;
         self.pending.clear();
+        self.side_running.clear();
     }
 
     /// A new process or a cleared context: nothing from before can still be in flight.
@@ -463,7 +478,32 @@ impl StatusEngine {
             // The main agent's dialog in a turn the transcript already closed: it was
             // answered before this delivery came in.
             "PermissionRequest" if !side && self.hook_turn_open() && self.tx_closed(self.h_turn).is_some() => None,
+            "SubagentStart" => {
+                if let Some(a) = &ev.agent_id {
+                    if self.side_running.len() < MAX_SIDE_AGENTS {
+                        self.side_running.insert(a.clone());
+                    }
+                }
+                None
+            }
+            // That agent is gone, and its dialog (if any) with it.
+            "SubagentStop" => {
+                if let Some(a) = &ev.agent_id {
+                    self.side_running.remove(a);
+                    self.pending.retain(|p| p.agent.as_deref() != Some(a.as_str()));
+                    if self.pending.iter().all(|p| p.agent.is_some()) {
+                        self.main_dialog = false;
+                    }
+                }
+                self.settle(was_open, cause)
+            }
             "PermissionRequest" => {
+                // A side agent asking while no main turn runs is a background one.
+                if let Some(a) = ev.agent_id.as_ref().filter(|_| !was_open) {
+                    if self.side_running.len() < MAX_SIDE_AGENTS {
+                        self.side_running.insert(a.clone());
+                    }
+                }
                 // Some payloads lack `tool_use_id`: borrow it from the latest PreToolUse of
                 // the same agent and tool, so a parallel tool finishing is not the answer.
                 let tool_use_id = self.tool_use_id_for(ev);
@@ -633,10 +673,12 @@ impl StatusEngine {
                 let kind = if start { "compact" } else { v["subtype"].as_str().unwrap_or("local_command") };
                 return self.settle(was_open, format!("transcript:{kind}"));
             }
-            None if is_prompt(v) || turn_end_kind(v).is_some() => self.compacting = false,
+            None if is_prompt(v) || is_task_notification_line(v) || turn_end_kind(v).is_some() => {
+                self.compacting = false
+            }
             None => {}
         }
-        if is_prompt(v) {
+        if is_prompt(v) || is_task_notification_line(v) {
             if self.t_open {
                 return None;
             }
@@ -905,6 +947,20 @@ pub fn is_prompt(v: &Value) -> bool {
         && !first_text(&v["message"]["content"]).is_some_and(is_local_command_text)
 }
 
+/// A `UserPromptSubmit` prompt that is Claude Code's own `<task-notification>`: a
+/// background agent finished and the main agent resumes on its own (S1). Not the person's
+/// words: never shown as theirs, mined or labelled as the operator's.
+pub fn is_task_notification(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("<task-notification>")
+}
+
+/// The main-chain user line Claude Code writes for a `<task-notification>` (2.1.285:
+/// `promptSource: "system"`, `origin.kind: "task-notification"`). It starts a turn of the
+/// main agent, as its `UserPromptSubmit` hook does, so both sources count it.
+pub fn is_task_notification_line(v: &Value) -> bool {
+    v["type"] == "user" && v["isMeta"] != true && !is_sidechain(v) && v["origin"]["kind"] == "task-notification"
+}
+
 /// The user line a model-running slash command writes in place of a prompt
 /// (`<command-message>review is running…</command-message><command-name>/review…`). A local
 /// command may write the same shape (older versions), so the line alone opens no turn.
@@ -982,6 +1038,93 @@ mod tests {
     }
     fn statuses(e: &mut StatusEngine, inputs: &[Input]) -> Vec<Status> {
         e.apply_all(inputs).into_iter().map(|t| t.to).collect()
+    }
+
+    fn side_of(name: &str, agent: &str) -> Input {
+        Input::Hook(HookEvent {
+            agent_id: Some(agent.into()),
+            agent_type: Some("general-purpose".into()),
+            tool_name: Some("Bash".into()),
+            ..HookEvent::named(name)
+        })
+    }
+    fn prompt_hook(text: &str) -> Input {
+        Input::Hook(HookEvent { prompt: Some(text.into()), ..HookEvent::named("UserPromptSubmit") })
+    }
+    fn notification_line() -> Input {
+        Input::Transcript(serde_json::json!({
+            "type": "user", "isSidechain": false, "promptSource": "system",
+            "origin": {"kind": "task-notification", "producer": "session-task"},
+            "message": {"role": "user", "content": "<task-notification>\n<task-id>a-1</task-id>\n<status>completed</status>\n</task-notification>"}
+        }))
+    }
+    fn summary_line() -> Input {
+        Input::Transcript(serde_json::json!({"type": "system", "subtype": "stop_hook_summary"}))
+    }
+
+    /// S1: background agents outlive the main turn. One that asks for permission after the
+    /// main `Stop` keeps the task `NeedsYou` through the main agent's next turns (each
+    /// started by a `<task-notification>`), until its own tool runs or it stops.
+    #[test]
+    fn a_background_agent_s_dialog_outlives_the_main_turns() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[
+            hook("SessionStart"),
+            prompt_hook("use 2 agents"),
+            side_of("SubagentStart", "a-1"),
+            side_of("SubagentStart", "a-2"),
+            hook("Stop"),
+        ]);
+        assert_eq!(e.status(), Status::Idle);
+        e.apply(&side_of("PermissionRequest", "a-1"));
+        assert_eq!(e.status(), Status::NeedsYou);
+        // a-2 finishes: Claude resumes on its own and ends that turn.
+        e.apply_all(&[
+            side_of("SubagentStop", "a-2"),
+            notification_line(),
+            prompt_hook("<task-notification>\n<task-id>a-2</task-id>"),
+            summary_line(),
+            hook("Stop"),
+        ]);
+        assert_eq!(e.status(), Status::NeedsYou, "the background dialog is still on screen");
+        assert_eq!(e.pending_dialogs(), 1);
+        // a-1 stops (denied in the terminal): its dialog is gone with it.
+        e.apply(&side_of("SubagentStop", "a-1"));
+        assert_eq!(e.status(), Status::Idle);
+        assert_eq!(e.pending_dialogs(), 0);
+    }
+
+    /// Without `SubagentStart` (an older Claude) a side dialog still dies with the turn.
+    #[test]
+    fn a_side_dialog_of_an_unknown_agent_dies_with_the_turn() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[hook("SessionStart"), prompt_hook("go"), side_of("PermissionRequest", "a-9"), hook("Stop")]);
+        assert_eq!(e.status(), Status::Idle);
+    }
+
+    /// The `<task-notification>` prompt line opens a transcript turn, as its hook does: both
+    /// sources keep counting the same turns.
+    #[test]
+    fn a_task_notification_is_a_turn_in_both_sources() {
+        let mut e = StatusEngine::new();
+        let first =
+            Input::Transcript(serde_json::json!({"type": "user", "promptSource": "sdk", "message": {"content": "go"}}));
+        e.apply_all(&[hook("SessionStart"), first, prompt_hook("go"), summary_line(), hook("Stop")]);
+        for (n, id) in [(2, "a-1"), (3, "a-2")] {
+            e.apply_all(&[notification_line(), prompt_hook(&format!("<task-notification>\n<task-id>{id}</task-id>"))]);
+            assert_eq!(e.status(), Status::Working);
+            assert_eq!((e.h_turn, e.t_turn), (n, n), "the transcript counts the notification turns too");
+            e.apply_all(&[summary_line(), hook("Stop")]);
+            assert_eq!(e.status(), Status::Idle);
+        }
+    }
+
+    #[test]
+    fn task_notification_prompts_are_recognized() {
+        assert!(is_task_notification("<task-notification>\n<task-id>x</task-id>"));
+        assert!(is_task_notification("  <task-notification>"));
+        assert!(!is_task_notification("please read <task-notification>"));
+        assert!(!is_task_notification("hello"));
     }
 
     #[test]

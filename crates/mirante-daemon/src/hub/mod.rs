@@ -35,6 +35,7 @@ pub mod resume;
 pub mod rules;
 pub mod session;
 pub mod skills;
+pub mod subagents;
 
 pub type Result<T> = std::result::Result<T, HubError>;
 pub type EventRx = mpsc::Receiver<(String, DriverEvent)>;
@@ -197,6 +198,10 @@ pub(crate) struct Live {
     /// exit, which the pump thread may apply before the caller ends the session itself,
     /// then records this cause instead of `mirante:process_exited`.
     pub(crate) ending: Option<&'static str>,
+    /// Claude: its own agents (subagents) in this session, by `agent_id` (at most
+    /// [`subagents::MAX_LANES`]). Read-only lanes; dropped with the session (their
+    /// `subagent.*` events stay).
+    pub(crate) subagents: std::collections::BTreeMap<String, subagents::Lane>,
 }
 
 /// Events queued per subscriber. One that falls this far behind is dropped (its stream
@@ -299,6 +304,7 @@ impl Live {
             saw_session_start: false,
             attach_recorded: false,
             ending: None,
+            subagents: std::collections::BTreeMap::new(),
         }
     }
 }

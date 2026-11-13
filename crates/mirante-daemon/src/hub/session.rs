@@ -107,7 +107,8 @@ pub(crate) fn compact(line: &Value) -> Option<Value> {
 /// `{type: "tool", tool, summary, ok, agent}`. `summary` is what the tool worked on (command,
 /// path, pattern, URL, description; at most 200 chars, credentials [`redact`]ed); a side
 /// agent's prompt is never one. `tool` and `agent` (a side agent's type, else null) are at
-/// most 64 chars. Claude has no other step source: Codex steps come from its driver.
+/// most 64 chars; `agent_id` names which of Claude's own agents ran it (its lane), null for
+/// the main agent. Claude has no other step source: Codex steps come from its driver.
 pub(crate) fn tool_step(ev: &HookEvent) -> Option<Value> {
     let ok = match ev.hook_event_name.as_str() {
         "PostToolUse" => true,
@@ -122,7 +123,8 @@ pub(crate) fn tool_step(ev: &HookEvent) -> Option<Value> {
         .unwrap_or("");
     let summary = cap(&redact(summary), 200);
     let agent = ev.agent_type.as_deref().map(|a| cap(a, 64));
-    Some(json!({ "type": "tool", "tool": tool, "summary": summary, "ok": ok, "agent": agent }))
+    let agent_id = ev.agent_id.as_deref().filter(|a| super::subagents::valid_agent_id(a));
+    Some(json!({ "type": "tool", "tool": tool, "summary": summary, "ok": ok, "agent": agent, "agent_id": agent_id }))
 }
 
 /// What a Claude permission mode lets the agent approve on its own: `commands` (auto,
@@ -1021,8 +1023,11 @@ impl State {
         if let Some(mode) = ev.permission_mode.as_deref().filter(|m| !m.is_empty()) {
             st.observe_mode(&p.task, &session_id, mode, "hook")?;
         }
-        if ev.hook_event_name == "PermissionRequest" {
-            st.open_card(&p.task, &session_id, &ev)?;
+        let card =
+            if ev.hook_event_name == "PermissionRequest" { st.open_card(&p.task, &session_id, &ev)? } else { None };
+        // Claude's own agents: read-only lanes (cosmetic: a failure must not fail the hook).
+        if let Err(e) = st.observe_subagent(&p.task, &ev, &p.payload, card.as_deref()) {
+            eprintln!("mirante-daemon: task {}: subagent lane: {e}", p.task);
         }
         // A tool that failed still ran: its dialog was allowed.
         let tool_ran = matches!(ev.hook_event_name.as_str(), "PostToolUse" | "PostToolUseFailure");
@@ -1125,9 +1130,9 @@ impl State {
     /// (the main one, or a side agent by `agent_id`) never has two dialogs open: its older
     /// pending cards are settled as superseded (`permission_superseded`, recorded denied),
     /// so Mirante never answers a dialog that is no longer the one on screen.
-    fn open_card(&mut self, task_id: &str, session_id: &str, ev: &HookEvent) -> Result<()> {
+    fn open_card(&mut self, task_id: &str, session_id: &str, ev: &HookEvent) -> Result<Option<String>> {
         let Some(l) = self.live.get(task_id) else {
-            return Ok(());
+            return Ok(None);
         };
         let description = ev
             .tool_input
@@ -1145,7 +1150,7 @@ impl State {
             hook_lost: mirante_ipc::hookloss::fingerprint(&self.paths),
         };
         if key.tool_use_id.is_some() && l.dialogs.values().any(|k| k.same_dialog(&key)) {
-            return Ok(());
+            return Ok(None);
         }
         let older: Vec<String> = self
             .store
@@ -1164,11 +1169,12 @@ impl State {
             let payload = json!({ "permission_id": id, "by": card.id, "agent_id": key.agent });
             self.event(Some(task_id), "permission_superseded", payload)?;
         }
+        let id = card.id.clone();
         if let Some(l) = self.live.get_mut(task_id) {
             l.dialogs.insert(card.id, key);
             l.card_gen.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(())
+        Ok(Some(id))
     }
 
     /// Starts tailing a transcript the first time a hook names it. A file that already
@@ -1340,7 +1346,8 @@ mod tests {
         let bash = json!({"command": "cargo test"});
         k.hook(&t.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": bash}));
         let edit = json!({"file_path": "/w/src/lib.rs"});
-        let failed = json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Edit", "tool_input": edit, "agent_type": "Explore"});
+        let failed = json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Edit", "tool_input": edit,
+            "agent_type": "Explore", "agent_id": "a7386d060a40b63d6"});
         k.hook(&t.id, failed);
         k.hook(
             &t.id,
@@ -1351,8 +1358,9 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                json!({"type": "tool", "tool": "Bash", "summary": "cargo test", "ok": true, "agent": null}),
-                json!({"type": "tool", "tool": "Edit", "summary": "/w/src/lib.rs", "ok": false, "agent": "Explore"}),
+                json!({"type": "tool", "tool": "Bash", "summary": "cargo test", "ok": true, "agent": null, "agent_id": null}),
+                json!({"type": "tool", "tool": "Edit", "summary": "/w/src/lib.rs", "ok": false, "agent": "Explore",
+                    "agent_id": "a7386d060a40b63d6"}),
             ]
         );
     }

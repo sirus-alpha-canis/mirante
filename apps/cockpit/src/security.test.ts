@@ -226,6 +226,7 @@ describe("Tauri security baseline", () => {
       "REPO_FILES",
       "TASK_FILES",
       "TASK_FILE",
+      "TASK_SUBAGENTS",
       "GROUP_CREATE",
       "GROUP_GET",
       "GROUP_ARCHIVE",

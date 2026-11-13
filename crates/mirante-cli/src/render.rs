@@ -444,7 +444,11 @@ pub fn perms_table(perms: &[PermissionView]) -> String {
             fit(short(&p.request.id), 8),
             fit(&p.branch, 22),
             fit(&p.request.tool, 10),
-            p.request.detail.lines().next().unwrap_or("")
+            match &p.subagent {
+                // One of Claude's own agents asked, not the task's main agent.
+                Some(a) => format!("{}  (from subagent {a})", p.request.detail.lines().next().unwrap_or("")),
+                None => p.request.detail.lines().next().unwrap_or("").to_string(),
+            }
         ));
     }
     out.push_str("answer once: mirante allow <perm> | mirante deny <perm>\n");
@@ -965,7 +969,10 @@ mod tests {
             },
             task_title: "T".into(),
             branch: "feat".into(),
+            subagent: None,
         };
+        let from = PermissionView { subagent: Some("Explore".into()), ..p.clone() };
+        assert!(perms_table(&[from]).contains("rm -rf build  (from subagent Explore)"));
         let t = perms_table(&[p]);
         assert!(t.contains("abcdef12") && t.contains("rm -rf build") && !t.contains("second line"));
         assert!(t.contains("mirante allow <perm>"));

@@ -194,6 +194,18 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
         method::GROUP_SYNTHESIZE => {
             Ok(json!({"text": "Operator request: synthesize (fake daemon).", "expect": "fake"}))
         }
+        method::TASK_SUBAGENTS => {
+            let now =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+            Ok(json!([
+                {"id": "a7386d060a40b63d6", "agent_type": "Explore", "description": "Find the login handlers",
+                 "status": "done", "started_ms": now - 95_000, "ended_ms": now - 60_000, "tools": 7,
+                 "last_text": "The login flow lives in src/login.rs and src/session.rs.", "permissions": [], "pending": 0},
+                {"id": "a9ef71ae0212bb123", "agent_type": "general-purpose", "description": "Run the test suite",
+                 "status": "running", "started_ms": now - 40_000, "tools": 2,
+                 "last_text": "Running cargo test…", "permissions": [], "pending": 0}
+            ]))
+        }
         _ => Ok(json!({})),
     }
 }

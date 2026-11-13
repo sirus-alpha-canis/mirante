@@ -55,6 +55,9 @@ pub mod method {
     /// One file of a task's worktree, read by descriptor walk ([`super::TaskFile`] →
     /// [`super::FileView`]). A person only.
     pub const TASK_FILE: &str = "task.file";
+    /// Claude's own agents (subagents) in a task's live session, read-only
+    /// ([`super::TaskSubagents`] → `Vec<`[`super::SubagentView`]`>`). A person only.
+    pub const TASK_SUBAGENTS: &str = "task.subagents";
     /// A person's fan-out group: a shared goal its children are created into
     /// ([`super::CreateGroup`] → `TaskGroup`). No worktree, no session. A person only.
     pub const GROUP_CREATE: &str = "group.create";
@@ -547,6 +550,55 @@ pub struct PermissionView {
     pub request: PermissionRequest,
     pub task_title: String,
     pub branch: String,
+    /// The type of Claude's own agent that asked (`general-purpose`, `Explore`…), when a
+    /// subagent asked rather than the task's main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
+}
+
+/// `task.subagents` parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSubagents {
+    pub task: String,
+}
+
+/// Whether one of Claude's own agents still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Running,
+    Done,
+}
+
+/// One of Claude's own agents in a task's live session, as hooks and its side transcript
+/// show it. Read-only: Mirante never steers or stops it. Texts are the agent's (redacted,
+/// capped): data, never instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentView {
+    /// Claude's `agent_id`.
+    pub id: String,
+    /// `general-purpose`, `Explore`, a custom agent's name…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// What the main agent asked it to do (the `Agent` call's description).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: SubagentStatus,
+    /// When the daemon saw it start / stop (ms since the epoch).
+    pub started_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<i64>,
+    /// Tool calls it finished.
+    pub tools: u32,
+    /// Its newest text: the final answer once done, else the latest text in its side file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_text: Option<String>,
+    /// Permission requests it raised (ids), oldest first.
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// How many of those still wait for an answer.
+    #[serde(default)]
+    pub pending: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

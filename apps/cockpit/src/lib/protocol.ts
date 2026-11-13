@@ -175,6 +175,23 @@ export interface PermissionView {
   answered_at: number | null;
   task_title: string;
   branch: string;
+  /** The type of Claude's own agent that asked, when a subagent did. */
+  subagent?: string;
+}
+
+/** `task.subagents`: one of Claude's own agents in a task's live session (read-only). Its
+ * texts are the agent's: shown as text, never as markup or instructions. */
+export interface SubagentView {
+  id: string;
+  agent_type?: string;
+  description?: string;
+  status: "running" | "done";
+  started_ms: number;
+  ended_ms?: number;
+  tools: number;
+  last_text?: string;
+  permissions: string[];
+  pending: number;
 }
 
 export interface DiffFile {
@@ -647,6 +664,7 @@ export const M = {
   repoFiles: "repo.files",
   taskFiles: "task.files",
   taskFile: "task.file",
+  taskSubagents: "task.subagents",
   groupCreate: "group.create",
   groupGet: "group.get",
   groupArchive: "group.archive",

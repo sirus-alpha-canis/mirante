@@ -171,7 +171,13 @@ impl Hub {
                 continue;
             }
             for p in st.store.pending_permissions(&t.id)? {
-                out.push(PermissionView { request: p, task_title: t.title.clone(), branch: t.branch.clone() });
+                let subagent = st.subagent_of_card(&t.id, &p.id);
+                out.push(PermissionView {
+                    request: p,
+                    task_title: t.title.clone(),
+                    branch: t.branch.clone(),
+                    subagent,
+                });
             }
         }
         Ok(out)

@@ -56,12 +56,15 @@ pub const AGENT_TERM_ENV: [(&str, &str); 4] =
 /// Hook events registered without a matcher, and tool events registered with `"*"`.
 /// `StopFailure` (a turn ended by an API error) and `PostToolUseFailure` (a tool call that
 /// failed) are forwarded like the rest; the status engine ignores names it does not know.
-pub const PLAIN_EVENTS: [&str; 8] = [
+/// `SubagentStart` / `SubagentStop` open and close the read-only lane of one of Claude's
+/// own agents (FINDINGS-threads S1, Claude 2.1.285).
+pub const PLAIN_EVENTS: [&str; 9] = [
     "SessionStart",
     "UserPromptSubmit",
     "Notification",
     "Stop",
     "StopFailure",
+    "SubagentStart",
     "SubagentStop",
     "SessionEnd",
     "PreCompact",
@@ -399,6 +402,7 @@ mod tests {
         assert_eq!(s["hooks"]["PostToolUseFailure"][0]["matcher"], "*");
         assert!(s["hooks"]["StopFailure"][0].get("matcher").is_none());
         assert!(s["hooks"]["Stop"][0].get("matcher").is_none());
+        assert!(s["hooks"]["SubagentStart"][0].get("matcher").is_none());
         assert_eq!(s["permissions"]["allow"], json!(["Bash(cargo test:*)"]));
         assert!(s["permissions"].get("defaultMode").is_none());
     }

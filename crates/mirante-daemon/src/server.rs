@@ -338,6 +338,7 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::REPO_FILES => out(hub.repo_files(&params(p)?)),
         method::TASK_FILES => out(hub.task_files(&params(p)?)),
         method::TASK_FILE => out(hub.task_file(&params(p)?)),
+        method::TASK_SUBAGENTS => out(hub.task_subagents(&params(p)?)),
         method::GROUP_CREATE => out(hub.create_group(params(p)?)),
         method::GROUP_GET => out(hub.group_get(&params::<GroupRef>(p)?.group)),
         method::GROUP_ARCHIVE => out(hub.group_archive(&params::<GroupRef>(p)?.group)),

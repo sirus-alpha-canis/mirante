@@ -73,6 +73,9 @@ pub const ACCESS: &[(&str, Access)] = &[
     // A task's worktree files and their contents (the cockpit's side pane): never an agent's.
     (method::TASK_FILES, Access::Person),
     (method::TASK_FILE, Access::Person),
+    // Claude's own agents in a task (their texts, read from side transcripts): never an
+    // agent's, not even for its own task.
+    (method::TASK_SUBAGENTS, Access::Person),
     // Fan-out groups: made, read, archived and synthesized by a person only.
     (method::GROUP_CREATE, Access::Person),
     (method::GROUP_GET, Access::Person),

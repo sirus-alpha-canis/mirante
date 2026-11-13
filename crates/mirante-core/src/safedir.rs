@@ -359,6 +359,36 @@ impl SafeDir {
         Ok(bytes)
     }
 
+    /// The last `max` bytes of the file `name` (all of it when smaller), with the same
+    /// checks as [`SafeDir::read_bytes`]: a regular file with a single link on this
+    /// directory's device, never through a symlink. `true` when the start was cut (the first
+    /// line returned may be partial). For an append-only log that keeps growing.
+    pub fn read_tail(&self, name: &str, max: usize) -> Result<(Vec<u8>, bool)> {
+        use std::io::{Seek, SeekFrom};
+        let shown = self.shown(name);
+        let c = cname(name)?;
+        let mut f = match open_at(self.raw(), &c, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0) {
+            Ok(fd) => File::from(fd),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(unsafe_at(&shown, "is a symlink")),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(SafeError::Missing(shown)),
+            Err(e) => return Err(e.into()),
+        };
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(unsafe_at(&shown, "is not a regular file"));
+        }
+        if meta.nlink() != 1 || meta.dev() != self.dev {
+            return Err(unsafe_at(&shown, "is a hard link to another file"));
+        }
+        let start = meta.len().saturating_sub(max as u64);
+        if start > 0 {
+            f.seek(SeekFrom::Start(start))?;
+        }
+        let mut bytes = Vec::with_capacity((meta.len() - start) as usize);
+        f.take(max as u64).read_to_end(&mut bytes)?;
+        Ok((bytes, start > 0))
+    }
+
     /// [`SafeDir::read_bytes`] as UTF-8 text.
     pub fn read_file(&self, name: &str, max: usize) -> Result<String> {
         let bytes = self.read_bytes(name, max)?;
@@ -577,6 +607,25 @@ mod tests {
         root.create_file("b", b"two", 0o600).unwrap();
         assert_eq!(root.read_file("b", 10).unwrap(), "two");
         assert!(matches!(root.read_file("b", 2), Err(SafeError::TooLarge(_, 2))));
+    }
+
+    #[test]
+    fn read_tail_reads_the_end_and_never_follows_links() {
+        let d = TempDir::new("safedir-tail");
+        let root = SafeDir::open(d.path(), &[]).unwrap().unwrap();
+        std::fs::write(d.path().join("log"), "line1\nline2\nline3\n").unwrap();
+        assert_eq!(root.read_tail("log", 100).unwrap(), (b"line1\nline2\nline3\n".to_vec(), false));
+        assert_eq!(root.read_tail("log", 8).unwrap(), (b"2\nline3\n".to_vec(), true));
+        let outside = TempDir::new("safedir-tail-out");
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), d.path().join("link")).unwrap();
+        assert!(matches!(root.read_tail("link", 8), Err(SafeError::Unsafe(_))));
+        std::fs::hard_link(outside.path().join("secret"), d.path().join("hard")).ok();
+        if d.path().join("hard").exists() {
+            assert!(matches!(root.read_tail("hard", 8), Err(SafeError::Unsafe(_))));
+        }
+        assert!(matches!(root.read_tail("missing", 8), Err(SafeError::Missing(_))));
+        assert!(root.read_tail("../log", 8).is_err());
     }
 
     #[test]

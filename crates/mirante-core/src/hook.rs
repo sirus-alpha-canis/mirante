@@ -43,6 +43,13 @@ pub struct HookEvent {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub agent_type: Option<String>,
+    /// `SubagentStop`: the side agent's own transcript (`<dir>/<session>/subagents/
+    /// agent-<id>.jsonl`). Checked against the expected path before any read.
+    #[serde(default)]
+    pub agent_transcript_path: Option<String>,
+    /// `Stop` / `SubagentStop`: the agent's final text.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 impl HookEvent {
@@ -132,6 +139,18 @@ mod tests {
     fn invalid_payload_is_an_error_not_an_empty_event() {
         assert!(HookEvent::parse("not json").is_err());
         assert!(HookEvent::parse(r#"{"session_id":"s1"}"#).is_err());
+    }
+
+    /// S1 (Claude 2.1.285): `SubagentStop` names the side file and carries the final text.
+    #[test]
+    fn subagent_stop_carries_its_side_file_and_final_text() {
+        let raw = r#"{"hook_event_name":"SubagentStop","agent_id":"a7386d060a40b63d6","agent_type":"general-purpose",
+            "agent_transcript_path":"/p/s/subagents/agent-a7386d060a40b63d6.jsonl","last_assistant_message":"done",
+            "background_tasks":[{"id":"x","status":"running"}]}"#;
+        let e = HookEvent::parse(raw).unwrap();
+        assert!(e.is_side_agent());
+        assert_eq!(e.agent_transcript_path.as_deref(), Some("/p/s/subagents/agent-a7386d060a40b63d6.jsonl"));
+        assert_eq!(e.last_assistant_message.as_deref(), Some("done"));
     }
 
     #[test]
