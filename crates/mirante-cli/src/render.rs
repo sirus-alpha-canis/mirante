@@ -292,6 +292,40 @@ fn note(v: &TaskView) -> String {
     state.into_iter().chain(v.usage.clone()).collect::<Vec<_>>().join(" · ")
 }
 
+/// Where a row of `mirante ls` sits.
+#[derive(Clone, Copy)]
+enum Nest {
+    Top,
+    /// A fan-out group's task, under the group's line.
+    Member,
+    /// A thread or spawned child, under its parent.
+    Child,
+}
+
+/// "thread PR #12 · ", "thread branch x · ", "spawn ": what a child task is, before its title.
+fn child_kind_label(v: &TaskView) -> Option<String> {
+    use mirante_core::model::ChildKind;
+    use mirante_core::threads::LinkKind;
+    match v.task.child_kind? {
+        ChildKind::Spawn => Some("spawn ".into()),
+        ChildKind::Thread => {
+            let what = v.thread.as_ref().map(|t| {
+                let num = || t.link.reference.rsplit_once('#').map_or(t.link.reference.as_str(), |(_, n)| n);
+                match t.link.kind {
+                    LinkKind::Pr => format!("PR #{}", line(num(), 20)),
+                    LinkKind::Issue => format!("issue #{}", line(num(), 20)),
+                    LinkKind::Branch => format!("branch {}", line(&t.link.reference, 60)),
+                    LinkKind::Message => "message".to_string(),
+                }
+            });
+            Some(match what {
+                Some(w) => format!("thread {w} · "),
+                None => "thread ".into(),
+            })
+        }
+    }
+}
+
 pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
     if tasks.is_empty() {
         return "no tasks (mirante new <repo> --agent claude|codex --branch <name> <goal>)\n".into();
@@ -309,17 +343,30 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         fit("Q", 2),
         "TITLE"
     );
-    // A fan-out group's tasks follow its header line, indented, where its first task is.
-    let mut rows: Vec<(&TaskView, bool)> = Vec::new();
+    // A fan-out group's tasks follow its header line, indented, where its first task is; a
+    // task's threads and spawned children follow it, indented (when it is listed).
+    let listed: Vec<&str> = tasks.iter().map(|v| v.task.id.as_str()).collect();
+    let under_parent = |v: &TaskView| v.task.parent_id.as_deref().is_some_and(|p| listed.contains(&p));
+    let children_of =
+        |id: &str| -> Vec<&TaskView> { tasks.iter().filter(|c| c.task.parent_id.as_deref() == Some(id)).collect() };
+    let mut rows: Vec<(&TaskView, Nest)> = Vec::new();
     let mut shown: Vec<&str> = Vec::new();
     let mut headers: Vec<(usize, String)> = Vec::new();
     for v in tasks {
+        if under_parent(v) {
+            continue;
+        }
         match &v.group {
-            None => rows.push((v, false)),
+            None => {
+                rows.push((v, Nest::Top));
+                rows.extend(children_of(&v.task.id).into_iter().map(|c| (c, Nest::Child)));
+            }
             Some(g) if !shown.contains(&g.id.as_str()) => {
                 shown.push(&g.id);
-                let members: Vec<&TaskView> =
-                    tasks.iter().filter(|t| t.group.as_ref().is_some_and(|x| x.id == g.id)).collect();
+                let members: Vec<&TaskView> = tasks
+                    .iter()
+                    .filter(|t| t.group.as_ref().is_some_and(|x| x.id == g.id) && !under_parent(t))
+                    .collect();
                 let kind = match g.kind {
                     mirante_core::model::GroupKind::Compare => "compare",
                     mirante_core::model::GroupKind::Fanout => "fan-out",
@@ -328,12 +375,15 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
                     rows.len(),
                     format!("group {}  {kind} · {} task(s) · {}\n", short(&g.id), members.len(), line(&g.title, 80)),
                 ));
-                rows.extend(members.into_iter().map(|m| (m, true)));
+                for m in members {
+                    rows.push((m, Nest::Member));
+                    rows.extend(children_of(&m.task.id).into_iter().map(|c| (c, Nest::Child)));
+                }
             }
             Some(_) => {}
         }
     }
-    for (i, (v, nested)) in rows.into_iter().enumerate() {
+    for (i, (v, nest)) in rows.into_iter().enumerate() {
         if let Some((_, h)) = headers.iter().find(|(at, _)| *at == i) {
             out.push_str(h);
         }
@@ -344,8 +394,13 @@ pub fn tasks_table(tasks: &[TaskView], color: bool) -> String {
         if let Some(r) = repos_cell(v) {
             title = format!("{title}  ({r})");
         }
-        if nested {
-            title = format!("↳ {title}");
+        if let Some(kind) = child_kind_label(v) {
+            title = format!("{kind}{title}");
+        }
+        match nest {
+            Nest::Member => title = format!("↳ {title}"),
+            Nest::Child => title = format!("  └ {title}"),
+            Nest::Top => {}
         }
         out.push_str(&format!(
             "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
@@ -868,6 +923,51 @@ mod tests {
             d.contains("    bff-flight: /m/worktrees/_workspaces/login/bff-flight (from /src/gol/bff-flight)"),
             "{d}"
         );
+    }
+
+    /// Dogfood finding 3: a parent's threads and spawned children sit under it.
+    #[test]
+    fn threads_and_spawned_children_sit_under_their_parent() {
+        use mirante_core::model::ChildKind;
+        use mirante_core::threads::{LinkKind, ThreadLink};
+        let parent = view(Status::Idle, 0, None);
+        let pid = parent.task.id.clone();
+        let mut other = view(Status::Idle, 0, None);
+        other.task.id = "0190aaaa-bbbb-7ccc-8ddd-000000000009".into();
+        other.task.branch = "a/other".into();
+        other.task.title = "Other".into();
+        let mut th = view(Status::Working, 0, None);
+        th.task.id = "0190aaaa-bbbb-7ccc-8ddd-000000000001".into();
+        th.task.branch = "feat/login--1-review".into();
+        th.task.title = "Review it".into();
+        th.task.parent_id = Some(pid.clone());
+        th.task.child_kind = Some(ChildKind::Thread);
+        th.thread = Some(mirante_ipc::types::ThreadView {
+            link: ThreadLink { kind: LinkKind::Pr, reference: "acme/api#12".into(), url: None, title: None },
+            notes_hash: String::new(),
+            delivered: true,
+            summary: None,
+            summary_at: None,
+            summary_by: None,
+        });
+        let mut sp = view(Status::Idle, 0, None);
+        sp.task.id = "0190aaaa-bbbb-7ccc-8ddd-000000000002".into();
+        sp.task.branch = "feat/login--2-tests".into();
+        sp.task.title = "Split the tests".into();
+        sp.task.parent_id = Some(pid.clone());
+        sp.task.child_kind = Some(ChildKind::Spawn);
+        // Listed flat (as the daemon does, by branch): the children move under the parent.
+        let t = tasks_table(&[other.clone(), parent.clone(), th.clone(), sp.clone()], false);
+        let rows: Vec<&str> = t.lines().skip(1).collect();
+        assert_eq!(rows.len(), 4, "{t}");
+        assert!(rows[0].contains("00000009") && rows[0].ends_with("Other"), "{t}");
+        assert!(rows[1].contains("12345678") && rows[1].ends_with("Fix the login"), "{t}");
+        assert!(rows[2].contains("00000001") && rows[2].ends_with("  └ thread PR #12 · Review it"), "{t}");
+        assert!(rows[3].contains("00000002") && rows[3].ends_with("  └ spawn Split the tests"), "{t}");
+        // A child whose parent is not listed (archived) stays a row of its own.
+        let t = tasks_table(&[other, th], false);
+        assert!(t.lines().nth(2).unwrap().ends_with("thread PR #12 · Review it"), "{t}");
+        assert!(!t.contains('└'), "{t}");
     }
 
     #[test]

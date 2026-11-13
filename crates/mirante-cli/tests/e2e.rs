@@ -1181,6 +1181,35 @@ fn archive_stop_ends_the_session_then_archives() {
     assert!(out.contains("stopped") && out.contains("archived"), "{out}");
 }
 
+/// Dogfood threads findings 2 and 3: a parent's thread sits under it in `ls`; archiving
+/// the parent is refused naming it, and `--cascade` archives both.
+#[test]
+fn a_parents_thread_is_listed_under_it_and_archive_cascades_on_request() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    env.ok(&["new", &repo, "--agent", "claude", "--branch", "chat", "say", "hi"]);
+    wait_until("live", || env.task("chat").live);
+    let th: TaskView = env
+        .client()
+        .call(
+            method::TASK_CREATE,
+            json!({"repo": "", "agent": "claude", "branch": "", "goal": "review the PR", "parent": "chat",
+                   "link": {"kind": "pr", "ref": "acme/api#12"}}),
+        )
+        .unwrap();
+    let ls = env.ok(&["ls"]);
+    let rows: Vec<&str> = ls.lines().collect();
+    let at = rows.iter().position(|l| l.contains("chat ") && !l.contains('└')).unwrap();
+    assert!(rows[at + 1].contains(&th.task.branch) && rows[at + 1].contains("  └ thread PR #12 · "), "{ls}");
+    let refused = env.mirante(&["archive", "--stop", "chat"]);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && err.contains(&th.task.branch) && err.contains("--cascade"), "{err}");
+    assert!(env.task("chat").live, "nothing stopped");
+    let out = env.ok(&["archive", "--stop", "--cascade", "chat"]);
+    assert!(out.contains("stopped") && out.contains("archived"), "{out}");
+    assert!(env.ok(&["ls"]).contains("no tasks"));
+}
+
 #[test]
 fn new_refuses_a_folder_or_agent_it_cannot_use_before_making_anything() {
     let env = Env::new();
