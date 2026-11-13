@@ -21,6 +21,8 @@ export interface FeedItem {
   warn?: boolean;
   /** A line in our words: how to say it in the current language (see `feedText`). */
   msg?: FeedMsg;
+  /** A tool step one of Claude's own agents ran: its `agent_id` (its lane). */
+  agent?: string;
 }
 
 export interface FeedMsg {
@@ -45,6 +47,8 @@ export interface Perm {
   closedBy?: number;
   /** The live stream already lowered the task's `needs_you` for it. */
   counted?: boolean;
+  /** One of Claude's own agents asked (its type), not the task's main agent. */
+  subagent?: string;
 }
 
 export interface MemoryNotice {
@@ -96,6 +100,8 @@ export interface State {
   /** Per task: what its latest session was given (from its `skill.injected` and
    * `skill.refused` events). */
   sessionSkills: Record<string, SessionSkills>;
+  /** Per task: bumped on its `subagent.*` events (the "Inside Claude" lane refetches). */
+  subagentRev: Record<string, number>;
 }
 
 export interface SessionSkills {
@@ -125,6 +131,7 @@ export const initialState: State = {
   skillsRev: 0,
   skillTaskVersion: {},
   sessionSkills: {},
+  subagentRev: {},
 };
 
 /** Events after which skills views (library, proposals, tenants, a task's chip) refetch. */
@@ -250,8 +257,10 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
   switch (e.kind) {
     case "step": {
       switch (p.type) {
-        case "tool":
-          return { ...base, kind: "tool", tool: str(p.tool), text: `${str(p.tool)} ${str(p.summary)}`.trim(), ok: p.ok !== false };
+        case "tool": {
+          const step: FeedItem = { ...base, kind: "tool", tool: str(p.tool), text: `${str(p.tool)} ${str(p.summary)}`.trim(), ok: p.ok !== false };
+          return p.agent_id ? { ...step, agent: str(p.agent_id) } : step;
+        }
         case "command":
           return { ...base, kind: "command", text: `$ ${str(p.command)}`, ok: p.exit_code === 0 };
         case "agent_message":
@@ -309,6 +318,13 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
       if (p.self_approves === "edits") return sys("feed.editsOn", undefined, true);
       return SELF_APPROVING.has(str(p.from)) ? sys("feed.manualBack") : null;
     }
+    case "subagent.started":
+      return sys("feed.subagentStarted", { type: str(p.agent_type) || "agent" });
+    case "subagent.stopped":
+      return sys("feed.subagentStopped", { type: str(p.agent_type) || "agent" });
+    case "subagent.notified":
+      // Claude resumed on its own: the agent's doing, never the person's message.
+      return sys("feed.subagentNotified");
     case "session.auto_resumed":
       return sys("feed.autoResumed");
     case "session.auto_resume_skipped":
@@ -392,6 +408,22 @@ function permEffect(perms: Record<string, Perm>, e: DaemonEvent, rev: number): R
   const status = statusOf(e);
   const known = cur ?? { id, task_id: e.task_id, tool: "", detail: "", created_at: e.ts_ms, status, seq: e.seq, rev };
   return { ...perms, [id]: { ...known, status, seq: e.seq, rev, closedBy } };
+}
+
+/** `subagent.permission`: the card was raised by one of Claude's own agents (its type). */
+function subagentPermEffect(perms: Record<string, Perm>, e: DaemonEvent): Record<string, Perm> {
+  if (e.kind !== "subagent.permission") return perms;
+  const p = e.payload ?? {};
+  const id = str(p.permission_id);
+  const cur = perms[id];
+  const type = str(p.agent_type) || "agent";
+  return cur && cur.subagent !== type ? { ...perms, [id]: { ...cur, subagent: type } } : perms;
+}
+
+/** Each task's `subagent.*` events bump its lane's version. */
+function subagentRevEffect(rev: Record<string, number>, e: DaemonEvent): Record<string, number> {
+  if (!e.task_id || !e.kind.startsWith("subagent.")) return rev;
+  return { ...rev, [e.task_id]: (rev[e.task_id] ?? 0) + 1 };
 }
 
 /** What an event says about a loaded queue (the `message.list_queued` refetch it triggers
@@ -519,7 +551,7 @@ export function reduce(s: State, a: Action): State {
       if (s.bootId !== null && snap.boot_id !== s.bootId) {
         // A new daemon: its sessions, queues, notices and event numbers start over. Histories
         // are loaded again (they would not merge: seqs restart with the boot).
-        return { ...base, perms, feed: {}, queues: {}, sessionSkills: {}, historyErrors: {}, memory: [] };
+        return { ...base, perms, feed: {}, queues: {}, sessionSkills: {}, subagentRev: {}, historyErrors: {}, memory: [] };
       }
       return {
         ...base,
@@ -528,6 +560,7 @@ export function reduce(s: State, a: Action): State {
         queues: keepIds(s.queues, tasks),
         historyErrors: keepIds(s.historyErrors, tasks),
         sessionSkills: keepIds(s.sessionSkills, tasks),
+        subagentRev: keepIds(s.subagentRev, tasks),
       };
     }
     case "disconnected":
@@ -539,7 +572,7 @@ export function reduce(s: State, a: Action): State {
         ? [...s.memory, memoryNotice(e)].slice(-20)
         : s.memory;
       let tasks = taskEffect(s.tasks, e);
-      let perms = permEffect(s.perms, e, s.permRev + 1);
+      let perms = subagentPermEffect(permEffect(s.perms, e, s.permRev + 1), e);
       const permRev = perms === s.perms ? s.permRev : s.permRev + 1;
       const id = permId(e);
       // Each card lowers its task's count once, whichever of its closing events comes first.
@@ -560,6 +593,7 @@ export function reduce(s: State, a: Action): State {
         memory,
         queues: queueEffect(s.queues, e),
         dnaVersion: dnaEffect(s.dnaVersion, tasks, e),
+        subagentRev: subagentRevEffect(s.subagentRev, e),
         ...skillEffect(s, e),
       };
     }
@@ -590,6 +624,7 @@ export function reduce(s: State, a: Action): State {
           created_at: p.created_at,
           seq: cur?.seq ?? 0,
           rev: cur?.rev ?? 0,
+          ...(p.subagent || cur?.subagent ? { subagent: p.subagent ?? cur?.subagent } : {}),
         };
       }
       // A pending card the daemon no longer lists was answered elsewhere (CLI) or expired.
@@ -611,7 +646,7 @@ export function reduce(s: State, a: Action): State {
         if (SKILL_TASK.has(e.kind) && e.task_id === a.taskId) {
           skills = { sessionSkills: skillEffect({ ...s, ...skills }, e).sessionSkills };
         }
-        const next = permEffect(perms, e, permRev + 1);
+        const next = subagentPermEffect(permEffect(perms, e, permRev + 1), e);
         if (next !== perms) permRev++;
         perms = next;
         const item = ownsLine(perms, e) ? feedItem(e) : null;

@@ -720,4 +720,17 @@ button.skill-chip:hover { color: var(--text); }
 .child-steer { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
 .child-steer input { flex: 1; min-width: 0; }
 .group-synth { margin-top: 8px; }
+/* Claude's own agents (read-only): one row per subagent, its latest text clamped. */
+.subagent-lane { margin: 0 0 var(--s3, 12px); padding: var(--s2, 8px) var(--s3, 12px); border: 1px dashed var(--line, var(--panel-3)); border-radius: 8px; max-height: 35vh; overflow: auto; }
+.subagent-lane-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.subagent-lane-head h2 { margin: 0; font-size: var(--fs-md, 1rem); }
+.subagents { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 8px; }
+.subagent { padding: 6px 0 0; border-top: 1px solid var(--line, var(--panel-3)); }
+.subagent-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.subagent-head .pill { margin-left: 0; }
+.subagent-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-steps { margin: 4px 0 0; }
+.subagent-pane h3 { margin: var(--s2, 8px) 0 4px; font-size: var(--fs-sm); }
+.subagent-text { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.perm-from { font-size: var(--fs-sm); color: var(--muted); }
 .synth-text { white-space: pre-wrap; word-break: break-word; max-height: 30vh; overflow: auto; background: var(--panel-2, transparent); padding: 8px; border-radius: 6px; font-size: var(--fs-sm); user-select: text; }

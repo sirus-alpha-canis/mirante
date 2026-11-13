@@ -66,6 +66,8 @@ export function PermissionCard({
           {scope.text}
         </span>
         <code className="perm-detail">{perm.detail}</code>
+        {/* One of Claude's own agents asked: its dialog is real (the task needs you). */}
+        {perm.subagent && <span className="perm-from">{t("perm.fromSubagent", { type: perm.subagent })}</span>}
       </div>
       <div className="perm-actions">
         {inTerminal ? (

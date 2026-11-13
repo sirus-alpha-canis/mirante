@@ -204,7 +204,7 @@ describe("Detail (V1 classic)", () => {
     await userEvent.type(screen.getByLabelText("Message to the agent"), "stop");
     await userEvent.click(screen.getByRole("button", { name: "Steer now" }));
     await userEvent.click(await screen.findByRole("button", { name: "Interrupt and send" }));
-    const sent = () => h.calls.filter((c) => !c[0].startsWith("dna.") && !c[0].startsWith("skill."));
+    const sent = () => h.calls.filter((c) => !c[0].startsWith("dna.") && !c[0].startsWith("skill.") && c[0] !== "task.subagents");
     await waitFor(() => expect(sent().map((c) => c[0])).toEqual(["message.send", "session.interrupt", "message.send"]));
     expect(sent()[2][1]).toMatchObject({ mode: "queue", text: "stop" });
   });
@@ -485,6 +485,24 @@ describe("Detail (V1 classic)", () => {
       await userEvent.click(screen.getByRole("button", { name: "Review layout" }));
       expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
       expect(within(pane()!).getByText("Diff", { selector: ".side-pane-title" })).toBeInTheDocument();
+    });
+
+    it("Claude's own agents show in their lane; one opens beside, with its latest text", async () => {
+      const lane = { id: "a1", agent_type: "Explore", description: "Find the handlers", status: "running", started_ms: Date.now(), tools: 2, last_text: "Looking in src/", permissions: [], pending: 0 };
+      const h = makeEnv({ "task.subagents": [lane] });
+      h.load([task("a", { status: "working" })]);
+      renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+      const region = await screen.findByRole("region", { name: "Claude's own agents (read-only)" });
+      await userEvent.click(within(region).getByRole("button", { name: "Open beside" }));
+      expect(within(pane()!).getByText("Agent a1", { selector: ".side-pane-title" })).toBeInTheDocument();
+      expect(await within(pane()!).findByText("Looking in src/", { selector: ".subagent-text" })).toBeInTheDocument();
+    });
+
+    it("a Codex task asks for no Claude agents", () => {
+      const h = makeEnv();
+      h.load([task("a", { agent: "codex" })]);
+      renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+      expect(h.calls.some(([m]) => m === "task.subagents")).toBe(false);
     });
 
     it("the same task's terminal is never opened in the pane (Terminal stays main)", () => {

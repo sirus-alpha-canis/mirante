@@ -448,6 +448,43 @@ describe("skills (skill.*) events", () => {
   });
 });
 
+describe("Claude's own agents (subagents)", () => {
+  it("a card raised by a subagent says which, live and from the permission list", () => {
+    let s = connected();
+    s = reduce(s, { type: "event", event: ev(6, "t1", "permission_requested", { permission_id: "p1", tool: "Bash", detail: "touch x" }) });
+    s = reduce(s, { type: "event", event: ev(7, "t1", "subagent.permission", { permission_id: "p1", agent_id: "a1", agent_type: "Explore" }) });
+    expect(s.perms.p1.subagent).toBe("Explore");
+    expect(s.perms.p1.status).toBe("pending");
+    // The list keeps it (and names it when the event was missed).
+    s = reduce(s, { type: "permissions", list: [{ id: "p1", task_id: "t1", session_id: "s", tool: "Bash", detail: "touch x", status: "pending", created_at: 1, answered_at: null, task_title: "", branch: "" }] });
+    expect(s.perms.p1.subagent).toBe("Explore");
+    let h = connected();
+    h = reduce(h, { type: "permissions", list: [{ id: "p2", task_id: "t1", session_id: "s", tool: "Bash", detail: "ls", status: "pending", created_at: 1, answered_at: null, task_title: "", branch: "", subagent: "Plan" }] });
+    expect(h.perms.p2.subagent).toBe("Plan");
+    // Replayed history too.
+    let r = connected();
+    r = reduce(r, { type: "history", taskId: "t1", events: [ev(6, "t1", "permission_requested", { permission_id: "p3", tool: "Bash" }), ev(7, "t1", "subagent.permission", { permission_id: "p3", agent_type: "general-purpose" })] });
+    expect(r.perms.p3.subagent).toBe("general-purpose");
+  });
+
+  it("subagent events bump the task's lane version and read as the agent's, never the person's", () => {
+    let s = connected();
+    s = reduce(s, { type: "event", event: ev(6, "t1", "subagent.started", { agent_id: "a1", agent_type: "Explore" }) });
+    s = reduce(s, { type: "event", event: ev(7, "t1", "subagent.notified", { agent_id: "a1", status: "completed" }) });
+    expect(s.subagentRev.t1).toBe(2);
+    const feed = s.feed.t1;
+    expect(feed.map((i) => i.kind)).toEqual(["system", "system"]);
+    expect(feed[0].text).toBe("Claude started its own agent: Explore");
+    expect(feed[1].text).toBe("An agent of Claude's finished; Claude continues on its own");
+    expect(feed.some((i) => i.kind === "message")).toBe(false);
+  });
+
+  it("a subagent's tool step names its lane", () => {
+    expect(feedItem(ev(6, "t1", "step", { type: "tool", tool: "Bash", summary: "ls", ok: true, agent: "Explore", agent_id: "a1" }))?.agent).toBe("a1");
+    expect(feedItem(ev(6, "t1", "step", { type: "tool", tool: "Bash", summary: "ls", ok: true, agent_id: null }))?.agent).toBeUndefined();
+  });
+});
+
 describe("no-op updates keep the state (nothing re-renders)", () => {
   it("a task.get that changed nothing", () => {
     const s = connected();

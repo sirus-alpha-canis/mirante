@@ -1,5 +1,5 @@
 // The Detail's right-hand pane: one target at a time (a worktree file, the Diff, Steps,
-// another task's terminal, a memory note, a skill). Its header names the target and offers
+// another task's terminal, a memory note, a skill, one of Claude's own agents). Its header names the target and offers
 // "Open in editor" (files), Swap and Close. Bodies reuse the views that exist elsewhere
 // (FileView, DiffTab, NoteView, SkillPanel); a target a later batch fills says so.
 import type { ReactNode } from "react";
@@ -14,6 +14,7 @@ import { EditorButton } from "./EditorButton";
 import { FileView } from "./FileView";
 import { NoteView } from "./NoteView";
 import { SkillPanel } from "./Skills";
+import { SubagentPane } from "./SubagentLane";
 import { TerminalTab } from "./TerminalTab";
 
 export { type PaneApi, PaneContext, usePane } from "./paneContext";
@@ -109,6 +110,10 @@ export function SidePane({
     case "skill":
       if (target?.k !== "skill") break;
       body = <SkillPanel name={target.name} version={0} onChanged={() => {}} />;
+      break;
+    case "subagent":
+      if (target?.k !== "subagent") break;
+      body = <SubagentPane key={`${task.id}:${target.id}`} taskId={task.id} id={target.id} />;
       break;
     default:
       body = <p className="muted small">{t("pane.unavailable")}</p>;

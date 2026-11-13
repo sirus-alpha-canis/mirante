@@ -27,6 +27,16 @@ describe("PermissionCard", () => {
     expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
   });
 
+  it("a card raised by one of Claude's own agents says which", () => {
+    setup({}, perm({ detail: "touch c/new.txt", subagent: "general-purpose" }), "claude", false);
+    expect(screen.getByRole("group", { name: "Permission request: Bash" })).toHaveTextContent("from subagent general-purpose");
+  });
+
+  it("the main agent's card names no subagent", () => {
+    setup();
+    expect(screen.queryByText(/from subagent/)).toBeNull();
+  });
+
   it("a session-wide grant is marked as one", () => {
     setup({}, perm({ tool: GRANT_ROOT_TOOL }));
     expect(screen.getByText("session-wide grant")).toHaveClass("tag-warn");
