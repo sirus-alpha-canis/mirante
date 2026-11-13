@@ -25,7 +25,7 @@ use mirante_ipc::types::{
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
 
-use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd};
+use mirante_cli::args::{self, Cmd, DaemonCmd, MemoryCmd, QueueCmd, SkillOp, SkillsCmd, SpawnCmd};
 use mirante_cli::{app, confirm, daemon_ctl, launch_agent, memcheck, render, skilllint, term};
 use mirante_core::branch_name::{branch_from_goal, next_free_branch};
 use mirante_core::skills::lint::has_errors;
@@ -355,6 +355,94 @@ fn memory_review(paths: &Paths, id: String, accept: bool, title: Option<String>,
     match d.slug {
         Some(slug) => println!("accepted: .mirante/memory/{slug}.md written in {} (not committed)", d.repo),
         None => println!("rejected {}", render::short(&d.id)),
+    }
+    Ok(())
+}
+
+/// The proposal `id` names (a full id, or a unique suffix of 4+ characters). A person's
+/// list: the daemon refuses Mirante-launched agents here, before anything is shown or asked.
+fn find_spawn(c: &mut Client, id: &str) -> Result<mirante_ipc::types::SpawnProposalView, Box<dyn Error>> {
+    let all: Vec<mirante_ipc::types::SpawnProposalView> =
+        c.call(method::TASK_SPAWN_PROPOSALS, mirante_ipc::types::SpawnProposals::default())?;
+    let mut hits: Vec<_> =
+        all.into_iter().filter(|p| p.proposal.id == id || (id.len() >= 4 && p.proposal.id.ends_with(id))).collect();
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        0 => Err(format!("no proposed sub-task {id}").into()),
+        _ => Err(format!("id suffix {id} names several proposed sub-tasks; use more of the id").into()),
+    }
+}
+
+/// `mirante spawn …`: orchestration on/off, the proposals waiting, and the person's
+/// decision on one (typed on the controlling terminal, checked before the daemon is
+/// contacted; the daemon refuses Mirante-launched agents on its side).
+fn spawn(paths: &Paths, s: SpawnCmd) -> Res {
+    use mirante_core::orchestration::ProposalStatus;
+    use mirante_ipc::types::{Orchestrate, SpawnEdits, SpawnProposalView, SpawnProposals, SpawnReview, SpawnReviewed};
+    match s {
+        SpawnCmd::Orchestrate { task, on } => {
+            let v: TaskView = client(paths)?.call(method::TASK_ORCHESTRATE, Orchestrate { task, enabled: on })?;
+            let when = if v.live { " from its next session (restart or resume it)" } else { " from its next session" };
+            if on {
+                println!("orchestration on for {}{when}: its agent may propose sub-tasks; each waits for you (mirante spawn ls)", v.task.branch);
+            } else {
+                println!("orchestration off for {}{when}", v.task.branch);
+            }
+        }
+        SpawnCmd::Ls { task, all } => {
+            let status = (!all).then_some(ProposalStatus::Pending);
+            let ps: Vec<SpawnProposalView> =
+                client(paths)?.call(method::TASK_SPAWN_PROPOSALS, SpawnProposals { task, status })?;
+            if ps.is_empty() {
+                println!("{}", if all { "no proposed sub-tasks" } else { "no proposed sub-tasks wait for you" });
+            } else {
+                print!("{}", render::spawn_table(&ps));
+            }
+        }
+        SpawnCmd::Accept { id, goal, title, agent, repos, start } => {
+            let mut tty = confirm::DevTty::open()?;
+            let mut c = client(paths)?;
+            let p = find_spawn(&mut c, &id)?;
+            let mut summary = render::spawn_proposal(&p);
+            let edits = SpawnEdits { goal, agent, title, repos };
+            if edits != SpawnEdits::default() {
+                summary.push_str("\nYour changes:");
+                if let Some(g) = &edits.goal {
+                    summary.push_str(&format!("\n  goal: {}", mirante_core::dna::untrusted::line(g, 300)));
+                }
+                if let Some(t) = &edits.title {
+                    summary.push_str(&format!("\n  title: {}", mirante_core::dna::untrusted::line(t, 200)));
+                }
+                if let Some(a) = edits.agent {
+                    summary.push_str(&format!("\n  agent: {}", a.as_str()));
+                }
+                if let Some(r) = &edits.repos {
+                    summary.push_str(&format!("\n  repos: {}", r.join(", ")));
+                }
+            }
+            confirm::typed(&mut tty, &summary, "accept")?;
+            let edits = (edits != SpawnEdits::default()).then_some(edits);
+            let review =
+                SpawnReview { id: p.proposal.id.clone(), accept: true, edits, start: (!start).then_some(false) };
+            let r: SpawnReviewed = c.call(method::TASK_SPAWN_REVIEW, review)?;
+            let child = r.child.as_ref().map_or("?", |v| v.task.branch.as_str());
+            match (&r.started, &r.start_error) {
+                (_, Some(why)) => {
+                    println!("created {child}, but it did not start: {why}\nstart it later: mirante resume {child}")
+                }
+                (Some(_), None) => println!("created and started {child} (manual mode: its permissions ask you)"),
+                (None, None) => println!("created {child} (not started: mirante resume {child})"),
+            }
+        }
+        SpawnCmd::Reject { id } => {
+            let mut tty = confirm::DevTty::open()?;
+            let mut c = client(paths)?;
+            let p = find_spawn(&mut c, &id)?;
+            confirm::typed(&mut tty, &render::spawn_proposal(&p), "reject")?;
+            let review = SpawnReview { id: p.proposal.id.clone(), accept: false, edits: None, start: None };
+            let r: SpawnReviewed = c.call(method::TASK_SPAWN_REVIEW, review)?;
+            println!("rejected {}", render::short(&r.proposal.proposal.id));
+        }
     }
     Ok(())
 }
@@ -1153,6 +1241,7 @@ fn run(cmd: Cmd) -> Res {
             println!("killed pid {}", k.pid);
         }
         Cmd::Memory(m) => memory(&paths, m)?,
+        Cmd::Spawn(s) => spawn(&paths, s)?,
         Cmd::Skills(k) => skills(&paths, k)?,
         Cmd::Archive { task, stop } => {
             let mut c = client(&paths)?;

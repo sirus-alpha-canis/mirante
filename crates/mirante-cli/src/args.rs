@@ -35,6 +35,18 @@ const COMMANDS: &[Help] = &[
         text: "  group <group>          a fan-out group: each child's status, diff and last answer
   group archive <group>  archive every child, then the group (nothing when one is live or dirty)",
     },
+    Help {
+        names: &["spawn"],
+        text: "  spawn on <task> | spawn off <task>
+                         let that task's agent propose sub-tasks (its next session gets the
+                         mirante-orchestrator server), or stop it; a person's switch
+  spawn ls [<task>] [--all]
+                         sub-tasks agents proposed that wait for you (--all: decided ones too)
+  spawn accept <id> [--goal <g>] [--title <t>] [--agent claude|codex] [--repos <a,b,…>] [--no-start]
+                         create that sub-task under its parent (your edits first) and start it;
+                         typed confirmation on this terminal
+  spawn reject <id>      drop it (typed confirmation on this terminal)",
+    },
     Help { names: &["ls", "list"], text: "  ls [--all]             tasks with status and what needs you (--all: include archived)" },
     Help { names: &["show"], text: "  show <task>            one task in detail" },
     Help { names: &["watch"], text: "  watch                  live status board (rings the bell when a task needs you)" },
@@ -458,9 +470,78 @@ pub enum Cmd {
     },
     Memory(MemoryCmd),
     Skills(SkillsCmd),
+    Spawn(SpawnCmd),
     /// The full help, or one command's.
     Help(Option<String>),
     Version,
+}
+
+/// `mirante spawn …`: sub-tasks a task's agent proposed (a person decides each one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnCmd {
+    /// Orchestration on or off for a task.
+    Orchestrate {
+        task: String,
+        on: bool,
+    },
+    Ls {
+        task: Option<String>,
+        all: bool,
+    },
+    Accept {
+        id: String,
+        goal: Option<String>,
+        title: Option<String>,
+        agent: Option<AgentKind>,
+        repos: Option<Vec<String>>,
+        start: bool,
+    },
+    Reject {
+        id: String,
+    },
+}
+
+fn spawn(args: &[String]) -> Result<SpawnCmd, String> {
+    let (op, rest) = args.split_first().ok_or("spawn on|off|ls|accept|reject")?;
+    let none: &[&str] = &[];
+    match op.as_str() {
+        "on" | "off" => Ok(SpawnCmd::Orchestrate { task: one(&split(rest, none, none)?, "task")?, on: op == "on" }),
+        "ls" | "list" => {
+            let p = split(rest, none, &["--all"])?;
+            let task = match p.positional.as_slice() {
+                [] => None,
+                [t] => Some(t.clone()),
+                _ => return Err("spawn ls takes at most one <task>".into()),
+            };
+            Ok(SpawnCmd::Ls { task, all: !p.bools.is_empty() })
+        }
+        "accept" => {
+            let p = split(rest, &["--goal", "--title", "--agent", "--repos"], &["--no-start"])?;
+            let agent = match p.values.get("--agent").map(String::as_str) {
+                Some("claude") => Some(AgentKind::Claude),
+                Some("codex") => Some(AgentKind::Codex),
+                Some(other) => return Err(format!("unknown agent {other} (claude or codex)")),
+                None => None,
+            };
+            let repos = p
+                .values
+                .get("--repos")
+                .map(|l| l.split(',').map(str::trim).filter(|n| !n.is_empty()).map(String::from).collect::<Vec<_>>());
+            if repos.as_ref().is_some_and(Vec::is_empty) {
+                return Err("--repos needs at least one repo name".into());
+            }
+            Ok(SpawnCmd::Accept {
+                id: one(&p, "id")?,
+                goal: p.values.get("--goal").cloned(),
+                title: p.values.get("--title").cloned(),
+                agent,
+                repos,
+                start: p.bools.is_empty(),
+            })
+        }
+        "reject" => Ok(SpawnCmd::Reject { id: one(&split(rest, none, none)?, "id")? }),
+        other => Err(format!("unknown spawn command {other} (on, off, ls, accept, reject)")),
+    }
 }
 
 struct Parsed {
@@ -883,6 +964,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         "queue" => queue(rest).map(Cmd::Queue),
         "memory" => memory(rest).map(Cmd::Memory),
         "skills" => skills(rest).map(Cmd::Skills),
+        "spawn" => spawn(rest).map(Cmd::Spawn),
         "perms" => split(rest, none, none)?
             .positional
             .is_empty()
@@ -949,6 +1031,32 @@ mod tests {
 
     fn p(s: &str) -> Result<Cmd, String> {
         parse(&s.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn spawn_parses_on_off_ls_accept_with_edits_and_reject() {
+        assert_eq!(
+            p("spawn on mirante/x").unwrap(),
+            Cmd::Spawn(SpawnCmd::Orchestrate { task: "mirante/x".into(), on: true })
+        );
+        assert_eq!(p("spawn off x").unwrap(), Cmd::Spawn(SpawnCmd::Orchestrate { task: "x".into(), on: false }));
+        assert_eq!(p("spawn ls").unwrap(), Cmd::Spawn(SpawnCmd::Ls { task: None, all: false }));
+        assert_eq!(p("spawn ls t1 --all").unwrap(), Cmd::Spawn(SpawnCmd::Ls { task: Some("t1".into()), all: true }));
+        assert_eq!(
+            p("spawn accept 1a2b --agent codex --title Tests --repos site,bff --no-start").unwrap(),
+            Cmd::Spawn(SpawnCmd::Accept {
+                id: "1a2b".into(),
+                goal: None,
+                title: Some("Tests".into()),
+                agent: Some(AgentKind::Codex),
+                repos: Some(vec!["site".into(), "bff".into()]),
+                start: false,
+            })
+        );
+        assert_eq!(p("spawn reject 1a2b").unwrap(), Cmd::Spawn(SpawnCmd::Reject { id: "1a2b".into() }));
+        assert!(p("spawn accept 1a2b --agent gpt").is_err());
+        assert!(p("spawn budget 3").is_err(), "no budget in v1");
+        assert!(p("spawn").is_err());
     }
 
     #[test]

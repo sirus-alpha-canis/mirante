@@ -127,6 +127,55 @@ pub fn note_view(n: &NoteView) -> String {
 }
 
 /// The review queue: full id (what `accept` takes), status, origin, kind, title.
+/// Sub-tasks agents proposed: one line each (agent text through `line`).
+pub fn spawn_table(ps: &[mirante_ipc::types::SpawnProposalView]) -> String {
+    let mut out =
+        format!("{}{}{}{}{}\n", fit("ID", 38), fit("STATUS", 10), fit("AGENT", 7), fit("PARENT", 24), "SUB-TASK");
+    for p in ps {
+        let pr = &p.proposal;
+        let name = pr.title.clone().unwrap_or_else(|| pr.goal.lines().next().unwrap_or("").to_string());
+        out.push_str(&format!(
+            "{}{}{}{}{}\n",
+            fit(&line(&pr.id, 37), 38),
+            fit(pr.status.as_str(), 10),
+            fit(pr.agent.as_str(), 7),
+            fit(&line(&p.parent_branch, 23), 24),
+            line(&name, 120)
+        ));
+    }
+    out
+}
+
+/// One proposed sub-task in full, before the person decides (agent text through `line`).
+pub fn spawn_proposal(p: &mirante_ipc::types::SpawnProposalView) -> String {
+    let pr = &p.proposal;
+    let mut out = format!(
+        "Sub-task {} proposed by the agent of {} ({}), {}\n",
+        pr.id,
+        line(&p.parent_branch, 200),
+        line(&p.parent_title, 120),
+        pr.status.as_str()
+    );
+    if let Some(t) = &pr.title {
+        out.push_str(&format!("  title: {}\n", line(t, 200)));
+    }
+    out.push_str(&format!("  agent: {}\n", pr.agent.as_str()));
+    if let Some(w) = &pr.why {
+        out.push_str(&format!("  why: {}\n", line(w, 500)));
+    }
+    if !p.repos.is_empty() {
+        out.push_str(&format!("  repos: {}\n", p.repos.iter().map(|r| line(r, 100)).collect::<Vec<_>>().join(", ")));
+    }
+    out.push_str("  goal (written by the agent):\n");
+    for l in pr.goal.lines().take(60) {
+        out.push_str(&format!("  | {}\n", line(l, 300)));
+    }
+    out.push_str(
+        "It runs in its own worktree from the parent's branch, in manual mode: its permissions still ask you.",
+    );
+    out
+}
+
 pub fn proposals_table(ps: &[ProposalView]) -> String {
     let mut out = format!("{}{}{}{}{}\n", fit("ID", 38), fit("STATUS", 10), fit("FROM", 7), fit("KIND", 9), "TITLE");
     for p in ps {

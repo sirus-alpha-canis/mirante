@@ -1427,3 +1427,131 @@ fn a_task_across_two_repos_of_a_folder_with_a_fake_claude() {
         "{out}"
     );
 }
+
+/// The agent's `mirante-orchestrator` server proposes sub-tasks of its own task over the
+/// real socket; `[(name, args)]` tool calls, returning the replies after `initialize`.
+fn orchestrator_calls(env: &Env, task: &str, calls: &[(&str, Value)]) -> Vec<Value> {
+    use std::io::Write;
+    let mut mcp = env
+        .cmd(&bin("mirante-mcp"))
+        .args(["--surface", "orchestrator"])
+        .env("MIRANTE_TASK_ID", task)
+        .env("MIRANTE_TASK", task)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = mcp.stdin.take().unwrap();
+        let init = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}});
+        writeln!(stdin, "{init}").unwrap();
+        for (i, (name, args)) in calls.iter().enumerate() {
+            let call = json!({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
+            writeln!(stdin, "{call}").unwrap();
+        }
+    }
+    let out = mcp.wait_with_output().unwrap();
+    let replies: Vec<Value> =
+        String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), calls.len() + 1, "{replies:?}");
+    replies[1..].to_vec()
+}
+
+fn spawn_parent(env: &Env, branch: &str) -> TaskView {
+    use mirante_core::model::AgentKind;
+    use mirante_ipc::types::CreateTask;
+    env.ok(&["daemon", "start"]);
+    let create = CreateTask {
+        group: None,
+        repos: Vec::new(),
+        repo: env.repo.to_string_lossy().into_owned(),
+        agent: AgentKind::Claude,
+        branch: branch.into(),
+        base: None,
+        goal: "split the work".into(),
+        title: None,
+    };
+    env.client().call(method::TASK_CREATE, create).unwrap()
+}
+
+#[test]
+fn spawn_list_and_accept_from_a_person_terminal() {
+    let env = Env::new();
+    let repo = env.repo.clone();
+    let t = spawn_parent(&env, "mirante/split");
+    // Off: the agent's proposal is refused.
+    let r = orchestrator_calls(&env, &t.task.id, &[("task_spawn", json!({"children": [{"goal": "x"}]}))]);
+    assert_eq!(r[0]["result"]["isError"], true, "{}", r[0]);
+    assert!(r[0]["result"]["content"][0]["text"].as_str().unwrap().contains("orchestration is off"), "{}", r[0]);
+    assert!(env.ok(&["spawn", "on", "mirante/split"]).contains("orchestration on for mirante/split"));
+    let r = orchestrator_calls(
+        &env,
+        &t.task.id,
+        &[
+            (
+                "task_spawn",
+                json!({"children": [{"goal": "add login tests", "title": "Login tests", "why": "none yet"}]}),
+            ),
+            ("task_children", json!({})),
+        ],
+    );
+    assert_eq!(r[0]["result"]["isError"], false, "{}", r[0]);
+    assert!(r[0]["result"]["content"][0]["text"].as_str().unwrap().contains("wait for the person"));
+    assert!(r[1]["result"]["content"][0]["text"].as_str().unwrap().contains("[pending] Login tests"), "{}", r[1]);
+    let ls = env.ok(&["spawn", "ls"]);
+    assert!(ls.contains("Login tests") && ls.contains("mirante/split") && ls.contains("pending"), "{ls}");
+    let id = ls.lines().nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    // A person on a terminal approves it, with an edit; nothing happens without the word.
+    let out = env.on_tty(&repo, &["spawn", "accept", &id[id.len() - 6..], "--agent", "claude", "--no-start"], "nope");
+    assert!(out.contains("goal (written by the agent)") && out.contains("not confirmed"), "{out}");
+    let out = env.on_tty(
+        &repo,
+        &["spawn", "accept", &id[id.len() - 6..], "--title", "Login tests only", "--no-start"],
+        "accept",
+    );
+    assert!(out.contains("created mirante/split--1-login-tests-only"), "{out}");
+    let child = env.task("mirante/split--1-login-tests-only");
+    assert_eq!(
+        (child.task.parent_id.as_deref(), child.task.title.as_str()),
+        (Some(t.task.id.as_str()), "Login tests only")
+    );
+    assert!(env.ok(&["spawn", "ls"]).contains("no proposed sub-tasks wait for you"));
+    assert!(env.ok(&["spawn", "ls", "--all"]).contains("accepted"));
+    // The parent's agent reads it back, wrapped.
+    let r = orchestrator_calls(&env, &t.task.id, &[("task_result", json!({"child": child.task.id}))]);
+    let text = r[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("<mirante-child id=") && text.contains("no finished answer yet"), "{text}");
+    // The child's own agent cannot propose (one level deep), and orchestration cannot be on for it.
+    let r = orchestrator_calls(&env, &child.task.id, &[("task_spawn", json!({"children": [{"goal": "x"}]}))]);
+    assert_eq!(r[0]["result"]["isError"], true);
+    let out = env.mirante(&["spawn", "on", "mirante/split--1-login-tests-only"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("one level deep"));
+    assert!(env.ok(&["spawn", "off", "mirante/split"]).contains("orchestration off"));
+}
+
+#[test]
+fn spawn_accept_from_agent_env_is_refused_before_prompt() {
+    let env = Env::new();
+    let repo = env.repo.clone();
+    let t = spawn_parent(&env, "mirante/agentic");
+    env.ok(&["spawn", "on", "mirante/agentic"]);
+    let r = orchestrator_calls(&env, &t.task.id, &[("task_spawn", json!({"children": [{"goal": "x"}]}))]);
+    assert_eq!(r[0]["result"]["isError"], false, "{}", r[0]);
+    let ls = env.ok(&["spawn", "ls"]);
+    let id = ls.lines().nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    for verb in ["accept", "reject"] {
+        let out = env.on_tty_with(&repo, &["spawn", verb, &id], None, &[("MIRANTE_TASK", &t.task.id)]);
+        assert!(out.contains("Mirante-launched agents are refused") && !out.contains("to confirm"), "{out}");
+    }
+    // Nor can the agent turn orchestration on or off.
+    let out = env
+        .cmd(&bin("mirante"))
+        .args(["spawn", "off", "mirante/agentic"])
+        .env("MIRANTE_TASK", &t.task.id)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(env.ok(&["spawn", "ls"]).contains("pending"), "nothing was decided");
+    assert!(env.task("mirante/agentic").orchestration);
+}
