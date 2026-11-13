@@ -729,6 +729,8 @@ button.skill-chip:hover { color: var(--text); }
 .thread-card-meta { display: block; }
 .thread-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
 .thread-summary { flex-basis: 100%; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.thread-summarize { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.thread-confirm { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .link-chip { display: inline-flex; align-items: center; gap: 4px; }
 .thread-notes { display: flex; flex-direction: column; gap: 6px; }
 .thread-notes textarea { width: 100%; font-family: var(--mono); }

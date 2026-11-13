@@ -83,6 +83,9 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::GROUP_SYNTHESIZE, Access::Person),
     // A thread's notes and link: the person's context for it, never an agent's to change.
     (method::TASK_THREAD, Access::Person),
+    // A thread's summary: deterministic, or the person's own CLI on their click (it spends
+    // their quota): never an agent's.
+    (method::TASK_SUMMARIZE, Access::Person),
     (method::DNA_STATUS, Access::Person),
     (method::DNA_ENABLE, Access::Person),
     (method::DNA_DISABLE, Access::Person),

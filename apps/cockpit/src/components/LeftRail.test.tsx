@@ -333,6 +333,21 @@ describe("the rail's Sessions settings, folded by default", () => {
     expect(screen.queryByRole("checkbox")).toBeNull();
   });
 
+  it("thread summaries by Claude are off by default and turned on here (never Codex)", async () => {
+    let summaries = "none";
+    const { h } = mount({ ...base, auto_resume: true, summaries: "none" }, { "daemon.settings": (p: Record<string, unknown>) => {
+      if (typeof p.summaries === "string") summaries = p.summaries;
+      return { auto_resume: true, summaries };
+    } });
+    await userEvent.click(head());
+    const box = await screen.findByRole("combobox", { name: "Thread summaries" });
+    expect(box).toHaveValue("none");
+    expect([...box.querySelectorAll("option")].map((o) => o.getAttribute("value"))).toEqual(["none", "claude"]);
+    await userEvent.selectOptions(box, "claude");
+    expect(h.calls).toContainEqual(["daemon.settings", { summaries: "claude" }]);
+    expect(box).toHaveValue("claude");
+  });
+
   it.each([
     [{ auto_resume: false, pause_new_sessions_under_pressure: "critical" as const }, "Auto-resume off · Pause when critical"],
     [{ auto_resume: true, auto_resume_forced_off: true, pause_new_sessions_under_pressure: "elevated" as const }, "Auto-resume off · Pause when elevated"],

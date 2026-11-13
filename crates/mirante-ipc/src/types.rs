@@ -76,6 +76,10 @@ pub mod method {
     /// A thread's notes and/or link, changed by the person against the hash they edited
     /// ([`super::ThreadEdit`] → [`super::TaskView`]). A person only.
     pub const TASK_THREAD: &str = "task.thread";
+    /// A thread's summary: deterministic (status, last answer, diff stat), or, on the
+    /// person's click, from their own Claude CLI run headless and tool-less
+    /// ([`super::Summarize`] → [`super::SummaryView`]). A person only.
+    pub const TASK_SUMMARIZE: &str = "task.summarize";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -428,6 +432,51 @@ pub struct CreateTask {
     /// daemon (`<group branch>--<n>-<slug>`) and the task starts from the repo's `HEAD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+}
+
+/// Who summarizes a thread on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummarizeWith {
+    Claude,
+}
+
+/// `task.summarize`. Without `with`: the deterministic summary (no model). `with: claude`:
+/// the person's own Claude CLI, only when the `summaries` setting is `claude` and the
+/// tool-less probe passed for the installed Claude version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Summarize {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with: Option<SummarizeWith>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryView {
+    pub summary: String,
+    pub by: SummaryBy,
+    /// What the CLI run reported it cost (`claude` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Whether threads may be summarized by the person's CLI (never automatically; each run is
+/// a click). Codex is not offered: no invocation of it is reliably tool-less (Spike S2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummariesSetting {
+    #[default]
+    None,
+    Claude,
+}
+
+impl SummariesSetting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SummariesSetting::None => "none",
+            SummariesSetting::Claude => "claude",
+        }
+    }
 }
 
 /// `task.create` as the cockpit sends it: a [`CreateTask`], plus, for a thread, what it is
@@ -853,6 +902,10 @@ pub struct DaemonStatus {
     /// prints it): a newer binary on disk has another one. Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
+    /// Thread summaries by the person's own CLI (`none` | `claude`). Absent from older
+    /// daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summaries: Option<SummariesSetting>,
 }
 
 /// What `mirante-daemon --version` says: its version, and its build (absent from older
@@ -948,6 +1001,9 @@ pub struct SettingsParams {
     pub auto_resume: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_new_sessions_under_pressure: Option<PausePolicy>,
+    /// Thread summaries by the person's own CLI (`none` | `claude`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summaries: Option<SummariesSetting>,
 }
 
 /// The daemon's settings (`<home>/settings.json`).
@@ -968,6 +1024,10 @@ pub struct DaemonSettings {
     /// the next start.
     #[serde(default)]
     pub pause_forced_by_env: bool,
+    /// Thread summaries by the person's own CLI (`none` by default; each run is still a
+    /// click, its cost shown first).
+    #[serde(default)]
+    pub summaries: SummariesSetting,
 }
 #[cfg(test)]
 mod tests {

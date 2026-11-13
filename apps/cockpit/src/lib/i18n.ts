@@ -1005,6 +1005,18 @@ const en = {
   "thread.notesSaved": "Saved: they go out with your next message.",
   "thread.notesConflict": "These notes changed since you opened them; nothing was saved.",
   "thread.notesReload": "Load the current notes",
+  "thread.summarize": "Summarize",
+  "thread.summarizeTitle": "Mirante's own summary: status, last answer, changes (no model)",
+  "thread.summarizeClaude": "Summarize with Claude…",
+  "thread.summarizeClaudeLabel": "Summarize with Claude",
+  "thread.summarizeCost": "≈ $0.01–0.03 of your Claude usage, run headless with no tools. Run it?",
+  "thread.summarizeRun": "Run",
+  "thread.summarizing": "Summarizing…",
+  "thread.summaryCost": "Done (it reported ${cost})",
+  "sessions.summaries": "Thread summaries",
+  "sessions.summaries.none": "Mirante's own only (no model)",
+  "sessions.summaries.claude": "Also by my Claude CLI, when I click",
+  "sessions.summariesHelp": "Off by default. With Claude, a thread offers \"Summarize with Claude\": each run is your click and costs ≈ $0.01–0.03 of your Claude usage (headless, no tools, no MCP, no hooks). Codex is not offered: it cannot run without tools.",
 } satisfies Record<string, string>;
 
 export type Key = keyof typeof en;
@@ -1998,6 +2010,18 @@ const pt: Partial<Record<Key, string>> = {
   "thread.notesSaved": "Salvas: vão com sua próxima mensagem.",
   "thread.notesConflict": "Estas notas mudaram desde que você as abriu; nada foi salvo.",
   "thread.notesReload": "Carregar as notas atuais",
+  "thread.summarize": "Resumir",
+  "thread.summarizeTitle": "Resumo do próprio Mirante: status, última resposta, mudanças (sem modelo)",
+  "thread.summarizeClaude": "Resumir com o Claude…",
+  "thread.summarizeClaudeLabel": "Resumir com o Claude",
+  "thread.summarizeCost": "≈ US$ 0,01–0,03 do seu uso do Claude, rodando sem interface e sem ferramentas. Rodar?",
+  "thread.summarizeRun": "Rodar",
+  "thread.summarizing": "Resumindo…",
+  "thread.summaryCost": "Pronto (custo informado: US$ {cost})",
+  "sessions.summaries": "Resumos de threads",
+  "sessions.summaries.none": "Só o do Mirante (sem modelo)",
+  "sessions.summaries.claude": "Também pelo meu Claude CLI, quando eu clicar",
+  "sessions.summariesHelp": "Desligado por padrão. Com o Claude, a thread oferece \"Resumir com o Claude\": cada execução é um clique seu e custa ≈ US$ 0,01–0,03 do seu uso do Claude (sem interface, sem ferramentas, sem MCP, sem hooks). O Codex não é oferecido: ele não roda sem ferramentas.",
 };
 
 export const DICTS: Record<Lang, Partial<Record<Key, string>>> = { en, pt };

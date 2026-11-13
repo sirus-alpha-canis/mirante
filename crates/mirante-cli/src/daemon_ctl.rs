@@ -452,6 +452,7 @@ mod tests {
             pause_new_sessions_under_pressure: None,
             pause_forced_by_env: None,
             build: None,
+            summaries: None,
         };
         assert_eq!(version_warning(&st("0.1.0", 0), "0.1.0"), None);
         let idle = version_warning(&st("0.0.9", 0), "0.1.0").unwrap();
@@ -474,6 +475,7 @@ mod tests {
             pause_new_sessions_under_pressure: None,
             pause_forced_by_env: None,
             build: build.map(String::from),
+            summaries: None,
         }
     }
 

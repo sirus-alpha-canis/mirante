@@ -85,3 +85,37 @@ describe("ThreadNotes", () => {
     expect(screen.getByText("This task is not a thread: it has no notes.")).toBeInTheDocument();
   });
 });
+
+describe("ThreadHeader: summaries", () => {
+  it("Mirante's own summary needs no model; with summaries off there is no Claude button", async () => {
+    const h = header(thread(), { "daemon.settings": { auto_resume: true, summaries: "none" }, "task.summarize": { summary: "idle · x", by: "deterministic" } });
+    await waitFor(() => expect(h.calls).toContainEqual(["daemon.settings", {}]));
+    expect(screen.queryByRole("button", { name: "Summarize with Claude…" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Summarize" }));
+    expect(h.calls).toContainEqual(["task.summarize", { task: "th" }]);
+  });
+
+  it("Summarize with Claude shows the estimated cost first and needs a click every time", async () => {
+    const h = header(thread(), { "daemon.settings": { auto_resume: true, summaries: "claude" }, "task.summarize": { summary: "Rebased.", by: "claude", cost_usd: 0.0106 } });
+    const ask = await screen.findByRole("button", { name: "Summarize with Claude…" });
+    await userEvent.click(ask);
+    const confirm = screen.getByRole("group", { name: "Summarize with Claude" });
+    expect(confirm).toHaveTextContent("≈ $0.01–0.03 of your Claude usage");
+    expect(h.calls.filter(([m]) => m === "task.summarize")).toEqual([]);
+    await userEvent.click(within(confirm).getByRole("button", { name: "Run" }));
+    expect(h.calls.filter(([m]) => m === "task.summarize")).toEqual([["task.summarize", { task: "th", with: "claude" }]]);
+    expect(await screen.findByRole("status")).toHaveTextContent("Done (it reported $0.0106)");
+    // The next run asks again.
+    expect(screen.queryByRole("group", { name: "Summarize with Claude" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Summarize with Claude…" }));
+    expect(screen.getByRole("group", { name: "Summarize with Claude" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(h.calls.filter(([m]) => m === "task.summarize")).toHaveLength(1);
+  });
+
+  it("summary is untrusted text in the card and the header", () => {
+    header(thread({ thread: { link: pr, notes_hash: "h", delivered: true, summary: "<img src=x onerror=alert(1)> done", summary_by: "claude" } }));
+    expect(screen.getByText("<img src=x onerror=alert(1)> done")).toBeInTheDocument();
+    expect(document.querySelector("img")).toBeNull();
+  });
+});

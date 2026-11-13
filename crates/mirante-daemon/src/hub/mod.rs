@@ -36,6 +36,7 @@ pub mod rules;
 pub mod session;
 pub mod skills;
 pub mod subagents;
+pub mod summary;
 pub mod threads;
 
 pub type Result<T> = std::result::Result<T, HubError>;
@@ -370,6 +371,10 @@ pub struct Hub {
     pub(crate) git_read_limit: Duration,
     /// `daemon.settings` changes, one at a time (read, write, apply).
     pub(crate) settings_gate: Mutex<()>,
+    /// Thread summaries by the person's CLI: one run at a time.
+    pub(crate) summary_gate: Mutex<()>,
+    /// Tests: the Claude binary a summary runs (else the one the daemon resolves).
+    pub(crate) summary_bin: Mutex<Option<std::path::PathBuf>>,
     /// The daemon is going down ([`Hub::shutdown`]): set under the hub lock; launches are
     /// refused, auto-resume stops, new connections are turned away.
     pub(crate) shutting_down: AtomicBool,
@@ -528,6 +533,14 @@ impl State {
 
     pub(crate) fn event(&mut self, task_id: Option<&str>, kind: &str, payload: Value) -> Result<()> {
         self.store.append_event(task_id, kind, &payload)?;
+        // A thread's agent finished an answer: its deterministic summary follows.
+        if let (Some(id), "step") = (task_id, kind) {
+            if payload["type"] == "agent_message" && payload["final"] != false {
+                if let Some(text) = payload["text"].as_str() {
+                    self.refresh_summary(id, text);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -595,6 +608,8 @@ impl Hub {
             pause_setting: Mutex::new(mirante_ipc::types::PausePolicy::Off),
             pause_env: Mutex::new(None),
             settings_gate: Mutex::new(()),
+            summary_gate: Mutex::new(()),
+            summary_bin: Mutex::new(None),
             git_read_limit: files::GIT_LIMIT,
             shutting_down: AtomicBool::new(false),
             spawning: std::sync::atomic::AtomicUsize::new(0),
@@ -973,6 +988,7 @@ impl Hub {
             pause_new_sessions_under_pressure: Some(self.pause_policy()),
             pause_forced_by_env: self.pause_forced_by_env().then_some(true),
             build: Some(env!("MIRANTE_BUILD").to_string()),
+            summaries: Some(self.summaries_setting()),
         }
     }
 }

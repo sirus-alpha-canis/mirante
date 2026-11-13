@@ -169,7 +169,8 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
             .ok_or_else(|| RpcError::new(code::NOT_FOUND, format!("no task {}", p["task"]))),
         method::PERMISSION_LIST | method::TASK_EVENTS => Ok(json!([])),
         method::DAEMON_SETTINGS => {
-            Ok(json!({"auto_resume": p["auto_resume"].as_bool().unwrap_or(true), "forced_by_env": false}))
+            Ok(json!({"auto_resume": p["auto_resume"].as_bool().unwrap_or(true), "forced_by_env": false,
+                      "summaries": p["summaries"].as_str().unwrap_or("none")}))
         }
         method::REPO_FILES => {
             let q = p["query"].as_str().unwrap_or("").to_lowercase();
@@ -200,6 +201,9 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
             .find(|t| t["id"] == p["task"])
             .cloned()
             .ok_or_else(|| RpcError::new(code::NOT_FOUND, format!("no task {}", p["task"]))),
+        method::TASK_SUMMARIZE => {
+            Ok(json!({"summary": "idle · A demo summary from the fake daemon.", "by": "deterministic"}))
+        }
         method::TASK_SUBAGENTS => {
             let now =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);

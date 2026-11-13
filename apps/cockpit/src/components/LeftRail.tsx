@@ -4,7 +4,7 @@ import { shallow, useEnv, useSelect } from "../env";
 import { AGENT_OPTIONS } from "../lib/dispatch";
 import { same, type State } from "../store/state";
 import { dnaStatus } from "../lib/dna";
-import { type DaemonSettings, M, type PausePolicy } from "../lib/protocol";
+import { type DaemonSettings, M, type PausePolicy, type SummariesSetting as SummariesSettingValue } from "../lib/protocol";
 import { usePendingSkills } from "../lib/useSkills";
 import type { AgentKind, DaemonStatus } from "../lib/protocol";
 import { addRepo, addRepos, expandHome, loadRegistry, normaliseRepoPath, type Registry, showRepos } from "../lib/repos";
@@ -332,12 +332,58 @@ export function SessionSettings({ status }: { status: DaemonStatus | null }) {
       )}
       {forced && <p className="small muted">{t("sessions.forced")}</p>}
       <PauseSetting status={status} value={pause} onChosen={setPauseMine} />
+      <SummariesSetting status={status} />
       {error && (
         <p className="error small" role="alert">
           {error}
         </p>
       )}
     </Disclosure>
+  );
+}
+
+/** Thread summaries by the person's own CLI (`daemon.settings`'s `summaries`): off by
+ * default; Claude only (Codex cannot run without tools). Hidden for an older daemon. */
+function SummariesSetting({ status }: { status: DaemonStatus | null }) {
+  const { rpc } = useEnv();
+  const t = useT();
+  const id = useId();
+  const known = status?.summaries ?? null;
+  // The answer of the last change, until the next status poll says the same.
+  const [mine, setMine] = useState<SummariesSettingValue | null>(null);
+  useEffect(() => setMine(null), [known]);
+  const value = mine ?? known;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (!value) return null;
+  const change = async (want: SummariesSettingValue) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await rpc<DaemonSettings>(M.daemonSettings, { summaries: want });
+      setMine(r?.summaries ?? want);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="pause-setting">
+      <label htmlFor={id} className="small">
+        {t("sessions.summaries")}
+      </label>{" "}
+      <select id={id} value={value} disabled={busy} onChange={(e) => void change(e.target.value as SummariesSettingValue)}>
+        <option value="none">{t("sessions.summaries.none")}</option>
+        <option value="claude">{t("sessions.summaries.claude")}</option>
+      </select>
+      <p className="small muted">{t("sessions.summariesHelp")}</p>
+      {error && (
+        <p className="error small" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

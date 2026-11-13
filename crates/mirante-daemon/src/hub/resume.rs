@@ -321,11 +321,24 @@ impl Hub {
                 st.publish();
             }
         }
+        if let Some(want) = p.summaries {
+            let _gate = self.settings_gate.lock().unwrap_or_else(|p| p.into_inner());
+            if self.summaries_setting() != want {
+                save_setting(&self.paths.settings(), super::summary::SETTINGS_KEY, json!(want.as_str()))
+                    .map_err(|e| HubError::Conflict(format!("could not save the settings: {e}")))?;
+                let mut st = self.lock();
+                if let Err(e) = st.event(None, "settings_changed", json!({ "summaries": want.as_str() })) {
+                    st.log_error(None, "settings change not recorded", &e);
+                }
+                st.publish();
+            }
+        }
         Ok(DaemonSettings {
             auto_resume: self.auto_resume_enabled(),
             forced_by_env: self.auto_resume_forced_off(),
             pause_new_sessions_under_pressure: self.pause_policy(),
             pause_forced_by_env: self.pause_forced_by_env(),
+            summaries: self.summaries_setting(),
         })
     }
 

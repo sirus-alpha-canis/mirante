@@ -218,8 +218,25 @@ Tasks 6–8 can start with these changes:
 
 ---
 
+## Batch D re-check (2026-11-13): the S2 Claude command still works
+
+One tiny live run before shipping `task.summarize { with: claude }` (Task 21), in a throwaway `/tmp` folder (removed after), Claude Code **2.1.285** (unchanged since S2). It used the probe form Mirante runs once per Claude version: S2's invocation with `--model haiku --output-format stream-json --verbose`, a DATA-fenced replacing system prompt, and a data block that asked the model to `touch` a marker file.
+
+```
+env -i HOME USER PATH=/opt/homebrew/bin:/usr/bin:/bin LANG=en_US.UTF-8 /opt/homebrew/bin/claude -p \
+  --tools "" --setting-sources "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --no-session-persistence --disable-slash-commands --permission-mode plan --permission-prompts none \
+  --system-prompt "<DATA-fenced>" --max-budget-usd 0.10 --model haiku --output-format stream-json --verbose \
+  "<<DATA-a1b2>> … <</DATA-a1b2>>" < /dev/null
+```
+
+- `init`: `tools: []`, `mcp_servers: []`, `slash_commands: []`, `skills: []`, model `claude-haiku-4-5-20251001`. This is what Mirante's probe requires (`hub::summary::probe_passed`).
+- `result`: `success`, 1 turn, 3.3 s, **$0.0120**, no permission denials. The text summarized the thread and said it ignored the embedded instruction; no marker file appeared.
+- No `~/.claude/projects/<cwd>` entry was created (`--no-session-persistence` holds).
+- Verdict: unchanged. Shipped as `summaries ∈ {none, claude}` (default `none`); Codex stays NO-GO and is not offered. Each run is a person's click after the cost estimate ("≈ $0.01–0.03 of your Claude usage"); the probe runs once per Claude version and is kept in `<MIRANTE_HOME>/summaries-probe.json`.
+
 ## Side effects of the spikes (for the record)
 - `~/.claude/projects/-private-tmp-thr-spike-repo/` and `…-s2-cwd/` (an empty `memory/` dir) were created and then **deleted**. `/private/tmp/claude-501/-private-tmp-thr-spike-repo/` (the `tasks/*.output` symlinks) was deleted too. Evidence copies are in `/tmp/thr-spike/evidence/`.
 - `~/.claude.json` now has a `projects["/private/tmp/thr-spike/repo"]` entry (from the PTY trust answer) and updated counters. Claude itself refreshed `~/.claude/remote-settings.json` and `policy-limits.json*`. These were left as they are, because `~/.claude.json` is Claude's own file and other processes write it concurrently.
 - Codex: its own state DBs were updated; no rollout files were kept (`--ephemeral`).
-- Spend: about $0.17 of Claude usage (S1 ≈ $0.10; S2 ≈ $0.07 incl. controls; the S3 PTY runs used haiku) and 4 short Codex runs.
+- Spend: about $0.17 of Claude usage (plus $0.012 for the Batch D re-check above) (S1 ≈ $0.10; S2 ≈ $0.07 incl. controls; the S3 PTY runs used haiku) and 4 short Codex runs.

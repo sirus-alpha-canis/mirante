@@ -6,7 +6,7 @@ import { useEnv, useSelect } from "../env";
 import { DaemonError } from "../lib/daemon";
 import { useT } from "../lib/i18n";
 import { openableLink } from "../lib/links";
-import { M, RpcCode, type TaskView, type ThreadLink } from "../lib/protocol";
+import { type DaemonSettings, M, RpcCode, type SummaryView, type TaskView, type ThreadLink } from "../lib/protocol";
 import { linkLabel } from "../lib/threads";
 import type { State } from "../store/state";
 import { usePane } from "./paneContext";
@@ -75,11 +75,77 @@ export function ThreadHeader({ t: task, onSelect }: { t: TaskView; onSelect(id: 
         </button>
       )}
       <span className="small muted">{t(view.delivered ? "thread.delivered" : "thread.notDelivered")}</span>
+      <Summarize taskId={task.id} />
       {view.summary && (
         // Agent-derived (or Mirante's own) text: a text node, never markup.
         <p className="thread-summary small">{view.summary}</p>
       )}
     </section>
+  );
+}
+
+/** Summaries on demand: Mirante's own (status, last answer, diff stat; no model), and, when
+ * the person turned it on, their Claude CLI: the estimated cost first, and a click every
+ * time (never automatic). */
+function Summarize({ taskId }: { taskId: string }) {
+  const { rpc } = useEnv();
+  const t = useT();
+  const [claude, setClaude] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<{ error: boolean; text: string } | null>(null);
+  useEffect(() => {
+    let cancel = false;
+    rpc<DaemonSettings>(M.daemonSettings, {})
+      .then((s) => !cancel && setClaude(s?.summaries === "claude"))
+      .catch(() => {});
+    return () => {
+      cancel = true;
+    };
+  }, [rpc]);
+  const run = async (withClaude: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setConfirm(false);
+    setNote(null);
+    try {
+      const r = await rpc<SummaryView>(M.taskSummarize, withClaude ? { task: taskId, with: "claude" } : { task: taskId });
+      const cost = typeof r?.cost_usd === "number" ? r.cost_usd.toFixed(4) : null;
+      setNote(cost ? { error: false, text: t("thread.summaryCost", { cost }) } : null);
+    } catch (e) {
+      setNote({ error: true, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <span className="thread-summarize">
+      <button type="button" className="btn btn-small btn-ghost" disabled={busy} title={t("thread.summarizeTitle")} onClick={() => void run(false)}>
+        {t("thread.summarize")}
+      </button>
+      {claude && !confirm && (
+        <button type="button" className="btn btn-small btn-ghost" disabled={busy} onClick={() => setConfirm(true)}>
+          {t("thread.summarizeClaude")}
+        </button>
+      )}
+      {confirm && (
+        <span role="group" aria-label={t("thread.summarizeClaudeLabel")} className="thread-confirm">
+          <span className="small">{t("thread.summarizeCost")}</span>{" "}
+          <button type="button" className="btn btn-small" onClick={() => void run(true)}>
+            {t("thread.summarizeRun")}
+          </button>
+          <button type="button" className="btn btn-small btn-ghost" onClick={() => setConfirm(false)}>
+            {t("thread.cancel")}
+          </button>
+        </span>
+      )}
+      {busy && <span className="small muted">{t("thread.summarizing")}</span>}
+      {note && (
+        <span className={`small ${note.error ? "error" : "muted"}`} role={note.error ? "alert" : "status"}>
+          {note.text}
+        </span>
+      )}
+    </span>
   );
 }
 

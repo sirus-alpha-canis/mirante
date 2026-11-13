@@ -286,6 +286,8 @@ export interface DaemonStatus {
   pause_forced_by_env?: boolean | null;
   /** The daemon's build (`<commit>[-dirty].<unix seconds>`); absent from older daemons. */
   build?: string | null;
+  /** Thread summaries by the person's own CLI; absent from older daemons. */
+  summaries?: SummariesSetting | null;
 }
 
 /** What the daemon binary on disk says it is (`mirante-daemon --version`). */
@@ -303,6 +305,19 @@ export interface DaemonSettings {
   /** Absent from older daemons. */
   pause_new_sessions_under_pressure?: PausePolicy;
   pause_forced_by_env?: boolean;
+  /** Thread summaries by the person's own CLI (absent from older daemons: none). */
+  summaries?: SummariesSetting;
+}
+
+/** `none`: deterministic summaries only; `claude`: a "Summarize with Claude" button (each run
+ * a click). Codex is never offered: it cannot run without tools. */
+export type SummariesSetting = "none" | "claude";
+
+/** `task.summarize`'s answer. */
+export interface SummaryView {
+  summary: string;
+  by: SummaryBy;
+  cost_usd?: number | null;
 }
 
 export interface StartResult {
@@ -699,6 +714,7 @@ export const M = {
   groupArchive: "group.archive",
   groupSynthesize: "group.synthesize",
   taskThread: "task.thread",
+  taskSummarize: "task.summarize",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
   dnaStatus: "dna.status",

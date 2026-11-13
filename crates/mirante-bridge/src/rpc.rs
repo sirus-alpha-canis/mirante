@@ -92,6 +92,7 @@ pub const ALLOWED: &[&str] = &[
     // redacted and capped by the daemon), and asks for its summary (deterministic, or their
     // own Claude CLI on a click: headless, tool-less, output shown as text).
     method::TASK_THREAD,
+    method::TASK_SUMMARIZE,
     // The Brain's "Rules" view: every instruction layer an agent session reads (read-only;
     // the daemon picks the files from the agent's known locations, never a path the caller
     // names, and masks secrets).
@@ -240,6 +241,7 @@ mod tests {
             "group.archive",
             "group.synthesize",
             "task.thread",
+            "task.summarize",
             "rules.layers",
         ];
         assert_eq!(ALLOWED, expected);
