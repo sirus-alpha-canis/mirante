@@ -22,7 +22,10 @@ export function columnLabel(c: Column): string {
 export const BOARD: Column[] = ["needs_you", "working", "review"];
 
 export function needsYou(t: TaskView): boolean {
-  return t.lifecycle !== "archived" && (t.status === "needs_you" || t.needs_you > 0 || t.boot === "trust_prompt");
+  return (
+    t.lifecycle !== "archived" &&
+    (t.status === "needs_you" || t.needs_you > 0 || t.boot === "trust_prompt" || (t.spawn_pending ?? 0) > 0)
+  );
 }
 
 export function turnsEnded(feed: FeedItem[] | undefined): number {

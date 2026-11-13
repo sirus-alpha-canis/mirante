@@ -90,6 +90,13 @@ describe("AgentCard", () => {
     expect(h.opened).toEqual([["a", "Terminal"]]);
   });
 
+  it("sub-tasks its agent proposed say so on the Needs you card, with Review", async () => {
+    const h = setup({}, task("a", { spawn_pending: 2 }));
+    expect(screen.getByText("Its agent proposed 2 sub-tasks")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(h.opened).toEqual([["a", undefined]]);
+  });
+
   it("the card's lines are not a live region (status changes are announced once, elsewhere)", () => {
     setup({}, task("a", { status: "working" }), [ev(1, "a", "step", { type: "tool", tool: "Bash", summary: "ls", ok: true })]);
     expect(document.querySelector("[aria-live]")).toBeNull();

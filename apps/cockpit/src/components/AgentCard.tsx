@@ -129,6 +129,14 @@ export const AgentCard = memo(function AgentCard({
           </button>
         </p>
       )}
+      {(t.spawn_pending ?? 0) > 0 && (
+        <p className="perm perm-compact">
+          <span>{t.spawn_pending === 1 ? tt("card.spawnOne") : tt("card.spawnMany", { n: t.spawn_pending ?? 0 })}</span>{" "}
+          <button className="btn btn-small" onClick={() => onOpen(t.id)}>
+            {tt("card.spawnReview")}
+          </button>
+        </p>
+      )}
       {perms.map((p) => (
         <PermissionCard
           key={p.id}

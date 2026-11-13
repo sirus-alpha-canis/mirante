@@ -32,6 +32,7 @@ import { useOpenInEditor } from "./EditorButton";
 import { type ThreadApi, ThreadContext } from "./threadContext";
 import { NewThreadDialog } from "./NewThreadDialog";
 import { ThreadHeader } from "./ThreadHeader";
+import { OrchestrationPanel } from "./OrchestrationPanel";
 
 const GROUPS: Column[] = ["needs_you", "working", "review", "idle"];
 const TABS = ["Steps", "Terminal", "Diff", "Memory"] as const;
@@ -553,6 +554,8 @@ export function Detail({
           {t.thread && <ThreadHeader key={`thread-${t.id}`} t={t} onSelect={onSelect} />}
           {/* A fan-out group's member: its siblings (status, answer, steer, synthesize). */}
           {t.group_id && <GroupPanel key={`group-${t.group_id}`} taskId={t.id} onSelect={onSelect} />}
+          {/* Sub-tasks its agent proposes (each one the person's decision), or where this one came from. */}
+          <OrchestrationPanel key={`orch-${t.id}`} t={t} onSelect={onSelect} />
           {/* Claude's own agents inside this task (read-only). */}
           {t.agent === "claude" && <SubagentLane key={`subagents-${t.id}`} taskId={t.id} />}
           <div role="tablist" aria-label={tt("detail.views")} className="tabs" onKeyDown={onTabKey}>

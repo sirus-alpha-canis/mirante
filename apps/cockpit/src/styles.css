@@ -732,6 +732,17 @@ button.skill-chip:hover { color: var(--text); }
 .thread-summarize { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .thread-confirm { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .link-chip { display: inline-flex; align-items: center; gap: 4px; }
+/* Agent-proposed sub-tasks: the person's switch, one card per proposal, the approved list. */
+.orch { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
+.orch > p, .orch > .spawn-card, .orch > .subtasks { flex-basis: 100%; margin: 0; }
+.orch-switch { display: inline-flex; align-items: center; gap: 6px; }
+.spawn-card { border-left: 3px solid var(--needs); }
+.spawn-goal { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+.spawn-edit { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.spawn-edit textarea { width: 100%; font-family: var(--mono); }
+.spawn-repos { display: flex; gap: 10px; flex-wrap: wrap; border: 0; padding: 0; margin: 4px 0 0; }
+.subtasks { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.subtask-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .thread-notes { display: flex; flex-direction: column; gap: 6px; }
 .thread-notes textarea { width: 100%; font-family: var(--mono); }
 .thread-notes-foot { display: flex; justify-content: space-between; align-items: center; }

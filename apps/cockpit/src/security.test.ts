@@ -233,8 +233,16 @@ describe("Tauri security baseline", () => {
       "GROUP_SYNTHESIZE",
       "TASK_THREAD",
       "TASK_SUMMARIZE",
+      "TASK_ORCHESTRATE",
+      "TASK_SPAWN_PROPOSALS",
+      "TASK_SPAWN_REVIEW",
       "RULES_LAYERS",
     ]);
+    // Never the agent's orchestrator methods: proposing and reading children go through its
+    // `mirante-orchestrator` MCP server; the cockpit only decides.
+    expect(block).not.toContain("TASK_SPAWN_PROPOSE,");
+    expect(block).not.toContain("TASK_CHILDREN");
+    expect(block).not.toContain("TASK_CHILD_RESULT");
     // Never DNA_PROPOSE: agents propose through MCP; people write notes in their editor.
     expect(block).not.toContain("DNA_PROPOSE");
     // Never SKILL_PROPOSE (agents propose through their MCP server) nor SKILL_MAY_REVIEW

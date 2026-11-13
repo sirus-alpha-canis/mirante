@@ -50,13 +50,60 @@ export interface TaskView {
   group_role?: GroupRole | null;
   /** The group itself (fixed: its goal, kind and branch prefix). */
   group?: TaskGroup | null;
-  /** A thread's parent: the conversation it came from (absent otherwise). */
+  /** A child's parent: the conversation a thread came from, or the task whose agent
+   * proposed this one (absent otherwise). */
   parent_id?: string | null;
+  /** What kind of child: a thread, or a sub-task its parent's agent proposed and the person
+   * approved (absent for a task with no parent). */
+  child_kind?: ChildKind | null;
+  /** The person turned orchestration on: its next sessions get `mirante-orchestrator`. */
+  orchestration?: boolean;
+  /** While live: whether this session has that server (it applies from the next session). */
+  orchestrator_live?: boolean | null;
+  /** Sub-tasks its agent proposed that wait for the person's decision. */
+  spawn_pending?: number;
   /** A thread: what it is bound to, its notes' hash, delivery and summary (absent otherwise). */
   thread?: ThreadView | null;
 }
 
 export type LinkKind = "pr" | "issue" | "branch" | "message";
+
+export type ChildKind = "thread" | "spawn";
+export type ProposalStatus = "pending" | "accepted" | "rejected" | "withdrawn";
+
+/** `task.spawn_proposals` / `task.spawn_review`: a sub-task an agent proposed, as it wrote
+ * it (agent text: shown as text), and the task it is for. */
+export interface SpawnProposalView {
+  id: string;
+  parent_id: string;
+  status: ProposalStatus;
+  goal: string;
+  agent: AgentKind;
+  title?: string | null;
+  why?: string | null;
+  child_id?: string | null;
+  created_at: number;
+  decided_at?: number | null;
+  parent_title: string;
+  parent_branch: string;
+  /** A workspace parent: its repos' names, primary first. */
+  repos?: string[];
+}
+
+/** What the person changes before approving. */
+export interface SpawnEdits {
+  goal?: string;
+  agent?: AgentKind;
+  title?: string;
+  repos?: string[];
+}
+
+export interface SpawnReviewed {
+  proposal: SpawnProposalView;
+  child?: TaskView | null;
+  started?: StartResult | null;
+  start_error?: string | null;
+}
 
 /** `mirante_core::threads::ThreadLink`: what a thread is bound to (pasted, never fetched). */
 export interface ThreadLink {
@@ -715,6 +762,9 @@ export const M = {
   groupSynthesize: "group.synthesize",
   taskThread: "task.thread",
   taskSummarize: "task.summarize",
+  taskOrchestrate: "task.orchestrate",
+  taskSpawnProposals: "task.spawn_proposals",
+  taskSpawnReview: "task.spawn_review",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
   dnaStatus: "dna.status",

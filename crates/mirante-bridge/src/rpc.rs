@@ -93,6 +93,14 @@ pub const ALLOWED: &[&str] = &[
     // own Claude CLI on a click: headless, tool-less, output shown as text).
     method::TASK_THREAD,
     method::TASK_SUMMARIZE,
+    // Agent-initiated sub-tasks: the person turns orchestration on or off for a task, lists
+    // what its agent proposed, and approves (with edits) or rejects each one. Never
+    // `task.spawn_propose`, `task.children` or `task.child_result`: those are the agent's,
+    // through its `mirante-orchestrator` MCP server (the cockpit reads children from its
+    // own snapshot).
+    method::TASK_ORCHESTRATE,
+    method::TASK_SPAWN_PROPOSALS,
+    method::TASK_SPAWN_REVIEW,
     // The Brain's "Rules" view: every instruction layer an agent session reads (read-only;
     // the daemon picks the files from the agent's known locations, never a path the caller
     // names, and masks secrets).
@@ -242,6 +250,9 @@ mod tests {
             "group.synthesize",
             "task.thread",
             "task.summarize",
+            "task.orchestrate",
+            "task.spawn_proposals",
+            "task.spawn_review",
             "rules.layers",
         ];
         assert_eq!(ALLOWED, expected);
@@ -265,6 +276,10 @@ mod tests {
             // in a terminal), never the cockpit's, which re-reviews with `skill.rereview`
             // (the daemon names the folder).
             method::SKILL_ADD,
+            // Agents propose and read children through their orchestrator MCP server.
+            method::TASK_SPAWN_PROPOSE,
+            method::TASK_CHILDREN,
+            method::TASK_CHILD_RESULT,
             "x.y",
         ];
         for m in refused {

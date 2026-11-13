@@ -201,6 +201,20 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
             .find(|t| t["id"] == p["task"])
             .cloned()
             .ok_or_else(|| RpcError::new(code::NOT_FOUND, format!("no task {}", p["task"]))),
+        method::TASK_ORCHESTRATE => s
+            .tasks
+            .iter()
+            .find(|t| t["id"] == p["task"])
+            .cloned()
+            .map(|mut t| {
+                t["orchestration"] = json!(p["enabled"].as_bool().unwrap_or(false));
+                t
+            })
+            .ok_or_else(|| RpcError::new(code::NOT_FOUND, format!("no task {}", p["task"]))),
+        method::TASK_SPAWN_PROPOSALS => Ok(json!([])),
+        method::TASK_SPAWN_REVIEW => Ok(json!({"proposal": {"id": p["id"], "parent_id": "t1",
+            "status": if p["accept"] == true { "accepted" } else { "rejected" }, "goal": "demo", "agent": "claude",
+            "created_at": 1, "parent_title": "demo", "parent_branch": "mirante/demo"}})),
         method::TASK_SUMMARIZE => {
             Ok(json!({"summary": "idle · A demo summary from the fake daemon.", "by": "deterministic"}))
         }

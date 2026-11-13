@@ -80,3 +80,10 @@ describe("shallow", () => {
     expect(shallow(undefined, undefined)).toBe(true);
   });
 });
+
+describe("proposed sub-tasks", () => {
+  it("a pending proposal puts the parent under Needs you", () => {
+    expect(columnOf(task("p", { spawn_pending: 2 }), [])).toBe("needs_you");
+    expect(columnOf(task("p", { spawn_pending: 0 }), [])).toBe("idle");
+  });
+});
