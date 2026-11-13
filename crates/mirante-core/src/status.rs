@@ -82,9 +82,27 @@ struct Pending {
     agent: Option<String>,
     tool_use_id: Option<String>,
     tool_name: Option<String>,
+    /// The asking agent's other tool calls still running when it asked (by `tool_use_id`):
+    /// a parallel call of the same batch may start or finish while the dialog waits.
+    in_flight: Vec<String>,
 }
 
 impl Pending {
+    /// The same dialog delivered again (agent, tool call, tool).
+    fn same(&self, o: &Pending) -> bool {
+        (&self.agent, &self.tool_use_id, &self.tool_name) == (&o.agent, &o.tool_use_id, &o.tool_name)
+    }
+
+    /// A side agent's dialog is over when that agent starts a tool call it had not started
+    /// when it asked (`id`, a `PreToolUse` or a newer `PermissionRequest`): the agent moved
+    /// on, so its dialog was answered, whether or not its `SubagentStop` ever comes.
+    fn moved_on(&self, agent: &Option<String>, id: &str) -> bool {
+        self.agent.is_some()
+            && &self.agent == agent
+            && self.tool_use_id.as_deref() != Some(id)
+            && !self.in_flight.iter().any(|f| f == id)
+    }
+
     /// Is `ev` (a `PostToolUse`) the asked-for tool finishing? By `tool_use_id` when both
     /// sides have one, else by agent identity.
     fn answered_by(&self, ev: &HookEvent) -> bool {
@@ -272,6 +290,20 @@ impl StatusEngine {
         self.pending.len()
     }
 
+    /// The open dialogs, oldest first: who asked (`None`: the main agent) and the tool call
+    /// (`tool_use_id`) each is about. A card whose dialog is not here any more is over.
+    pub fn dialogs(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.pending.iter().map(|p| (p.agent.clone(), p.tool_use_id.clone())).collect()
+    }
+
+    /// Drops the dialogs of side agent `ev.agent_id` that it moved on from
+    /// ([`Pending::moved_on`]).
+    fn expire_side_dialogs(&mut self, ev: &HookEvent, id: Option<&str>) {
+        if let (Some(_), Some(id)) = (&ev.agent_id, id) {
+            self.pending.retain(|p| !p.moved_on(&ev.agent_id, id));
+        }
+    }
+
     /// The tool call a `PermissionRequest` is about: its own `tool_use_id`, else the one of
     /// the latest `PreToolUse` of the same agent and tool (what the engine pairs it with).
     pub fn tool_use_id_for(&self, ev: &HookEvent) -> Option<String> {
@@ -447,8 +479,22 @@ impl StatusEngine {
             // only means idle when no turn is open.
             "SessionStart" if !was_open => self.set(Status::Idle, cause),
             "PreCompact" if !side && !was_compacting => self.settle(was_open, cause),
-            "UserPromptSubmit" if !side => self.hook_prompt(ev, was_open, cause),
+            "UserPromptSubmit" if !side => {
+                // The person submitted a prompt: no side agent's dialog holds the input any
+                // more (its `SubagentStop` may never come). A `<task-notification>` is Claude
+                // resuming on its own, not the person: a background dialog survives it.
+                let before = self.pending.len();
+                if !ev.prompt.as_deref().is_some_and(is_task_notification) {
+                    self.pending.retain(|p| p.agent.is_none());
+                }
+                let dropped = self.pending.len() < before;
+                match self.hook_prompt(ev, was_open, cause.clone()) {
+                    None if dropped => self.settle(was_open, cause),
+                    t => t,
+                }
+            }
             "PreToolUse" => {
+                self.expire_side_dialogs(ev, ev.tool_use_id.as_deref());
                 self.remember_tool(ev);
                 if !side && self.hook_turn_open() {
                     self.follow_mids(false);
@@ -507,11 +553,22 @@ impl StatusEngine {
                 // Some payloads lack `tool_use_id`: borrow it from the latest PreToolUse of
                 // the same agent and tool, so a parallel tool finishing is not the answer.
                 let tool_use_id = self.tool_use_id_for(ev);
-                let p = Pending { agent: ev.agent_id.clone(), tool_use_id, tool_name: ev.tool_name.clone() };
+                // A side agent asking again about another call: its older dialog is over.
+                self.expire_side_dialogs(ev, tool_use_id.as_deref());
+                let in_flight = self
+                    .recent_tool_ids
+                    .iter()
+                    .filter(|((agent, _), id)| *agent == ev.agent_id && Some(*id) != tool_use_id.as_ref())
+                    .map(|(_, id)| id.clone())
+                    .collect();
+                let p = Pending { agent: ev.agent_id.clone(), tool_use_id, tool_name: ev.tool_name.clone(), in_flight };
                 // A duplicate delivery of the same dialog is not a second dialog (without a
                 // `tool_use_id`, only a repeat of the newest one can be told apart).
-                let dup =
-                    if p.tool_use_id.is_some() { self.pending.contains(&p) } else { self.pending.back() == Some(&p) };
+                let dup = if p.tool_use_id.is_some() {
+                    self.pending.iter().any(|q| q.same(&p))
+                } else {
+                    self.pending.back().is_some_and(|q| q.same(&p))
+                };
                 if !dup {
                     self.pending.push_back(p);
                 }
@@ -1639,6 +1696,76 @@ mod lifecycle_tests {
         e.apply(&ups("again"));
         assert_eq!(e.apply(&side_tool("StopFailure", "a-1")), None);
         assert_eq!(e.status(), Status::Working);
+    }
+
+    fn side_call(name: &str, agent: &str, id: &str) -> Input {
+        Input::Hook(HookEvent {
+            agent_id: Some(agent.into()),
+            tool_name: Some("Bash".into()),
+            tool_use_id: Some(id.into()),
+            ..HookEvent::named(name)
+        })
+    }
+
+    /// Review I5: a background agent's dialog outlives the main turn; without its
+    /// `SubagentStop` it must still end, when that agent starts a new tool call.
+    #[test]
+    fn a_side_dialog_ends_when_its_agent_moves_on_without_subagent_stop() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[
+            ups("go"),
+            side_tool("SubagentStart", "a-1"),
+            side_call("PreToolUse", "a-1", "s1"),
+            side_call("PermissionRequest", "a-1", "s1"),
+            hook("Stop"),
+        ]);
+        assert_eq!((e.status(), e.pending_dialogs()), (Status::NeedsYou, 1));
+        // Another agent's call, or the same call again, is no sign.
+        assert_eq!(e.apply(&side_call("PreToolUse", "a-2", "x1")), None);
+        assert_eq!(e.apply(&side_call("PreToolUse", "a-1", "s1")), None);
+        assert_eq!(e.status(), Status::NeedsYou);
+        let t = e.apply(&side_call("PreToolUse", "a-1", "s2")).unwrap();
+        assert_eq!((t.from, t.to), (Status::NeedsYou, Status::Idle));
+        assert_eq!(e.dialogs(), vec![]);
+    }
+
+    /// A parallel call already running when the agent asked is no sign it moved on; a
+    /// newer dialog of the same side agent replaces its older one.
+    #[test]
+    fn a_side_agents_parallel_call_keeps_its_dialog_and_a_newer_dialog_replaces_it() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[
+            ups("go"),
+            side_tool("SubagentStart", "a-1"),
+            side_call("PreToolUse", "a-1", "s1"),
+            Input::Hook(HookEvent {
+                agent_id: Some("a-1".into()),
+                tool_name: Some("Read".into()),
+                tool_use_id: Some("p1".into()),
+                ..HookEvent::named("PreToolUse")
+            }),
+            side_call("PermissionRequest", "a-1", "s1"),
+        ]);
+        assert_eq!(e.pending_dialogs(), 1);
+        e.apply(&side_call("PostToolUse", "a-1", "p1"));
+        assert_eq!(e.dialogs(), vec![(Some("a-1".to_string()), Some("s1".to_string()))]);
+        e.apply_all(&[side_call("PreToolUse", "a-1", "s2"), side_call("PermissionRequest", "a-1", "s2")]);
+        assert_eq!(e.dialogs(), vec![(Some("a-1".to_string()), Some("s2".to_string()))]);
+    }
+
+    /// Review I5: the person submitting a prompt ends every side agent's dialog.
+    #[test]
+    fn a_persons_prompt_ends_side_dialogs() {
+        let mut e = StatusEngine::new();
+        e.apply_all(&[
+            side_tool("SubagentStart", "a-1"),
+            side_call("PreToolUse", "a-1", "s1"),
+            side_call("PermissionRequest", "a-1", "s1"),
+        ]);
+        assert_eq!(e.status(), Status::NeedsYou);
+        let t = e.apply(&ups("next")).unwrap();
+        assert_eq!((t.from, t.to), (Status::NeedsYou, Status::Working));
+        assert_eq!(e.pending_dialogs(), 0);
     }
 
     #[test]

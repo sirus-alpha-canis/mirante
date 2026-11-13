@@ -309,7 +309,45 @@ impl State {
         };
         let t = live.engine.apply(input);
         let turn_open = live.engine.turn_open();
-        self.after_input(task_id, t.map(|t| (t.from, t.to, t.cause)), turn_open)
+        self.after_input(task_id, t.map(|t| (t.from, t.to, t.cause)), turn_open)?;
+        // A tool that ran settles its own card as allowed (`settle_tool_ran`, right after).
+        let tool_ran = matches!(input, Input::Hook(ev) if matches!(ev.hook_event_name.as_str(), "PostToolUse" | "PostToolUseFailure"));
+        if !tool_ran {
+            self.settle_gone_dialogs(task_id, input)?;
+        }
+        Ok(())
+    }
+
+    /// Settles (as denied) the pending cards of the live Claude session whose dialog the
+    /// status engine no longer holds: the turn it was raised in ended while a background
+    /// agent's dialog keeps the task `NeedsYou` (no status change settles it then), or the
+    /// side agent that asked moved on. A card left pending would block every inline answer
+    /// (several pending cards: answer in the terminal).
+    fn settle_gone_dialogs(&mut self, task_id: &str, input: &Input) -> Result<()> {
+        let Some(l) = self.live.get(task_id) else {
+            return Ok(());
+        };
+        let open = l.engine.dialogs();
+        let session_id = l.session_id.clone();
+        let gone: Vec<String> = self
+            .store
+            .pending_permissions(task_id)?
+            .into_iter()
+            .filter(|p| p.session_id == session_id)
+            .filter(|p| {
+                l.dialogs.get(&p.id).is_some_and(|k| !open.iter().any(|(a, id)| *a == k.agent && *id == k.tool_use_id))
+            })
+            .map(|p| p.id)
+            .collect();
+        let cause = match input {
+            Input::Hook(ev) => format!("hook:{}", ev.hook_event_name),
+            Input::Transcript(_) => "transcript".to_string(),
+            Input::PermissionAnswered { .. } => "mirante:permission_answered".to_string(),
+        };
+        for id in gone {
+            self.settle_card(task_id, &id, PermissionStatus::Denied, &cause)?;
+        }
+        Ok(())
     }
 
     /// Persists a status change and the turn records, then runs what a change implies:
@@ -1970,6 +2008,51 @@ mod tests {
         let s = settled(&k, &t);
         assert_eq!(s.len(), 2);
         assert!(s.iter().all(|(_, a)| *a == json!(PermissionStatus::Denied)));
+    }
+
+    /// Review I5: a background agent's dialog keeps the task `NeedsYou` past the main
+    /// turn's end; the main agent's card is settled all the same (it would block every
+    /// inline answer), and the side card is settled once that agent moves on, even when its
+    /// `SubagentStop` never comes.
+    #[test]
+    fn a_main_card_settles_at_turn_end_and_a_side_card_when_its_agent_moves_on() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "go"}));
+        k.hook(&t.id, json!({"hook_event_name": "SubagentStart", "agent_id": "a-1"}));
+        k.hook(&t.id, tool("PreToolUse", "t1"));
+        k.hook(&t.id, perm("t1", "main"));
+        k.hook(&t.id, tool("PreToolUse", "t2"));
+        k.hook(&t.id, perm("t2", "side"));
+        assert_eq!(k.pending(&t.id).len(), 2);
+        // The main turn ends (the main dialog was denied in the terminal; a Stop follows).
+        k.hook(&t.id, json!({"hook_event_name": "Stop"}));
+        assert_eq!(status(&k, &t.id), Status::NeedsYou, "the background agent still asks");
+        let left = k.pending(&t.id);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].detail, "side");
+        // The side agent starts another tool call: its dialog was answered. No SubagentStop.
+        let mut next = json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_use_id": "t3"});
+        next["agent_id"] = json!("a-1");
+        k.hook(&t.id, next);
+        assert!(k.pending(&t.id).is_empty());
+        assert_eq!(status(&k, &t.id), Status::Idle);
+        assert_eq!(settled(&k, &t.id).len(), 2);
+    }
+
+    /// Review I5: the person submitting a prompt means no side agent's dialog holds the
+    /// input any more.
+    #[test]
+    fn a_persons_prompt_ends_a_side_agents_stuck_dialog() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "a").task;
+        k.hook(&t.id, json!({"hook_event_name": "SubagentStart", "agent_id": "a-1"}));
+        k.hook(&t.id, tool("PreToolUse", "t2"));
+        k.hook(&t.id, perm("t2", "side"));
+        assert_eq!(status(&k, &t.id), Status::NeedsYou);
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "next"}));
+        assert!(k.pending(&t.id).is_empty());
+        assert_eq!(status(&k, &t.id), Status::Working);
     }
 
     #[test]
