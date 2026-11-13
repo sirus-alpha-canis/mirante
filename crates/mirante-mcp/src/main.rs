@@ -1,7 +1,8 @@
 //! `mirante-mcp`: the stdio MCP server Mirante injects into one task's agent session (see
 //! the library docs). It does nothing without `MIRANTE_TASK_ID`, like `mirante-hook`.
 //! `--surface memory` (the default) serves repo memory, `--surface skills` serves
-//! `skill_propose`; anything else exits 2. stdout carries only protocol messages; logs go
+//! `skill_propose`, `--surface orchestrator` serves `task_spawn` / `task_children` /
+//! `task_result`; anything else exits 2. stdout carries only protocol messages; logs go
 //! to stderr.
 use std::io::{self, BufReader, Write};
 use std::time::Duration;
@@ -40,9 +41,9 @@ fn surface(args: &[String]) -> Result<Surface, String> {
         [] => return Ok(Surface::Memory),
         [flag, v] if flag == "--surface" => v.as_str(),
         [one] => one.strip_prefix("--surface=").ok_or_else(|| format!("unknown argument {one}"))?,
-        _ => return Err("usage: mirante-mcp [--surface memory|skills]".into()),
+        _ => return Err("usage: mirante-mcp [--surface memory|skills|orchestrator]".into()),
     };
-    Surface::parse(value).ok_or_else(|| format!("unknown surface {value} (memory or skills)"))
+    Surface::parse(value).ok_or_else(|| format!("unknown surface {value} (memory, skills or orchestrator)"))
 }
 
 fn main() {
