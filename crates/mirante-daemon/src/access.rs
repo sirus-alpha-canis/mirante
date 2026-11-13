@@ -9,7 +9,9 @@
 //!   `mirante-mcp`, anything they start): only what those need: `hook.event` (the hook's
 //!   delivery, for its own task only), `dna.search` / `dna.get` / `dna.propose` (the memory
 //!   MCP server, own task only, checked by the hub), `skill.propose` (the skills MCP server,
-//!   own task only), and `daemon.status` (pid and version, nothing about tasks). Never a
+//!   own task only), `task.spawn_propose` / `task.children` / `task.child_result` (the
+//!   orchestrator MCP server, own task only; deciding a proposal is a person's), and
+//!   `daemon.status` (pid and version, nothing about tasks). Never a
 //!   lifecycle method (`task.create`, `session.start`, `message.send`, `attach`,
 //!   `permission.answer`, …), a read of other tasks, or a decision.
 //! - **Unverified** (the peer could not be checked: gone, its pid reused, or its
@@ -89,6 +91,13 @@ pub const ACCESS: &[(&str, Access)] = &[
     // Orchestration (whether a task's agent gets the orchestrator MCP server): a person's
     // decision, never an agent's, not even for its own task.
     (method::TASK_ORCHESTRATE, Access::Person),
+    // The orchestrator MCP server: an agent proposes children and reads its own children's
+    // results, for its own task only (the hub checks which); a person decides each proposal.
+    (method::TASK_SPAWN_PROPOSE, Access::Agents),
+    (method::TASK_CHILDREN, Access::Agents),
+    (method::TASK_CHILD_RESULT, Access::Agents),
+    (method::TASK_SPAWN_PROPOSALS, Access::Person),
+    (method::TASK_SPAWN_REVIEW, Access::Person),
     (method::DNA_STATUS, Access::Person),
     (method::DNA_ENABLE, Access::Person),
     (method::DNA_DISABLE, Access::Person),
@@ -223,6 +232,9 @@ mod tests {
             method::DNA_GET,
             method::DNA_PROPOSE,
             method::SKILL_PROPOSE,
+            method::TASK_SPAWN_PROPOSE,
+            method::TASK_CHILDREN,
+            method::TASK_CHILD_RESULT,
         ]
         .into();
         assert_eq!(agents, expected);

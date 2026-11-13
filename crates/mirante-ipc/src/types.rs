@@ -1,7 +1,8 @@
 //! Method names and their parameter / result types. A task may be referenced by its full
 //! id, its branch name, or a unique suffix of its id (at least 4 characters).
 use mirante_core::groups::TaskGroup;
-use mirante_core::model::{AgentKind, GroupKind, PermissionRequest, Task, TaskRepo};
+use mirante_core::model::{AgentKind, GroupKind, Lifecycle, PermissionRequest, Status, Task, TaskRepo};
+use mirante_core::orchestration::{ProposalStatus, SpawnProposal};
 use mirante_core::threads::{Moved, SummaryBy, ThreadLink};
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,24 @@ pub mod method {
     /// [`super::TaskView`]): while on, its next sessions get the `mirante-orchestrator` MCP
     /// server. Never for a child task. A person only.
     pub const TASK_ORCHESTRATE: &str = "task.orchestrate";
+    /// A task's agent proposes child tasks, each waiting for a person's decision
+    /// ([`super::SpawnPropose`] → `Vec<`[`super::SpawnProposalView`]`>`). Refused while
+    /// orchestration is off. An agent proposes for its own task only.
+    pub const TASK_SPAWN_PROPOSE: &str = "task.spawn_propose";
+    /// Proposed child tasks, of one task or every one's ([`super::SpawnProposals`] →
+    /// `Vec<`[`super::SpawnProposalView`]`>`). A person only.
+    pub const TASK_SPAWN_PROPOSALS: &str = "task.spawn_proposals";
+    /// A person approves (creates and starts the child, with their edits) or rejects a
+    /// proposal ([`super::SpawnReview`] → [`super::SpawnReviewed`]). A person only.
+    pub const TASK_SPAWN_REVIEW: &str = "task.spawn_review";
+    /// The children a task's agent proposed and a person approved, and its proposals
+    /// ([`super::TaskRef`] → [`super::ChildrenView`]; agent text redacted and capped). An
+    /// agent reads its own task's only.
+    pub const TASK_CHILDREN: &str = "task.children";
+    /// One approved child's result: status, last finished answer, diff stat
+    /// ([`super::ChildResultParams`] → [`super::ChildResult`]). An agent reads its own
+    /// task's children only.
+    pub const TASK_CHILD_RESULT: &str = "task.child_result";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -281,6 +300,137 @@ pub struct ThreadView {
 pub struct Orchestrate {
     pub task: String,
     pub enabled: bool,
+}
+
+/// One child task an agent proposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposedChild {
+    pub goal: String,
+    /// Default: the proposing task's agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Why the agent wants it, for the person deciding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// `task.spawn_propose`: 1 to 5 children of `task`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnPropose {
+    pub task: String,
+    pub children: Vec<ProposedChild>,
+}
+
+/// `task.spawn_proposals`: of one task (absent: every task's), of one status (absent: any).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnProposals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ProposalStatus>,
+}
+
+/// A proposal as clients see it: what the agent wrote, and the task it is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnProposalView {
+    #[serde(flatten)]
+    pub proposal: SpawnProposal,
+    pub parent_title: String,
+    pub parent_branch: String,
+    /// A workspace parent: its repos' names (primary first). The child runs on these, or
+    /// on fewer the person picks (the primary always). Empty for a single-repo parent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+}
+
+/// What the person changes before approving: each one given replaces the proposal's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnEdits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// A workspace parent: the repos (names) the child runs on; the primary is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+}
+
+/// `task.spawn_review`. `start` (default true): an approved child starts at once with its
+/// goal as the first prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnReview {
+    pub id: String,
+    pub accept: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits: Option<SpawnEdits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnReviewed {
+    pub proposal: SpawnProposalView,
+    /// The child an approval made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<TaskView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<StartResult>,
+    /// The child was made but did not start (e.g. memory is tight): start it later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_error: Option<String>,
+}
+
+/// One approved child, as its parent's agent reads it (agent text redacted and capped).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildView {
+    pub id: String,
+    pub title: String,
+    pub branch: String,
+    pub agent: AgentKind,
+    pub status: Status,
+    pub lifecycle: Lifecycle,
+    pub live: bool,
+    /// A permission (or a trust prompt) waits for the person in it.
+    pub needs_you: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<String>,
+    /// The start of its newest finished answer. Agent text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_answer: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildrenView {
+    pub children: Vec<ChildView>,
+    /// What the agent proposed, with where each stands (the newest last).
+    pub proposals: Vec<SpawnProposal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildResultParams {
+    pub task: String,
+    pub child: String,
+}
+
+/// One approved child's result (agent text redacted and capped).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildResult {
+    pub child: String,
+    pub title: String,
+    pub branch: String,
+    pub status: Status,
+    pub lifecycle: Lifecycle,
+    /// No session of it is running (it ended, or never started).
+    pub ended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_answer: Option<String>,
+    /// `None` once archived or when git could not tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffStat>,
 }
 
 /// `task.thread`: each one given replaces what the thread has; `expect_hash` is the

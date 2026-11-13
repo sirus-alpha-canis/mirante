@@ -353,6 +353,14 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::TASK_THREAD => out(hub.thread_edit(params(p)?)),
         method::TASK_SUMMARIZE => out(hub.summarize(params(p)?)),
         method::TASK_ORCHESTRATE => out(hub.orchestrate(caller, params(p)?)),
+        method::TASK_SPAWN_PROPOSE => out(hub.spawn_propose(caller, params(p)?)),
+        method::TASK_SPAWN_PROPOSALS => {
+            let l: mirante_ipc::types::SpawnProposals = if p.is_null() { Default::default() } else { params(p)? };
+            out(hub.spawn_proposals(caller, l))
+        }
+        method::TASK_SPAWN_REVIEW => out(hub.spawn_review(caller, params(p)?)),
+        method::TASK_CHILDREN => out(hub.task_children(caller, &params::<TaskRef>(p)?.task)),
+        method::TASK_CHILD_RESULT => out(hub.child_result(caller, params(p)?)),
         method::RULES_LAYERS => out(hub.rules_layers(params(p)?)),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),

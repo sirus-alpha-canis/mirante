@@ -417,21 +417,31 @@ fn last_seq(store: &Store) -> Result<u64> {
     }
 }
 
-/// Where a task being created goes: nowhere special, into a fan-out group, or a thread.
+/// Where a task being created goes: nowhere special, into a fan-out group, a thread, or a
+/// child its parent's agent proposed and a person approved.
 #[derive(Debug, Clone)]
 pub(crate) enum Placement {
     Plain,
     Group(groups::Member),
     Thread(mirante_core::threads::NewThread),
+    Spawn(mirante_core::orchestration::NewSpawn),
 }
 
 impl Placement {
-    /// Its goal is the person's own words (mining may read it).
+    /// Its goal is the person's own words (mining may read it). An approved child's goal
+    /// was written by an agent: never.
     fn by_person(&self) -> bool {
         match self {
             Placement::Group(g) => g.by_person,
             Placement::Plain | Placement::Thread(_) => true,
+            Placement::Spawn(_) => false,
         }
+    }
+
+    /// The origin is copied from the parent in the store's transaction (never fixed from
+    /// the checkout).
+    fn inherits_origin(&self) -> bool {
+        matches!(self, Placement::Spawn(_))
     }
 }
 
@@ -708,15 +718,21 @@ impl Hub {
             agent: p.agent,
             goal: p.goal,
         };
+        let inherits = place.inherits_origin();
         let mut st = self.lock();
         let made = match place {
             Placement::Group(g) => st.store.create_group_task(new, None, &g.group, g.role),
             Placement::Thread(th) => st.store.create_thread_task(new, None, th),
+            Placement::Spawn(sp) => st.store.create_spawned_task(new, None, sp),
             Placement::Plain => st.store.create_task(new),
         };
         match made {
             Ok(task) => {
-                let fixed = fix_origin(&mut st, &task, &repo, checkout.as_deref(), &origin, &tenant, by_person);
+                let fixed = if inherits {
+                    inherited_origin(&st, &task)
+                } else {
+                    fix_origin(&mut st, &task, &repo, checkout.as_deref(), &origin, &tenant, by_person)
+                };
                 let mut v = st.view(task)?;
                 v.origin = fixed;
                 st.publish();
@@ -773,10 +789,12 @@ impl Hub {
             group_path: group.to_string_lossy().into_owned(),
             repos: made.repos.clone(),
         };
+        let inherits = place.inherits_origin();
         let mut st = self.lock();
         let made_task = match place {
             Placement::Group(g) => st.store.create_group_task(new, Some(ws), &g.group, g.role),
             Placement::Thread(th) => st.store.create_thread_task(new, Some(ws), th),
+            Placement::Spawn(sp) => st.store.create_spawned_task(new, Some(ws), sp),
             Placement::Plain => st.store.create_workspace_task(new, ws),
         };
         match made_task {
@@ -789,6 +807,8 @@ impl Hub {
                         st.log_error(Some(&task.id), "workspace tenants", &e);
                     }
                     None
+                } else if inherits {
+                    inherited_origin(&st, &task)
                 } else {
                     fix_origin(&mut st, &task, primary, checkout.as_deref(), &origin, &tenant, by_person)
                 };
@@ -932,6 +952,10 @@ impl Hub {
             return Err(e.into());
         }
         let t = st.store.transition_lifecycle(&task.id, Lifecycle::Archived)?;
+        // What its agent proposed and nobody decided goes with it.
+        if let Err(e) = st.store.withdraw_proposals(&task.id) {
+            st.log_error(Some(&task.id), "withdrawing the archived task's proposals", &e);
+        }
         if let Err(e) = remove_session_dir(&self.paths, &task.id) {
             st.log_error(Some(&task.id), "removing the archived task's session files", &e);
         }
@@ -1038,6 +1062,13 @@ fn fix_origin(
             None
         }
     }
+}
+
+/// The origin a child copied from its parent when it was made (`None`: the parent had
+/// none, so the child gets no skills either).
+fn inherited_origin(st: &State, task: &Task) -> Option<mirante_ipc::types::CreatedOrigin> {
+    let o = st.store.skill_origin_of(&task.id).ok().flatten()?;
+    Some(mirante_ipc::types::CreatedOrigin { origin: o.origin, tenant: o.tenant, observed: o.observed, pinned: false })
 }
 
 /// Why a workspace task across `tenants` gets no skills and no repo memory.
