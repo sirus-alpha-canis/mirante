@@ -709,3 +709,15 @@ button.skill-chip:hover { color: var(--text); }
 .quick-open .quick-path { font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .quick-open .quick-hint { margin: var(--s2) var(--s3) 0; }
 .step-open { margin-left: var(--s1); padding: 0 4px; line-height: 1; }
+/* A fan-out group inside a member's Detail: one card per task, then Synthesize. */
+.group-panel { margin: 0 0 var(--s3, 12px); padding: var(--s2, 8px) var(--s3, 12px); border: 1px solid var(--line, var(--panel-3)); border-radius: 8px; max-height: 40vh; overflow: auto; }
+.group-panel-head { display: flex; gap: 8px; align-items: baseline; }
+.group-panel-head h2 { margin: 0; font-size: var(--fs-md, 1rem); }
+.child-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; margin-top: 8px; }
+.child-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.answer-clamp3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; margin: 6px 0 0; }
+.child-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.child-steer { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
+.child-steer input { flex: 1; min-width: 0; }
+.group-synth { margin-top: 8px; }
+.synth-text { white-space: pre-wrap; word-break: break-word; max-height: 30vh; overflow: auto; background: var(--panel-2, transparent); padding: 8px; border-radius: 6px; font-size: var(--fs-sm); user-select: text; }

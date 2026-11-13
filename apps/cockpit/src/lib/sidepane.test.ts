@@ -51,4 +51,15 @@ describe("side pane memory", () => {
       expect(p.open, bad).toBe(false);
     }
   });
+
+  it("a Diff target may name another task (a sibling's, beside this one); gone or bad, it is dropped", () => {
+    const s = store();
+    savePane(s, "t1", { open: true, width: 40, target: { k: "diff", task: "t2" }, swapped: false });
+    expect(loadPane(s, "t1", alive).target).toEqual({ k: "diff", task: "t2" });
+    expect(loadPane(s, "t1", (id) => id !== "t2").target).toBeNull();
+    savePane(s, "t1", { open: true, width: 40, target: { k: "diff", task: "t1" }, swapped: false });
+    expect(loadPane(s, "t1", alive).target).toEqual({ k: "diff" });
+    s.setItem(paneKey("t"), JSON.stringify({ open: true, target: { k: "diff", task: 5 } }));
+    expect(loadPane(s, "t", alive).target).toEqual({ k: "diff" });
+  });
 });

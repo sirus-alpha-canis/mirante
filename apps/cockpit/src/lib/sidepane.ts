@@ -4,7 +4,8 @@
 
 export type PaneTarget =
   | { k: "file"; path: string; line?: number }
-  | { k: "diff" }
+  /** `task`: another task's Diff (a fan-out sibling's, beside this one's own). */
+  | { k: "diff"; task?: string }
   | { k: "steps" }
   | { k: "terminal"; task: string }
   | { k: "note"; repo: string; slug: string }
@@ -48,6 +49,7 @@ export function checkTarget(v: unknown): PaneTarget | null {
       return line ? { k: "file", path: o.path, line } : { k: "file", path: o.path };
     }
     case "diff":
+      return str(o.task, 200) ? { k: "diff", task: o.task } : { k: "diff" };
     case "steps":
     case "notes":
       return { k: o.k };
@@ -67,6 +69,7 @@ export function checkTarget(v: unknown): PaneTarget | null {
 /** Whether `target` may show in the pane of `taskId`: never the task's own terminal (it
  * stays the main view), never the terminal of a task that is gone or archived. */
 export function targetAllowed(target: PaneTarget, taskId: string, taskAlive: (id: string) => boolean): boolean {
+  if (target.k === "diff") return !target.task || target.task === taskId || taskAlive(target.task);
   if (target.k !== "terminal") return true;
   return target.task !== taskId && taskAlive(target.task);
 }
@@ -85,6 +88,8 @@ export function loadPane(store: KV, taskId: string, taskAlive: (id: string) => b
   const swapped = o.swapped === true;
   let target = checkTarget(o.target);
   if (target && !targetAllowed(target, taskId, taskAlive)) target = null;
+  // This task's own Diff, named: the plain one.
+  if (target?.k === "diff" && target.task === taskId) target = { k: "diff" };
   // An open pane with nothing in it stays open; one whose target was dropped is closed.
   const dropped = o.target != null && target === null;
   return { open: o.open === true && !dropped, width, target, swapped };

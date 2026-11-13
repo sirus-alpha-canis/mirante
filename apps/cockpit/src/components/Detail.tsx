@@ -24,6 +24,7 @@ import { TrustCard } from "./TrustCard";
 import { onMac, shortcutFor } from "../lib/shortcuts";
 import { clampWidth, loadPane, type PaneState, type PaneTarget, PANE_MAX, PANE_MIN, savePane } from "../lib/sidepane";
 import { SidePane } from "./SidePane";
+import { GroupPanel } from "./GroupPanel";
 import { type PaneApi, PaneContext } from "./paneContext";
 import { QuickOpen } from "./QuickOpen";
 import { useOpenInEditor } from "./EditorButton";
@@ -510,6 +511,8 @@ export function Detail({
             <Actions key={t.id} t={t} />
           </header>
           {!onTerminal && notices}
+          {/* A fan-out group's member: its siblings (status, answer, steer, synthesize). */}
+          {t.group_id && <GroupPanel key={`group-${t.group_id}`} taskId={t.id} onSelect={onSelect} />}
           <div role="tablist" aria-label={tt("detail.views")} className="tabs" onKeyDown={onTabKey}>
             {TABS.map((name) => (
               <button

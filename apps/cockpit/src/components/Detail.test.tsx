@@ -547,3 +547,23 @@ describe("Detail (V1 classic)", () => {
     });
   });
 });
+
+describe("Detail: a fan-out group's member", () => {
+  it("shows the group's panel above the tabs; Diff beside opens a sibling's Diff in the side pane", async () => {
+    const g = { id: "g1", kind: "compare" as const, title: "fix login", goal: "fix login", branch: "mirante/fix-login", created_at: 1 };
+    const a = task("a", { status: "working", group_id: "g1", group_role: "child", group: g, branch: "mirante/fix-login--1-claude" });
+    const b = task("b", { status: "idle", group_id: "g1", group_role: "child", group: g, agent: "codex", branch: "mirante/fix-login--2-codex", title: "the codex run" });
+    const h = makeEnv({
+      "group.get": { group: g, members: [{ view: a }, { view: b }] },
+      "task.diff": (p: Record<string, unknown>) => ({ base: `main-${String(p.task)}`, merge_base: "abcdef123456", files: [], untracked: [], patch: "", truncated: false, compare_url: null, pushed: false }),
+    });
+    h.load([a, b]);
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    const panel = screen.getByRole("region", { name: "Fan-out fix login" });
+    await userEvent.click(within(panel).getByRole("button", { name: "Diff beside" }));
+    const pane = screen.getByRole("complementary", { name: "Side pane" });
+    expect(within(pane).getByText("Diff: the codex run")).toBeInTheDocument();
+    await waitFor(() => expect(h.calls).toContainEqual(["task.diff", { task: "b" }]));
+  });
+});
+

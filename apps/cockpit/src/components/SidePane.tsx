@@ -20,13 +20,13 @@ export { type PaneApi, PaneContext, usePane } from "./paneContext";
 
 function useTitle(target: PaneTarget | null): string {
   const t = useT();
-  const other = useSelect((s) => (target?.k === "terminal" ? s.tasks[target.task]?.title : undefined));
+  const other = useSelect((s) => (target?.k === "terminal" || (target?.k === "diff" && target.task) ? s.tasks[target.task!]?.title : undefined));
   if (!target) return t("pane.label");
   switch (target.k) {
     case "file":
       return target.line ? `${target.path}:${target.line}` : target.path;
     case "diff":
-      return t("pane.diff");
+      return target.task ? t("pane.diffOf", { title: other ?? target.task }) : t("pane.diff");
     case "steps":
       return t("pane.steps");
     case "notes":
@@ -88,9 +88,13 @@ export function SidePane({
       if (target?.k !== "file") break;
       body = <FileView key={`${task.id}:${target.path}`} taskId={task.id} path={target.path} line={target.line} onOpenPath={onOpenFile} />;
       break;
-    case "diff":
-      body = <DiffTab key={`pane-diff-${task.id}`} taskId={task.id} version={version} />;
+    case "diff": {
+      if (target?.k !== "diff") break;
+      // Another task's Diff (a sibling's): its own changes, refetched on this task's turns too.
+      const id = target.task ?? task.id;
+      body = <DiffTab key={`pane-diff-${id}`} taskId={id} version={version} />;
       break;
+    }
     case "steps":
       body = steps;
       break;
