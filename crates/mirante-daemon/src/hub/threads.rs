@@ -583,6 +583,28 @@ mod tests {
         assert!(s.summary.starts_with("idle · Fixed it. / Added a test."), "{}", s.summary);
     }
 
+    /// Dogfood finding 1: an answer holding terminal escapes is stored and summarized
+    /// without them.
+    #[test]
+    fn the_stored_and_the_asked_summary_hold_no_terminal_escapes() {
+        let k = Kit::new();
+        let th = create(&k, None, pr(4), "", "t-esc").unwrap();
+        let id = th.task.id.clone();
+        k.hub
+            .lock()
+            .event(
+                Some(&id),
+                "step",
+                json!({"type": "agent_message", "text": "Plan ready\u{1b}]0;pwned\u{7}\nstep two", "final": true}),
+            )
+            .unwrap();
+        let v = k.hub.get_task(&id).unwrap().thread.unwrap();
+        assert_eq!(v.summary.as_deref(), Some("Plan ready]0;pwned / step two"));
+        let s = k.hub.summarize(Summarize { task: id.clone(), with: None }).unwrap();
+        assert!(!s.summary.chars().any(char::is_control), "{:?}", s.summary);
+        assert!(s.summary.contains("Plan ready]0;pwned / step two"), "{}", s.summary);
+    }
+
     /// A fake `claude` (env is cleared for it: its log path is written into it). It records
     /// each run's cwd, env, stdin and argv (NUL-separated, the last run's), and answers
     /// `--version`, the probe (`init_tools` in its init line) and a summary.

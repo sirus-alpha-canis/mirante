@@ -277,14 +277,21 @@ pub fn strip_thread_block(text: &str) -> &str {
 
 /// A thread's summary without a model: its status (when given), the first
 /// [`SUMMARY_LINES`] non-empty lines of its last finished answer (at most
-/// [`SUMMARY_CHARS`] characters) and its diff stat `(files, added, removed)` (when given).
+/// [`SUMMARY_CHARS`] characters, controls and invisible characters stripped) and its diff
+/// stat `(files, added, removed)` (when given).
 pub fn deterministic_summary(status: Option<Status>, answer: Option<&str>, diff: Option<(u64, u64, u64)>) -> String {
     let mut parts = Vec::new();
     if let Some(s) = status {
         parts.push(s.as_str().replace('_', " "));
     }
     if let Some(a) = answer {
-        let lines: Vec<&str> = a.lines().map(str::trim).filter(|l| !l.is_empty()).take(SUMMARY_LINES).collect();
+        // An agent's text: no terminal escapes or other controls reach the card (a tab is a space).
+        let lines: Vec<String> = a
+            .lines()
+            .map(|l| crate::dna::untrusted::line(l, usize::MAX).trim().to_string())
+            .filter(|l| !l.is_empty())
+            .take(SUMMARY_LINES)
+            .collect();
         let joined = lines.join(" / ");
         if !joined.is_empty() {
             let cut = if joined.chars().count() > SUMMARY_CHARS {
@@ -657,6 +664,15 @@ mod tests {
         assert!(s.ends_with('…'));
         assert_eq!(deterministic_summary(None, None, None), "no answer yet");
         assert_eq!(deterministic_summary(Some(Status::NeedsYou), None, None), "needs you");
+    }
+
+    #[test]
+    fn deterministic_summary_strips_terminal_escapes() {
+        let s = deterministic_summary(None, Some("Plan ready\u{1b}]0;pwned\u{7}\n\u{9b}2Jstep\ttwo\u{1b}[31m"), None);
+        assert_eq!(s, "Plan ready]0;pwned / 2Jstep two[31m");
+        assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+        // A line made only of controls is empty and skipped.
+        assert_eq!(deterministic_summary(None, Some("\u{1b}\u{7}\nok"), None), "ok");
     }
 
     fn task(s: &mut Store, branch: &str) -> Task {
