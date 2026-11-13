@@ -16,6 +16,7 @@ import { NoteView } from "./NoteView";
 import { SkillPanel } from "./Skills";
 import { SubagentPane } from "./SubagentLane";
 import { TerminalTab } from "./TerminalTab";
+import { ThreadNotes } from "./ThreadHeader";
 
 export { type PaneApi, PaneContext, usePane } from "./paneContext";
 
@@ -98,6 +99,9 @@ export function SidePane({
     }
     case "steps":
       body = steps;
+      break;
+    case "notes":
+      body = <ThreadNotes key={`notes-${task.id}`} taskId={task.id} />;
       break;
     case "terminal":
       if (target?.k !== "terminal") break;

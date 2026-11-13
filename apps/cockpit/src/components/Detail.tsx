@@ -31,6 +31,7 @@ import { QuickOpen } from "./QuickOpen";
 import { useOpenInEditor } from "./EditorButton";
 import { type ThreadApi, ThreadContext } from "./threadContext";
 import { NewThreadDialog } from "./NewThreadDialog";
+import { ThreadHeader } from "./ThreadHeader";
 
 const GROUPS: Column[] = ["needs_you", "working", "review", "idle"];
 const TABS = ["Steps", "Terminal", "Diff", "Memory"] as const;
@@ -548,6 +549,8 @@ export function Detail({
             </p>
           )}
           {!onTerminal && notices}
+          {/* A thread: where it came from, what it is bound to, its notes and summary. */}
+          {t.thread && <ThreadHeader key={`thread-${t.id}`} t={t} onSelect={onSelect} />}
           {/* A fan-out group's member: its siblings (status, answer, steer, synthesize). */}
           {t.group_id && <GroupPanel key={`group-${t.group_id}`} taskId={t.id} onSelect={onSelect} />}
           {/* Claude's own agents inside this task (read-only). */}

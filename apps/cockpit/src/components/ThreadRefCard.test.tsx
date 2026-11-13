@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { TaskView } from "../lib/protocol";
@@ -48,5 +48,17 @@ describe("ThreadRefCard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("memory is tight");
     expect(h.api.open).not.toHaveBeenCalled();
+  });
+
+  it("parent feed shows one compact card per thread: \"PR #123 · Working · <summary> · 4 min ago\", updated in place", () => {
+    const now = Date.now();
+    const h = setup(thread({ status: "working", thread: { link, notes_hash: "h", delivered: true, summary: "Rebased <b>main</b>.", summary_at: now - 4 * 60_000, summary_by: "deterministic" } }));
+    const card = screen.getByRole("article", { name: "Thread: PR #123" });
+    expect(within(card).getByText("PR #123 · Working · Rebased <b>main</b>. · 4 min ago")).toBeInTheDocument();
+    expect(card.querySelector("b")).toBeNull();
+    // The thread changes: the same card says so (no new line, no child events).
+    act(() => h.env.cockpit.dispatch({ type: "task", view: thread({ status: "idle", needs_you: 1, thread: { link, notes_hash: "h", delivered: true, summary: "Needs a decision.", summary_at: now, summary_by: "claude" } }) }));
+    expect(screen.getByRole("article", { name: "Thread: PR #123" })).toBe(card);
+    expect(within(card).getByText("PR #123 · Needs you · Needs a decision. · just now")).toBeInTheDocument();
   });
 });

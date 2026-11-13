@@ -5,7 +5,10 @@ import { memo, useCallback, useState } from "react";
 import { useEnv, useLive, useSelect } from "../env";
 import { useT } from "../lib/i18n";
 import type { ThreadLink } from "../lib/protocol";
+import { elapsed } from "../lib/inbox";
 import { continueThread, linkLabel } from "../lib/threads";
+import { useNow } from "../lib/useNow";
+import { columnLabel, columnOf } from "../store/select";
 import type { State } from "../store/state";
 import { useThreads } from "./threadContext";
 
@@ -26,10 +29,16 @@ export const ThreadRefCard = memo(function ThreadRefCard({
   const live = useLive();
   const api = useThreads();
   const thread = useSelect(useCallback((s: State) => s.tasks[id], [id]));
+  const col = useSelect(useCallback((s: State) => (s.tasks[id] ? columnOf(s.tasks[id], s.feed[id]) : null), [id]));
+  const now = useNow(30_000);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const shownLink = thread?.thread?.link ?? link;
   const label = shownLink ? linkLabel(shownLink) : t("thread.message");
+  // "PR #123 · Working · <summary> · 4 min ago": the summary is agent-derived, a text node.
+  const view = thread?.thread;
+  const when = view?.summary_at ?? thread?.updated_at;
+  const meta = [label, col ? columnLabel(col) : null, view?.summary || null, when ? (now - when < 60_000 ? t("thread.justNow") : t("thread.ago", { time: elapsed(now - when) })) : null].filter(Boolean).join(" · ");
   const onContinue = async () => {
     if (!thread || busy) return;
     setBusy(true);
@@ -50,7 +59,8 @@ export const ThreadRefCard = memo(function ThreadRefCard({
       </span>
       <span className="thread-card-body">
         {moved && <span className="small muted">{t(moved === "moved" ? "thread.movedTo" : "thread.continuedIn")} </span>}
-        <span className="tag">{label}</span> <span className="thread-card-title">{thread?.title ?? title}</span>
+        <span className="thread-card-title">{thread?.title ?? title}</span>
+        <span className="thread-card-meta small muted">{thread ? meta : label}</span>
       </span>
       {thread && api && (
         <span className="thread-card-actions">
