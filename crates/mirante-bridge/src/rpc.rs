@@ -88,6 +88,10 @@ pub const ALLOWED: &[&str] = &[
     method::GROUP_GET,
     method::GROUP_ARCHIVE,
     method::GROUP_SYNTHESIZE,
+    // Threads: the person edits a thread's notes and link (against the hash they read;
+    // redacted and capped by the daemon), and asks for its summary (deterministic, or their
+    // own Claude CLI on a click: headless, tool-less, output shown as text).
+    method::TASK_THREAD,
     // The Brain's "Rules" view: every instruction layer an agent session reads (read-only;
     // the daemon picks the files from the agent's known locations, never a path the caller
     // names, and masks secrets).
@@ -235,6 +239,7 @@ mod tests {
             "group.get",
             "group.archive",
             "group.synthesize",
+            "task.thread",
             "rules.layers",
         ];
         assert_eq!(ALLOWED, expected);

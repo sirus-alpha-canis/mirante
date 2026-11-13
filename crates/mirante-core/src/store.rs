@@ -28,6 +28,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (9, include_str!("migrations/0009_task_origin_by_person.sql")),
     (10, include_str!("migrations/0010_workspace_tasks.sql")),
     (11, include_str!("migrations/0011_task_groups.sql")),
+    (12, include_str!("migrations/0012_threads.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -206,10 +207,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 11);
+        assert_eq!(s.schema_version().unwrap(), 12);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 11);
+        assert_eq!(s.schema_version().unwrap(), 12);
     }
 
     #[test]
@@ -333,7 +334,23 @@ pub(crate) fn load_task(conn: &Connection, id: &str) -> Result<Task> {
 
 impl Store {
     pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
-        self.insert_task(new, None, None)
+        self.insert_task(new, None, None, None)
+    }
+
+    /// A thread (`crate::threads`): the task bound to `thread.link`, with its notes and the
+    /// conversation it came from (`thread.parent`, one level deep). In the same transaction:
+    /// refused while an open thread under the same parent is bound to the same object; its
+    /// `thread_updated` lands on it, and `thread_started` (or `message_moved`) on the parent.
+    pub fn create_thread_task(
+        &mut self,
+        new: NewTask,
+        ws: Option<NewWorkspace>,
+        thread: crate::threads::NewThread,
+    ) -> Result<Task> {
+        if ws.as_ref().is_some_and(|w| w.repos.is_empty()) {
+            return Err(CoreError::Limit("a workspace task needs at least one repo".into()));
+        }
+        self.insert_task(new, ws, None, Some(thread))
     }
 
     /// A task in the fan-out group `group` (single-repo, or across repos with `ws`). In the
@@ -350,7 +367,7 @@ impl Store {
         if ws.as_ref().is_some_and(|w| w.repos.is_empty()) {
             return Err(CoreError::Limit("a workspace task needs at least one repo".into()));
         }
-        self.insert_task(new, ws, Some((group, role)))
+        self.insert_task(new, ws, Some((group, role)), None)
     }
 
     /// A workspace task: the task row (its repo and worktree are the primary's,
@@ -359,7 +376,7 @@ impl Store {
         if ws.repos.is_empty() {
             return Err(CoreError::Limit("a workspace task needs at least one repo".into()));
         }
-        self.insert_task(new, Some(ws), None)
+        self.insert_task(new, Some(ws), None, None)
     }
 
     fn insert_task(
@@ -367,6 +384,7 @@ impl Store {
         new: NewTask,
         ws: Option<NewWorkspace>,
         group: Option<(&str, GroupRole)>,
+        thread: Option<crate::threads::NewThread>,
     ) -> Result<Task> {
         let now = now_ms();
         let task = Task {
@@ -377,7 +395,7 @@ impl Store {
             branch: new.branch,
             agent: new.agent,
             goal: new.goal,
-            notes: String::new(),
+            notes: thread.as_ref().map(|t| t.notes.clone()).unwrap_or_default(),
             lifecycle: Lifecycle::Created,
             status: Status::Idle,
             created_at: now,
@@ -386,7 +404,7 @@ impl Store {
             group_path: ws.as_ref().map(|w| w.group_path.clone()),
             group_id: group.map(|(g, _)| g.to_string()),
             group_role: group.map(|(_, r)| r),
-            parent_id: None,
+            parent_id: thread.as_ref().and_then(|t| t.parent.clone()),
         };
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some((g, role)) = group {
@@ -437,6 +455,9 @@ impl Store {
                 "group_child_added",
                 &json!({ "group": g, "role": role }),
             )?;
+        }
+        if let Some(th) = &thread {
+            crate::threads::insert_thread(&tx, &self.boot_id, &task, th)?;
         }
         tx.commit()?;
         Ok(task)

@@ -26,17 +26,21 @@ pub(crate) struct Queued {
     pub(crate) text: String,
     /// A person sent it: it reaches the agent behind the operator label ([`Queued::wire`]).
     pub(crate) operator: bool,
+    /// It may carry a thread's block when one is owed (a person's message, or the first
+    /// prompt; never an agent's message or a synthesis request).
+    pub(crate) context: bool,
 }
 
 impl Queued {
     /// A message nobody vouches for as the person's (a task's first prompt, an agent's).
     pub(crate) fn new(text: impl Into<String>) -> Queued {
-        Queued { id: mirante_core::model::new_id(), text: text.into(), operator: false }
+        Queued { id: mirante_core::model::new_id(), text: text.into(), operator: false, context: true }
     }
 
-    /// A message from the person at the keyboard.
-    pub(crate) fn from_operator(text: impl Into<String>, operator: bool) -> Queued {
-        Queued { operator, ..Queued::new(text) }
+    /// A message from the person at the keyboard (`operator`), or from someone else.
+    /// `context`: it may carry a thread's block ([`Queued::context`]).
+    pub(crate) fn from_operator(text: impl Into<String>, operator: bool, context: bool) -> Queued {
+        Queued { operator, context, ..Queued::new(text) }
     }
 
     /// What the agent is handed: the text, behind the operator label when a person sent it.

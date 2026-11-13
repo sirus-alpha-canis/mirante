@@ -16,6 +16,7 @@ pub mod safedir;
 pub mod skills;
 pub mod status;
 pub mod store;
+pub mod threads;
 pub mod transcript_tail;
 pub mod workspace;
 pub mod worktree;

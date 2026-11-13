@@ -112,6 +112,18 @@ impl Hub {
             // (a `!` bash-mode line, a multi-line slash command).
             crate::driver::paste::typed_message(&m.text).map_err(HubError::Invalid)?;
         }
+        // A thread's block owed to the agent rides on a person's message (never an agent's,
+        // never a slash command): computed now, used if the message goes out now.
+        let person = by == "person";
+        let owed = if person && !super::threads::is_command(&m.text) { st.thread_owed(&task.id)? } else { None };
+        let wire = match &owed {
+            Some(o) => super::threads::with_block(&o.block, &m.text, operator),
+            None => super::queue::wire(&m.text, operator),
+        };
+        if task.agent == AgentKind::Claude && owed.is_some() {
+            // The typist sees the message with its block.
+            crate::driver::paste::typed_message(&wire).map_err(HubError::Invalid)?;
+        }
         // Memory is tight: queued messages wait for the guard (an explicit steer still goes).
         let paused = st.mem.paused;
         let l = st.live.get_mut(&task.id).ok_or_else(|| {
@@ -132,7 +144,7 @@ impl Hub {
             SendMode::Queue => ready && !paused && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
         };
         if !now {
-            let q = super::queue::Queued::from_operator(m.text.clone(), operator);
+            let q = super::queue::Queued::from_operator(m.text.clone(), operator, person);
             let id = q.id.clone();
             l.queue.push_back(q);
             let position = l.queue.len();
@@ -148,7 +160,6 @@ impl Hub {
             st.publish();
             return Ok(SendResult { delivered: SendMode::Queue, queued });
         }
-        let wire = super::queue::wire(&m.text, operator);
         l.driver.clone().expect("ready implies a driver").send(&wire)?;
         if l.agent == AgentKind::Claude && task.status == Status::Working {
             l.steers.push(wire);
@@ -157,6 +168,9 @@ impl Hub {
             l.delivery_in_flight = Some(std::time::Instant::now());
         }
         let queued = l.queue.len();
+        if let Some(o) = &owed {
+            st.thread_handed(&task.id, o)?;
+        }
         st.event(Some(&task.id), "message_sent", json!({ "mode": m.mode, "text": logged(&m.text), "by": by }))?;
         st.publish();
         Ok(SendResult { delivered: SendMode::Steer, queued })

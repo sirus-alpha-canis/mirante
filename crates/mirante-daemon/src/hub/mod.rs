@@ -36,6 +36,7 @@ pub mod rules;
 pub mod session;
 pub mod skills;
 pub mod subagents;
+pub mod threads;
 
 pub type Result<T> = std::result::Result<T, HubError>;
 pub type EventRx = mpsc::Receiver<(String, DriverEvent)>;
@@ -180,6 +181,12 @@ pub(crate) struct Live {
     /// screen (any applied hook, a card opened or settled, a tool call or result in the
     /// transcript). An answer captures it and the typist compares it right before the key.
     pub(crate) card_gen: Arc<AtomicU64>,
+    /// A thread: its block is owed to the agent with the next delivery a person makes
+    /// (`start`: a fresh conversation, `resume`: a resumed one). After that, a change of its
+    /// notes or link owes it again (`changed`, from the store's hashes).
+    pub(crate) thread_due: Option<&'static str>,
+    /// Why the block went out last (handed back here when that delivery is aborted).
+    pub(crate) thread_last: Option<&'static str>,
     /// Codex quota / token usage, as the driver last reported it.
     pub(crate) usage: Option<String>,
     /// Codex: the effective sandbox, as the driver last reported it (`net:off`).
@@ -297,6 +304,8 @@ impl Live {
             hold: Arc::default(),
             ledger: evidence::ToolLedger::default(),
             card_gen: Arc::default(),
+            thread_due: None,
+            thread_last: None,
             usage: None,
             sandbox: None,
             permission_mode: None,
@@ -398,6 +407,24 @@ fn last_seq(store: &Store) -> Result<u64> {
     }
 }
 
+/// Where a task being created goes: nowhere special, into a fan-out group, or a thread.
+#[derive(Debug, Clone)]
+pub(crate) enum Placement {
+    Plain,
+    Group(groups::Member),
+    Thread(mirante_core::threads::NewThread),
+}
+
+impl Placement {
+    /// Its goal is the person's own words (mining may read it).
+    fn by_person(&self) -> bool {
+        match self {
+            Placement::Group(g) => g.by_person,
+            Placement::Plain | Placement::Thread(_) => true,
+        }
+    }
+}
+
 /// First line of the goal, at most 60 characters.
 pub fn title_from_goal(goal: &str) -> String {
     let line = goal.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("untitled");
@@ -463,6 +490,7 @@ impl State {
                 Some(g) => Some(self.store.get_group(g)?),
                 None => None,
             },
+            thread: self.thread_view(&task.id)?,
             task,
         })
     }
@@ -621,25 +649,20 @@ impl Hub {
         if p.group.is_some() {
             return self.create_group_child(caller, p);
         }
-        self.create_in(caller, p, None)
+        self.create_in(caller, p, Placement::Plain)
     }
 
-    /// [`Hub::create_task_from`], into `group` when given (checked again, with the child
-    /// cap, in the store's transaction).
-    pub(crate) fn create_in(
-        &self,
-        caller: &dna::Caller,
-        p: CreateTask,
-        group: Option<groups::Member>,
-    ) -> Result<TaskView> {
+    /// [`Hub::create_task_from`], into a group or as a thread when `place` says so (checked
+    /// again, with the child cap or the thread dedupe, in the store's transaction).
+    pub(crate) fn create_in(&self, caller: &dna::Caller, p: CreateTask, place: Placement) -> Result<TaskView> {
         if p.goal.trim().is_empty() {
             return Err(HubError::Invalid("the goal is empty".into()));
         }
         if !p.repos.is_empty() {
-            return self.create_workspace_task(caller, p, group);
+            return self.create_workspace_task(caller, p, place);
         }
         let repo = std::fs::canonicalize(&p.repo).map_err(|e| HubError::Invalid(format!("repo {}: {e}", p.repo)))?;
-        let by_person = self.identify(caller) == dna::Identity::Person && group.as_ref().is_none_or(|g| g.by_person);
+        let by_person = self.identify(caller) == dna::Identity::Person && place.by_person();
         // Before anything is made: a folder that cannot hold a worktree, or an agent that
         // cannot be found, leaves no branch or checkout behind.
         if let Some(why) = mirante_core::worktree::checkout_problem(&repo) {
@@ -663,9 +686,10 @@ impl Hub {
             goal: p.goal,
         };
         let mut st = self.lock();
-        let made = match &group {
-            Some(g) => st.store.create_group_task(new, None, &g.group, g.role),
-            None => st.store.create_task(new),
+        let made = match place {
+            Placement::Group(g) => st.store.create_group_task(new, None, &g.group, g.role),
+            Placement::Thread(th) => st.store.create_thread_task(new, None, th),
+            Placement::Plain => st.store.create_task(new),
         };
         match made {
             Ok(task) => {
@@ -701,16 +725,11 @@ impl Hub {
     /// The primary (first) repo fixes the task's origin; when the selected repos belong to
     /// different tenants no origin is recorded (no skills) and the repo memory is not given
     /// either (`workspace_tenants` says so).
-    fn create_workspace_task(
-        &self,
-        caller: &dna::Caller,
-        p: CreateTask,
-        fanout: Option<groups::Member>,
-    ) -> Result<TaskView> {
+    fn create_workspace_task(&self, caller: &dna::Caller, p: CreateTask, place: Placement) -> Result<TaskView> {
         let root = self.worktrees.root().to_path_buf();
         let group = workspace::validate_group(&p.repo, &root)?;
         let selected = workspace::validate_selection(&group, &p.repos, &root)?;
-        let by_person = self.identify(caller) == dna::Identity::Person && fanout.as_ref().is_none_or(|g| g.by_person);
+        let by_person = self.identify(caller) == dna::Identity::Person && place.by_person();
         self.check_agent_for_create(p.agent)?;
         let tenants = self.tenants_of(selected.iter().map(|s| s.repo.as_path()));
         let primary = &selected[0].repo;
@@ -732,9 +751,10 @@ impl Hub {
             repos: made.repos.clone(),
         };
         let mut st = self.lock();
-        let made_task = match &fanout {
-            Some(g) => st.store.create_group_task(new, Some(ws), &g.group, g.role),
-            None => st.store.create_workspace_task(new, ws),
+        let made_task = match place {
+            Placement::Group(g) => st.store.create_group_task(new, Some(ws), &g.group, g.role),
+            Placement::Thread(th) => st.store.create_thread_task(new, Some(ws), th),
+            Placement::Plain => st.store.create_workspace_task(new, ws),
         };
         match made_task {
             Ok(task) => {

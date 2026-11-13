@@ -194,6 +194,12 @@ fn answer(shared: &Arc<Mutex<Shared>>, m: &str, p: &Value) -> Result<Value, RpcE
         method::GROUP_SYNTHESIZE => {
             Ok(json!({"text": "Operator request: synthesize (fake daemon).", "expect": "fake"}))
         }
+        method::TASK_THREAD => s
+            .tasks
+            .iter()
+            .find(|t| t["id"] == p["task"])
+            .cloned()
+            .ok_or_else(|| RpcError::new(code::NOT_FOUND, format!("no task {}", p["task"]))),
         method::TASK_SUBAGENTS => {
             let now =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);

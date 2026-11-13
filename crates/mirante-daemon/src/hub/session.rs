@@ -215,12 +215,24 @@ impl State {
         let Some(driver) = l.driver.clone() else {
             return Ok(());
         };
+        // A thread's block owed to the agent rides on the next message that may carry it.
+        let carries = l.queue.front().is_some_and(|q| q.context && !super::threads::is_command(&q.text));
+        let owed = if carries { self.thread_owed(task_id)? } else { None };
+        let l = self.live.get_mut(task_id).expect("checked above");
         // Popped and handed to the driver under the hub lock: from here the message is being
         // delivered, and `message.edit` / `remove` / `reorder` refuse it (CONFLICT).
         let next = l.queue.pop_front().expect("not empty");
         l.requeue_at = 0;
-        match driver.send(&next.wire()) {
+        let wire = match &owed {
+            Some(o) => super::threads::with_block(&o.block, &next.text, next.operator),
+            None => next.wire(),
+        };
+        match driver.send(&wire) {
             Ok(()) => {
+                if let Some(o) = &owed {
+                    self.thread_handed(task_id, o)?;
+                }
+                let l = self.live.get_mut(task_id).expect("still live under the lock");
                 l.delivery_in_flight = Some(Instant::now());
                 l.left_queue.insert(next.id.clone());
                 let payload =
@@ -255,7 +267,7 @@ impl State {
         });
         for (text, delivery) in verdicts {
             // The person's words, not the label the agent saw.
-            let text = super::messages::logged(mirante_core::delivery::strip_operator_label(&text));
+            let text = super::messages::logged(super::threads::plain_words(&text));
             self.event(Some(task_id), "message_delivery", json!({ "text": text, "delivery": delivery }))?;
         }
         Ok(())
@@ -466,11 +478,15 @@ impl State {
             DriverEvent::DeliveryAborted { text: wire, reason } => {
                 // The driver hands back what it was given (labelled when a person sent it):
                 // the queue holds the sender's own words and who sent them.
-                let text = mirante_core::delivery::strip_operator_label(&wire).to_string();
-                let operator = text != wire;
+                let text = super::threads::plain_words(&wire).to_string();
+                let operator = super::threads::labelled(&wire);
+                // It carried the thread's block: the block is owed again.
+                if mirante_core::delivery::strip_operator_label(&wire).starts_with("<mirante-thread") {
+                    self.thread_handed_back(task_id);
+                }
                 let mut id = None;
                 if let Some(l) = self.live.get_mut(task_id) {
-                    let plain = |s: &String| mirante_core::delivery::strip_operator_label(s) == text;
+                    let plain = |s: &String| super::threads::plain_words(s) == text;
                     if let Some(i) = l.steers.iter().rposition(plain) {
                         l.steers.remove(i);
                     }
@@ -483,7 +499,7 @@ impl State {
                         }
                         other => {
                             l.last_sent = other;
-                            queue::Queued::from_operator(text.clone(), operator)
+                            queue::Queued::from_operator(text.clone(), operator, operator)
                         }
                     };
                     id = Some(back.id.clone());
@@ -544,7 +560,7 @@ impl State {
                 // the agent was handed: the feed shows the person's words, not the label.
                 // Masked like every message text the log keeps.
                 if let Some(text) = v["text"].as_str() {
-                    let plain = super::messages::logged(mirante_core::delivery::strip_operator_label(text));
+                    let plain = super::messages::logged(super::threads::plain_words(text));
                     if plain != text {
                         v["text"] = json!(plain);
                     }
@@ -665,6 +681,10 @@ impl Hub {
             let sink = Sink::new(&session.id, self.events.clone());
             let mut live = Live::new(&session.id, task.agent, native.clone());
             live.hold = sink.hold_flag();
+            // A thread's block is owed to a fresh conversation, and again after a resume.
+            if st.store.thread_state(&task.id).ok().flatten().is_some() {
+                live.thread_due = Some(if native.is_some() { "resume" } else { "start" });
+            }
             if let Some(p) = req.prompt.filter(|p| !p.trim().is_empty()) {
                 live.queue.push_back(queue::Queued::new(p));
             }

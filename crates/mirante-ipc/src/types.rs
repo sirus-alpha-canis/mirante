@@ -2,6 +2,7 @@
 //! id, its branch name, or a unique suffix of its id (at least 4 characters).
 use mirante_core::groups::TaskGroup;
 use mirante_core::model::{AgentKind, GroupKind, PermissionRequest, Task, TaskRepo};
+use mirante_core::threads::{Moved, SummaryBy, ThreadLink};
 use serde::{Deserialize, Serialize};
 
 pub mod method {
@@ -72,6 +73,9 @@ pub mod method {
     /// its children; a preview first ([`super::Synthesize`] → [`super::Synthesis`]). A
     /// person only.
     pub const GROUP_SYNTHESIZE: &str = "group.synthesize";
+    /// A thread's notes and/or link, changed by the person against the hash they edited
+    /// ([`super::ThreadEdit`] → [`super::TaskView`]). A person only.
+    pub const TASK_THREAD: &str = "task.thread";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -225,6 +229,40 @@ pub struct TaskView {
     /// A task of a fan-out group: the group (absent otherwise, and from older daemons).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<TaskGroup>,
+    /// A thread: its link, notes hash, delivery and summary (absent otherwise, and from
+    /// older daemons). Its notes are the task's `notes`; its parent the task's `parent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadView>,
+}
+
+/// A thread's state, as clients see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadView {
+    pub link: ThreadLink,
+    /// What `task.thread` must be given back as `expect_hash` (the link and notes now).
+    pub notes_hash: String,
+    /// The agent was handed these notes and link (at its start, a resume, or the message
+    /// after they changed).
+    pub delivered: bool,
+    /// The newest summary (agent-derived text when `summary_by` is `claude`: shown as text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_by: Option<SummaryBy>,
+}
+
+/// `task.thread`: each one given replaces what the thread has; `expect_hash` is the
+/// `notes_hash` the person edited (a `CONFLICT` when it changed meanwhile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadEdit {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<ThreadLink>,
+    pub expect_hash: String,
 }
 
 /// The origin `task.create` fixed for a task (its skills follow it).
@@ -390,6 +428,30 @@ pub struct CreateTask {
     /// daemon (`<group branch>--<n>-<slug>`) and the task starts from the repo's `HEAD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+}
+
+/// `task.create` as the cockpit sends it: a [`CreateTask`], plus, for a thread, what it is
+/// bound to. Without `link` it is a plain [`CreateTask`] (older clients send that).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateThread {
+    #[serde(flatten)]
+    pub task: CreateTask,
+    /// A thread: what it is bound to. With `parent`, an empty `branch` is named by the
+    /// daemon (`<parent branch>--<n>-<slug>`) from the parent's branch (a workspace parent:
+    /// the same repos at `HEAD`), and an empty `repo` is the parent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<ThreadLink>,
+    /// A thread's parent: the conversation it came from (a task; a thread's own parent when
+    /// it is a thread, one level deep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// A thread's notes (the person's; redacted, at most 8 KiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// A thread made from a message of the parent's conversation (moved out of its queue,
+    /// or copied).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<Moved>,
 }
 
 /// `group.create`: the shared goal of a fan-out and its children's branch prefix.
@@ -967,6 +1029,7 @@ mod tests {
             origin: None,
             repos: Vec::new(),
             group: None,
+            thread: None,
         };
         let j = serde_json::to_value(&v).unwrap();
         assert!(j.get("repos").is_none() && j.get("workspace_path").is_none(), "single-repo: as before");

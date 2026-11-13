@@ -669,6 +669,7 @@ export const M = {
   groupGet: "group.get",
   groupArchive: "group.archive",
   groupSynthesize: "group.synthesize",
+  taskThread: "task.thread",
   sessionHibernate: "session.hibernate",
   sessionWake: "session.wake",
   dnaStatus: "dna.status",

@@ -81,6 +81,8 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::GROUP_GET, Access::Person),
     (method::GROUP_ARCHIVE, Access::Person),
     (method::GROUP_SYNTHESIZE, Access::Person),
+    // A thread's notes and link: the person's context for it, never an agent's to change.
+    (method::TASK_THREAD, Access::Person),
     (method::DNA_STATUS, Access::Person),
     (method::DNA_ENABLE, Access::Person),
     (method::DNA_DISABLE, Access::Person),

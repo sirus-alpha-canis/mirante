@@ -38,7 +38,7 @@ pub(crate) struct Member {
 
 /// git already has this branch (a base was given, so nothing was checked out), or its
 /// worktree folder exists.
-fn branch_taken(e: &HubError) -> bool {
+pub(crate) fn branch_taken(e: &HubError) -> bool {
     match e {
         HubError::Core(CoreError::InvalidBranch { reason, .. }) => reason.starts_with("branch already exists"),
         HubError::Core(CoreError::Git { args, stderr }) => args == "worktree add" && stderr.ends_with("already exists"),
@@ -114,7 +114,7 @@ impl Hub {
         };
         let member = Member { group: group.id.clone(), role: GroupRole::Child, by_person: true };
         if !p.branch.trim().is_empty() {
-            return self.create_in(caller, p, Some(member));
+            return self.create_in(caller, p, super::Placement::Group(member));
         }
         let label = match group.kind {
             GroupKind::Compare => p.agent.as_str().to_string(),
@@ -124,7 +124,7 @@ impl Hub {
         let mut n = made + 1;
         loop {
             p.branch = child_branch(&group.branch, n, &label);
-            match self.create_in(caller, p.clone(), Some(member.clone())) {
+            match self.create_in(caller, p.clone(), super::Placement::Group(member.clone())) {
                 Err(e) if branch_taken(&e) && n < made + MAX_RENAMES => n += 1,
                 other => return other,
             }
@@ -313,7 +313,7 @@ impl Hub {
                 title: Some(title.clone()),
                 group: None,
             };
-            match self.create_in(&dna::Caller::Person, p, Some(member.clone())) {
+            match self.create_in(&dna::Caller::Person, p, super::Placement::Group(member.clone())) {
                 Err(e) if branch_taken(&e) && n < MAX_RENAMES => branch = format!("{base}-{n}"),
                 Err(e) => return Err(e),
                 Ok(v) => return Ok(Synthesis { text, expect, task: Some(v), sent: None }),

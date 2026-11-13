@@ -488,7 +488,7 @@ mod tests {
             .unwrap();
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 11);
+        assert!(s.schema_version().unwrap() >= 11);
         let t = s.get_task("t1").unwrap();
         assert_eq!((t.group_id, t.group_role, t.parent_id), (None, None, None));
     }

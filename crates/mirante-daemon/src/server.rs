@@ -304,7 +304,14 @@ pub fn dispatch_from(hub: &Hub, caller: &Caller, m: &str, p: Value) -> Result<Va
 /// [`crate::access::check`]. The hub's own guards still check `caller` where they need to.
 fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) -> Result<Value, RpcError> {
     match m {
-        method::TASK_CREATE => out(hub.create_task_from(caller, params(p)?)),
+        method::TASK_CREATE => {
+            let c: mirante_ipc::types::CreateThread = params(p)?;
+            if c.link.is_some() || c.parent.is_some() || c.notes.is_some() || c.moved.is_some() {
+                out(hub.create_thread(caller, c))
+            } else {
+                out(hub.create_task_from(caller, c.task))
+            }
+        }
         method::TASK_LIST => {
             let l: ListParams = if p.is_null() { ListParams::default() } else { params(p)? };
             out(hub.list_tasks(l.archived))
@@ -343,6 +350,7 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::GROUP_GET => out(hub.group_get(&params::<GroupRef>(p)?.group)),
         method::GROUP_ARCHIVE => out(hub.group_archive(&params::<GroupRef>(p)?.group)),
         method::GROUP_SYNTHESIZE => out(hub.group_synthesize(params(p)?)),
+        method::TASK_THREAD => out(hub.thread_edit(params(p)?)),
         method::RULES_LAYERS => out(hub.rules_layers(params(p)?)),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),

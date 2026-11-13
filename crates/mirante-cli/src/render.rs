@@ -787,6 +787,7 @@ mod tests {
             origin: None,
             repos: Vec::new(),
             group: None,
+            thread: None,
         }
     }
 
