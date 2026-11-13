@@ -8,6 +8,21 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ### Fixed
 
+- **Thread summaries keep no terminal escapes.** The deterministic summary (stored when a
+  thread's agent finishes an answer, and `task.summarize` without a model) passed ESC, BEL
+  and other control characters through from the agent's text; each line is now stripped
+  like the CLI's `group` output (dogfood threads finding 1).
+- **Archiving a parent no longer leaves its threads and sub-tasks open.** `task.archive` on
+  a task with open threads or agent-proposed children is refused with a conflict naming
+  them, unless `cascade: true` (`mirante archive <task> --cascade`): every child and the
+  task are checked first (a dirty one, or a live one without `stop: true` / `--stop`,
+  refuses before anything is archived or stopped), then the children are archived, then
+  the task. `group archive` takes its tasks' children with it the same way. In the app a
+  task's Detail has **Archive**, asked inline; a parent lists its open threads and sub-tasks
+  with "Archive all (N)" / Cancel, and Remove from Projects archives children before their
+  parents (finding 2).
+- **`mirante ls` puts a parent's threads and sub-tasks under it**, indented
+  (`  └ thread PR #12 · …`, `  └ spawn …`); groups are shown as before (finding 3).
 - **macOS no longer keeps asking for Documents access.** Local builds were ad-hoc signed,
   so macOS identified the app and the binaries by their cdhash and forgot every answer at
   the next build. `scripts/dev-sign.sh` (new; run by `scripts/install.sh` on macOS unless

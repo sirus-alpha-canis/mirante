@@ -137,6 +137,9 @@ and a `src/main.rs` of a few lines.
 - [ ] In the child, ask it to `task_spawn`: it has no orchestrator (one level deep); turning
       orchestration on for the child is refused.
 - [ ] Archive the parent with a proposal still waiting: the proposal is **withdrawn**.
+- [ ] Archive a parent with an open thread and a child: refused, naming both; with
+      `mirante archive <parent> --cascade` (or Detail → Archive → "Archive all (3)") all three
+      are archived; a dirty child refuses first and nothing is archived.
 
 ## F. Tasks across several repositories
 
@@ -202,7 +205,7 @@ touched.
 | E | `task_children` / `task_result` from the parent | wrapped in `<mirante-child id=… status="idle">` after the "DATA to verify" preamble; the child's answer with ESC/BEL stripped |
 | E | `task_result` of a thread (not a proposed child) | refused: "not a child this task's agent proposed" |
 | E | the child's own `task_spawn` / `mirante spawn on <child>` | refused (orchestration off) / "children cannot have children (one level deep)" |
-| E | archive the parent with a proposal waiting | the proposal `withdrawn`; the parent archived; its threads and its child **stay open** (see finding 2) |
+| E | archive the parent with a proposal waiting | the proposal `withdrawn`; the parent archived; its threads and its child **stay open** (see finding 2; since fixed: refused unless `--cascade`) |
 | C | hooks replayed through `mirante-hook` with the child's `MIRANTE_*` env: `SubagentStart`, `PreToolUse`/`PostToolUse` with `agent_id`, a side file and `.meta.json` | `task.subagents`: one lane, `general-purpose`, `running`, description "List files in a/" from `.meta.json`, last text from the side file; the `attachment` line's secret never shown |
 | C | `SubagentStart` with `agent_id: "../../etc"` | no lane |
 | C | `PermissionRequest` with `agent_id` | the card has `subagent: general-purpose`; `mirante perms`: "(from subagent general-purpose)" |
@@ -220,14 +223,22 @@ touched.
    `ESC]0;pwned BEL` is stored and summarized as is (`thread.summary`, `task.summarize`). The
    cockpit renders it as a text node, so nothing runs, but the card shows the stray bytes;
    the CLI's `group` output strips them. Strip control characters (except newlines) in
-   `deterministic_summary` like `parse_result` does for Claude's. Open.
+   `deterministic_summary` like `parse_result` does for Claude's. **Fixed** (2026-11-13):
+   each line goes through `untrusted::line` (the stored summary and `task.summarize`).
 2. **Archiving a parent leaves its threads and agent-proposed children open.** Pending
    proposals are withdrawn, but `archive` neither refuses ("archive its threads first") nor
    cascades; the children stay open with a `parent_id` pointing at an archived task (they
    still work and can be archived alone). The plan's cascade was built for groups only.
-   Decide which you want. Open.
+   Decide which you want. **Fixed** (2026-11-13): both. `task.archive` on a parent with open
+   threads or sub-tasks is refused, naming them; `cascade: true` (`mirante archive <task>
+   --cascade`, with `--stop` for live ones) checks every child and the parent first (dirty,
+   live, being archived: nothing archived or stopped), then archives the children, then the
+   parent. `group archive` takes members' children with it. The cockpit's Detail has
+   Archive with an inline confirm listing the children ("Archive all (N)" / Cancel).
 3. **`mirante ls` indents a group's tasks but not a parent's threads or children**; they are
-   listed flat after it, by branch name (`mirante/chat--1-…`). Cosmetic. Open.
+   listed flat after it, by branch name (`mirante/chat--1-…`). Cosmetic. **Fixed**
+   (2026-11-13): they follow their parent, indented (`  └ thread PR #12 · …`,
+   `  └ spawn …`); a child whose parent is not listed stays a row of its own.
 4. The synthesis `expect` hash covers the rendered request, which names its target: a preview
    for "a new task" cannot be sent "into a child" (refused as changed). The cockpit always
    previews the target the person picked; only a hand-written client notices.
@@ -256,10 +267,12 @@ a real agent.
    into a new task.
 6. **Summaries** (optional, about $0.01 each): turn on "claude", click Summarize with Claude
    once; the first click runs the tool-less probe for your Claude version.
-7. **Decide** findings 1–3.
+7. Findings 1–3 are fixed (see Findings); try `mirante archive <parent> --cascade` and the
+   Detail's Archive on a parent with a thread once by hand.
 
 ## Log
 
 | Date | Section | Result | Notes |
 |---|---|---|---|
 | 2026-11-13 | A–F daemon, CLI and MCP paths (fake agent) | pass, 3 findings open | see "Run on 2026-11-13" |
+| 2026-11-13 | findings 1–3 | fixed | summary escapes stripped; archive refuses or cascades (CLI `--cascade`, Detail's Archive); `ls` nests children |
