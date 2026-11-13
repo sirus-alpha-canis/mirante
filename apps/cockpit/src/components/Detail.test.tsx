@@ -585,3 +585,55 @@ describe("Detail: a fan-out group's member", () => {
   });
 });
 
+
+describe("Detail: threads", () => {
+  const link = { kind: "pr" as const, ref: "acme/api#123", url: "https://github.com/acme/api/pull/123" };
+  const events = [
+    ev(1, "a", "message_sent", { mode: "steer", text: "look at the PR", by: "person" }),
+    ev(2, "a", "step", { type: "agent_message", text: "thinking aloud", final: false }),
+    ev(3, "a", "step", { type: "agent_message", text: "The PR needs a rebase.", final: true }),
+    ev(4, "a", "step", { type: "command", command: "git status", exit_code: 0 }),
+  ];
+
+  it("each person message and final answer has \"New thread from this\"", () => {
+    const h = makeEnv();
+    h.load([task("a")], events);
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    const buttons = screen.getAllByRole("button", { name: "New thread from this" });
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].closest("li")).toHaveTextContent("look at the PR");
+    expect(buttons[1].closest("li")).toHaveTextContent("The PR needs a rebase.");
+  });
+
+  it("the parent feed shows \"continued in thread X\" (message_moved), one card per thread", () => {
+    const th = task("th", { title: "rebase the PR", parent_id: "a", thread: { link, notes_hash: "h", delivered: true } });
+    const h = makeEnv();
+    h.load([task("a"), th], [...events, ev(5, "a", "message_moved", { thread: "th", title: "rebase the PR", link, mode: "copied", from_seq: 3 }), ev(6, "a", "thread_started", { thread: "th2", title: "other", link: { kind: "issue", ref: "acme/api#9" } })]);
+    renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+    const card = screen.getByRole("article", { name: "Thread: PR #123" });
+    expect(card).toHaveTextContent("Continued in thread");
+    expect(card).toHaveTextContent("rebase the PR");
+    expect(screen.getByRole("article", { name: "Thread: Issue #9" })).toBeInTheDocument();
+  });
+
+  it("New thread from this creates the thread from the answer (copied), starts it, and opens it with its composer focused", async () => {
+    const th = task("th", { title: "rebase the PR", parent_id: "a", thread: { link, notes_hash: "h", delivered: false } });
+    const h = makeEnv({ "task.create": th, "session.start": { task: "th", boot: "ready", resumed: false, screen: "" } });
+    h.load([task("a")], events);
+    const onSelect = vi.fn();
+    const r = renderWith(h.env, <Detail taskId="a" onSelect={onSelect} />);
+    await userEvent.click(screen.getAllByRole("button", { name: "New thread from this" })[1]);
+    const dialog = screen.getByRole("dialog", { name: "New thread" });
+    expect(within(dialog).getByText(/This conversation keeps it/)).toBeInTheDocument();
+    await userEvent.type(within(dialog).getByLabelText("What the thread works on"), "rebase the PR");
+    await userEvent.type(within(dialog).getByLabelText("Bound to (optional)"), "https://github.com/acme/api/pull/123");
+    expect(within(dialog).getByText("Bound to PR #123")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Start thread" }));
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith("th"));
+    expect(h.calls.find(([m]) => m === "task.create")?.[1]).toMatchObject({ parent: "a", goal: "rebase the PR", link, moved: { mode: "copied", seq: 3 } });
+    expect(h.calls).toContainEqual(["session.start", { task: "th", prompt: "rebase the PR" }]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    r.rerender(wrap(h.env, <Detail taskId="th" onSelect={onSelect} />));
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("msg-th")));
+  });
+});

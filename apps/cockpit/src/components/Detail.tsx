@@ -29,6 +29,8 @@ import { SubagentLane } from "./SubagentLane";
 import { type PaneApi, PaneContext } from "./paneContext";
 import { QuickOpen } from "./QuickOpen";
 import { useOpenInEditor } from "./EditorButton";
+import { type ThreadApi, ThreadContext } from "./threadContext";
+import { NewThreadDialog } from "./NewThreadDialog";
 
 const GROUPS: Column[] = ["needs_you", "working", "review", "idle"];
 const TABS = ["Steps", "Terminal", "Diff", "Memory"] as const;
@@ -391,6 +393,25 @@ export function Detail({
   const togglePane = useCallback(() => setPane((p) => ({ ...p, open: !p.open })), [setPane]);
   const [quick, setQuick] = useState(false);
   const editor = useOpenInEditor(taskId);
+  // Threads: "New thread from this" opens the dialog on that line; Continue opens a thread
+  // with its composer focused (once, when its Detail shows).
+  const [threadFrom, setThreadFrom] = useState<FeedItem | null>(null);
+  const [threadError, setThreadError] = useState<string | null>(null);
+  const composerFor = useRef<string | null>(null);
+  const threadApi = useMemo<ThreadApi>(
+    () => ({
+      newThreadFrom: (item) => setThreadFrom(item),
+      open: (id, composer) => {
+        composerFor.current = composer ? id : null;
+        if (id === taskId) {
+          if (composer) document.getElementById(`msg-${id}`)?.focus();
+          return;
+        }
+        onSelect(id);
+      },
+    }),
+    [taskId, onSelect],
+  );
   // ⌘\ (the pane) and ⌘P (quick-open) are this view's chords; the app leaves them here.
   // Off macOS the terminal keeps Ctrl chords, as with the app's own.
   const keys = useRef({ togglePane, quickOpen: () => setQuick(true) });
@@ -454,7 +475,13 @@ export function Detail({
   const title = useRef<HTMLHeadingElement>(null);
   const hasTask = !!t;
   useEffect(() => {
-    if (hasTask) title.current?.focus();
+    if (!hasTask) return;
+    if (composerFor.current === taskId) {
+      composerFor.current = null;
+      const box = document.getElementById(`msg-${taskId}`);
+      if (box) return box.focus();
+    }
+    title.current?.focus();
   }, [taskId, hasTask]);
   const onTerminal = tab === "Terminal";
   const notices = t && (
@@ -482,6 +509,7 @@ export function Detail({
         </main>
       ) : (
         <PaneContext.Provider value={paneApi}>
+        <ThreadContext.Provider value={threadApi}>
         <main className="detail-main" aria-label={tt("detail.task", { title: t.title })}>
           <header className="detail-head">
             <h1 tabIndex={-1} ref={title}>
@@ -511,6 +539,14 @@ export function Detail({
             </button>
             <Actions key={t.id} t={t} />
           </header>
+          {threadError && (
+            <p className="error small" role="alert">
+              {threadError}{" "}
+              <button type="button" className="btn btn-small btn-ghost" onClick={() => setThreadError(null)}>
+                {tt("thread.dismiss")}
+              </button>
+            </p>
+          )}
           {!onTerminal && notices}
           {/* A fan-out group's member: its siblings (status, answer, steer, synthesize). */}
           {t.group_id && <GroupPanel key={`group-${t.group_id}`} taskId={t.id} onSelect={onSelect} />}
@@ -583,7 +619,20 @@ export function Detail({
           {quick && (
             <QuickOpen taskId={t.id} onOpen={(path) => paneApi.openFile(path)} onOpenEditor={(path) => editor.open(path)} onClose={() => setQuick(false)} />
           )}
+          {threadFrom && (
+            <NewThreadDialog
+              parent={t}
+              item={threadFrom}
+              onClose={() => setThreadFrom(null)}
+              onStarted={(s) => {
+                setThreadFrom(null);
+                setThreadError(s.startError ? tt("thread.startFailed", { error: s.startError }) : null);
+                threadApi.open(s.task.id, true);
+              }}
+            />
+          )}
         </main>
+        </ThreadContext.Provider>
         </PaneContext.Provider>
       )}
     </div>

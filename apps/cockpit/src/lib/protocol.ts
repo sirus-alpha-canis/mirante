@@ -50,6 +50,35 @@ export interface TaskView {
   group_role?: GroupRole | null;
   /** The group itself (fixed: its goal, kind and branch prefix). */
   group?: TaskGroup | null;
+  /** A thread's parent: the conversation it came from (absent otherwise). */
+  parent_id?: string | null;
+  /** A thread: what it is bound to, its notes' hash, delivery and summary (absent otherwise). */
+  thread?: ThreadView | null;
+}
+
+export type LinkKind = "pr" | "issue" | "branch" | "message";
+
+/** `mirante_core::threads::ThreadLink`: what a thread is bound to (pasted, never fetched). */
+export interface ThreadLink {
+  kind: LinkKind;
+  ref: string;
+  url?: string | null;
+  title?: string | null;
+}
+
+export type SummaryBy = "deterministic" | "claude";
+
+/** `ThreadView`: a thread's state. Its notes are the task's `notes`. */
+export interface ThreadView {
+  link: ThreadLink;
+  /** What `task.thread` must be given back as `expect_hash`. */
+  notes_hash: string;
+  /** The agent was handed these notes and link. */
+  delivered: boolean;
+  /** Agent-derived when `summary_by` is `claude`: shown as text only. */
+  summary?: string | null;
+  summary_at?: number | null;
+  summary_by?: SummaryBy | null;
 }
 
 export type GroupRole = "child" | "synth";

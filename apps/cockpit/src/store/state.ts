@@ -1,11 +1,11 @@
 // The client store: one reducer over (snapshot | event | refreshed view | history). The
 // daemon's event stream is a hint (seq-ordered, may replay); task views fetched with
 // `task.get` / `task.list` are the authority and overwrite what events guessed.
-import type { DaemonEvent, PermissionView, QueuedMessage, SendMode, Snapshot, TaskView } from "../lib/protocol";
+import type { DaemonEvent, PermissionView, QueuedMessage, SendMode, Snapshot, TaskView, ThreadLink } from "../lib/protocol";
 import { describeMemoryEvent, isMemoryEvent, memoryMsg } from "../lib/memguard";
 import { type Key, type Params, t } from "../lib/i18n";
 
-export type FeedKind = "tool" | "command" | "agent_message" | "message" | "turn" | "system" | "permission";
+export type FeedKind = "tool" | "command" | "agent_message" | "message" | "turn" | "system" | "permission" | "thread";
 
 export interface FeedItem {
   seq: number;
@@ -23,6 +23,14 @@ export interface FeedItem {
   msg?: FeedMsg;
   /** A tool step one of Claude's own agents ran: its `agent_id` (its lane). */
   agent?: string;
+  /** An agent message that ends its turn (Codex's are all final). */
+  final?: boolean;
+  /** A thread made from this conversation (its compact card): the thread's task id. */
+  thread?: string;
+  /** What the thread is bound to (as it was made; the card reads the live one). */
+  link?: ThreadLink;
+  /** The thread was made from a message here: moved out of the queue, or copied. */
+  moved?: "moved" | "copied";
 }
 
 export interface FeedMsg {
@@ -264,7 +272,7 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
         case "command":
           return { ...base, kind: "command", text: `$ ${str(p.command)}`, ok: p.exit_code === 0 };
         case "agent_message":
-          return { ...base, kind: "agent_message", text: str(p.text) };
+          return { ...base, kind: "agent_message", text: str(p.text), final: p.final !== false };
         case "skills_failed":
           return sys("feed.skillsFailed", { error: str(p.error) });
         case "skills_withdrawn":
@@ -277,6 +285,13 @@ export function feedItem(e: DaemonEvent): FeedItem | null {
     }
     case "message_queued":
       return { ...base, kind: "message", mode: "queue", text: str(p.text) };
+    case "thread_started":
+    case "message_moved": {
+      // One compact card per thread (it reads the thread's live state; never its events).
+      const link = p.link && typeof p.link === "object" ? (p.link as ThreadLink) : undefined;
+      const item: FeedItem = { ...base, kind: "thread", thread: str(p.thread), text: str(p.title), ...(link ? { link } : {}) };
+      return e.kind === "message_moved" ? { ...item, moved: p.mode === "moved" ? "moved" : "copied" } : item;
+    }
     case "message_sent":
       return p.mode === "queue" ? sys("feed.queuedDelivered") : { ...base, kind: "message", mode: "steer", text: str(p.text) };
     case "message_delivery":

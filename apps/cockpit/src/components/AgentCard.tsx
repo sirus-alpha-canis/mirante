@@ -15,6 +15,8 @@ import { ProjectChip } from "./ProjectChip";
 import { SkillsCount } from "./SkillsChip";
 import { TrustCard } from "./TrustCard";
 import { usePane } from "./paneContext";
+import { useThreads } from "./threadContext";
+import { ThreadRefCard } from "./ThreadRefCard";
 
 /** One feed line; `count` > 1 when identical lines in a row were folded into it. */
 /** Inside a task's Detail: a Read/Edit step's file, opened in the side pane. */
@@ -33,13 +35,28 @@ function StepFileButton({ path }: { path: string }) {
 
 export const FeedLine = memo(function FeedLine({ item, count = 1 }: { item: FeedItem; count?: number }) {
   const t = useT();
+  const threads = useThreads();
+  if (item.kind === "thread" && item.thread) {
+    return (
+      <li className="line line-thread">
+        <ThreadRefCard id={item.thread} title={item.text} link={item.link} moved={item.moved} />
+      </li>
+    );
+  }
   const who = item.kind === "message" ? t(item.mode === "queue" ? "card.youQueued" : "card.youSteer") : null;
   const file = stepFile(item);
+  // Inside a task's Detail: a person's message or an agent's final answer may become a thread.
+  const threadable = threads && (item.kind === "message" || (item.kind === "agent_message" && item.final !== false));
   return (
     <li className={`line line-${item.kind} ${item.ok === false ? "line-failed" : ""} ${item.warn ? "line-warn" : ""}`}>
       {who && <span className="who">{who}</span>}
       <span className="text">{feedText(item)}</span>
       {file && <StepFileButton path={file} />}
+      {threadable && (
+        <button type="button" className="btn btn-small btn-ghost line-thread-new" onClick={() => threads.newThreadFrom(item)}>
+          {t("thread.newFrom")}
+        </button>
+      )}
       {count > 1 && (
         <span className="repeat" aria-label={t("card.times", { n: count })}>
           ×{count}

@@ -11,7 +11,8 @@ export interface Folded {
   count: number;
 }
 
-const sameLine = (a: FeedItem, b: FeedItem) => a.kind === b.kind && a.text === b.text && a.ok === b.ok && a.mode === b.mode;
+const sameLine = (a: FeedItem, b: FeedItem) =>
+  a.kind === b.kind && a.text === b.text && a.ok === b.ok && a.mode === b.mode && a.thread === b.thread;
 
 /** Consecutive identical lines (same kind, text and outcome) as one line with a count. */
 export function collapseRepeats(items: FeedItem[]): Folded[] {
