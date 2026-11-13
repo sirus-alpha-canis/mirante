@@ -4,7 +4,7 @@
 //! Read-only: nothing here writes a file.
 use std::path::{Path, PathBuf};
 
-use mirante_core::claude_launch::{memory_allow, MCP_SERVER, PLUGIN_NAME};
+use mirante_core::claude_launch::{memory_allow, orchestrator_allow, MCP_SERVER, PLUGIN_NAME};
 use mirante_core::delivery::OPERATOR_LABEL;
 use mirante_core::model::{AgentKind, Lifecycle, Task};
 use mirante_ipc::types::{DnaRef, RuleLayer, RulesParams, RulesView, SkillTaskParams, TaskSkill};
@@ -116,10 +116,12 @@ impl Hub {
         // Claude's per-task settings file.
         if agent == AgentKind::Claude {
             let allow = memory_allow().join(", ");
+            let orch = orchestrator_allow().join(", ");
             let described = format!(
                 "Additive --settings: Mirante's hook (mirante-hook) on every Claude event, so the cockpit sees status, \
-                 permissions and steps; when repo memory is on, these tools are pre-allowed: {allow}. It adds to your \
-                 settings files, it does not replace them."
+                 permissions and steps; when repo memory is on, these tools are pre-allowed: {allow}; when you turned \
+                 orchestration on for the task, these read-only ones too: {orch}. It adds to your settings files, it \
+                 does not replace them."
             );
             let mut l = match task {
                 Some(t) => {

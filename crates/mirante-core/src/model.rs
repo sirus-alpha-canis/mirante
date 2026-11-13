@@ -115,6 +115,17 @@ pub enum GroupKind {
 }
 text_enum!(GroupKind, "group_kind", { Fanout => "fanout", Compare => "compare" });
 
+/// What a task with a parent is: a thread (bound to an object, made by a person; see
+/// `crate::threads`) or a child its parent's agent proposed and a person approved
+/// (`crate::orchestration`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildKind {
+    Thread,
+    Spawn,
+}
+text_enum!(ChildKind, "child_kind", { Thread => "thread", Spawn => "spawn" });
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionStatus {
@@ -166,9 +177,13 @@ pub struct Task {
     /// Its role in that group (set exactly when `group_id` is).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_role: Option<GroupRole>,
-    /// An agent-initiated child's parent task (reserved; nothing sets it yet).
+    /// A child's parent task (one level deep), fixed at creation: the conversation a
+    /// thread came from, or the task whose agent proposed this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// What kind of child it is (set exactly when `parent_id` is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_kind: Option<ChildKind>,
 }
 
 impl Task {

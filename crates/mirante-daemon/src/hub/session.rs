@@ -699,6 +699,8 @@ impl Hub {
         };
         let mcp = self.memory_server_for(&task);
         let skills_mcp = self.skills_server_for(&task);
+        let orchestrator = self.orchestrator_server_for(&task);
+        let orchestrated = orchestrator.is_some();
         // A resumed Codex thread has its skills in its history (its first turn carried
         // them): it gets nothing again, only the withdrawal of those retired or changed
         // since. A resumed Claude session gets its plugin and always-on text again.
@@ -713,6 +715,7 @@ impl Hub {
             paths: self.paths.clone(),
             mcp,
             skills_mcp,
+            orchestrator,
             skills,
             withdrawn,
         };
@@ -722,6 +725,7 @@ impl Hub {
                 let attached = match st.live.get_mut(&task.id).filter(|l| l.session_id == session_id) {
                     Some(l) => {
                         l.driver = Some(driver.clone());
+                        l.orchestrator = orchestrated;
                         if l.saw_session_start {
                             // The hook arrived while the agent was being spawned.
                             driver.session_started();

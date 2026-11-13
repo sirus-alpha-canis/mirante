@@ -80,6 +80,10 @@ pub mod method {
     /// person's click, from their own Claude CLI run headless and tool-less
     /// ([`super::Summarize`] → [`super::SummaryView`]). A person only.
     pub const TASK_SUMMARIZE: &str = "task.summarize";
+    /// A person turns orchestration on or off for a task ([`super::Orchestrate`] →
+    /// [`super::TaskView`]): while on, its next sessions get the `mirante-orchestrator` MCP
+    /// server. Never for a child task. A person only.
+    pub const TASK_ORCHESTRATE: &str = "task.orchestrate";
     /// The daemon's settings, changing the ones given ([`super::SettingsParams`] →
     /// [`super::DaemonSettings`]). A person only.
     pub const DAEMON_SETTINGS: &str = "daemon.settings";
@@ -237,6 +241,21 @@ pub struct TaskView {
     /// older daemons). Its notes are the task's `notes`; its parent the task's `parent_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<ThreadView>,
+    /// The person turned orchestration on: the task's next sessions get the
+    /// `mirante-orchestrator` server (`task_spawn` proposals, reads of its own children).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestration: bool,
+    /// While live: whether this session was given that server (it applies from the next
+    /// session when they differ).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_live: Option<bool>,
+    /// Child tasks its agent proposed that wait for the person's decision.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spawn_pending: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A thread's state, as clients see it.
@@ -255,6 +274,13 @@ pub struct ThreadView {
     pub summary_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_by: Option<SummaryBy>,
+}
+
+/// `task.orchestrate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Orchestrate {
+    pub task: String,
+    pub enabled: bool,
 }
 
 /// `task.thread`: each one given replaces what the thread has; `expect_hash` is the
@@ -1073,6 +1099,7 @@ mod tests {
             group_id: None,
             group_role: None,
             parent_id: None,
+            child_kind: None,
         };
         let v = TaskView {
             task,
@@ -1090,6 +1117,9 @@ mod tests {
             repos: Vec::new(),
             group: None,
             thread: None,
+            orchestration: false,
+            orchestrator_live: None,
+            spawn_pending: 0,
         };
         let j = serde_json::to_value(&v).unwrap();
         assert!(j.get("repos").is_none() && j.get("workspace_path").is_none(), "single-repo: as before");

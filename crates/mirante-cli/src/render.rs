@@ -773,6 +773,7 @@ mod tests {
                 group_id: None,
                 group_role: None,
                 parent_id: None,
+                child_kind: None,
             },
             live: true,
             boot: Some(BootState::Ready),
@@ -788,6 +789,9 @@ mod tests {
             repos: Vec::new(),
             group: None,
             thread: None,
+            orchestration: false,
+            orchestrator_live: None,
+            spawn_pending: 0,
         }
     }
 

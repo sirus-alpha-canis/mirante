@@ -369,6 +369,10 @@ pub struct SpawnRequest {
     /// (`skill_propose`): set only when the task's client has skill learning on and its
     /// origin is confirmed.
     pub skills_mcp: Option<std::path::PathBuf>,
+    /// The `mirante-mcp` binary to give this session as its `mirante-orchestrator` server
+    /// (`task_spawn`, `task_children`, `task_result`): set only when the person turned
+    /// orchestration on for the task, and never for a child task.
+    pub orchestrator: Option<std::path::PathBuf>,
     /// The verified skills whose scope matches the task's origin (see
     /// `Hub::skills_for`); `None` when there are none.
     pub skills: Option<InjectedSkills>,

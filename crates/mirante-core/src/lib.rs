@@ -11,6 +11,7 @@ pub mod git;
 pub mod groups;
 pub mod hook;
 pub mod model;
+pub mod orchestration;
 pub mod redact;
 pub mod safedir;
 pub mod skills;

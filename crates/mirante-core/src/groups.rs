@@ -425,14 +425,14 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let p = s.create_task(task("p")).unwrap();
         let c = s.create_task(task("c")).unwrap();
-        // Nothing sets a parent yet; the schema already holds the rules.
+        // A parent is fixed at creation, one level deep.
         assert!(s.conn.execute("UPDATE tasks SET parent_id = ?2 WHERE id = ?1", [&c.id, &p.id]).is_err());
         s.conn
             .execute(
                 &format!(
                     "INSERT INTO tasks (id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, \
-                     status, created_at, updated_at, parent_id) VALUES ('k', 'k', '/r', '/w/k', 'k', 'claude', 'g', '', \
-                     'created', 'idle', 1, 1, '{}')",
+                     status, created_at, updated_at, parent_id, child_kind) VALUES ('k', 'k', '/r', '/w/k', 'k', \
+                     'claude', 'g', '', 'created', 'idle', 1, 1, '{}', 'spawn')",
                     p.id
                 ),
                 [],
@@ -442,8 +442,8 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO tasks (id, title, repo_path, worktree_path, branch, agent, goal, notes, lifecycle, \
-                 status, created_at, updated_at, parent_id) VALUES ('gk', 'g', '/r', '/w/g', 'g', 'claude', 'g', '', \
-                 'created', 'idle', 1, 1, 'k')",
+                 status, created_at, updated_at, parent_id, child_kind) VALUES ('gk', 'g', '/r', '/w/g', 'g', \
+                 'claude', 'g', '', 'created', 'idle', 1, 1, 'k', 'spawn')",
                 [],
             )
             .unwrap_err();

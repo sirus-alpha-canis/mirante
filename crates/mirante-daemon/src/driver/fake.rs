@@ -160,6 +160,8 @@ pub struct FakeFactory {
     pub mcps: Mutex<Vec<Option<std::path::PathBuf>>>,
     /// Every spawn request's `skills_mcp`, in order.
     pub skill_mcps: Mutex<Vec<Option<std::path::PathBuf>>>,
+    /// Every spawn request's `orchestrator`, in order.
+    pub orchestrators: Mutex<Vec<Option<std::path::PathBuf>>>,
     /// Every spawn request's `skills`, in order.
     pub skills: Mutex<Vec<Option<super::InjectedSkills>>>,
     /// Every spawn request's `withdrawn`, in order.
@@ -193,6 +195,7 @@ impl DriverFactory for Arc<FakeFactory> {
         self.resumes.lock().unwrap().push(req.resume.clone());
         self.mcps.lock().unwrap().push(req.mcp.clone());
         self.skill_mcps.lock().unwrap().push(req.skills_mcp.clone());
+        self.orchestrators.lock().unwrap().push(req.orchestrator.clone());
         self.skills.lock().unwrap().push(req.skills.clone());
         self.withdrawn.lock().unwrap().push(req.withdrawn.clone());
         self.cwds.lock().unwrap().push(req.task.cwd().to_string());

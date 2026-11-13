@@ -352,6 +352,7 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::GROUP_SYNTHESIZE => out(hub.group_synthesize(params(p)?)),
         method::TASK_THREAD => out(hub.thread_edit(params(p)?)),
         method::TASK_SUMMARIZE => out(hub.summarize(params(p)?)),
+        method::TASK_ORCHESTRATE => out(hub.orchestrate(caller, params(p)?)),
         method::RULES_LAYERS => out(hub.rules_layers(params(p)?)),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),

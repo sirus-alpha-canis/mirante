@@ -30,6 +30,7 @@ pub mod files;
 pub mod groups;
 pub mod memory;
 pub mod messages;
+pub mod orchestration;
 pub mod queue;
 pub mod resume;
 pub mod rules;
@@ -188,6 +189,9 @@ pub(crate) struct Live {
     pub(crate) thread_due: Option<&'static str>,
     /// Why the block went out last (handed back here when that delivery is aborted).
     pub(crate) thread_last: Option<&'static str>,
+    /// This session was given the `mirante-orchestrator` server (MCP config is fixed at
+    /// launch: turning orchestration on or off applies from the next session).
+    pub(crate) orchestrator: bool,
     /// Codex quota / token usage, as the driver last reported it.
     pub(crate) usage: Option<String>,
     /// Codex: the effective sandbox, as the driver last reported it (`net:off`).
@@ -307,6 +311,7 @@ impl Live {
             card_gen: Arc::default(),
             thread_due: None,
             thread_last: None,
+            orchestrator: false,
             usage: None,
             sandbox: None,
             permission_mode: None,
@@ -496,6 +501,9 @@ impl State {
                 None => None,
             },
             thread: self.thread_view(&task.id)?,
+            orchestration: self.store.orchestration(&task.id)?,
+            orchestrator_live: live.map(|l| l.orchestrator),
+            spawn_pending: self.store.pending_proposals(&task.id)?,
             task,
         })
     }

@@ -86,6 +86,9 @@ pub const ACCESS: &[(&str, Access)] = &[
     // A thread's summary: deterministic, or the person's own CLI on their click (it spends
     // their quota): never an agent's.
     (method::TASK_SUMMARIZE, Access::Person),
+    // Orchestration (whether a task's agent gets the orchestrator MCP server): a person's
+    // decision, never an agent's, not even for its own task.
+    (method::TASK_ORCHESTRATE, Access::Person),
     (method::DNA_STATUS, Access::Person),
     (method::DNA_ENABLE, Access::Person),
     (method::DNA_DISABLE, Access::Person),
