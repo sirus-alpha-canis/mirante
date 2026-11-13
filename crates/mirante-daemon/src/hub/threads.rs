@@ -7,7 +7,6 @@
 //! the system prompt: the first prompt of a fresh conversation, the first message after a
 //! resume, and the next message after the notes or link changed. The queue and the event
 //! log keep the person's own words; the block is added when the message is handed over.
-use std::path::Path;
 
 use mirante_core::delivery::{label_operator, strip_operator_label, OPERATOR_LABEL};
 use mirante_core::groups::child_branch;
@@ -242,10 +241,7 @@ impl Hub {
         let (text, by, cost): (String, SummaryBy, Option<f64>) = match s.with {
             None => {
                 let diff = (task.lifecycle != Lifecycle::Archived)
-                    .then(|| match task.workspace_path {
-                        Some(_) => crate::diff::workspace_stat(&repos),
-                        None => crate::diff::diff_stat(Path::new(&task.repo_path), Path::new(&task.worktree_path)),
-                    })
+                    .then(|| self.diff_stat_of(&task, &repos))
                     .and_then(|r| r.ok())
                     .map(|d| (d.files, d.added, d.removed));
                 (

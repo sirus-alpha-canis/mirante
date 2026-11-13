@@ -30,6 +30,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (11, include_str!("migrations/0011_task_groups.sql")),
     (12, include_str!("migrations/0012_threads.sql")),
     (13, include_str!("migrations/0013_orchestration.sql")),
+    (14, include_str!("migrations/0014_workspace_body_and_summary_probe.sql")),
 ];
 
 /// True for a UNIQUE / PRIMARY KEY constraint violation (the DB-level backstop for locks).
@@ -208,10 +209,10 @@ mod tests {
         let dir = TempDir::new("store-migrate");
         let path = dir.path().join("db/mirante.sqlite");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 13);
+        assert_eq!(s.schema_version().unwrap(), 14);
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 13);
+        assert_eq!(s.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -502,6 +503,48 @@ impl Store {
     }
 
     /// The repos of a workspace task, primary first; empty for a single-repo task.
+    /// Records the text Mirante wrote in a workspace task's folder (see migration 14).
+    pub fn set_workspace_body(&self, task_id: &str, body: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workspace_bodies (task_id, body) VALUES (?1, ?2) \
+             ON CONFLICT (task_id) DO UPDATE SET body = ?2",
+            params![task_id, body],
+        )?;
+        Ok(())
+    }
+
+    /// The text Mirante wrote in a workspace task's folder; `None` for a task made before
+    /// it was recorded, or a single-repo task.
+    pub fn workspace_body(&self, task_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT body FROM workspace_bodies WHERE task_id = ?1", params![task_id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The tool-less check's verdict for this Claude binary as it is on disk, if it ran.
+    pub fn summary_probe(&self, bin: &str, version: &str, size: i64, mtime: i64) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ok FROM summary_probes WHERE bin = ?1 AND version = ?2 AND size = ?3 AND mtime = ?4",
+                params![bin, version, size, mtime],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|ok| ok == 1))
+    }
+
+    /// Records the tool-less check's verdict for this Claude binary as it is on disk.
+    pub fn set_summary_probe(&self, bin: &str, version: &str, size: i64, mtime: i64, ok: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO summary_probes (bin, version, size, mtime, ok, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (bin, version, size, mtime) DO UPDATE SET ok = ?5, at = ?6",
+            params![bin, version, size, mtime, ok as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn task_repos(&self, task_id: &str) -> Result<Vec<TaskRepo>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT name, repo_path, worktree_path, branch, created_branch, head FROM task_repos \

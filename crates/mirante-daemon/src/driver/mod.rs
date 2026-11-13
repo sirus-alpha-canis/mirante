@@ -380,6 +380,9 @@ pub struct SpawnRequest {
     /// since (see `Hub::codex_withdrawals`); the driver tells the agent not to follow them
     /// and removes their files. Empty otherwise.
     pub withdrawn: Vec<String>,
+    /// A workspace task's read-only repositories its Claude may read without asking (see
+    /// `Hub::read_only_repos`): one Read rule each, their credential files denied.
+    pub read_only: Vec<std::path::PathBuf>,
 }
 
 pub trait DriverFactory: Send + Sync {

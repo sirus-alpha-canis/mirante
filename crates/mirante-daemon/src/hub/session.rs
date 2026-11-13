@@ -697,6 +697,7 @@ impl Hub {
             st.publish();
             (task, session.id, native, sink, conversation.id, Spawning::new(&self.spawning))
         };
+        self.restore_workspace_files(&task);
         let mcp = self.memory_server_for(&task);
         let skills_mcp = self.skills_server_for(&task);
         let orchestrator = self.orchestrator_server_for(&task);
@@ -718,6 +719,7 @@ impl Hub {
             orchestrator,
             skills,
             withdrawn,
+            read_only: self.read_only_repos(&task),
         };
         match self.factory.spawn(req, sink) {
             Ok(driver) => {
@@ -1297,6 +1299,36 @@ impl super::testkit::Kit {
 
     pub fn pending(&self, task_id: &str) -> Vec<mirante_core::model::PermissionRequest> {
         self.hub.lock().store.pending_permissions(task_id).unwrap()
+    }
+}
+
+impl Hub {
+    /// A workspace task's session starts with Mirante's own files of its folder as Mirante
+    /// wrote them (`workspace::restore_files`): what an earlier session changed there is
+    /// written again (`workspace_files_restored`). A failure is logged; the session starts.
+    fn restore_workspace_files(&self, task: &mirante_core::model::Task) {
+        let Some(ws) = task.workspace_path.as_deref() else {
+            return;
+        };
+        let body = match self.lock().store.workspace_body(&task.id) {
+            Ok(Some(b)) => b,
+            Ok(None) => return,
+            Err(e) => {
+                self.lock().log_error(Some(&task.id), "reading the workspace files", &e);
+                return;
+            }
+        };
+        let done = mirante_core::workspace::restore_files(&self.worktrees, std::path::Path::new(ws), &body);
+        let mut st = self.lock();
+        match done {
+            Ok(fixed) if fixed.is_empty() => {}
+            Ok(fixed) => {
+                if let Err(e) = st.event(Some(&task.id), "workspace_files_restored", json!({ "files": fixed })) {
+                    st.log_error(Some(&task.id), "workspace files", &e);
+                }
+            }
+            Err(e) => st.log_error(Some(&task.id), "restoring the workspace files", &e),
+        }
     }
 }
 

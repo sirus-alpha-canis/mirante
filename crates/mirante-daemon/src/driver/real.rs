@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use mirante_core::agent_bin::{self, child_path, Agent, Lookup};
 use mirante_core::claude_launch::{
-    launch_spec, mcp_json, memory_allow, orchestrator_allow, read_only_allow, settings_json, AlwaysOn, LaunchInput,
+    launch_spec, mcp_json, memory_allow, orchestrator_allow, read_only_rules, settings_json, AlwaysOn, LaunchInput,
     McpServers, AGENT_ENV, TASK_ENV,
 };
 use mirante_core::model::AgentKind;
@@ -137,9 +137,11 @@ pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(
     if req.orchestrator.is_some() {
         allow.extend(orchestrator_allow());
     }
-    // A workspace task reads its folder's other repositories without asking (writes outside
-    // the workspace still ask: Claude runs in manual mode).
-    allow.extend(req.task.group_path.as_deref().and_then(|g| read_only_allow(Path::new(g))));
+    // A workspace task reads its folder's other repositories of its tenant without asking,
+    // one rule each, their credential files denied (writes outside the workspace still ask:
+    // Claude runs in manual mode).
+    let (read, deny) = read_only_rules(&req.read_only);
+    allow.extend(read);
     let mcp = if servers_of(req).any() {
         let path = dir.join("mcp.json");
         let json = mcp_json(servers_of(req), &req.task.id, req.paths.home());
@@ -152,7 +154,7 @@ pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(
         }
         None
     };
-    write_private(&settings, &settings_json(&hook, &allow).to_string())?;
+    write_private(&settings, &settings_json(&hook, &allow, &deny).to_string())?;
     Ok((settings, mcp))
 }
 
@@ -575,6 +577,7 @@ mod tests {
             orchestrator: None,
             skills: None,
             withdrawn: Vec::new(),
+            read_only: Vec::new(),
         }
     }
 
@@ -632,6 +635,24 @@ mod tests {
         let a = codex_mcp_args(mem(Path::new("/x/o\"brien/mirante-mcp")), "t1", Path::new("/h")).unwrap();
         assert_eq!(a[1], "mcp_servers.mirante-memory.command=\"/x/o\\\"brien/mirante-mcp\"");
         assert!(codex_mcp_args(mem(Path::new("/x\ny/mirante-mcp")), "t1", Path::new("/h")).is_err());
+    }
+
+    /// Review I2: a workspace task's group folder never becomes one Read rule; its
+    /// read-only repos are named one by one, their credential files denied.
+    #[test]
+    fn claude_reads_each_read_only_repo_not_the_group_folder() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.paths = Paths::new(&d.path().join("home"));
+        req.task.group_path = Some("/".into());
+        req.read_only = vec![PathBuf::from("/Users/p/gol/docs")];
+        let (settings, _) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(s["permissions"]["allow"], serde_json::json!(["Read(//Users/p/gol/docs/**)"]));
+        let deny = s["permissions"]["deny"].as_array().unwrap();
+        assert!(deny.contains(&serde_json::json!("Read(//Users/p/gol/docs/**/.env)")), "{deny:?}");
+        assert!(deny.contains(&serde_json::json!("Read(//Users/p/gol/docs/**/.git/**)")), "{deny:?}");
+        assert!(!s.to_string().contains("Read(//**)"));
     }
 
     #[test]

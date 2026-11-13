@@ -54,7 +54,9 @@ impl Hub {
                 if t.lifecycle == Lifecycle::Archived {
                     return Err(HubError::Conflict(format!("task {} is archived; its worktree is gone", t.branch)));
                 }
-                let root = std::fs::canonicalize(&t.worktree_path)
+                // Never through a worktree folder swapped for a symlink.
+                let root = self.checked_worktree(&t).map_err(HubError::Conflict)?;
+                let root = std::fs::canonicalize(&root)
                     .map_err(|e| HubError::Conflict(format!("worktree {}: {e}", t.worktree_path)))?;
                 let project = self.checkout(&t.repo_path)?;
                 (root, project, Some(t))

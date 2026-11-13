@@ -139,7 +139,7 @@ pub fn daemon_env_to_scrub<I: IntoIterator<Item = String>>(present: I) -> Vec<St
 /// Settings passed with `claude --settings <file>`: the hook program at `hook_cmd` (a path,
 /// shell-quoted here because Claude runs hook commands through a shell) for every event and
 /// the given allowlist. Additive: the user's ~/.claude hooks, skills and MCP servers still load.
-pub fn settings_json(hook_cmd: &str, allow: &[String]) -> Value {
+pub fn settings_json(hook_cmd: &str, allow: &[String], deny: &[String]) -> Value {
     let handler = json!([{ "type": "command", "command": shell_quote(hook_cmd) }]);
     let mut hooks = serde_json::Map::new();
     for name in PLAIN_EVENTS {
@@ -148,7 +148,11 @@ pub fn settings_json(hook_cmd: &str, allow: &[String]) -> Value {
     for name in TOOL_EVENTS {
         hooks.insert(name.to_string(), json!([{ "matcher": "*", "hooks": handler.clone() }]));
     }
-    json!({ "hooks": Value::Object(hooks), "permissions": { "allow": allow } })
+    let mut permissions = json!({ "allow": allow });
+    if !deny.is_empty() {
+        permissions["deny"] = json!(deny);
+    }
+    json!({ "hooks": Value::Object(hooks), "permissions": permissions })
 }
 
 /// Name of Mirante's MCP server in an agent's config. Claude's tool ids are
@@ -238,14 +242,35 @@ pub fn orchestrator_allow() -> Vec<String> {
     ["task_children", "task_result"].iter().map(|t| format!("mcp__{ORCH_SERVER}__{t}")).collect()
 }
 
-/// A permission rule that lets Claude read everything under the absolute folder `dir`
-/// (`Read(//abs/path/**)`: `//` anchors at the filesystem root; Claude applies Read rules
-/// to Grep and Glob too) and nothing else. `None` for a relative path or one with a
-/// character the rule syntax gives a meaning to (no rule beats a wrong one).
-pub fn read_only_allow(dir: &Path) -> Option<String> {
-    let s = dir.to_str()?;
-    let plain = s.starts_with('/') && !s.chars().any(|c| c.is_control() || "()*?[]{}!\\\"'".contains(c));
-    plain.then(|| format!("Read(/{}/**)", s.trim_end_matches('/')))
+/// Files of a read-only repository Claude may never read, even when the person would
+/// answer a prompt for them: credentials usually live there (`.env` files, keys, and
+/// `.git/` whose `config` may hold a token in a remote URL).
+const READ_ONLY_DENIED: [&str; 5] = ["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/.git/**"];
+
+/// The permission rules for repositories Claude may read without asking (a workspace
+/// task's read-only repos): one allow rule per repository, `Read(//abs/repo/**)` (`//`
+/// anchors at the filesystem root; Claude applies Read rules to Grep and Glob too), and
+/// deny rules for the files [`READ_ONLY_DENIED`] names inside it (a deny rule wins over
+/// any allow, and over the person's own settings' allow rules). Claude Code checks a path
+/// through a symlink against both its spelling and its target: an allow rule needs both
+/// to match, a deny rule either. A path that is not absolute or holds a character the
+/// rule syntax gives a meaning to gets no rule at all (no rule beats a wrong one): reading
+/// there asks. Returns `(allow, deny)`.
+pub fn read_only_rules(repos: &[PathBuf]) -> (Vec<String>, Vec<String>) {
+    let (mut allow, mut deny) = (Vec::new(), Vec::new());
+    for dir in repos {
+        let Some(s) = dir.to_str() else {
+            continue;
+        };
+        let plain = s.starts_with('/') && !s.chars().any(|c| c.is_control() || "()*?[]{}!\\\"'#".contains(c));
+        let s = s.trim_end_matches('/');
+        if !plain || s.is_empty() {
+            continue;
+        }
+        allow.push(format!("Read(/{s}/**)"));
+        deny.extend(READ_ONLY_DENIED.iter().map(|d| format!("Read(/{s}/{d})")));
+    }
+    (allow, deny)
 }
 
 /// The name of the per-session plugin Mirante generates for a task's on-demand skills;
@@ -434,7 +459,7 @@ mod tests {
 
     #[test]
     fn settings_register_every_event_with_the_hook_command() {
-        let s = settings_json("/opt/mirante/bin/mirante-hook", &["Bash(cargo test:*)".to_string()]);
+        let s = settings_json("/opt/mirante/bin/mirante-hook", &["Bash(cargo test:*)".to_string()], &[]);
         for name in PLAIN_EVENTS.iter().chain(TOOL_EVENTS.iter()) {
             assert_eq!(s["hooks"][*name][0]["hooks"][0]["command"], "'/opt/mirante/bin/mirante-hook'", "{name}");
         }
@@ -450,7 +475,7 @@ mod tests {
     #[test]
     fn hook_command_is_shell_quoted() {
         let path = "/Users/o'brien/My Apps/mirante-hook";
-        let s = settings_json(path, &[]);
+        let s = settings_json(path, &[], &[]);
         let cmd = s["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(cmd, r#"'/Users/o'\''brien/My Apps/mirante-hook'"#);
         // A real shell must read it back as exactly one word equal to the path.
@@ -556,7 +581,7 @@ mod tests {
 
     #[test]
     fn memory_read_tools_are_pre_allowed_and_propose_is_not() {
-        let s = settings_json("/h", &memory_allow());
+        let s = settings_json("/h", &memory_allow(), &[]);
         assert_eq!(
             s["permissions"]["allow"],
             json!(["mcp__mirante-memory__memory_search", "mcp__mirante-memory__memory_get"])
@@ -613,13 +638,24 @@ mod tests {
         }
     }
 
+    /// Review I2: one allow rule per read-only repository (never the folder holding them),
+    /// each with deny rules for the files that hold credentials.
     #[test]
-    fn a_read_only_folder_is_one_read_rule_or_none() {
-        assert_eq!(read_only_allow(Path::new("/Users/p/gol")).as_deref(), Some("Read(//Users/p/gol/**)"));
-        assert_eq!(read_only_allow(Path::new("/Users/p/my repos/")).as_deref(), Some("Read(//Users/p/my repos/**)"));
-        for bad in ["gol", "/a/(x)", "/a/*", "/a/b\nc", "/a/\"q"] {
-            assert_eq!(read_only_allow(Path::new(bad)), None, "{bad:?}");
+    fn read_only_repos_are_one_rule_each_with_their_secrets_denied() {
+        let repos = [PathBuf::from("/Users/p/gol/docs"), PathBuf::from("/Users/p/gol/my repo/")];
+        let (allow, deny) = read_only_rules(&repos);
+        assert_eq!(allow, ["Read(//Users/p/gol/docs/**)", "Read(//Users/p/gol/my repo/**)"]);
+        assert!(!allow.iter().any(|r| r == "Read(//Users/p/gol/**)"), "never the folder");
+        for d in ["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/.git/**"] {
+            assert!(deny.contains(&format!("Read(//Users/p/gol/docs/{d})")), "{d}: {deny:?}");
         }
+        assert_eq!(deny.len(), 10);
+        for bad in ["gol", "/a/(x)", "/a/*", "/a/b\nc", "/a/\"q", "/a/#x", "/"] {
+            assert_eq!(read_only_rules(&[PathBuf::from(bad)]), (vec![], vec![]), "{bad:?}");
+        }
+        let s = settings_json("/h", &allow, &deny);
+        assert_eq!(s["permissions"]["deny"].as_array().unwrap().len(), 10);
+        assert!(settings_json("/h", &[], &[])["permissions"].get("deny").is_none());
     }
 
     #[test]

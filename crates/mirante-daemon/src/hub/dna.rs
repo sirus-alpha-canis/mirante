@@ -710,8 +710,9 @@ impl Hub {
         if p.anchors.is_empty() || p.anchors.len() > MAX_ANCHORS {
             return Err(HubError::Invalid(format!("a note cites 1..={MAX_ANCHORS} code ranges")));
         }
-        // git, unlocked: cite committed lines at the worktree's HEAD.
-        let worktree = Path::new(&task.worktree_path);
+        // git, unlocked: cite committed lines at the worktree's HEAD (never through a
+        // worktree folder swapped for a symlink).
+        let worktree = &self.checked_worktree(&task).map_err(HubError::Conflict)?;
         let invalid = |e: DnaError| HubError::Invalid(e.to_string());
         let commit = rev_parse(worktree, "HEAD").map_err(dna_err)?;
         let mut anchors = Vec::with_capacity(p.anchors.len());
@@ -892,8 +893,8 @@ impl Hub {
         }
         self.dna_ensure_fresh(&repo)?;
         let live = task.lifecycle != Lifecycle::Archived;
-        let worktree = Path::new(&task.worktree_path);
-        let files: Vec<String> = if live {
+        let checked = if live { Some(self.checked_worktree(&task).map_err(HubError::Conflict)?) } else { None };
+        let files: Vec<String> = if let Some(worktree) = &checked {
             let d = crate::diff::task_diff(&repo, worktree, &task.branch).map_err(HubError::Conflict)?;
             d.files.into_iter().map(|f| f.path).chain(d.untracked).collect()
         } else {
@@ -934,7 +935,7 @@ impl Hub {
             .iter()
             .flat_map(|n| n.anchors.iter().filter(|a| files.contains(&a.anchor.path) && holds(a)).map(move |a| (n, a)))
             .collect();
-        if live && !cited.is_empty() {
+        if let Some(worktree) = checked.as_ref().filter(|_| !cited.is_empty()) {
             let tip = rev_parse(worktree, "HEAD").map_err(dna_err)?;
             let anchors: Vec<_> = cited.iter().map(|(_, a)| a.anchor.clone()).collect();
             let checked = check_all(&repo, &tip, &anchors).map_err(dna_err)?;

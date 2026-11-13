@@ -1370,6 +1370,8 @@ fn a_task_across_two_repos_of_a_folder_with_a_fake_claude() {
         std::fs::create_dir_all(&r).unwrap();
         git_in(&r, &["init", "-q", "-b", "main"]);
         git_in(&r, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // One client's repos (a read-only repo of another client is never readable unasked).
+        git_in(&r, &["remote", "add", "origin", &format!("git@github.com:gol-sa/{name}.git")]);
     }
     let gol = std::fs::canonicalize(gol).unwrap();
     env.ok(&["daemon", "start"]);
@@ -1386,10 +1388,13 @@ fn a_task_across_two_repos_of_a_folder_with_a_fake_claude() {
     let text = std::fs::read_to_string(ws.join("MIRANTE_WORKSPACE.md")).unwrap();
     assert!(text.contains("**Site-B2C**") && text.contains("**bff-flight**"), "{text}");
     assert!(text.contains(&format!("- docs: `{}`", gol.join("docs").display())), "{text}");
-    // Claude may read the folder's repos without asking.
+    // Claude may read the folder's other repo without asking: that repo, never the folder,
+    // its credential files denied.
     let settings = Paths::new(&env.home).session_dir(&v.task.id).join("claude-settings.json");
     let settings = std::fs::read_to_string(settings).unwrap();
-    assert!(settings.contains(&format!("Read(/{g}/**)")), "{settings}");
+    assert!(settings.contains(&format!("Read(/{g}/docs/**)")), "{settings}");
+    assert!(!settings.contains(&format!("Read(/{g}/**)")), "{settings}");
+    assert!(settings.contains(&format!("Read(/{g}/docs/**/.env)")), "{settings}");
     // ls: the folder and its repos.
     let ls = env.ok(&["ls"]);
     assert!(ls.contains("(gol: Site-B2C, bff-flight)"), "{ls}");

@@ -290,6 +290,56 @@ impl WorktreeManager {
         &self.root
     }
 
+    /// The levels of `path` below the root (each a plain name). Refused when `path` is not
+    /// under the root (as recorded, or once the root's own symlinks are resolved).
+    pub fn rel_levels(&self, path: &Path) -> Result<Vec<String>> {
+        let outside =
+            || CoreError::OutsideRoot { path: path.display().to_string(), root: self.root.display().to_string() };
+        let canon_root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let rel = path.strip_prefix(&self.root).or_else(|_| path.strip_prefix(&canon_root)).map_err(|_| outside())?;
+        let mut out = Vec::new();
+        for c in rel.components() {
+            match c {
+                Component::Normal(n) => out.push(n.to_str().ok_or_else(outside)?.to_string()),
+                _ => return Err(outside()),
+            }
+        }
+        if out.is_empty() {
+            return Err(outside());
+        }
+        Ok(out)
+    }
+
+    /// `path` (a checkout under the root) when no level of it below the root is a symlink
+    /// and it is a real directory: what Mirante made, not a folder an agent swapped for a
+    /// link to somewhere else (another task's worktree, the home folder). `Ok(None)` when a
+    /// level does not exist (deleted by hand). Nothing is followed to decide.
+    pub fn real_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let levels = self.rel_levels(path)?;
+        let mut at = self.root.clone();
+        for name in &levels {
+            at.push(name);
+            match std::fs::symlink_metadata(&at) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(CoreError::InvalidWorkspace(format!(
+                        "{} is a symlink, not the folder Mirante made: refused",
+                        at.display()
+                    )))
+                }
+                Ok(m) if !m.is_dir() => {
+                    return Err(CoreError::InvalidWorkspace(format!(
+                        "{} is not a folder Mirante made: refused",
+                        at.display()
+                    )))
+                }
+                Ok(_) => {}
+            }
+        }
+        Ok(Some(at))
+    }
+
     /// [`WorktreeManager::create`] at `path`, which must lie under the root.
     pub fn create_at(&self, repo: &Path, path: &Path, branch: &str, base: Option<&str>) -> Result<Worktree> {
         validate_branch_name(branch)?;
@@ -338,10 +388,10 @@ impl WorktreeManager {
     /// Ok when [`WorktreeManager::remove`] would not refuse `path` for uncommitted work (a
     /// missing directory is fine); else the [`CoreError::DirtyWorktree`] it would give.
     pub fn check_clean(&self, path: &Path) -> Result<()> {
-        if !path.exists() {
+        let Some(path) = self.real_path(path)? else {
             return Ok(());
-        }
-        match dirt(path)? {
+        };
+        match dirt(&path)? {
             Dirt::Clean | Dirt::ToolDirsOnly => Ok(()),
             Dirt::Changes(all) => {
                 let more = all.len().saturating_sub(DIRTY_LISTED);
@@ -374,7 +424,9 @@ impl WorktreeManager {
     /// [`TOOL_DIRS`] (caches the user's own tools write into every checkout, e.g. Serena's
     /// `.serena/`) do not count, and the removal is then forced (git would refuse it).
     /// If the directory is already gone (deleted by hand), the path is checked against the
-    /// root lexically and `git worktree prune` drops the stale metadata.
+    /// root lexically and `git worktree prune` drops the stale metadata. A level of `path`
+    /// below the root that is a symlink is refused ([`WorktreeManager::real_path`]): an
+    /// agent could have swapped its folder for a link to another task's worktree.
     pub fn remove(&self, repo: &Path, path: &Path) -> Result<()> {
         let lock = self.repo_lock(repo)?;
         let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -382,13 +434,13 @@ impl WorktreeManager {
     }
 
     /// [`WorktreeManager::remove`] with the repo lock already held.
-    fn remove_locked(&self, repo: &Path, path: &Path) -> Result<()> {
+    fn remove_locked(&self, repo: &Path, given: &Path) -> Result<()> {
         let root = resolve(&self.root)?;
-        let path = resolve(path)?;
+        let path = resolve(given)?;
         if path == root || !path.starts_with(&root) {
             return Err(CoreError::OutsideRoot { path: path.display().to_string(), root: root.display().to_string() });
         }
-        if path.exists() {
+        if self.real_path(given)?.is_some() {
             let force = match dirt(&path)? {
                 Dirt::Clean => false,
                 Dirt::ToolDirsOnly => true,

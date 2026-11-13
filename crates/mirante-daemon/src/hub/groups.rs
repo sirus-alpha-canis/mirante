@@ -148,12 +148,7 @@ impl Hub {
             .into_iter()
             .map(|(view, last_answer)| {
                 let diff = (view.task.lifecycle != Lifecycle::Archived)
-                    .then(|| match view.task.workspace_path {
-                        Some(_) => crate::diff::workspace_stat(&view.repos),
-                        None => {
-                            crate::diff::diff_stat(Path::new(&view.task.repo_path), Path::new(&view.task.worktree_path))
-                        }
-                    })
+                    .then(|| self.diff_stat_of(&view.task, &view.repos))
                     .and_then(|r| r.ok());
                 GroupMember { view, last_answer, diff }
             })
@@ -190,16 +185,18 @@ impl Hub {
         let id = id.as_str();
         let mut dirty = Vec::new();
         for t in &open {
+            // The same checks `archive` makes, removing nothing (a workspace task: its repos,
+            // the agent's own files in its folder, swapped folders).
             let clean = match &t.workspace_path {
-                Some(_) => {
+                Some(ws) => {
                     let repos = self.lock().store.task_repos(&t.id)?;
-                    repos.iter().try_for_each(|r| self.worktrees.check_clean(Path::new(&r.worktree_path)))
+                    mirante_core::workspace::check_removable(&self.worktrees, Path::new(ws), &repos)
                 }
                 None => self.worktrees.check_clean(Path::new(&t.worktree_path)),
             };
             match clean {
                 Ok(()) => {}
-                Err(CoreError::DirtyWorktree { .. }) => dirty.push(t.branch.clone()),
+                Err(CoreError::DirtyWorktree { .. } | CoreError::DirtyWorkspace { .. }) => dirty.push(t.branch.clone()),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -539,6 +536,46 @@ mod tests {
         assert!(v.members.iter().all(|m| m.view.task.lifecycle == Lifecycle::Archived));
         assert!(k.hub.list_tasks(false).unwrap().is_empty());
         assert!(child(&k, &g, AgentKind::Claude, "x").is_err(), "an archived group takes no children");
+    }
+
+    /// Review I3: a workspace child whose folder holds the agent's own file blocks the
+    /// group archive before any task is archived (all or nothing).
+    #[test]
+    fn group_archive_checks_a_workspace_childs_folder_before_archiving_anything() {
+        let k = Kit::new();
+        let g = group(&k, GroupKind::Compare);
+        let a = child(&k, &g, AgentKind::Claude, "x").unwrap();
+        let folder = k.dir.path().join("grp");
+        let one = folder.join("one");
+        std::fs::create_dir_all(&one).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git").arg("-C").arg(&one).args(args).output().unwrap();
+            assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"]);
+        let folder = std::fs::canonicalize(folder).unwrap();
+        let b = k
+            .hub
+            .create_task(CreateTask {
+                group: Some(g.id.clone()),
+                repo: folder.to_string_lossy().into_owned(),
+                repos: vec![folder.join("one").to_string_lossy().into_owned()],
+                agent: AgentKind::Claude,
+                branch: String::new(),
+                base: None,
+                goal: "x".into(),
+                title: None,
+            })
+            .unwrap();
+        let ws = std::path::PathBuf::from(b.task.workspace_path.clone().unwrap());
+        std::fs::write(ws.join("plan.md"), "notes\n").unwrap();
+        let e = k.hub.group_archive(&g.id).unwrap_err();
+        assert!(e.to_string().contains(&b.task.branch) && e.to_string().contains("nothing was archived"), "{e}");
+        assert_ne!(k.hub.get_task(&a.task.id).unwrap().task.lifecycle, Lifecycle::Archived, "nothing archived");
+        std::fs::remove_file(ws.join("plan.md")).unwrap();
+        let v = k.hub.group_archive(&g.id).unwrap();
+        assert!(v.members.iter().all(|m| m.view.task.lifecycle == Lifecycle::Archived));
     }
 
     #[test]

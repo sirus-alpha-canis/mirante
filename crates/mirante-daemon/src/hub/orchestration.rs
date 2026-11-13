@@ -6,7 +6,7 @@
 //! child is an ordinary task under its parent (one level deep): its own worktree, agent
 //! session and permissions, in manual mode, answered by a person. Nothing here approves a
 //! permission, and no agent decides on its own work.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mirante_core::groups::child_branch;
 use mirante_core::model::{Lifecycle, Task};
@@ -303,12 +303,8 @@ impl Hub {
             let live = st.live.contains_key(&child.id);
             (child, answer, repos, live)
         };
-        let diff = (child.lifecycle != Lifecycle::Archived)
-            .then(|| match child.workspace_path {
-                Some(_) => crate::diff::workspace_stat(&repos),
-                None => crate::diff::diff_stat(Path::new(&child.repo_path), Path::new(&child.worktree_path)),
-            })
-            .and_then(|r| r.ok());
+        let diff =
+            (child.lifecycle != Lifecycle::Archived).then(|| self.diff_stat_of(&child, &repos)).and_then(|r| r.ok());
         Ok(ChildResult {
             ended: !live,
             child: child.id,
@@ -334,6 +330,7 @@ pub(crate) mod tests {
     use mirante_ipc::rpc::code;
     use mirante_ipc::types::{method, CreateTask, CreateThread, StartSession};
     use serde_json::json;
+    use std::path::Path;
 
     pub(crate) fn on(k: &Kit, task: &str) -> TaskView {
         k.hub.orchestrate(&dna::Caller::Person, Orchestrate { task: task.into(), enabled: true }).unwrap()

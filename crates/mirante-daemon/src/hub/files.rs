@@ -126,10 +126,15 @@ impl Hub {
     }
 }
 
-/// The root a task path is read under, and the path's levels below it.
-struct Resolved<'a> {
+/// The root a task path is read under, and the path's levels below it. The root is
+/// Mirante's worktrees root and the levels include the worktree's own (its repo, branch, or
+/// workspace and repo name): the descriptor walk then refuses a worktree folder an agent
+/// swapped for a symlink, at any level.
+struct Resolved {
     root: std::path::PathBuf,
-    segs: Vec<&'a str>,
+    segs: Vec<String>,
+    /// How many of `segs` lead to the worktree (or workspace) folder.
+    base: usize,
 }
 
 impl Hub {
@@ -152,9 +157,9 @@ impl Hub {
         let limit = p.limit.unwrap_or(FILES_DEFAULT).clamp(1, FILES_MAX);
         let mut all = Vec::new();
         match &t.workspace_path {
-            None => all.extend(self.worktree_files(Path::new(&t.worktree_path))?),
+            None => all.extend(self.worktree_files(&self.checked_worktree(&t).map_err(HubError::Conflict)?)?),
             Some(ws) => {
-                for r in &repos {
+                for r in &self.checked_repos(&t, &repos).map_err(HubError::Conflict)? {
                     let files = self.worktree_files(Path::new(&r.worktree_path))?;
                     all.extend(files.into_iter().map(|f| format!("{}/{f}", r.name)));
                 }
@@ -209,17 +214,27 @@ impl Hub {
     }
 
     /// Where `path` lives for task `t`: its worktree, or for a workspace task the selected
-    /// repo its first level names (or one of the workspace's own files).
-    fn resolve_file<'a>(t: &mirante_core::model::Task, repos: &[TaskRepo], segs: Vec<&'a str>) -> Result<Resolved<'a>> {
+    /// repo its first level names (or one of the workspace's own files). Read from
+    /// Mirante's worktrees root down (see [`Resolved`]).
+    fn resolve_file(&self, t: &mirante_core::model::Task, repos: &[TaskRepo], segs: Vec<&str>) -> Result<Resolved> {
+        let levels = |p: &str| self.worktrees.rel_levels(Path::new(p)).map_err(|e| HubError::Invalid(e.to_string()));
+        let at = |base: Vec<String>, rest: &[&str]| {
+            let n = base.len();
+            let mut segs = base;
+            segs.extend(rest.iter().map(|s| s.to_string()));
+            Ok(Resolved { root: self.worktrees.root().to_path_buf(), segs, base: n })
+        };
         let Some(ws) = &t.workspace_path else {
-            return Ok(Resolved { root: t.worktree_path.clone().into(), segs });
+            return at(levels(&t.worktree_path)?, &segs);
         };
         if segs.len() == 1 && workspace::OWN_FILES.contains(&segs[0]) {
-            return Ok(Resolved { root: ws.into(), segs });
+            return at(levels(ws)?, &segs);
         }
         match repos.iter().find(|r| r.name == segs[0]) {
             Some(r) if segs.len() > 1 => {
-                Ok(Resolved { root: r.worktree_path.clone().into(), segs: segs[1..].to_vec() })
+                // The recorded worktree is the workspace's `<name>` folder (else refused).
+                workspace::repo_dir(&self.worktrees, Path::new(ws), r).map_err(|e| HubError::Invalid(e.to_string()))?;
+                at(levels(ws)?, &segs)
             }
             _ => Err(HubError::Invalid(format!(
                 "{}: not a file of the task's repositories ({})",
@@ -235,9 +250,14 @@ impl Hub {
     pub fn task_file(&self, p: &TaskFile) -> Result<FileView> {
         let segs = wf::check_rel(&p.path).map_err(|e| HubError::Invalid(e.to_string()))?;
         let (t, repos) = self.files_task(&p.task)?;
-        let at = Self::resolve_file(&t, &repos, segs)?;
-        let read = wf::read_in(&at.root, &at.segs, wf::CAPS).map_err(|e| match e {
-            wf::FileError::Missing(m) => HubError::NotFound(format!("{m} does not exist")),
+        let at = self.resolve_file(&t, &repos, segs)?;
+        let all: Vec<&str> = at.segs.iter().map(String::as_str).collect();
+        // Errors name the path as the person gave it, not Mirante's levels above it.
+        let base = at.segs[..at.base].join("/");
+        let shown = |m: String| m.strip_prefix(&base).map(|r| r.trim_start_matches('/').to_string()).unwrap_or(m);
+        let read = wf::read_in(&at.root, &all, wf::CAPS).map_err(|e| match e {
+            wf::FileError::Missing(m) => HubError::NotFound(format!("{} does not exist", shown(m))),
+            wf::FileError::Symlink(m) => HubError::Invalid(wf::FileError::Symlink(shown(m)).to_string()),
             other => HubError::Invalid(other.to_string()),
         })?;
         // Joined only now, after a read through descriptors succeeded.
@@ -516,6 +536,75 @@ mod tests {
         }
     }
 
+    /// A fake home folder holding a credentials file, outside every worktree.
+    fn fake_home(k: &Kit) -> std::path::PathBuf {
+        let home = k.dir.path().join("fakehome");
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(home.join(".aws/credentials"), "aws_secret_access_key=SECRET\n").unwrap();
+        git(&home, &["init", "-q", "-b", "main"]);
+        git(&home, &["add", "."]);
+        git(&home, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "home"]);
+        home
+    }
+
+    /// Review I1: the workspace folder is the agent's working directory, so it can swap a
+    /// repo's folder for a symlink (to the home folder, to another task's worktree). The
+    /// side pane, git and the archive must refuse it, not follow it.
+    #[test]
+    fn a_workspace_repo_swapped_for_a_symlink_is_refused_everywhere() {
+        let k = Kit::new();
+        let t = ws_task(&k);
+        let ws = std::path::PathBuf::from(t.workspace_path.clone().unwrap());
+        let home = fake_home(&k);
+        // The agent: `rm -rf two && ln -s ~ two` (the worktree's own commit is clean).
+        std::fs::remove_dir_all(ws.join("two")).unwrap();
+        std::os::unix::fs::symlink(&home, ws.join("two")).unwrap();
+        let r = tf(&k, &t.id, "two/.aws/credentials", true);
+        assert!(r.is_err(), "the side pane read through the swap: {r:?}");
+        let r = tf(&k, &t.id, "two/README.md", false);
+        assert!(r.is_err(), "{r:?}");
+        let l = k.hub.task_files(&TaskFiles { task: t.id.clone(), query: "cred".into(), limit: None });
+        assert!(l.is_err(), "git listed the swap's target: {l:?}");
+        let d = k.hub.task_diff(&t.id);
+        assert!(d.is_err(), "git diffed the swap's target: {d:?}");
+        let a = k.hub.archive(&t.id);
+        assert!(a.is_err(), "archived through the swap: {a:?}");
+        assert!(home.join(".aws/credentials").exists(), "the target is untouched");
+        // The workspace's own files are still read (not through the swapped folder).
+        assert_eq!(tf(&k, &t.id, "MIRANTE_WORKSPACE.md", false).unwrap().kind, FileKind::Text);
+    }
+
+    /// Review I1, archive: a repo folder swapped for a link to another task's (clean)
+    /// worktree must not get that worktree removed.
+    #[test]
+    fn archiving_never_removes_the_worktree_a_swapped_folder_points_to() {
+        let k = Kit::new();
+        let t = ws_task(&k);
+        // The victim: another task's clean worktree of the same repository.
+        let other = ws_task_on(&k, "victim");
+        let victim = std::path::PathBuf::from(other.workspace_path.clone().unwrap()).join("one");
+        let ws = std::path::PathBuf::from(t.workspace_path.clone().unwrap());
+        std::fs::remove_dir_all(ws.join("one")).unwrap();
+        std::os::unix::fs::symlink(&victim, ws.join("one")).unwrap();
+        assert!(k.hub.archive(&t.id).is_err());
+        assert!(victim.join("README.md").exists(), "the other task's worktree stays");
+    }
+
+    /// The same for a single-repo task whose worktree folder was swapped.
+    #[test]
+    fn a_single_worktree_swapped_for_a_symlink_is_refused() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        let home = fake_home(&k);
+        std::fs::remove_dir_all(&t.worktree_path).unwrap();
+        std::os::unix::fs::symlink(&home, &t.worktree_path).unwrap();
+        assert!(tf(&k, &t.id, ".aws/credentials", true).is_err());
+        assert!(k.hub.task_files(&TaskFiles { task: t.id.clone(), query: String::new(), limit: None }).is_err());
+        assert!(k.hub.task_diff(&t.id).is_err());
+        assert!(k.hub.archive(&t.id).is_err());
+        assert!(home.join(".aws/credentials").exists());
+    }
+
     /// A workspace task over `one` and `two` of a folder that also holds `three`.
     fn ws_task(k: &Kit) -> mirante_core::model::Task {
         let g = k.dir.path().join("grp");
@@ -527,14 +616,19 @@ mod tests {
             git(&r, &["add", "."]);
             git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
         }
-        let g = std::fs::canonicalize(g).unwrap();
+        ws_task_on(k, "ws")
+    }
+
+    /// Another workspace task over `one` and `two` of the folder [`ws_task`] made.
+    fn ws_task_on(k: &Kit, branch: &str) -> mirante_core::model::Task {
+        let g = std::fs::canonicalize(k.dir.path().join("grp")).unwrap();
         k.hub
             .create_task(mirante_ipc::types::CreateTask {
                 group: None,
                 repo: g.to_string_lossy().into_owned(),
                 repos: ["one", "two"].iter().map(|n| g.join(n).to_string_lossy().into_owned()).collect(),
                 agent: mirante_core::model::AgentKind::Claude,
-                branch: "ws".into(),
+                branch: branch.into(),
                 base: None,
                 goal: "g".into(),
                 title: None,
