@@ -17,7 +17,7 @@ use mirante_core::worktree::WorktreeManager;
 use mirante_core::CoreError;
 use mirante_ipc::rpc::{code, RpcError};
 use mirante_ipc::types::{
-    BootState, CreateTask, DaemonStatus, Snapshot, TaskDiff, TaskEventsParams, TaskView, TASK_EVENTS_MAX,
+    ArchiveTask, BootState, CreateTask, DaemonStatus, Snapshot, TaskDiff, TaskEventsParams, TaskView, TASK_EVENTS_MAX,
 };
 use mirante_ipc::Paths;
 use serde_json::{json, Value};
@@ -1021,14 +1021,132 @@ impl Hub {
         Ok(EventsPage { events, truncated })
     }
 
+    /// `task.archive` with no options: refused while the task has open threads or
+    /// agent-proposed children (see [`Hub::archive_with`]).
+    pub fn archive(&self, reference: &str) -> Result<TaskView> {
+        self.archive_with(ArchiveTask { task: reference.into(), ..Default::default() })
+    }
+
+    /// `task.archive`. A task with open (not archived) threads or agent-proposed children is
+    /// refused, naming them, unless `cascade`: then every one of them and the task are
+    /// checked first (none live unless `stop`, none being archived, none holding uncommitted
+    /// work; nothing is archived or stopped when one fails), live sessions are ended when
+    /// `stop`, the children are archived, then the task. A parent archived before this rule
+    /// existed can still be cascaded to its open children.
+    pub fn archive_with(&self, a: ArchiveTask) -> Result<TaskView> {
+        let (task, children) = {
+            let st = self.lock();
+            let t = st.resolve(&a.task)?;
+            let children: Vec<Task> =
+                st.store.children_of(&t.id)?.into_iter().filter(|c| c.lifecycle != Lifecycle::Archived).collect();
+            (t, children)
+        };
+        if children.is_empty() {
+            if a.stop && self.lock().live.contains_key(&task.id) {
+                self.stop_if_live(&task.id)?;
+            }
+            return self.archive_one(&task.id);
+        }
+        if !a.cascade {
+            let named: Vec<String> = children.iter().map(child_label).collect();
+            return Err(HubError::Conflict(format!(
+                "task {} has open threads or sub-tasks (nothing was archived): {}; archive them first, \
+                 or archive with cascade (mirante archive --cascade) to archive them all",
+                task.branch,
+                named.join(", ")
+            )));
+        }
+        let parent_open = task.lifecycle != Lifecycle::Archived;
+        let mut all = children.clone();
+        if parent_open {
+            all.push(task.clone());
+        }
+        self.check_archivable(&all, a.stop)?;
+        if a.stop {
+            for t in &all {
+                self.stop_if_live(&t.id)?;
+            }
+        }
+        for c in &children {
+            self.archive_one(&c.id).map_err(|e| {
+                HubError::Conflict(format!("archiving {} failed: {e} (the tasks before it are archived)", c.branch))
+            })?;
+        }
+        if parent_open {
+            return self.archive_one(&task.id);
+        }
+        let st = self.lock();
+        let t = st.store.get_task(&task.id)?;
+        st.view(t)
+    }
+
+    /// Ends `task_id`'s session when one is live; one that ended meanwhile is no error.
+    fn stop_if_live(&self, task_id: &str) -> Result<()> {
+        if !self.lock().live.contains_key(task_id) {
+            return Ok(());
+        }
+        match self.stop(task_id) {
+            Ok(_) => Ok(()),
+            Err(_) if !self.lock().live.contains_key(task_id) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The checks archiving makes, run over several tasks before any is archived (a group,
+    /// a parent and its children), removing nothing: none live (unless `stop` will end
+    /// them), none being archived, none holding uncommitted work (each named).
+    pub(crate) fn check_archivable(&self, tasks: &[Task], stop: bool) -> Result<()> {
+        {
+            let st = self.lock();
+            if !stop {
+                let live: Vec<&str> =
+                    tasks.iter().filter(|t| st.live.contains_key(&t.id)).map(|t| t.branch.as_str()).collect();
+                if !live.is_empty() {
+                    return Err(HubError::Conflict(format!(
+                        "stop these tasks first (nothing was archived): {}",
+                        live.join(", ")
+                    )));
+                }
+            }
+            if let Some(t) = tasks.iter().find(|t| t.lifecycle == Lifecycle::Archiving) {
+                return Err(HubError::Conflict(format!("task {} is being archived", t.branch)));
+            }
+        }
+        let mut dirty = Vec::new();
+        for t in tasks {
+            // The same checks `archive` makes, removing nothing (a workspace task: its repos,
+            // the agent's own files in its folder, swapped folders).
+            let clean = match &t.workspace_path {
+                Some(ws) => {
+                    let repos = self.lock().store.task_repos(&t.id)?;
+                    workspace::check_removable(&self.worktrees, Path::new(ws), &repos)
+                }
+                None => self.worktrees.check_clean(Path::new(&t.worktree_path)),
+            };
+            match clean {
+                Ok(()) => {}
+                Err(CoreError::DirtyWorktree { .. } | CoreError::DirtyWorkspace { .. }) => dirty.push(t.branch.clone()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if !dirty.is_empty() {
+            return Err(HubError::Conflict(format!(
+                "these tasks hold uncommitted work (nothing was archived; commit or discard it first): {}",
+                dirty.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Removes the worktree (git refuses a dirty one) and archives the task. The branch is
-    /// kept. Refused while a session is live.
+    /// kept. Refused while a session is live. Its children are not looked at (the callers
+    /// do: [`Hub::archive_with`], [`Hub::group_archive`]).
     ///
     /// Crash-safe: `Archiving` is persisted before the worktree is touched (no session may
     /// start meanwhile), then `Archived` after. A removal that fails puts the task back to
     /// `Active` (`archive_failed` says why); a crash in between is finished or undone by
     /// [`Hub::recover`].
-    pub fn archive(&self, reference: &str) -> Result<TaskView> {
+    pub(crate) fn archive_one(&self, reference: &str) -> Result<TaskView> {
         let task = {
             let mut st = self.lock();
             let t = st.resolve(reference)?;
@@ -1185,6 +1303,14 @@ pub(crate) fn mixed_tenants_reason(tenants: &[String]) -> String {
         "skills and repo memory are off for this task: its repositories belong to different clients ({})",
         tenants.join(", ")
     )
+}
+
+/// How a refusal names a child: `thread <branch>` or `sub-task <branch>`.
+fn child_label(t: &Task) -> String {
+    match t.child_kind {
+        Some(mirante_core::model::ChildKind::Spawn) => format!("sub-task {}", t.branch),
+        _ => format!("thread {}", t.branch),
+    }
 }
 
 #[cfg(test)]

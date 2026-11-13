@@ -10,6 +10,7 @@ pub mod method {
     pub const TASK_CREATE: &str = "task.create";
     pub const TASK_LIST: &str = "task.list";
     pub const TASK_GET: &str = "task.get";
+    /// Archives a task ([`super::ArchiveTask`]; result: its view).
     pub const TASK_ARCHIVE: &str = "task.archive";
     /// A task's audit trail, oldest first ([`super::TaskEventsParams`]).
     pub const TASK_EVENTS: &str = "task.events";
@@ -579,6 +580,19 @@ pub struct KillOrphan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRef {
     pub task: String,
+}
+
+/// `task.archive`: a task with open threads or agent-proposed children is refused (a
+/// conflict naming them) unless `cascade`, which archives them first, all or nothing (a
+/// dirty one, or a live one without `stop`, refuses before anything is archived). `stop`
+/// ends the live sessions first. `{ "task": … }` alone is the plain archive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveTask {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cascade: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

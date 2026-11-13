@@ -308,6 +308,49 @@ describe("Detail (V1 classic)", () => {
     expect(h.calls).toContainEqual(["session.stop", { task: "a" }]);
   });
 
+  it("Archive asks first; a task without children is archived alone", async () => {
+    const h = setup({ "task.archive": (p: Record<string, unknown>) => task(String(p.task), { lifecycle: "archived", live: false }) });
+    await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    const box = screen.getByRole("group", { name: "Confirm archive" });
+    expect(box).toHaveTextContent("Archive this task? Its worktree is removed (a live session is stopped first); the branch is kept.");
+    expect(h.calls.map((c) => c[0])).not.toContain("task.archive");
+    await userEvent.click(within(box).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("group", { name: "Confirm archive" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    await userEvent.click(screen.getByRole("button", { name: "Archive the task" }));
+    expect(h.calls).toContainEqual(["task.archive", { task: "a", stop: true }]);
+  });
+
+  it("archiving a parent lists its open threads and sub-tasks, then archives them all (or nothing on Cancel)", async () => {
+    const h = makeEnv({ "task.archive": (p: Record<string, unknown>) => task(String(p.task), { lifecycle: "archived", live: false }) });
+    h.load([
+      task("a", { status: "working" }),
+      task("t", { title: "review PR 12", branch: "feat/a--1-review", parent_id: "a", child_kind: "thread", live: true }),
+      task("s", { title: "split the tests", branch: "feat/a--2-tests", parent_id: "a", child_kind: "spawn", live: false }),
+      task("x", { title: "old one", parent_id: "a", child_kind: "thread", lifecycle: "archived", live: false }),
+    ]);
+    renderWith(h.env, <Detail taskId="a" onSelect={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    const box = screen.getByRole("group", { name: "Confirm archive" });
+    expect(box).toHaveTextContent("This task has 2 open threads or sub-tasks; they are archived with it, first (live sessions are stopped):");
+    const items = within(within(box).getByRole("list", { name: "Its open threads and sub-tasks" })).getAllByRole("listitem");
+    expect(items.map((i) => i.textContent)).toEqual(["Thread: review PR 12 (feat/a--1-review) · live", "Sub-task: split the tests (feat/a--2-tests)"]);
+    await userEvent.click(within(box).getByRole("button", { name: "Cancel" }));
+    expect(h.calls.map((c) => c[0])).not.toContain("task.archive");
+    await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    await userEvent.click(screen.getByRole("button", { name: "Archive all (3)" }));
+    expect(h.calls.filter((c) => c[0] === "task.archive")).toEqual([["task.archive", { task: "a", cascade: true, stop: true }]]);
+  });
+
+  it("a cascade the daemon refuses (a dirty child) says why and archives nothing", async () => {
+    const h = makeEnv({ "task.archive": rpcError(RpcCode.CONFLICT, "these tasks hold uncommitted work (nothing was archived; commit or discard it first): feat/a--1-review") });
+    h.load([task("a", { status: "working" }), task("t", { branch: "feat/a--1-review", parent_id: "a", child_kind: "thread" })]);
+    renderWith(h.env, <Detail taskId="a" onSelect={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    await userEvent.click(screen.getByRole("button", { name: "Archive all (2)" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("nothing was archived; commit or discard it first): feat/a--1-review");
+  });
+
   it("a session action runs once while in flight, and a later success clears the error", async () => {
     let n = 0;
     let release!: () => void;

@@ -3,7 +3,8 @@ import { shallow, useEnv, useLive, useSelect } from "../env";
 import { isHibernated } from "../lib/memguard";
 import { collapseRepeats, summarizeSteps } from "../lib/feed";
 import { inboxOf } from "../lib/inbox";
-import { type Key, useLang, useT } from "../lib/i18n";
+import { type Key, tn, useLang, useT } from "../lib/i18n";
+import { archiveTask } from "../lib/archive";
 import { M, type TaskView } from "../lib/protocol";
 import type { FeedItem, State } from "../store/state";
 import { useDnaKey, useDnaRev } from "../lib/useDna";
@@ -273,6 +274,73 @@ function Actions({ t }: { t: TaskView }) {
         </>
       )}
       <HibernateButton t={t} />
+      <ArchiveAction t={t} />
+      {error && (
+        <span className="error" role="alert">
+          {error}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Archive, asked inline first. A parent's open threads and sub-tasks are listed, and
+ * "Archive all (N)" archives them with it (the daemon checks every one before archiving
+ * any, and refuses a dirty one); Cancel archives nothing. */
+function ArchiveAction({ t }: { t: TaskView }) {
+  const env = useEnv();
+  const tt = useT();
+  const live = useLive();
+  const children = useSelect(
+    useCallback((s: State) => Object.values(s.tasks).filter((x) => x.parent_id === t.id && x.lifecycle !== "archived"), [t.id]),
+    shallow,
+  );
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (t.lifecycle === "archived") return null;
+  const archive = async () => {
+    if (busy || !live) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await archiveTask(env, t, children);
+      setAsking(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!asking) {
+    return (
+      <button className="btn btn-small" disabled={!live} onClick={() => (setError(null), setAsking(true))}>
+        {tt("detail.archive")}
+      </button>
+    );
+  }
+  return (
+    <span role="group" aria-label={tt("detail.confirmArchive")} className="archive-confirm">
+      {children.length === 0 ? (
+        <span className="small">{tt("detail.archiveQuestion")}</span>
+      ) : (
+        <>
+          <span className="small">{tn(children.length, "detail.archiveChildrenOne", "detail.archiveChildrenMany")}</span>{" "}
+          <span role="list" aria-label={tt("detail.archiveChildrenList")} className="archive-children small">
+            {children.map((c) => (
+              <span role="listitem" key={c.id}>
+                {`${tt(c.child_kind === "spawn" ? "detail.childSpawn" : "detail.childThread")}: ${c.title} (${c.branch})${c.live ? ` · ${tt("detail.childLive")}` : ""}`}
+              </span>
+            ))}
+          </span>
+        </>
+      )}{" "}
+      <button className="btn btn-small btn-warn" disabled={busy || !live} onClick={() => void archive()}>
+        {children.length === 0 ? tt("detail.archiveTask") : tt("detail.archiveAll", { n: children.length + 1 })}
+      </button>
+      <button className="btn btn-small" disabled={busy} onClick={() => setAsking(false)}>
+        {tt("ui.cancel")}
+      </button>
       {error && (
         <span className="error" role="alert">
           {error}

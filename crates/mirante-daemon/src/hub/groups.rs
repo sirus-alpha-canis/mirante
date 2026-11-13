@@ -5,7 +5,6 @@
 //! person answers). Nothing here approves a permission or sends one agent's text to another
 //! on its own: a synthesis is a person's request, previewed first, with the agents' answers
 //! fenced as data.
-use std::path::Path;
 
 use mirante_core::groups::{
     child_branch, marker_for, results_hash, synth_branch, synthesis_prompt, NewGroup, Sibling, TaskGroup,
@@ -156,9 +155,10 @@ impl Hub {
         Ok(GroupView { group, members })
     }
 
-    /// Archives every task of the group, then the group. Checked first, before anything is
-    /// archived: none may be live or being archived, and none may hold uncommitted work
-    /// (each is named). Branches are kept.
+    /// Archives every task of the group (each one's open threads and agent-proposed
+    /// children first), then the group. Checked first, before anything is archived: none
+    /// may be live or being archived, and none may hold uncommitted work (each is named).
+    /// Branches are kept.
     pub fn group_archive(&self, reference: &str) -> Result<GroupView> {
         let (id, open) = {
             let st = self.lock();
@@ -167,47 +167,21 @@ impl Hub {
             if g.archived_at.is_some() {
                 return Err(HubError::Conflict(format!("the group \"{}\" is already archived", g.title)));
             }
-            let open: Vec<Task> =
+            let members: Vec<Task> =
                 st.store.group_members(&id)?.into_iter().filter(|t| t.lifecycle != Lifecycle::Archived).collect();
-            let live: Vec<&str> =
-                open.iter().filter(|t| st.live.contains_key(&t.id)).map(|t| t.branch.as_str()).collect();
-            if !live.is_empty() {
-                return Err(HubError::Conflict(format!(
-                    "stop these tasks first (nothing was archived): {}",
-                    live.join(", ")
-                )));
+            let mut open = Vec::new();
+            for m in &members {
+                open.extend(st.store.children_of(&m.id)?.into_iter().filter(|c| c.lifecycle != Lifecycle::Archived));
             }
-            if let Some(t) = open.iter().find(|t| t.lifecycle == Lifecycle::Archiving) {
-                return Err(HubError::Conflict(format!("task {} is being archived", t.branch)));
-            }
+            // A member that is also another member's child is archived once, as a child.
+            let more: Vec<Task> = members.into_iter().filter(|m| !open.iter().any(|o: &Task| o.id == m.id)).collect();
+            open.extend(more);
             (id, open)
         };
         let id = id.as_str();
-        let mut dirty = Vec::new();
+        self.check_archivable(&open, false)?;
         for t in &open {
-            // The same checks `archive` makes, removing nothing (a workspace task: its repos,
-            // the agent's own files in its folder, swapped folders).
-            let clean = match &t.workspace_path {
-                Some(ws) => {
-                    let repos = self.lock().store.task_repos(&t.id)?;
-                    mirante_core::workspace::check_removable(&self.worktrees, Path::new(ws), &repos)
-                }
-                None => self.worktrees.check_clean(Path::new(&t.worktree_path)),
-            };
-            match clean {
-                Ok(()) => {}
-                Err(CoreError::DirtyWorktree { .. } | CoreError::DirtyWorkspace { .. }) => dirty.push(t.branch.clone()),
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if !dirty.is_empty() {
-            return Err(HubError::Conflict(format!(
-                "these tasks hold uncommitted work (nothing was archived; commit or discard it first): {}",
-                dirty.join(", ")
-            )));
-        }
-        for t in &open {
-            self.archive(&t.id).map_err(|e| {
+            self.archive_one(&t.id).map_err(|e| {
                 HubError::Conflict(format!("archiving {} failed: {e} (the tasks before it are archived)", t.branch))
             })?;
         }
@@ -322,6 +296,7 @@ impl Hub {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::process::Command;
 
     use mirante_core::model::{AgentKind, GroupKind, GroupRole, Lifecycle, Status};
@@ -576,6 +551,50 @@ mod tests {
         std::fs::remove_file(ws.join("plan.md")).unwrap();
         let v = k.hub.group_archive(&g.id).unwrap();
         assert!(v.members.iter().all(|m| m.view.task.lifecycle == Lifecycle::Archived));
+    }
+
+    /// A child's thread is archived with the group (it would otherwise block the child's
+    /// archive, or stay open under an archived task).
+    #[test]
+    fn group_archive_takes_a_childs_thread_with_it_all_or_nothing() {
+        let k = Kit::new();
+        let g = group(&k, GroupKind::Compare);
+        let a = child(&k, &g, AgentKind::Claude, "x").unwrap();
+        let th = k
+            .hub
+            .create_thread(
+                &dna::Caller::Person,
+                mirante_ipc::types::CreateThread {
+                    task: CreateTask {
+                        repo: String::new(),
+                        repos: Vec::new(),
+                        agent: AgentKind::Claude,
+                        branch: String::new(),
+                        base: None,
+                        goal: "review".into(),
+                        title: None,
+                        group: None,
+                    },
+                    link: Some(mirante_core::threads::ThreadLink {
+                        kind: mirante_core::threads::LinkKind::Pr,
+                        reference: "acme/api#7".into(),
+                        url: None,
+                        title: None,
+                    }),
+                    parent: Some(a.task.id.clone()),
+                    notes: None,
+                    moved: None,
+                },
+            )
+            .unwrap();
+        std::fs::write(Path::new(&th.task.worktree_path).join("wip.txt"), "x").unwrap();
+        let e = k.hub.group_archive(&g.id).unwrap_err();
+        assert!(e.to_string().contains(&th.task.branch) && e.to_string().contains("nothing was archived"), "{e}");
+        assert_ne!(k.hub.get_task(&a.task.id).unwrap().task.lifecycle, Lifecycle::Archived, "nothing archived");
+        std::fs::remove_file(Path::new(&th.task.worktree_path).join("wip.txt")).unwrap();
+        k.hub.group_archive(&g.id).unwrap();
+        assert_eq!(k.hub.get_task(&th.task.id).unwrap().task.lifecycle, Lifecycle::Archived);
+        assert_eq!(k.hub.get_task(&a.task.id).unwrap().task.lifecycle, Lifecycle::Archived);
     }
 
     #[test]

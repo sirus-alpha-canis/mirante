@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
 use mirante_ipc::types::{
-    method, AttachParams, AttachResult, DnaContextParams, GroupRef, ListParams, QueueRef, QueuedRef, SubscribeParams,
-    TaskRef,
+    method, ArchiveTask, AttachParams, AttachResult, DnaContextParams, GroupRef, ListParams, QueueRef, QueuedRef,
+    SubscribeParams, TaskRef,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -317,7 +317,7 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
             out(hub.list_tasks(l.archived))
         }
         method::TASK_GET => out(hub.get_task(&params::<TaskRef>(p)?.task)),
-        method::TASK_ARCHIVE => out(hub.archive(&params::<TaskRef>(p)?.task)),
+        method::TASK_ARCHIVE => out(hub.archive_with(params::<ArchiveTask>(p)?)),
         method::TASK_EVENTS => out(hub.task_events(params(p)?)),
         method::TASK_DIFF => out(hub.task_diff(&params::<TaskRef>(p)?.task)),
         method::SESSION_START => out(hub.start_session(params(p)?, false)),

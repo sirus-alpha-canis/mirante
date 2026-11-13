@@ -436,6 +436,12 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .detail-head h1 { font-size: var(--fs-md); font-weight: 600; margin: 0; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-head .actions > .error { position: absolute; top: 100%; right: 0; z-index: 4; margin-top: 4px; max-width: 60%; padding: 4px var(--s2); background: var(--panel-2); border-radius: var(--r); box-shadow: var(--shadow); }
 .actions { display: inline-flex; gap: 6px; align-items: center; }
+/* Archive's question opens under the header (the header stays one line: its height is the
+   terminal's): the children it would archive, one per line, then the buttons. */
+.detail-head .archive-confirm { position: absolute; top: 100%; right: 0; z-index: 5; margin-top: 4px; max-width: min(560px, 90%); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: var(--s2); background: var(--panel-2); border-radius: var(--r); box-shadow: var(--shadow); white-space: normal; }
+.archive-confirm > .small:first-child { flex-basis: 100%; }
+.archive-children { display: flex; flex-direction: column; flex-basis: 100%; gap: 2px; padding-left: var(--s2); overflow-wrap: anywhere; }
+.archive-confirm > .error { flex-basis: 100%; }
 .tabs { display: flex; gap: 2px; margin-top: var(--s3); }
 .tabs [role="tab"] { background: none; border: none; border-radius: var(--r); height: 26px; padding: 0 10px; color: var(--muted); cursor: pointer; }
 .tabs [role="tab"]:hover { color: var(--text); }

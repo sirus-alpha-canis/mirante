@@ -92,9 +92,10 @@ const COMMANDS: &[Help] = &[
     },
     Help {
         names: &["archive"],
-        text: "  archive [--stop] <task>
+        text: "  archive [--stop] [--cascade] <task>
                          remove the worktree (branch kept) and hide the task; --stop ends a
-                         live session first",
+                         live session first; a task with open threads or sub-tasks is
+                         refused unless --cascade (they are archived first, all or nothing)",
     },
     Help {
         names: &["memory"],
@@ -450,8 +451,10 @@ pub enum Cmd {
     },
     Archive {
         task: String,
-        /// End a live session first.
+        /// End a live session first (with `cascade`, its children's too).
         stop: bool,
+        /// Archive its open threads and sub-tasks first.
+        cascade: bool,
     },
     Hibernate {
         task: String,
@@ -979,8 +982,9 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             Ok(Cmd::Resume { task: one(&p, "task")?, trust: has("--trust"), fresh: has("--fresh") })
         }
         "archive" => {
-            let p = split(rest, none, &["--stop"])?;
-            Ok(Cmd::Archive { task: one(&p, "task")?, stop: !p.bools.is_empty() })
+            let p = split(rest, none, &["--stop", "--cascade"])?;
+            let has = |f: &str| p.bools.iter().any(|b| b == f);
+            Ok(Cmd::Archive { task: one(&p, "task")?, stop: has("--stop"), cascade: has("--cascade") })
         }
         "hibernate" => Ok(Cmd::Hibernate { task: one(&split(rest, none, none)?, "task")? }),
         "wake" => {
@@ -1351,9 +1355,13 @@ mod tests {
     }
 
     #[test]
-    fn archive_can_stop_first() {
-        assert_eq!(p("archive feat").unwrap(), Cmd::Archive { task: "feat".into(), stop: false });
-        assert_eq!(p("archive --stop feat").unwrap(), Cmd::Archive { task: "feat".into(), stop: true });
+    fn archive_can_stop_first_and_cascade() {
+        let a = |stop, cascade| Cmd::Archive { task: "feat".into(), stop, cascade };
+        assert_eq!(p("archive feat").unwrap(), a(false, false));
+        assert_eq!(p("archive --stop feat").unwrap(), a(true, false));
+        assert_eq!(p("archive --cascade feat").unwrap(), a(false, true));
+        assert_eq!(p("archive feat --cascade --stop").unwrap(), a(true, true));
+        assert!(command_usage("archive").unwrap().contains("--cascade"));
     }
 
     #[test]

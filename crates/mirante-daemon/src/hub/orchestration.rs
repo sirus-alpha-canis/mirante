@@ -328,7 +328,7 @@ pub(crate) mod tests {
     use mirante_core::model::AgentKind;
     use mirante_core::threads::{LinkKind, ThreadLink};
     use mirante_ipc::rpc::code;
-    use mirante_ipc::types::{method, CreateTask, CreateThread, StartSession};
+    use mirante_ipc::types::{method, ArchiveTask, CreateTask, CreateThread, StartSession};
     use serde_json::json;
     use std::path::Path;
 
@@ -643,6 +643,104 @@ pub(crate) mod tests {
             json!({"task": c.id, "children": [{"goal": "x"}]}),
         );
         assert_eq!(e.unwrap_err().code, code::CONFLICT, "a child cannot propose");
+    }
+
+    /// A parent with an open thread and an approved (started) child.
+    fn family(k: &Kit) -> (TaskView, TaskView, TaskView) {
+        let p = k.create(AgentKind::Claude, "chat");
+        on(k, &p.task.id);
+        let th = thread_of(k, &p.task.id);
+        let prop = propose(k, &dna::Caller::Person, &p.task.id, &["split the tests"]).unwrap().remove(0).proposal;
+        let c = accept(k, &prop.id, None).unwrap().child.unwrap();
+        (p, th, c)
+    }
+
+    fn lifecycle(k: &Kit, id: &str) -> Lifecycle {
+        k.hub.get_task(id).unwrap().task.lifecycle
+    }
+
+    fn archive(k: &Kit, task: &str, cascade: bool, stop: bool) -> Result<TaskView> {
+        k.hub.archive_with(ArchiveTask { task: task.into(), cascade, stop })
+    }
+
+    /// Dogfood finding 2: archiving a parent neither refused nor cascaded.
+    #[test]
+    fn archiving_a_parent_with_open_children_is_refused_naming_them() {
+        let k = Kit::new();
+        let (p, th, c) = family(&k);
+        let e = k.hub.archive(&p.task.id).unwrap_err();
+        let HubError::Conflict(m) = &e else { panic!("{e:?}") };
+        assert!(m.contains(&th.task.branch) && m.contains(&c.task.branch), "{m}");
+        assert!(m.contains("thread") && m.contains("sub-task") && m.contains("cascade"), "{m}");
+        assert!(m.contains("nothing was archived"), "{m}");
+        // Over the socket: a conflict, and the plain `{task}` params are the same call.
+        let e = crate::server::dispatch(&k.hub, method::TASK_ARCHIVE, json!({"task": p.task.id})).unwrap_err();
+        assert_eq!(e.code, code::CONFLICT);
+        for id in [&p.task.id, &th.task.id, &c.task.id] {
+            assert_ne!(lifecycle(&k, id), Lifecycle::Archived, "nothing archived");
+        }
+        // An archived child no longer counts.
+        k.hub.stop(&c.task.id).unwrap();
+        archive(&k, &c.task.id, false, false).unwrap();
+        archive(&k, &th.task.id, false, false).unwrap();
+        assert_eq!(archive(&k, &p.task.id, false, false).unwrap().task.lifecycle, Lifecycle::Archived);
+    }
+
+    #[test]
+    fn cascade_archives_the_children_first_then_the_parent() {
+        let k = Kit::new();
+        let (p, th, c) = family(&k);
+        // The child is live: refused without `stop`, nothing archived.
+        assert!(k.hub.get_task(&c.task.id).unwrap().live);
+        let e = archive(&k, &p.task.id, true, false).unwrap_err();
+        let HubError::Conflict(m) = &e else { panic!("{e:?}") };
+        assert!(m.contains(&c.task.branch) && m.contains("nothing was archived"), "{m}");
+        assert_ne!(lifecycle(&k, &th.task.id), Lifecycle::Archived);
+        // With `stop` over the socket: every session ended, all archived, branches kept.
+        let v = crate::server::dispatch(
+            &k.hub,
+            method::TASK_ARCHIVE,
+            json!({"task": p.task.id, "cascade": true, "stop": true}),
+        )
+        .unwrap();
+        assert_eq!(v["lifecycle"], "archived");
+        for id in [&p.task.id, &th.task.id, &c.task.id] {
+            assert_eq!(lifecycle(&k, id), Lifecycle::Archived);
+            assert!(!k.hub.get_task(id).unwrap().live);
+        }
+        let seq = |id: &str| {
+            k.hub
+                .lock()
+                .store
+                .task_events(id)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == "lifecycle" && e.payload["to"] == "archived")
+                .map(|e| e.seq)
+        };
+        let (ps, ts, cs) = (seq(&p.task.id).unwrap(), seq(&th.task.id).unwrap(), seq(&c.task.id).unwrap());
+        assert!(ts < ps && cs < ps, "children first");
+    }
+
+    #[test]
+    fn a_dirty_child_refuses_the_cascade_and_leaves_everything_untouched() {
+        let k = Kit::new();
+        let (p, th, c) = family(&k);
+        std::fs::write(Path::new(&th.task.worktree_path).join("wip.txt"), "x").unwrap();
+        let e = archive(&k, &p.task.id, true, true).unwrap_err();
+        let HubError::Conflict(m) = &e else { panic!("{e:?}") };
+        assert!(m.contains(&th.task.branch) && m.contains("uncommitted") && m.contains("nothing was archived"), "{m}");
+        assert!(!m.contains(&c.task.branch), "{m}");
+        for id in [&p.task.id, &th.task.id, &c.task.id] {
+            assert_ne!(lifecycle(&k, id), Lifecycle::Archived, "nothing archived");
+        }
+        assert!(k.hub.get_task(&c.task.id).unwrap().live, "nothing stopped either");
+        // A dirty parent refuses the same way.
+        std::fs::remove_file(Path::new(&th.task.worktree_path).join("wip.txt")).unwrap();
+        std::fs::write(Path::new(&p.task.worktree_path).join("wip.txt"), "x").unwrap();
+        let e = archive(&k, &p.task.id, true, true).unwrap_err();
+        assert!(e.to_string().contains(&p.task.branch) && e.to_string().contains("nothing was archived"), "{e}");
+        assert_ne!(lifecycle(&k, &th.task.id), Lifecycle::Archived);
     }
 
     #[test]

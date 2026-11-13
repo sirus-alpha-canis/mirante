@@ -159,6 +159,17 @@ describe("removing a project that has tasks", () => {
     expect(loadRegistry(h.env.storage).repos).toEqual([]);
   });
 
+  it("a parent's threads and sub-tasks are archived before it (the daemon refuses a parent with open children)", async () => {
+    const h = setup([task("a"), task("b", { live: false, parent_id: "a", child_kind: "thread" }), task("c", { live: false, parent_id: "a", child_kind: "spawn" })], ["/repos/shop"], {
+      [M.sessionStop]: (p: Record<string, unknown>) => task(String(p.task), { live: false }),
+      [M.taskArchive]: (p: Record<string, unknown>) => task(String(p.task), { live: false, lifecycle: "archived" }),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Remove shop from Projects" }));
+    await userEvent.click(screen.getByRole("button", { name: "Archive tasks and remove" }));
+    expect(h.calls.filter(([m]) => m === M.taskArchive).map(([, p]) => p.task)).toEqual(["b", "c", "a"]);
+    expect(row("shop")).toBeNull();
+  });
+
   it("a task's project not in the registry can be removed the same way", async () => {
     setup([task("x", { repo_path: "/repos/api", live: false })], [], {
       [M.taskArchive]: (p: Record<string, unknown>) => task(String(p.task), { repo_path: "/repos/api", lifecycle: "archived", live: false }),

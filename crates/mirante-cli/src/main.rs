@@ -13,14 +13,14 @@ use mirante_core::groups::TaskGroup;
 use mirante_core::model::{GroupKind, PermissionRequest, Status};
 use mirante_ipc::rpc::code;
 use mirante_ipc::types::{
-    CreateGroup, GroupRef, GroupView,
-    method, AnswerPermission, AttachParams, AttachResult, BootState, CheckReport, CreateTask, DaemonStatus, DnaGet,
-    DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus, DoctorReport,
-    EditQueued, KillOrphan, ListParams, NoteAction, NoteSummary, NoteView, OrphanView, PermissionView, ProposalView,
-    ProposeAnchor, QueueRef, QueuedMessage, QueuedRef, ReorderQueue, RepoOrigin, ResizeParams, SendMessage, SendMode,
-    SendResult, SkillAction, SkillActionKind, SkillAdd, SkillEdits, SkillGet, SkillLearn, SkillListParams, SkillMine,
-    SkillMined, SkillProposalView, SkillProposals, SkillRepoParams, SkillReview, SkillSummary, SkillView, Snapshot,
-    StartResult, StartSession, SubscribeParams, SystemView, TaskRef, TaskView, TenantView, TrustAnswer,
+    method, AnswerPermission, ArchiveTask, AttachParams, AttachResult, BootState, CheckReport, CreateGroup, CreateTask,
+    DaemonStatus, DnaGet, DnaGraph, DnaNoteAction, DnaProposals, DnaPropose, DnaRef, DnaReview, DnaSearch, DnaStatus,
+    DoctorReport, EditQueued, GroupRef, GroupView, KillOrphan, ListParams, NoteAction, NoteSummary, NoteView,
+    OrphanView, PermissionView, ProposalView, ProposeAnchor, QueueRef, QueuedMessage, QueuedRef, ReorderQueue,
+    RepoOrigin, ResizeParams, SendMessage, SendMode, SendResult, SkillAction, SkillActionKind, SkillAdd, SkillEdits,
+    SkillGet, SkillLearn, SkillListParams, SkillMine, SkillMined, SkillProposalView, SkillProposals, SkillRepoParams,
+    SkillReview, SkillSummary, SkillView, Snapshot, StartResult, StartSession, SubscribeParams, SystemView, TaskRef,
+    TaskView, TenantView, TrustAnswer,
 };
 use mirante_ipc::{signals, Client, ClientError, Paths};
 use serde_json::{json, Value};
@@ -1051,8 +1051,10 @@ fn run(cmd: Cmd) -> Res {
             }
             for v in made {
                 notice(&format!("starting {} on {}…", v.task.agent.as_str(), v.task.branch));
-                let r: StartResult =
-                    c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal.clone()) })?;
+                let r: StartResult = c.call(
+                    method::SESSION_START,
+                    StartSession { task: v.task.id.clone(), prompt: Some(goal.clone()) },
+                )?;
                 boot_flow(&mut c, r, trust)?;
             }
             println!("compare them: mirante group {}", render::short(&g.id));
@@ -1243,16 +1245,15 @@ fn run(cmd: Cmd) -> Res {
         Cmd::Memory(m) => memory(&paths, m)?,
         Cmd::Spawn(s) => spawn(&paths, s)?,
         Cmd::Skills(k) => skills(&paths, k)?,
-        Cmd::Archive { task, stop } => {
+        Cmd::Archive { task, stop, cascade } => {
             let mut c = client(&paths)?;
-            if stop {
-                let v: TaskView = c.call(method::TASK_GET, TaskRef { task: task.clone() })?;
-                if v.live {
-                    let _: TaskView = c.call(method::SESSION_STOP, TaskRef { task: task.clone() })?;
-                    println!("{} stopped", render::short(&v.task.id));
-                }
+            let was_live = stop && c.call::<TaskView>(method::TASK_GET, TaskRef { task: task.clone() })?.live;
+            // The daemon checks first (its open threads and sub-tasks: refused, or with
+            // --cascade each one checked), then ends the live sessions and archives.
+            let v: TaskView = c.call(method::TASK_ARCHIVE, ArchiveTask { task, cascade, stop })?;
+            if was_live {
+                println!("{} stopped", render::short(&v.task.id));
             }
-            let v: TaskView = c.call(method::TASK_ARCHIVE, TaskRef { task })?;
             println!("{} archived (branch {} kept)", render::short(&v.task.id), v.task.branch);
         }
     }
