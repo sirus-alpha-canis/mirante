@@ -20,6 +20,9 @@ import {
   applySuggestion,
   branchFromGoal,
   branchProblem,
+  bulletsOf,
+  childGoal,
+  FANOUT_MAX,
   type ContextRef,
   contextKey,
   dispatchRepo,
@@ -35,7 +38,18 @@ import {
   type SuggestionItem,
   withContext,
 } from "../lib/dispatch";
-import { type AgentKind, type CreatedOrigin, M, type NoteSummary, RpcCode, type SkillSummary, type StartResult, type TaskView } from "../lib/protocol";
+import {
+  type AgentKind,
+  type CreatedOrigin,
+  type GroupKind,
+  M,
+  type NoteSummary,
+  RpcCode,
+  type SkillSummary,
+  type StartResult,
+  type TaskGroup,
+  type TaskView,
+} from "../lib/protocol";
 import { type Project, repoName } from "../store/select";
 import { PressureHint, SendArrow, useAutoGrow } from "./composer";
 import type { State } from "../store/state";
@@ -126,6 +140,15 @@ export function saveAgent(store: KV, agent: AgentKind): void {
 
 /** What `task.create` gets: one repo, or a folder (`repo`) and the repos in it (`repos`). */
 type Target = { repo: string; repos?: string[]; agent: AgentKind; branch: string; goal: string };
+
+/** The branch prefixes fan-out groups already use (a new group's prefix moves past them). */
+function groupBranches(s: State): string[] {
+  const out = new Set<string>();
+  for (const t of Object.values(s.tasks)) if (t.group) out.add(t.group.branch);
+  return [...out];
+}
+
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** The repos of a folder a task may change: a checkbox each (the goal's are pre-checked
  * until the person changes one) and "Select all". The others stay read-only for the agent. */
@@ -263,6 +286,9 @@ export function DispatchComposer(props: {
   const lineBranch = line?.branch ? line.branch : null;
   const branch = lineBranch ?? edited ?? auto;
   const repoChip = useRef<HTMLButtonElement>(null);
+  // A fan-out: the @ line's agents ("@claude @codex …"), or the goal's bullets ("Fan out to N").
+  const fanAgents = line?.fanout?.agents;
+  const bullets = useMemo(() => (fanAgents ? null : bulletsOf(goalText)), [fanAgents, goalText]);
 
   // "+ contexto": what is attached to this goal (cleared with it once dispatched).
   const refs = form.refs;
@@ -287,12 +313,18 @@ export function DispatchComposer(props: {
     }
   };
 
-  const submit = async () => {
+  /** `fan`: "Fan out to N" (one child per bullet of the goal). */
+  const submit = async (fan = false) => {
     if (inFlight.current || !live) return;
     const sent = props.value;
     const sentRefs = refs;
     let target: Target;
     let renames = false;
+    // The goal as typed (no references), and the agents of an "@claude @codex" line.
+    let raw = "";
+    let compare: AgentKind[] | undefined;
+    const route = (target: Target, renames: boolean) =>
+      compare || fan ? fanOut(target, raw, compare, renames, sent, sentRefs) : send(target, renames, sent);
     // A folder: its checked repos (refused when none); files and notes picked in a project
     // name nothing there.
     const across = (g: GroupTarget, goal: string, b: string): Target | string => {
@@ -308,6 +340,8 @@ export function DispatchComposer(props: {
       const p = parseDispatch(sent, props.projects, groups);
       if (!p.ok) return setError(p.error);
       if (props.projects.length === 0) return setError(t("dispatch.noRepo"));
+      raw = p.value.goal;
+      compare = p.value.fanout?.agents;
       const g = lineGroup(p.value);
       if (g) {
         let b = p.value.branch;
@@ -320,7 +354,7 @@ export function DispatchComposer(props: {
         const made = across(g, p.value.goal, b);
         if (typeof made === "string") return setError(made);
         target = { ...made, agent: p.value.agent };
-        return void send(target, renames, sent);
+        return void route(target, renames);
       }
       const r = dispatchRepo(p.value.repo, repo, props.projects);
       if (!r.ok) {
@@ -346,6 +380,7 @@ export function DispatchComposer(props: {
     } else if (formGroup) {
       const goal = sent.trim();
       if (!goal) return setError(t("dispatch.noGoal"));
+      raw = goal;
       const bad = branchProblem(branch);
       if (bad) return setError(bad);
       const made = across(formGroup, goal, branch);
@@ -355,6 +390,7 @@ export function DispatchComposer(props: {
     } else {
       const goal = sent.trim();
       if (!goal) return setError(t("dispatch.noGoal"));
+      raw = goal;
       if (!repo) {
         if (props.projects.length === 0) return setError(t("dispatch.noRepo"));
         repoChip.current?.focus();
@@ -370,7 +406,77 @@ export function DispatchComposer(props: {
       target = { repo, agent: props.agent, branch, goal: withContext(goal, sentRefs) };
       renames = edited === null;
     }
-    await send(target, renames, sent);
+    await route(target, renames);
+  };
+
+  /** A fan-out: a group (no worktree, no session) holding the shared goal, then one child
+   * per agent ("@claude @codex …", the same goal) or per bullet (the intro is the shared
+   * goal), each its own task the daemon names `<prefix>--<n>-<slug>`, each started. A child
+   * that cannot be made or started is named; the others go on. `auto`: the prefix is named
+   * after the shared goal (else the branch typed or edited is the prefix). */
+  const fanOut = async (target: Target, raw: string, agents: AgentKind[] | undefined, auto: boolean, sent: string, sentRefs: ContextRef[]) => {
+    let kind: GroupKind;
+    let shared: string;
+    let children: { agent: AgentKind; goal: string; title?: string }[];
+    if (agents) {
+      kind = "compare";
+      shared = raw;
+      children = agents.map((agent) => ({ agent, goal: target.goal }));
+    } else {
+      const b = bulletsOf(raw);
+      if (!b) return setError(t("dispatch.parseGoal"));
+      if (b.parts.length > FANOUT_MAX) return setError(t("dispatch.fanoutTooMany", { n: b.parts.length, max: FANOUT_MAX }));
+      kind = "fanout";
+      shared = b.intro || raw;
+      children = b.parts.map((part) => ({ agent: target.agent, goal: withContext(childGoal(b.intro, part), sentRefs), title: part }));
+    }
+    const taken = target.repos ? takenIn(target.repos, target.repo) : takenIn([target.repo]);
+    for (const g of groupBranches(cockpit.getState())) taken.add(g);
+    const prefix = auto ? nextFreeBranch(branchFromGoal(shared), taken) : target.branch;
+    inFlight.current = true;
+    setBusy(true);
+    setError(null);
+    setOriginNote(null);
+    try {
+      const g = await rpc<TaskGroup>(M.groupCreate, { kind, goal: shared, branch: prefix });
+      const made: { v: TaskView; goal: string }[] = [];
+      const problems: string[] = [];
+      for (const c of children) {
+        try {
+          const v = await rpc<TaskView>(M.taskCreate, {
+            repo: target.repo,
+            ...(target.repos ? { repos: target.repos } : {}),
+            agent: c.agent,
+            branch: "",
+            goal: c.goal,
+            ...(c.title ? { title: c.title } : {}),
+            group: g.id,
+          });
+          cockpit.dispatch({ type: "task", view: v });
+          made.push({ v, goal: c.goal });
+        } catch (e) {
+          problems.push(t("dispatch.childFailed", { name: c.title ?? c.agent, error: message(e) }));
+        }
+      }
+      if (problems.length) setError(problems.join("\n"));
+      if (made.length === 0) return;
+      if (latest.current === sent) {
+        props.onChange("");
+        setForm((f) => ({ ...f, edited: null, refs: [], checked: null }));
+      }
+      props.onDispatched?.(made[0].v.id);
+      for (const { v, goal } of made) {
+        rpc<StartResult>(M.sessionStart, { task: v.id, prompt: goal }).catch((e) => {
+          const line = t("dispatch.childNotStarted", { branch: v.branch, error: message(e) });
+          setError((cur) => (cur ? `${cur}\n${line}` : line));
+        });
+      }
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
   };
 
   const send = async (target: Target, renames: boolean, sent: string) => {
@@ -475,8 +581,17 @@ export function DispatchComposer(props: {
   };
   // The branch, as a plain-text token: the @ line's, the auto-named one (editable), or the
   // one being edited.
-  const branchChip =
-    lineBranch !== null ? (
+  const branchChip = fanAgents ? (
+    <>
+      <span className="token token-static">{t("dispatch.fanoutTarget", { n: fanAgents.length })}</span>{" "}
+      <span className="sep" aria-hidden="true">
+        ·
+      </span>{" "}
+      <span className="token token-static">
+        <span aria-hidden="true">⎇</span> <code>{`${branch}--n`}</code>
+      </span>
+    </>
+  ) : lineBranch !== null ? (
       <span className="token token-static">
         <span aria-hidden="true">⎇</span> <code>{lineBranch}</code>
       </span>
@@ -608,6 +723,17 @@ export function DispatchComposer(props: {
           )}
         </span>
         <span className="token-spacer" />
+        {bullets && (
+          <button
+            type="button"
+            className="btn btn-small"
+            disabled={!sendable}
+            title={`${t("dispatch.fanoutTitle")} (${t("dispatch.fanoutTarget", { n: bullets.parts.length })})`}
+            onClick={() => void submit(true)}
+          >
+            {t("dispatch.fanoutTo", { n: bullets.parts.length })}
+          </button>
+        )}
         {props.pressure && <PressureHint text={t("dispatch.pressure")} />}
         <span className={`composer-hint${sendable ? " on" : ""}`} aria-hidden="true">
           {hints.send}

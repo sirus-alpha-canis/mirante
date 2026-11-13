@@ -19,6 +19,30 @@ export interface Dispatch {
   /** The branch typed after "project/", or "": named after the goal. */
   branch: string;
   goal: string;
+  /** "@claude @codex <goal>" or "@claude ×3 <goal>": one goal on several agents. */
+  fanout?: { kind: "compare"; agents: AgentKind[] };
+}
+
+/** The most children one fan-out makes (the daemon's cap). */
+export const FANOUT_MAX = 8;
+
+const BULLET = /^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$/;
+
+/** A goal whose lines include two or more bullets ("- ", "* ", "1. "): the text before the
+ * first bullet (`intro`) and each bullet's text. Only bullets the person wrote: no
+ * natural-language parsing ("fan out" does nothing on its own). */
+export function bulletsOf(goal: string): { intro: string; parts: string[] } | null {
+  const lines = goal.split("\n");
+  const first = lines.findIndex((l) => BULLET.test(l));
+  if (first < 0) return null;
+  const parts = lines.slice(first).map((l) => BULLET.exec(l)?.[1]).filter((p): p is string => !!p);
+  if (parts.length < 2) return null;
+  return { intro: lines.slice(0, first).join("\n").trim(), parts };
+}
+
+/** A part's goal as its child gets it: the part, then the shared intro it belongs to. */
+export function childGoal(intro: string, part: string): string {
+  return intro ? `${part}\n\nPart of: ${intro}` : part;
 }
 
 export type Parsed = { ok: true; value: Dispatch } | { ok: false; error: string };
@@ -68,6 +92,22 @@ export function parseDispatch(input: string, projects: readonly { name: string }
   const agent = AGENTS[m[1].toLowerCase()];
   if (!agent) return { ok: false, error: t("dispatch.parseUnknownAgent", { agent: m[1] }) };
   let rest = (m[2] ?? "").trim();
+  // More agents ("@claude @codex …") or a count ("@claude ×3 …"): one goal on each.
+  const agents: AgentKind[] = [agent];
+  for (;;) {
+    const more = /^(@\w+)(?:\s+([\s\S]*))?$/.exec(rest);
+    const times = /^[×x](\d+)(?:\s+([\s\S]*))?$/i.exec(rest);
+    if (more && AGENTS[more[1].toLowerCase()]) {
+      agents.push(AGENTS[more[1].toLowerCase()]);
+      rest = (more[2] ?? "").trim();
+    } else if (times) {
+      const n = Number(times[1]);
+      for (let i = 1; i < n; i++) agents.push(agents[agents.length - 1]);
+      rest = (times[2] ?? "").trim();
+    } else break;
+    if (agents.length > FANOUT_MAX) return { ok: false, error: t("dispatch.fanoutTooMany", { n: agents.length, max: FANOUT_MAX }) };
+  }
+  const fanout = agents.length > 1 ? { kind: "compare" as const, agents } : undefined;
   let repo: string | null = null;
   let group: string | null = null;
   let branch = "";
@@ -92,7 +132,7 @@ export function parseDispatch(input: string, projects: readonly { name: string }
     }
   }
   if (!rest) return { ok: false, error: t("dispatch.parseGoal") };
-  return { ok: true, value: { agent, repo, group, branch, goal: rest } };
+  return { ok: true, value: { agent, repo, group, branch, goal: rest, ...(fanout ? { fanout } : {}) } };
 }
 
 /** The members whose name the goal mentions (ignoring case; a whole word: "Site-B2C" in

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 // The CLI's own vectors (mirante-core's branch_name checks the same file).
 import branchVectorsText from "../../../../crates/mirante-core/src/branch_name/vectors.json?raw";
 import {
+  bulletsOf,
+  childGoal,
   AGENT_OPTIONS,
   CONTEXT_HEADER,
   contextKey,
@@ -314,5 +316,41 @@ describe("withContext", () => {
 
   it("offers Claude and Codex, in that order", () => {
     expect(AGENT_OPTIONS.map((a) => a.id)).toEqual(["claude", "codex"]);
+  });
+});
+
+describe("fan-out from the one-line syntax", () => {
+  const projects = [{ name: "shop" }];
+  it("@claude @codex <goal> is a compare: one child per agent, same goal", () => {
+    expect(parseDispatch("@claude @codex fix login", projects)).toMatchObject({
+      ok: true,
+      value: { agent: "claude", goal: "fix login", fanout: { kind: "compare", agents: ["claude", "codex"] } },
+    });
+    expect(parseDispatch("@codex @claude shop fix login", projects)).toMatchObject({ ok: true, value: { repo: "shop", fanout: { agents: ["codex", "claude"] } } });
+  });
+  it("@claude ×3 <goal> compares three Claude runs (x3 too)", () => {
+    expect(parseDispatch("@claude ×3 fix login", projects)).toMatchObject({ ok: true, value: { fanout: { kind: "compare", agents: ["claude", "claude", "claude"] } } });
+    expect(parseDispatch("@codex x2 shop go", projects)).toMatchObject({ ok: true, value: { repo: "shop", goal: "go", fanout: { agents: ["codex", "codex"] } } });
+    const one = parseDispatch("@claude fix login", projects);
+    expect(one.ok && one.value.fanout).toBeUndefined();
+    // A count of one, or an unknown second @word, is no fan-out (the word stays in the goal).
+    const once = parseDispatch("@claude ×1 go", projects);
+    expect(once.ok && once.value.fanout).toBeUndefined();
+    expect(parseDispatch("@claude @bob go", projects)).toMatchObject({ ok: true, value: { goal: "@bob go" } });
+  });
+  it("more than 8 children is refused with why", () => {
+    const r = parseDispatch("@claude ×9 go", projects);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.error).toContain("At most 8");
+  });
+  it("a goal with two or more bullet lines splits into parts after its intro", () => {
+    expect(bulletsOf("Login page:\n- add tests\n* fix the CSS\n2. update docs")).toEqual({
+      intro: "Login page:",
+      parts: ["add tests", "fix the CSS", "update docs"],
+    });
+    expect(bulletsOf("just one\n- item")).toBeNull();
+    expect(bulletsOf("no bullets at all")).toBeNull();
+    expect(childGoal("Login page:", "add tests")).toBe("add tests\n\nPart of: Login page:");
+    expect(childGoal("", "add tests")).toBe("add tests");
   });
 });

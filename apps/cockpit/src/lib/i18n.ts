@@ -907,6 +907,12 @@ const en = {
   "group.open": "Open",
   "group.breadcrumb": "in fan-out {title}",
   "notify.group": "{title}: {n} children need you",
+  "dispatch.fanoutTooMany": "At most {max} children in one fan-out ({n} asked).",
+  "dispatch.fanoutTo": "Fan out to {n}",
+  "dispatch.fanoutTitle": "One child task per bullet, each in its own worktree; the text before the bullets is the shared goal",
+  "dispatch.fanoutTarget": "{n} children · {n} agent sessions",
+  "dispatch.childFailed": "{name} not created: {error}",
+  "dispatch.childNotStarted": "{branch} did not start: {error}",
 } satisfies Record<string, string>;
 
 export type Key = keyof typeof en;
@@ -1803,6 +1809,12 @@ const pt: Partial<Record<Key, string>> = {
   "group.open": "Abrir",
   "group.breadcrumb": "na divisão {title}",
   "notify.group": "{title}: {n} tarefas filhas precisam de você",
+  "dispatch.fanoutTooMany": "No máximo {max} tarefas filhas por divisão ({n} pedidas).",
+  "dispatch.fanoutTo": "Dividir em {n}",
+  "dispatch.fanoutTitle": "Uma tarefa filha por item, cada uma no seu worktree; o texto antes dos itens é o objetivo comum",
+  "dispatch.fanoutTarget": "{n} tarefas filhas · {n} sessões de agente",
+  "dispatch.childFailed": "{name} não foi criada: {error}",
+  "dispatch.childNotStarted": "{branch} não iniciou: {error}",
 };
 
 export const DICTS: Record<Lang, Partial<Record<Key, string>>> = { en, pt };

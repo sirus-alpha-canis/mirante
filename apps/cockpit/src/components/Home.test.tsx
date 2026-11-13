@@ -1123,3 +1123,65 @@ describe("Home: fan-out groups", () => {
     expect(screen.getByRole("article", { name: "Fan-out fix login" })).toBeInTheDocument();
   });
 });
+
+describe("fan-out from the composer", () => {
+  const group = (kind: "compare" | "fanout", branch: string) => ({ id: "g1", kind, title: "t", goal: "t", branch, created_at: 1 });
+  const kid = (p: Record<string, unknown>) => task(`k-${String(p.agent)}-${String(p.title ?? "")}`, { group_id: "g1", group_role: "child", agent: p.agent as "claude" });
+
+  it("@claude @codex <goal>: one group, one child per agent on the same goal, each started", async () => {
+    const h = setup({
+      "group.create": (p: Record<string, unknown>) => group("compare", String(p.branch)),
+      "task.create": kid,
+      "session.start": { boot: "booting" },
+    });
+    fireEvent.change(screen.getByLabelText("Goal"), { target: { value: "@claude @codex fix login" } });
+    const hint = screen.getByLabelText("Where the agent will work");
+    expect(hint).toHaveTextContent("→ shop · 2 children · 2 agent sessions · ⎇ mirante/fix-login--n");
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    await waitFor(() => expect(sent(h).filter((c) => c[0] === "session.start")).toHaveLength(2));
+    expect(sent(h)[0]).toEqual(["group.create", { kind: "compare", goal: "fix login", branch: "mirante/fix-login" }]);
+    expect(sent(h).filter((c) => c[0] === "task.create").map((c) => c[1])).toEqual([
+      { repo: "/repos/shop", agent: "claude", branch: "", goal: "fix login", group: "g1" },
+      { repo: "/repos/shop", agent: "codex", branch: "", goal: "fix login", group: "g1" },
+    ]);
+    expect(sent(h).filter((c) => c[0] === "session.start").map((c) => c[1].prompt)).toEqual(["fix login", "fix login"]);
+    expect(screen.getByLabelText("Goal")).toHaveValue("");
+  });
+
+  it("a goal with two or more bullets offers 'Fan out to N': one child per bullet, the intro is the shared goal", async () => {
+    const h = setup({
+      "group.create": (p: Record<string, unknown>) => group("fanout", String(p.branch)),
+      "task.create": kid,
+      "session.start": { boot: "booting" },
+    });
+    expect(screen.queryByRole("button", { name: /^Fan out/ })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Goal"), { target: { value: "Login page:\n- add tests\n- fix the CSS" } });
+    await userEvent.click(screen.getByRole("button", { name: "Fan out to 2" }));
+    await waitFor(() => expect(sent(h).filter((c) => c[0] === "session.start")).toHaveLength(2));
+    expect(sent(h)[0]).toEqual(["group.create", { kind: "fanout", goal: "Login page:", branch: "mirante/login-page" }]);
+    expect(sent(h).filter((c) => c[0] === "task.create").map((c) => c[1])).toEqual([
+      { repo: "/repos/shop", agent: "claude", branch: "", goal: "add tests\n\nPart of: Login page:", title: "add tests", group: "g1" },
+      { repo: "/repos/shop", agent: "claude", branch: "", goal: "fix the CSS\n\nPart of: Login page:", title: "fix the CSS", group: "g1" },
+    ]);
+  });
+
+  it("a child that cannot be made is named; the others are still made and started", async () => {
+    const h = setup({
+      "group.create": (p: Record<string, unknown>) => group("compare", String(p.branch)),
+      "task.create": (p: Record<string, unknown>) => (p.agent === "codex" ? rpcError(RpcCode.INVALID_PARAMS, "codex is not installed") : kid(p)),
+      "session.start": { boot: "booting" },
+    });
+    fireEvent.change(screen.getByLabelText("Goal"), { target: { value: "@claude @codex fix login" } });
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("codex not created: codex is not installed"));
+    expect(sent(h).filter((c) => c[0] === "session.start")).toHaveLength(1);
+  });
+
+  it("more than 8 children is refused with why, before anything is made", async () => {
+    const h = setup({ "group.create": group("compare", "x") });
+    fireEvent.change(screen.getByLabelText("Goal"), { target: { value: "@claude ×9 fix login" } });
+    await userEvent.click(screen.getByRole("button", { name: "Dispatch" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("At most 8");
+    expect(sent(h)).toEqual([]);
+  });
+});
