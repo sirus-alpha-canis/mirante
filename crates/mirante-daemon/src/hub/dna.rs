@@ -1504,9 +1504,9 @@ pub(crate) mod tests {
         if let Some(init) = proc_of(1).filter(|_| unsafe { libc::getuid() } != 0) {
             forbidden_with(k.hub.dna_review(&Caller::Peer(init), review_accept("x")), "terminal you opened yourself");
         }
-        // macOS hides a platform binary's environment (`nc -U` on the socket).
+        // macOS hides a platform binary's environment (`nc -U` on the socket), with SIP on.
         #[cfg(target_os = "macos")]
-        {
+        if crate::driver::proctree::tests::platform_binaries_hide_their_environment() {
             let mut nc = Command::new("/bin/sleep").arg("30").current_dir(k.dir.path()).spawn().unwrap();
             let caller = Caller::Peer(proc_of(nc.id() as i32).unwrap());
             assert!(matches!(k.hub.identify(&caller), Identity::Unverified(_)));

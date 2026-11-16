@@ -474,9 +474,25 @@ pub(crate) mod tests {
         assert_eq!(environ(-1), None);
     }
 
+    /// macOS hides a platform binary's environment only while System Integrity Protection
+    /// is on (the default). GitHub's hosted macOS runners run with it off, and show it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn platform_binaries_hide_their_environment() -> bool {
+        let out = Command::new("/usr/bin/csrutil").arg("status").output();
+        let status = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let on = !status.contains("status: disabled");
+        if !on {
+            eprintln!("skipped: needs System Integrity Protection ({status})");
+        }
+        on
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_platform_binary_hides_its_environment() {
+        if !platform_binaries_hide_their_environment() {
+            return;
+        }
         let mut child = Command::new("/bin/sleep").arg("30").env("MIRANTE_PROBE", "here").spawn().unwrap();
         assert_eq!(environ(child.id() as i32), None);
         assert_eq!(argv(child.id() as i32).unwrap(), ["/bin/sleep", "30"]);
@@ -567,19 +583,29 @@ pub(crate) mod tests {
         // Child 1 ignores SIGTERM. Child 2 forks a new sleeper (in its own group) when told
         // to stop, records its pid, and keeps running. Each says when its trap is set.
         let script = format!(
-            "sh -c 'trap \"\" TERM; touch {r1}; while :; do sleep 0.1; done' & \
-             sh -c 'trap \"perl -e \\\"setpgrp(0,0); sleep 60\\\" & echo \\$! > {p}\" TERM; touch {r2}; while :; do sleep 0.1; done' & \
+            "sh -c 'trap \"\" TERM; echo $$ > {r1}; while :; do sleep 0.1; done' & \
+             sh -c 'trap \"perl -e \\\"setpgrp(0,0); sleep 60\\\" & echo \\$! > {p}\" TERM; echo $$ > {r2}; while :; do sleep 0.1; done' & \
              wait",
             p = pidfile.display(),
             r1 = r1.display(),
             r2 = r2.display()
         );
         let (root, reaper) = spawn_group(&script);
-        wait_until("both traps set", || r1.exists() && r2.exists());
+        let pid_in = |f: &std::path::Path| std::fs::read_to_string(f).ok().and_then(|s| s.trim().parse::<i32>().ok());
+        wait_until("both traps set", || pid_in(&r1).is_some() && pid_in(&r2).is_some());
+        let (c1, c2) = (pid_in(&r1).unwrap(), pid_in(&r2).unwrap());
+        let before = (descendants(root), [c1, c2].map(|c| (proc_of(c), pgid(c))));
         let rec = Recorder { calls: Mutex::new(Vec::new()) };
         let r = kill_tree(root, Duration::from_millis(800), &rec);
         assert!(r.survivors.is_empty(), "{r:?}");
-        assert!(r.killed >= 1, "the TERM-ignoring child needed SIGKILL: {r:?}");
+        let calls: Vec<_> =
+            rec.calls.lock().unwrap().iter().filter(|(pid, _, _)| [c1, c2, root.pid].contains(pid)).copied().collect();
+        assert!(
+            r.killed >= 1,
+            "the TERM-ignoring child needed SIGKILL: {r:?}; root {root:?}, children {c1} {c2}, before {before:?}, \
+             now {:?}, their signals {calls:?}",
+            [c1, c2].map(|c| (proc_of(c), pgid(c)))
+        );
         let forked: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
         assert!(proc_of(forked).is_none(), "the child forked during the kill is gone too");
         assert!(rec.calls.lock().unwrap().iter().any(|(pid, _, group)| *pid == forked && !group));
