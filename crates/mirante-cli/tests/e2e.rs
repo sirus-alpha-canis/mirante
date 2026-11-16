@@ -871,7 +871,9 @@ fn an_agent_proposes_a_skill_through_the_skills_server() {
         group: None,
         repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
-        agent: AgentKind::Codex,
+        // The fake Claude (Env::cmd): a Codex task would start the real `codex` found on
+        // this machine (CI has none, and a developer's would run for real).
+        agent: AgentKind::Claude,
         branch: branch.into(),
         base: None,
         goal: "g".into(),
@@ -1054,7 +1056,8 @@ fn skills_tenant_and_mine_follow_the_pinned_origin() {
         group: None,
         repos: Vec::new(),
         repo: repo.to_string_lossy().into_owned(),
-        agent: AgentKind::Codex,
+        // The fake Claude, not a real `codex` from PATH (see the test above).
+        agent: AgentKind::Claude,
         branch: "b1".into(),
         base: None,
         goal: "g".into(),

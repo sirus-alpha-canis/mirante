@@ -567,43 +567,55 @@ mod tests {
     #[test]
     fn attaching_during_a_flood_gives_contiguous_numbered_lines() {
         let n = 30_000;
-        let p = PtyProcess::spawn(
-            &sh(&format!("i=0; while [ $i -lt {n} ]; do echo $i; i=$((i+1)); done; printf 'END'; sleep 5")),
-            |_| {},
-        )
-        .unwrap();
-        wait_for("the flood", || p.grid().lines().any(|l| l.trim().parse::<u32>().is_ok_and(|v| v > 500)));
-        let (_id, initial, rx) = p.attach();
-        let drained = std::thread::spawn(move || {
-            let mut live = Vec::new();
-            while let Ok(c) = rx.recv_timeout(Duration::from_secs(10)) {
-                live.extend_from_slice(&c);
-                if live[live.len().saturating_sub(c.len() + 2)..].windows(3).any(|w| w == b"END") {
-                    break;
+        // A client that falls behind (its 256-chunk queue full of one-line reads) is rightly
+        // sent a repaint instead (the stalled-client test covers that); on a loaded machine the
+        // draining thread can be descheduled that long. Such a run proves nothing about the
+        // handoff, so it is tried again; one run in a few must keep up.
+        for _ in 0..4 {
+            let p = PtyProcess::spawn(
+                &sh(&format!("i=0; while [ $i -lt {n} ]; do echo $i; i=$((i+1)); done; printf 'END'; sleep 5")),
+                |_| {},
+            )
+            .unwrap();
+            wait_for("the flood", || p.grid().lines().any(|l| l.trim().parse::<u32>().is_ok_and(|v| v > 500)));
+            let (_id, initial, rx) = p.attach();
+            let drained = std::thread::spawn(move || {
+                let mut live = Vec::new();
+                while let Ok(c) = rx.recv_timeout(Duration::from_secs(10)) {
+                    live.extend_from_slice(&c);
+                    if live[live.len().saturating_sub(c.len() + 2)..].windows(3).any(|w| w == b"END") {
+                        break;
+                    }
+                }
+                live
+            });
+            let live = drained.join().unwrap();
+            let mut screen = vt100::Parser::new(nz(24), nz(80), 0);
+            screen.process(&initial);
+            let rows: Vec<String> = screen.screen().rows(0, 80).collect();
+            // The cursor's row is cut where the live stream continues it (maybe empty).
+            let (crow, ccol) = screen.screen().cursor_position();
+            let complete: Vec<&str> =
+                rows[..crow as usize].iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+            let partial: String = rows[crow as usize].chars().take(ccol as usize).collect();
+            let text = format!("{partial}{}", String::from_utf8_lossy(&live));
+            if text.contains('\x1b') {
+                eprintln!("a repaint interrupted the stream (the client fell behind); trying again");
+                continue;
+            }
+            let mut nums: Vec<u32> = complete.iter().map(|l| l.trim().parse().unwrap()).collect();
+            for l in text.split("\r\n") {
+                if let Ok(v) = l.trim().parse::<u32>() {
+                    nums.push(v);
                 }
             }
-            live
-        });
-        let live = drained.join().unwrap();
-        let mut screen = vt100::Parser::new(nz(24), nz(80), 0);
-        screen.process(&initial);
-        let rows: Vec<String> = screen.screen().rows(0, 80).collect();
-        // The cursor's row is cut where the live stream continues it (maybe empty).
-        let (crow, ccol) = screen.screen().cursor_position();
-        let complete: Vec<&str> = rows[..crow as usize].iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
-        let partial: String = rows[crow as usize].chars().take(ccol as usize).collect();
-        let text = format!("{partial}{}", String::from_utf8_lossy(&live));
-        let mut nums: Vec<u32> = complete.iter().map(|l| l.trim().parse().unwrap()).collect();
-        for l in text.split("\r\n") {
-            if let Ok(v) = l.trim().parse::<u32>() {
-                nums.push(v);
+            for w in nums.windows(2) {
+                assert_eq!(w[1], w[0] + 1, "gap or repeat around {}", w[0]);
             }
+            assert_eq!(nums.last(), Some(&(n - 1)));
+            return;
         }
-        assert!(!text.contains('\x1b'), "a repaint interrupted the stream (the client fell behind)");
-        for w in nums.windows(2) {
-            assert_eq!(w[1], w[0] + 1, "gap or repeat around {}", w[0]);
-        }
-        assert_eq!(nums.last(), Some(&(n - 1)));
+        panic!("the client fell behind on every try");
     }
 
     #[test]
@@ -692,7 +704,15 @@ mod tests {
         );
         let p = PtyProcess::spawn(&sh(&script), |_| {}).unwrap();
         let (_, _initial, rx) = p.attach();
-        std::thread::sleep(Duration::from_millis(500));
+        // The client reads nothing until its queue overflowed. Not a fixed pause: on a loaded
+        // machine the flood (one short line per read) can take longer than that to fill 256
+        // slots, and a client that never fell behind is rightly never sent a repaint.
+        let overflowed = || lock(&p.fanout).subs.values().any(|s| s.needs_repaint);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !overflowed() {
+            assert!(Instant::now() < deadline, "the flood never filled the client's queue");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let backlog: Vec<Vec<u8>> = rx.try_iter().collect();
         assert!(backlog.len() <= super::super::ATTACH_QUEUE + 1, "{} chunks queued", backlog.len());
         // Once there is room again it gets the whole screen (the chunks in between are gone).
