@@ -15,8 +15,17 @@
 //! `Host`/`HostName` pairs only: no wildcards, no `Match`, no `Include`, never `ssh -G`.
 use std::collections::HashMap;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+
+/// Opens a reparse point (symlink, junction) itself instead of what it points to.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 use super::SkillError;
 use crate::dna::sha256_hex;
@@ -119,12 +128,22 @@ pub fn aliases(text: &str) -> Aliases {
 /// 256 KiB; any error gives no aliases.
 pub fn read_aliases(home: &Path) -> Aliases {
     let read = || -> std::io::Result<String> {
+        #[cfg(unix)]
         let f = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(home.join(".ssh/config"))?;
+        #[cfg(windows)]
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(home.join(".ssh/config"))?;
         if !f.metadata()?.is_file() {
             return Err(std::io::Error::other("not a regular file"));
+        }
+        #[cfg(windows)]
+        if f.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other("a reparse point"));
         }
         let mut text = String::new();
         f.take(MAX_SSH_CONFIG).read_to_string(&mut text)?;
@@ -600,6 +619,28 @@ mod tests {
         assert_eq!(a.0.len(), 3, "{a:?}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn read_aliases_refuses_a_symlinked_config() {
+        let home = TempDir::new("ssh-home-win");
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::write(&elsewhere, "Host a\n HostName github.com\n").unwrap();
+        match std::os::windows::fs::symlink_file(&elsewhere, home.path().join(".ssh/config")) {
+            Ok(()) => assert_eq!(read_aliases(home.path()), Aliases::default(), "read through a symlink"),
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                // A test that cannot run here says so; in CI that is a failure, not a skip.
+                assert!(std::env::var_os("CI").is_none(), "file symlinks need privilege (a skip fails CI)");
+                eprintln!("SKIPPED: creating a file symlink needs Developer Mode or admin");
+            }
+            Err(e) => panic!("symlink_file: {e}"),
+        }
+        let _ = std::fs::remove_file(home.path().join(".ssh/config"));
+        std::fs::copy(&elsewhere, home.path().join(".ssh/config")).unwrap();
+        assert_eq!(read_aliases(home.path()).get("a"), Some("github.com"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn read_aliases_ignores_a_symlinked_config() {
         let home = TempDir::new("ssh-home");

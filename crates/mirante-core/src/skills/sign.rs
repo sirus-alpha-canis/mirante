@@ -20,8 +20,12 @@
 //! Injection requires the trust ledger and the signature both.
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -29,7 +33,16 @@ use std::time::{Duration, Instant};
 use super::{SkillError, NAMESPACE, PRINCIPAL};
 
 /// The ssh-keygen used unless `MIRANTE_SSH_KEYGEN` names another.
+#[cfg(unix)]
 pub const DEFAULT_SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
+/// The ssh-keygen used unless `MIRANTE_SSH_KEYGEN` names another (Windows' OpenSSH).
+#[cfg(windows)]
+pub const DEFAULT_SSH_KEYGEN: &str = r"C:\Windows\System32\OpenSSH\ssh-keygen.exe";
+/// Opens a reparse point (symlink, junction) itself instead of what it points to.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 /// The variable that overrides [`DEFAULT_SSH_KEYGEN`].
 pub const SSH_KEYGEN_ENV: &str = "MIRANTE_SSH_KEYGEN";
 const KEY: &str = "skills_ed25519";
@@ -74,19 +87,30 @@ fn private_dir(dir: &Path) -> Result<(), SkillError> {
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
             std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+            #[cfg(windows)]
+            std::fs::create_dir(dir)?;
         }
         Err(e) => return Err(e.into()),
     }
+    #[cfg(unix)]
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 /// Opens an existing regular file for reading without following a symlink.
 fn open_plain(p: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
     let f = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p)?;
+    #[cfg(windows)]
+    let f = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(p)?;
     if !f.metadata()?.is_file() {
         return Err(std::io::Error::other(format!("{} is not a regular file", p.display())));
+    }
+    #[cfg(windows)]
+    if f.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(format!("{} is a reparse point", p.display())));
     }
     Ok(f)
 }
@@ -139,6 +163,7 @@ impl SshKeygen {
         }
         for f in [&k.key, &public] {
             open_plain(f).map_err(|e| sign_err(format!("{}: {e}", f.display())))?;
+            #[cfg(unix)]
             std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600))?;
         }
         let mut pubkey = String::new();
@@ -171,6 +196,7 @@ impl SshKeygen {
     /// Runs the binary with `args` and `input` on stdin; stdout on success.
     fn run(&self, args: &[&str], input: &[u8]) -> Result<Vec<u8>, SkillError> {
         let mut cmd = Command::new(&self.bin);
+        #[cfg(unix)]
         cmd.args(args)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -180,10 +206,22 @@ impl SshKeygen {
             // Its own process group: a timeout kills whatever it started too (a child holding
             // the pipes open would otherwise keep the readers waiting).
             .process_group(0);
+        // Windows: no process groups (a timeout kills the process itself); a cleared
+        // environment keeps only what the system binaries need to start.
+        #[cfg(windows)]
+        cmd.args(args)
+            .env_clear()
+            .env("SystemRoot", r"C:\Windows")
+            .env("PATH", r"C:\Windows\System32")
+            .env("ProgramData", r"C:\ProgramData")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if self.tmp.is_dir() {
             cmd.current_dir(&self.tmp);
         }
         let mut child = cmd.spawn().map_err(|e| sign_err(format!("cannot run {}: {e}", self.bin.display())))?;
+        #[cfg(unix)]
         let pgid = child.id() as libc::pid_t;
         // The writer and readers are detached: a process the binary started can hold the
         // pipes open past its exit (even outside its process group, after a setsid), and
@@ -211,6 +249,8 @@ impl SshKeygen {
         drop(tx);
         let timed_out = || {
             // SAFETY: plain syscall; the group is the child's own (process_group(0)).
+            #[cfg(unix)]
+            #[rustfmt::skip]
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
             sign_err(format!("{} timed out", self.bin.display()))
         };
@@ -254,8 +294,12 @@ impl SshKeygen {
 fn write_private(p: &Path, bytes: &[u8]) -> Result<(), SkillError> {
     let name = p.file_name().and_then(|n| n.to_str()).ok_or_else(|| sign_err("bad file name"))?;
     let tmp = p.with_file_name(format!(".{name}.tmp-{}", uuid::Uuid::now_v7()));
+    #[cfg(unix)]
     let mut f =
         OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    #[cfg(windows)]
+    let mut f =
+        OpenOptions::new().write(true).create_new(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(&tmp)?;
     let done = f.write_all(bytes).and_then(|()| f.sync_all()).and_then(|()| std::fs::rename(&tmp, p));
     if let Err(e) = done {
         let _ = std::fs::remove_file(&tmp);
@@ -316,8 +360,12 @@ impl Verifier for SshKeygen {
             return Err(sign_err("not an SSH signature"));
         }
         let path = self.tmp.join(format!("sig-{}", uuid::Uuid::now_v7()));
+        #[cfg(unix)]
         let mut f =
             OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)?;
+        #[cfg(windows)]
+        let mut f =
+            OpenOptions::new().write(true).create_new(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(&path)?;
         let written = f.write_all(sig.as_bytes()).and_then(|()| f.sync_all());
         drop(f);
         let result = written.map_err(SkillError::from).and_then(|()| {
@@ -336,7 +384,62 @@ impl Verifier for SshKeygen {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    /// A test that cannot run here says so; in CI (`CI` set) that is a failure, not a skip.
+    fn skip(why: &str) {
+        assert!(std::env::var_os("CI").is_none(), "{why} (a skip is a failure in CI)");
+        eprintln!("SKIPPED: {why}");
+    }
+
+    #[test]
+    fn open_plain_refuses_a_symlink() {
+        let d = TempDir::new("sk-win-link");
+        std::fs::write(d.path().join("secret"), "the key").unwrap();
+        std::fs::write(d.path().join("plain"), "ok").unwrap();
+        let mut text = String::new();
+        open_plain(&d.path().join("plain")).unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "ok");
+        // A directory junction needs no privilege.
+        std::fs::create_dir(d.path().join("dir")).unwrap();
+        let junction = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(d.path().join("junction"))
+            .arg(d.path().join("dir"))
+            .output()
+            .unwrap();
+        assert!(junction.status.success(), "{junction:?}");
+        assert!(open_plain(&d.path().join("junction")).is_err());
+        match std::os::windows::fs::symlink_file(d.path().join("secret"), d.path().join("link")) {
+            Ok(()) => assert!(open_plain(&d.path().join("link")).is_err(), "read through a symlink"),
+            Err(e) if e.raw_os_error() == Some(1314) => skip("creating a file symlink needs Developer Mode or admin"),
+            Err(e) => panic!("symlink_file: {e}"),
+        }
+    }
+
+    #[test]
+    fn windows_ssh_keygen_signs_and_verifies() {
+        let bin = PathBuf::from(DEFAULT_SSH_KEYGEN);
+        if !bin.exists() {
+            return skip(&format!("{DEFAULT_SSH_KEYGEN} is not installed"));
+        }
+        let d = TempDir::new("sk-win");
+        let k = SshKeygen::ensure_key_with(d.path(), &bin).unwrap();
+        let fp = k.fingerprint().unwrap();
+        assert!(fp.starts_with("SHA256:"), "{fp}");
+        let sig = k.sign(b"manifest\n").unwrap();
+        k.verify(b"manifest\n", &sig, PRINCIPAL, &fp).unwrap();
+        assert!(k.verify(b"manifest!\n", &sig, PRINCIPAL, &fp).is_err());
+        assert!(k.verify(b"manifest\n", &sig, "someone-else", &fp).is_err());
+        // The temporary signature files are removed.
+        assert_eq!(std::fs::read_dir(d.path().join("tmp")).unwrap().count(), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::TempDir;

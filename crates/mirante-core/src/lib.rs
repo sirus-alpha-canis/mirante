@@ -25,6 +25,7 @@ pub mod worktree_file;
 
 /// Test-only helper shared with the other crates' tests; not part of the API.
 #[doc(hidden)]
+#[cfg(unix)]
 pub mod test_script;
 
 pub use error::{CoreError, Result};
