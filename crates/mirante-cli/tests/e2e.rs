@@ -291,6 +291,22 @@ fn a_daemon_killed_mid_turn_ends_the_session_on_restart_and_resume_works() {
     assert!(std::fs::read_to_string(&env.log).unwrap().lines().last().unwrap().contains(&format!("--resume {sid}")));
 }
 
+/// `daemon stop` returns once the daemon is gone, live sessions and all: the very next
+/// command finds no daemon (it used to meet the old one still shutting down, which refuses
+/// with "shutting down" or a broken pipe).
+#[test]
+fn daemon_stop_returns_once_the_daemon_is_gone() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().into_owned();
+    for branch in ["one", "two"] {
+        env.ok(&["new", &repo, "--agent", "claude", "--branch", branch, "say", "hi"]);
+    }
+    wait_until("both live", || env.task("one").live && env.task("two").live);
+    assert!(env.ok(&["daemon", "stop"]).contains("stopped"));
+    assert!(env.ok(&["daemon", "status"]).contains("not running"));
+    assert!(Client::connect(&Paths::new(&env.home).socket()).is_err());
+}
+
 #[test]
 fn a_daemon_restart_resumes_live_sessions_but_not_stopped_ones() {
     let mut env = Env::new();

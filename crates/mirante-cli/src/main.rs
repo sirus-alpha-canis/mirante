@@ -975,6 +975,10 @@ fn run(cmd: Cmd) -> Res {
                 c.set_timeout(Some(Duration::from_secs(60)))?;
                 let back = stop_note(&mut c);
                 let _: Value = c.call(method::DAEMON_SHUTDOWN, json!({}))?;
+                // The answer comes before the daemon is gone: until then it still accepts
+                // connections only to refuse them ("shutting down", or a broken pipe), so the
+                // next command right after `stop` would fail. Gone means gone.
+                daemon_ctl::wait_stopped(&paths, Duration::from_secs(10))?;
                 println!("stopped ({back})");
             }
             Err(_) => println!("not running"),

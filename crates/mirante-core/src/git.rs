@@ -284,9 +284,14 @@ mod tests {
     fn output_timeout_kills_a_slow_git_and_returns_a_fast_one() {
         let ok = Git::global().arg("version").output_timeout(std::time::Duration::from_secs(20)).unwrap();
         assert!(ok.status.success() && String::from_utf8_lossy(&ok.stdout).starts_with("git version"));
-        // A zero limit stands for a git that takes too long: it is killed, never awaited.
-        let e = Git::global().arg("version").output_timeout(std::time::Duration::ZERO).unwrap_err();
+        // A git that takes too long is killed, never awaited. A real slow one (a shell alias
+        // that sleeps): a zero limit on `git version` raced it, and a fast machine's git had
+        // already exited at the first look.
+        let t0 = std::time::Instant::now();
+        let slow = Git::global().args(["-c", "alias.slow=!sleep 5", "slow"]);
+        let e = slow.output_timeout(std::time::Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{:?}", t0.elapsed());
     }
 
     #[test]
