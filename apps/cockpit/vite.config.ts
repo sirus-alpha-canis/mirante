@@ -32,6 +32,9 @@ export default defineConfig(({ mode }) => ({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./src/test-setup.ts"],
+    // The heaviest tests (fifty review cards, a production build) take ~2 s on a laptop and
+    // several times that on a shared CI runner: 5 s (the default) flaked there. A hang still fails.
+    testTimeout: 20_000,
     // Not processed; styles.css only as text (`?raw`), for the layout rules tests pin.
     css: { include: [/styles\.css/] },
   },

@@ -27,11 +27,18 @@ describe("layout", () => {
     const nodes = Array.from({ length: 300 }, (_, i) => ({ id: `n${i}` }));
     const links = nodes.slice(1).map((n, i) => ({ src: nodes[i].id, dst: n.id }));
     // Warm the JIT first (a cold first call also compiles the function, ~30 ms here); the
-    // budget is for the layout itself, measured under a full parallel test run.
+    // budget is for the layout itself, measured under a full parallel test run. The best of
+    // a few runs, with room: a shared CI runner preempts a single run for 100+ ms, while a
+    // regression worth catching (another factor of n, more iterations) costs 10x or more.
     layout({ nodes: nodes.slice(0, 120), links }, 900, 600);
-    const t0 = performance.now();
-    const p = layout({ nodes, links }, 900, 600);
-    expect(performance.now() - t0).toBeLessThan(50);
+    let best = Infinity;
+    let p: ReturnType<typeof layout> = {};
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      p = layout({ nodes, links }, 900, 600);
+      best = Math.min(best, performance.now() - t0);
+    }
+    expect(best).toBeLessThan(100);
     expect(Object.keys(p)).toHaveLength(300);
     for (const q of Object.values(p)) expect(Number.isFinite(q.x) && Number.isFinite(q.y)).toBe(true);
   });

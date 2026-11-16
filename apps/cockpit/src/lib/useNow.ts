@@ -2,22 +2,26 @@
 // so twenty working rows do not run twenty timers. Re-renders only its readers.
 import { useSyncExternalStore } from "react";
 
-const clocks = new Map<number, { now: number; listeners: Set<() => void>; timer: ReturnType<typeof setInterval> | null }>();
-
-function clock(period: number) {
-  let c = clocks.get(period);
-  if (!c) {
-    c = { now: Date.now(), listeners: new Set(), timer: null };
-    clocks.set(period, c);
-  }
-  return c;
+interface Clock {
+  now: number;
+  listeners: Set<() => void>;
+  timer: ReturnType<typeof setInterval> | null;
+  /** One function per clock, never one per render: React resubscribes whenever `subscribe`
+   * changes, the resubscribe restarted the clock and read a new `Date.now()`, and that
+   * re-rendered (and resubscribed) again, without end once a render takes a millisecond. */
+  subscribe: (l: () => void) => () => void;
 }
 
-/** `Date.now()`, refreshed every `period` ms while something reads it. */
-export function useNow(period = 30_000): number {
-  const c = clock(period);
-  return useSyncExternalStore(
-    (l) => {
+const clocks = new Map<number, Clock>();
+
+function clock(period: number): Clock {
+  const known = clocks.get(period);
+  if (known) return known;
+  const c: Clock = {
+    now: Date.now(),
+    listeners: new Set(),
+    timer: null,
+    subscribe: (l) => {
       c.listeners.add(l);
       if (!c.timer) {
         c.now = Date.now();
@@ -34,6 +38,13 @@ export function useNow(period = 30_000): number {
         }
       };
     },
-    () => c.now,
-  );
+  };
+  clocks.set(period, c);
+  return c;
+}
+
+/** `Date.now()`, refreshed every `period` ms while something reads it. */
+export function useNow(period = 30_000): number {
+  const c = clock(period);
+  return useSyncExternalStore(c.subscribe, () => c.now);
 }
