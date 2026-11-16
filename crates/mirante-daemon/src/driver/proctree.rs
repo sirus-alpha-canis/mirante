@@ -318,19 +318,21 @@ fn adopt_group(root: Proc, known: &mut Vec<Proc>, pinned: bool) {
 
 /// Signals `sig` to the root's process group (when the group still provably belongs to
 /// this tree: the root is alive, or `pinned`, or a known member is still in it) and to
-/// every known process of the tree that is still the same process.
+/// every known process of the tree that is still the same process. Returns how many were
+/// alive when it began: the group signal may end them before their own signal (whether it
+/// does depends on the scheduler), and they needed this signal all the same.
 fn signal_tree(root: Proc, known: &[Proc], pinned: bool, sig: i32, s: &dyn Signaler) -> usize {
+    let targets: Vec<Proc> = std::iter::once(&root).chain(known).filter(|p| p.pid > 1 && alive(**p)).copied().collect();
     if group_ours(root, known, pinned) {
         s.signal_group(root.pid, sig);
     }
-    let mut n = 0;
-    for p in std::iter::once(&root).chain(known) {
-        if p.pid > 1 && alive(*p) {
+    for p in &targets {
+        // Checked again: a pid that died meanwhile may already be another process's.
+        if alive(*p) {
             s.signal(p.pid, sig);
-            n += 1;
         }
     }
-    n
+    targets.len()
 }
 
 /// Ends `root` and everything below it: SIGTERM to the tree, then up to `grace` for it to
@@ -516,6 +518,21 @@ pub(crate) mod tests {
         }
     }
 
+    /// A [`Recorder`] that lets a group signal land before anything else is sent, as a
+    /// scheduler that delivers it at once does (GitHub's macOS runners).
+    struct Settling(Recorder);
+
+    impl Signaler for Settling {
+        fn signal(&self, pid: i32, sig: i32) -> bool {
+            self.0.signal(pid, sig)
+        }
+        fn signal_group(&self, pgid: i32, sig: i32) -> bool {
+            let sent = self.0.signal_group(pgid, sig);
+            std::thread::sleep(Duration::from_millis(100));
+            sent
+        }
+    }
+
     /// A shell in its own process group (like an agent), reaped by a background thread so
     /// it never lingers as a zombie.
     fn spawn_group(script: &str) -> (Proc, std::thread::JoinHandle<()>) {
@@ -595,8 +612,9 @@ pub(crate) mod tests {
         wait_until("both traps set", || pid_in(&r1).is_some() && pid_in(&r2).is_some());
         let (c1, c2) = (pid_in(&r1).unwrap(), pid_in(&r2).unwrap());
         let before = (descendants(root), [c1, c2].map(|c| (proc_of(c), pgid(c))));
-        let rec = Recorder { calls: Mutex::new(Vec::new()) };
+        let rec = Settling(Recorder { calls: Mutex::new(Vec::new()) });
         let r = kill_tree(root, Duration::from_millis(800), &rec);
+        let rec = rec.0;
         assert!(r.survivors.is_empty(), "{r:?}");
         let calls: Vec<_> =
             rec.calls.lock().unwrap().iter().filter(|(pid, _, _)| [c1, c2, root.pid].contains(pid)).copied().collect();
