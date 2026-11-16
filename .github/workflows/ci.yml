@@ -53,8 +53,15 @@ jobs:
       # mirante-daemon, mirante-hook, mirante-mcp).
       - name: cargo build --workspace
         run: cargo build --workspace --all-targets --locked
+      # The output also goes to a file: when it fails, each failing test, its panic and the
+      # failed binary become annotations (public, unlike the logs, which need a sign-in).
       - name: cargo test --workspace
-        run: cargo test --workspace --locked
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
+      - name: cargo test failures as annotations
+        if: failure()
+        run: scripts/ci-test-annotations.sh "$RUNNER_TEMP/cargo-test.log"
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo clippy (mirante-bridge/fake)
@@ -89,8 +96,14 @@ jobs:
       # Not a gate yet: the daemon's Linux paths (proctree, memory PSI, PTY) are not
       # exercised day to day. Promote to a gate once it is green.
       - name: cargo test --workspace (informational)
+        id: linux-tests
         continue-on-error: true
-        run: cargo test --workspace --locked --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
+      - name: cargo test failures as annotations (informational)
+        if: steps.linux-tests.outcome == 'failure'
+        run: scripts/ci-test-annotations.sh "$RUNNER_TEMP/cargo-test.log" warning
 
   # The desktop app: frontend tests, typecheck and build, then the Tauri crate.
   cockpit:
@@ -125,8 +138,9 @@ jobs:
           workspaces: apps/cockpit/src-tauri -> target
       - name: pnpm install
         run: pnpm install --frozen-lockfile
+      # The github-actions reporter makes each failing test an annotation (the logs need a sign-in).
       - name: pnpm test
-        run: pnpm test
+        run: pnpm test --reporter=default --reporter=github-actions
       - name: pnpm typecheck
         run: pnpm typecheck
       # Also produces dist/, which the Tauri crate embeds at compile time.
@@ -209,7 +223,7 @@ jobs:
         with:
           persist-credentials: false
       - name: shellcheck scripts
-        run: shellcheck --version && shellcheck -S warning scripts/install.sh scripts/uninstall.sh scripts/try.sh scripts/dev-sign.sh
+        run: shellcheck --version && shellcheck -S warning scripts/install.sh scripts/uninstall.sh scripts/try.sh scripts/dev-sign.sh scripts/ci-test-annotations.sh
 
   # Not a gate: the tree is not rustfmt-clean yet. Reports the drift as a warning
   # annotation and stays green. Turn it into a gate once the tree is formatted.
