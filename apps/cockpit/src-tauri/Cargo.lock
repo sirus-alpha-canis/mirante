@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-cli",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-core",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-cockpit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "mirante-bridge",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-core",

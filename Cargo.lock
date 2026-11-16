@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-cli",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-core",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-core",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-hook"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mirante-core",
  "mirante-ipc",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "mirante-core",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "mirante-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mirante-core",
  "mirante-ipc",
@@ -582,7 +582,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "spike-kit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "portable-pty",

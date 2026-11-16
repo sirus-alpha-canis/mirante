@@ -6,6 +6,28 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-16
+
+### Highlights
+
+- **A calmer cockpit ("Observatório")**, and the app ships its own fonts (no network fetch).
+- **Rules is a top-level view**: what each agent receives, per project or per task.
+- **Tasks across several repositories** of a folder added to Projects.
+- **A side pane in a task's Detail**, **⌘P** to quick-open the task's files, and **Open in
+  editor** at the line.
+- **Fan-out groups**: one goal to several agents (`@claude @codex …`, `@claude ×3 …`).
+- **Threads**: a task started from a message or answer, bound to a PR, issue, branch or that
+  message, with its own conversation, worktree and notes.
+- **Claude's own subagents** listed read-only in a Claude task's Detail.
+- **Orchestration proposals**: agents may propose sub-tasks (off by default); a person
+  decides each one.
+- **The memory guard is advisory by default**: memory pressure no longer blocks work.
+- **Local builds are signed** with a stable local identity (`scripts/install.sh`), and an
+  opt-in **LaunchAgent** (`mirante daemon install-agent`) starts the daemon at login.
+- **Hardening**: worktree files are read by the daemon only (no symlinks, no `.git`,
+  capped, secrets behind Reveal), Markdown previews keep raw HTML as text, and thread
+  summaries drop terminal escapes.
+
 ### Fixed
 
 - **Thread summaries keep no terminal escapes.** The deterministic summary (stored when a
@@ -286,5 +308,6 @@ signed releases.
 - A daemon that exits during startup is reported with the end of its log, not
   "No such file or directory (os error 2)".
 
-[Unreleased]: https://github.com/sirus-alpha-canis/mirante/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sirus-alpha-canis/mirante/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sirus-alpha-canis/mirante/releases/tag/v0.2.0
 [0.1.0]: https://github.com/sirus-alpha-canis/mirante/releases/tag/v0.1.0
