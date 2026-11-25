@@ -168,8 +168,9 @@ agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab picks, Es
 ## Look
 
 Direction "Observatório": surfaces instead of borders (a frame, a reading surface, cards,
-a lift for what is active), color only for state (amber needs you, cyan working, green
-ready), no brand accent (the Orb-Dot mark is the identity), type 12/13/15/20. The theme
+a lift for what is active), in Vibely's palette: neutral greys, and color only for state
+from its semantic scales (amber needs you, blue working, green ready, red failed); no brand
+accent (red is the brand and "danger" only), type 12/13/15/20. The theme
 follows macOS (◐ cycles system → light → dark). A 36px top bar holds the mark (Home), where
 you are (Home › project › task), the views, the daemon's health dot, what needs you (click:
 ⌘J) and ⌘K; a 24px status line at the foot shows the daemon, system memory, what needs

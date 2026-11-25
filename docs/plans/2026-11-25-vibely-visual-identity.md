@@ -58,6 +58,12 @@
 
 Every text/background pair is checked by `styles.test.ts`: 4.5:1 for text and 3:1 for the focus ring.
 
+**As built (Batch A, Task 1):**
+- Dark `--faint` is **#919191 (new)**, not #909090 (n400): #909090 on `--panel-3` #2A2A2A is 4.496:1, just under AA; #919191 gives 4.55:1. Every other value is as in the map.
+- `--focus` (not in the map) is n800 #3B3B3B light / n200 #BBBBBB dark: 8.9:1 and 7.5:1 on `--panel-3`, its lowest surface.
+- The window backdrop (`src-tauri/src/lib.rs`) and the splash background match `--panel` (#FAFAFA / #1A1A1A), not `--bg`: that is what `body` paints, so the window shows no flash. Unchanged design; only the values moved.
+- The terminal keeps its own always-dark xterm theme (#141519); it is not a token.
+
 ## Batch A — Tokens and fonts
 
 **Task 1: tokens**

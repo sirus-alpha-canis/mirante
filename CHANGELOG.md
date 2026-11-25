@@ -6,6 +6,13 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Changed
+
+- **The cockpit takes Vibely's palette** (neutral greys; the state colours from Vibely's
+  semantic scales): "working" is blue now instead of cyan, needs-you amber, ready green,
+  failed red. Radii are 4 / 8 / 12. Every text colour still passes WCAG AA in both themes.
+  The product name stays Mirante.
+
 ## [0.2.0] — 2026-11-16
 
 ### Highlights

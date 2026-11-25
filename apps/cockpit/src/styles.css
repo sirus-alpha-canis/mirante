@@ -4,9 +4,11 @@
    - Surfaces, not borders: four steps (--bg the frame: top bar, rail, status line; --panel the
      reading surface; --panel-2 cards and fields; --panel-3 a lift: hover, an active item, a
      quiet button).
-   - Color only for state: amber needs you, cool cyan working, soft green ready, red failed.
-     No brand accent: the Orb-Dot mark carries the identity. Project dots are the one
-     decorative color, desaturated.
+   - Color only for state, from Vibely's semantic scales (docs/plans/2026-11-25-vibely-visual-
+     identity.md): amber (alert) needs you, blue (information) working, green (success) ready,
+     red (primary) failed. Red is the brand and "danger", never an accent: --accent is
+     neutral, like Vibely's "normal" button. Project dots are the one decorative color,
+     desaturated. `(new)` marks a value not in Vibely's palette (picked to pass AA).
    - Type scale 12 / 13 / 15 / 20; hierarchy from weight and color.
    - Spacing on an 8px grid (4px halves inside dense rows).
    Every text token passes WCAG AA (4.5:1) on the surfaces it is used on: styles.test.ts. */
@@ -37,28 +39,28 @@
   src: url("./assets/fonts/JetBrainsMono-Bold.woff2") format("woff2");
 }
 :root {
-  --bg: #efede9;
-  --panel: #f8f7f4;
-  --panel-2: #ffffff;
-  --panel-3: #e4e1db;
-  --text: #23211e;
-  --muted: #5f5b55;
-  --faint: #6a655e;
-  --line: #e4e1db;
-  --accent: #23211e;
+  --bg: #efefef; /* (new) between n000 and n100 */
+  --panel: #fafafa; /* n000 */
+  --panel-2: #ffffff; /* light theme screenBackground */
+  --panel-3: #e5e5e5; /* n100 */
+  --text: #1e1e1e; /* n900 */
+  --muted: #3b3b3b; /* n800 */
+  --faint: #666666; /* n600 */
+  --line: #e5e5e5; /* n100 */
+  --accent: #1e1e1e; /* n900: the neutral "normal" button */
   --accent-text: #ffffff;
-  --needs: #8a5a10;
-  --needs-bg: #f6ecdc;
-  --work: #1c6b7a;
-  --work-bg: #e0eef1;
-  --review: #2d6e40;
-  --review-bg: #e3efe6;
-  --danger: #b4322a;
-  --on-danger: #ffffff;
-  --add: #2d6e40;
-  --del: #b4322a;
-  --focus: #3a3733;
-  --shadow: 0 8px 28px rgb(35 33 30 / 0.16);
+  --needs: #8f4e19; /* (new) alert900 darkened for AA */
+  --needs-bg: #feecc8; /* alert100 */
+  --work: #2659be; /* information700 */
+  --work-bg: #eaf1fd; /* information000 */
+  --review: #1c6e53; /* success900 */
+  --review-bg: #e8fbf5; /* success000 */
+  --danger: #a8141b; /* primary500 */
+  --on-danger: #fafafa; /* n000 */
+  --add: #1c6e53; /* success900 */
+  --del: #a8141b; /* primary500 */
+  --focus: #3b3b3b; /* n800 */
+  --shadow: 0 4px 6px rgb(0 0 0 / 0.19);
   color-scheme: light;
 
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
@@ -73,8 +75,8 @@
   --s4: 16px;
   --s5: 24px;
   --r-sm: 4px;
-  --r: 6px;
-  --r-lg: 10px;
+  --r: 8px;
+  --r-lg: 12px;
   --row: 30px;
   --ease: cubic-bezier(0.2, 0, 0, 1);
   --t: 150ms;
@@ -82,55 +84,55 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #141519;
-    --panel: #1b1c21;
-    --panel-2: #232429;
-    --panel-3: #2e3036;
-    --text: #e7e3dd;
-    --muted: #a7a29a;
-    --faint: #8f8a82;
-    --line: #2e3036;
-    --accent: #e7e3dd;
-    --accent-text: #1b1c21;
-    --needs: #e3a857;
-    --needs-bg: #433c31;
-    --work: #67bccb;
-    --work-bg: #2f3f46;
-    --review: #86c194;
-    --review-bg: #35403c;
-    --danger: #ec8a7f;
-    --on-danger: #1b0d0b;
-    --add: #86c194;
-    --del: #ec8a7f;
-    --focus: #c9c4bc;
-    --shadow: 0 8px 28px rgb(0 0 0 / 0.45);
+    --bg: #111111; /* n1000 */
+    --panel: #1a1a1a; /* dark theme blackAndLightRed */
+    --panel-2: #1e1e1e; /* n900 */
+    --panel-3: #2a2a2a; /* (new) */
+    --text: #fafafa; /* n000 */
+    --muted: #bbbbbb; /* n200 */
+    --faint: #919191; /* (new) n400 one step lighter: 4.5:1 on --panel-3 */
+    --line: #2a2a2a; /* (new) */
+    --accent: #fafafa; /* n000 */
+    --accent-text: #111111; /* n1000 */
+    --needs: #fbbb3c; /* alert500 */
+    --needs-bg: #3d2e10; /* (new) */
+    --work: #7aa3f4; /* information300 */
+    --work-bg: #18264a; /* (new) */
+    --review: #36d39f; /* success500 */
+    --review-bg: #123a2d; /* (new) */
+    --danger: #d9787c; /* (new) primary300 lightened for AA */
+    --on-danger: #111111; /* n1000 */
+    --add: #36d39f; /* success500 */
+    --del: #d9787c; /* (new) */
+    --focus: #bbbbbb; /* n200 */
+    --shadow: 0 4px 6px rgb(0 0 0 / 0.19);
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --bg: #141519;
-  --panel: #1b1c21;
-  --panel-2: #232429;
-  --panel-3: #2e3036;
-  --text: #e7e3dd;
-  --muted: #a7a29a;
-  --faint: #8f8a82;
-  --line: #2e3036;
-  --accent: #e7e3dd;
-  --accent-text: #1b1c21;
-  --needs: #e3a857;
-  --needs-bg: #433c31;
-  --work: #67bccb;
-  --work-bg: #2f3f46;
-  --review: #86c194;
-  --review-bg: #35403c;
-  --danger: #ec8a7f;
-  --on-danger: #1b0d0b;
-  --add: #86c194;
-  --del: #ec8a7f;
-  --focus: #c9c4bc;
-  --shadow: 0 8px 28px rgb(0 0 0 / 0.45);
+  --bg: #111111; /* n1000 */
+  --panel: #1a1a1a; /* dark theme blackAndLightRed */
+  --panel-2: #1e1e1e; /* n900 */
+  --panel-3: #2a2a2a; /* (new) */
+  --text: #fafafa; /* n000 */
+  --muted: #bbbbbb; /* n200 */
+  --faint: #919191; /* (new) n400 one step lighter: 4.5:1 on --panel-3 */
+  --line: #2a2a2a; /* (new) */
+  --accent: #fafafa; /* n000 */
+  --accent-text: #111111; /* n1000 */
+  --needs: #fbbb3c; /* alert500 */
+  --needs-bg: #3d2e10; /* (new) */
+  --work: #7aa3f4; /* information300 */
+  --work-bg: #18264a; /* (new) */
+  --review: #36d39f; /* success500 */
+  --review-bg: #123a2d; /* (new) */
+  --danger: #d9787c; /* (new) primary300 lightened for AA */
+  --on-danger: #111111; /* n1000 */
+  --add: #36d39f; /* success500 */
+  --del: #d9787c; /* (new) */
+  --focus: #bbbbbb; /* n200 */
+  --shadow: 0 4px 6px rgb(0 0 0 / 0.19);
   color-scheme: dark;
 }
 

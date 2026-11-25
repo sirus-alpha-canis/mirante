@@ -53,6 +53,43 @@ describe("styles", () => {
     tokens("--accent-text").forEach((f, i) => expect(contrast(f, accent[i])).toBeGreaterThanOrEqual(4.5));
   });
 
+  it("takes Vibely's palette (docs/plans/2026-11-25-vibely-visual-identity.md): light, then both dark blocks", () => {
+    const map: Record<string, [string, string]> = {
+      "--bg": ["#efefef", "#111111"],
+      "--panel": ["#fafafa", "#1a1a1a"],
+      "--panel-2": ["#ffffff", "#1e1e1e"],
+      "--panel-3": ["#e5e5e5", "#2a2a2a"],
+      "--line": ["#e5e5e5", "#2a2a2a"],
+      "--text": ["#1e1e1e", "#fafafa"],
+      "--muted": ["#3b3b3b", "#bbbbbb"],
+      "--faint": ["#666666", "#919191"],
+      "--accent": ["#1e1e1e", "#fafafa"],
+      "--accent-text": ["#ffffff", "#111111"],
+      "--needs": ["#8f4e19", "#fbbb3c"],
+      "--needs-bg": ["#feecc8", "#3d2e10"],
+      "--work": ["#2659be", "#7aa3f4"],
+      "--work-bg": ["#eaf1fd", "#18264a"],
+      "--review": ["#1c6e53", "#36d39f"],
+      "--review-bg": ["#e8fbf5", "#123a2d"],
+      "--add": ["#1c6e53", "#36d39f"],
+      "--danger": ["#a8141b", "#d9787c"],
+      "--del": ["#a8141b", "#d9787c"],
+      "--on-danger": ["#fafafa", "#111111"],
+      "--focus": ["#3b3b3b", "#bbbbbb"],
+    };
+    for (const [name, [light, dark]] of Object.entries(map)) expect(tokens(name).map((v) => v.toLowerCase()), name).toEqual([light, dark, dark]);
+    expect(css).toMatch(/--r-sm: 4px;\s*--r: 8px;\s*--r-lg: 12px;/);
+    // Working is blue now; the old cyan is gone.
+    expect(css).not.toMatch(/#1c6b7a|#67bccb/i);
+  });
+
+  it("muted and faint text stay readable (4.5:1) on the lift surface (keys, quiet chips, the send button)", () => {
+    const lift = tokens("--panel-3");
+    for (const name of ["--muted", "--faint"]) {
+      tokens(name).forEach((f, i) => expect(contrast(f, lift[i]), `${name} ${f} on ${lift[i]}`).toBeGreaterThanOrEqual(4.5));
+    }
+  });
+
   it("the focus ring stands out (3:1) from every surface", () => {
     const focus = tokens("--focus");
     expect(focus).toHaveLength(3);
