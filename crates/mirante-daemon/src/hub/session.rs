@@ -964,6 +964,8 @@ impl Hub {
         }
         // The person's shells end with the daemon (they are never resumed).
         self.close_all_shells();
+        // And every serve-sim streaming a simulator (the simulators themselves stay up).
+        self.close_all_devices();
         let deadline = Instant::now() + SPAWN_WAIT;
         while self.spawning.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));

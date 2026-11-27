@@ -183,6 +183,35 @@ pub mod method {
     pub const SHELL_CLOSE: &str = "shell.close";
     /// A task's running shells ([`super::TaskRef`] → `Vec<`[`super::ShellView`]`>`).
     pub const SHELL_LIST: &str = "shell.list";
+    /// What the iOS Simulator surface needs and has: Apple Silicon, Xcode's `simctl`, an
+    /// iOS runtime, Node 20+, the pinned serve-sim, and the exact install command
+    /// (`{}` → [`super::DeviceSetup`]). A person only.
+    pub const DEVICE_SETUP: &str = "device.setup";
+    /// The available iOS simulators (`{}` → `Vec<`[`super::DeviceView`]`>`). A person only.
+    pub const DEVICE_LIST: &str = "device.list";
+    /// Boots a listed simulator ([`super::DeviceRef`] → `{}`). A person only.
+    pub const DEVICE_BOOT: &str = "device.boot";
+    /// Shuts a listed simulator down (the cockpit confirms first) ([`super::DeviceRef`] →
+    /// `{}`). A person only.
+    pub const DEVICE_SHUTDOWN: &str = "device.shutdown";
+    /// Installs the pinned serve-sim into Mirante's tools folder with the command
+    /// `device.setup` showed, then checks its version and integrity (`{}` →
+    /// [`super::DeviceSetup`]). A person only, on an explicit click.
+    pub const DEVICE_TOOL_INSTALL: &str = "device.tool_install";
+    /// Starts (or shares) the device's serve-sim and hands out its loopback port and token
+    /// ([`super::DeviceStreamStart`] → [`super::DeviceStreamGrant`]). A person only; the
+    /// cockpit reaches it only from the bridge's Rust side (never the allowlist), so the
+    /// token never reaches page script.
+    pub const DEVICE_STREAM_START: &str = "device.stream_start";
+    /// Lets go of a stream; serve-sim stops a grace period after its last viewer
+    /// ([`super::DeviceStreamStop`] → `{}`). A person only, bridge-internal like the start.
+    pub const DEVICE_STREAM_STOP: &str = "device.stream_stop";
+    /// The helper programs Mirante runs for the person (serve-sims), with their memory, as
+    /// the memory guard shows them (`{}` → `Vec<`[`super::ToolView`]`>`). A person only.
+    pub const DEVICE_TOOLS: &str = "device.tools";
+    /// Stops a device's serve-sim now ("Stop device stream"); the simulator stays up
+    /// ([`super::DeviceRef`] → `{}`). A person only.
+    pub const DEVICE_STOP: &str = "device.stop";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -1224,6 +1253,103 @@ pub struct ShellResize {
     pub shell: String,
     pub rows: u16,
     pub cols: u16,
+}
+
+/// A program the device surface needs: found, and its version.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFound {
+    pub found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// serve-sim: installed means the pinned version is there (Mirante's tools folder, or a
+/// global install of that same version); `other` names a different version found and not
+/// used.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServeSimFound {
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub pinned: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
+}
+
+/// `device.setup`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSetup {
+    /// Apple Silicon (serve-sim supports nothing else).
+    pub arm64: bool,
+    /// `xcrun simctl` answers.
+    pub xcode: bool,
+    /// An available iOS runtime.
+    pub ios_runtime: bool,
+    /// Node 20 or later.
+    pub node: ToolFound,
+    pub serve_sim: ServeSimFound,
+    /// The exact command `device.tool_install` runs (shown to the person before the click).
+    pub install_command: String,
+    /// Everything needed is there.
+    pub ready: bool,
+}
+
+/// One simulator of `simctl list devices available`, with its runtime's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceView {
+    pub udid: String,
+    pub name: String,
+    /// The runtime shown (`iOS 18.2`).
+    pub runtime: String,
+    /// `Booted`, `Shutdown`, `Booting`, … as simctl says.
+    pub state: String,
+    /// A serve-sim of Mirante's streams it now.
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRef {
+    pub udid: String,
+}
+
+/// `device.stream_start`: `task` is the task whose pane shows it (its streams are let go
+/// when it is archived).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStreamStart {
+    pub udid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+/// Where the device's serve-sim listens (127.0.0.1 only) and its bearer token. Only the
+/// bridge's Rust side ever sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStreamGrant {
+    pub stream: String,
+    pub udid: String,
+    pub port: u16,
+    pub token: String,
+}
+
+/// A helper program Mirante runs (memguard `kind: "tool"`): never an agent session, never
+/// hibernated; the person stops it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolView {
+    /// `"tool"`.
+    pub kind: String,
+    /// `"serve-sim"`.
+    pub name: String,
+    pub udid: String,
+    /// Its process tree's footprint (absent when unreadable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Open streams viewing it (0: it stops after the grace period).
+    pub streams: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStreamStop {
+    pub stream: String,
 }
 
 /// What an attachment is: an image (PNG, JPEG, GIF or WebP by its magic bytes) or any

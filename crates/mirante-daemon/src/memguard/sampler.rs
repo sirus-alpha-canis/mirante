@@ -76,7 +76,7 @@ pub fn process_bytes(pid: i32) -> Option<u64> {
 }
 
 /// Sums `bytes_of` over `root` and its live descendants.
-fn sum_tree(root: Proc, bytes_of: impl Fn(i32) -> Option<u64>) -> Option<TreeSample> {
+pub(crate) fn sum_tree(root: Proc, bytes_of: impl Fn(i32) -> Option<u64>) -> Option<TreeSample> {
     let mut s = TreeSample { bytes: bytes_of(root.pid)?, procs: 1 };
     for p in descendants(root) {
         if let Some(b) = bytes_of(p.pid) {

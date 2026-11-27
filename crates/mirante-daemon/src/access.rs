@@ -143,6 +143,18 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::SHELL_RESIZE, Access::Person),
     (method::SHELL_CLOSE, Access::Person),
     (method::SHELL_LIST, Access::Person),
+    // The iOS Simulator beside a task: booting, shutting down, installing serve-sim, and a
+    // stream's port and token (input to the device). Never an agent's, not even for its own
+    // task (an agent screenshot tool is a later, separate design).
+    (method::DEVICE_SETUP, Access::Person),
+    (method::DEVICE_LIST, Access::Person),
+    (method::DEVICE_BOOT, Access::Person),
+    (method::DEVICE_SHUTDOWN, Access::Person),
+    (method::DEVICE_TOOL_INSTALL, Access::Person),
+    (method::DEVICE_STREAM_START, Access::Person),
+    (method::DEVICE_STREAM_STOP, Access::Person),
+    (method::DEVICE_TOOLS, Access::Person),
+    (method::DEVICE_STOP, Access::Person),
 ];
 
 /// Who may call `m`: its [`ACCESS`] entry, or a person only when it has none.
@@ -291,6 +303,37 @@ mod tests {
         for m in
             [method::SHELL_OPEN, method::SHELL_ATTACH, method::SHELL_RESIZE, method::SHELL_CLOSE, method::SHELL_LIST]
         {
+            assert_eq!(access_of(m), Access::Person, "{m}");
+            for who in [&agent, &orphan, &unverified] {
+                assert_eq!(check(m, who).unwrap_err().code, code::FORBIDDEN, "{m} {who:?}");
+            }
+            assert!(check(m, &Identity::Person).is_ok(), "{m}");
+        }
+    }
+
+    /// The device surface is a person's: an agent (even for its own task), an agent with no
+    /// task or an unverified caller never lists, boots, installs or streams a simulator.
+    #[test]
+    fn devices_are_a_persons_only() {
+        let agent = Identity::Agent { task: Some("t".into()) };
+        let orphan = Identity::Agent { task: None };
+        let unverified = Identity::Unverified("x".into());
+        let all = [
+            method::DEVICE_SETUP,
+            method::DEVICE_LIST,
+            method::DEVICE_BOOT,
+            method::DEVICE_SHUTDOWN,
+            method::DEVICE_TOOL_INSTALL,
+            method::DEVICE_STREAM_START,
+            method::DEVICE_STREAM_STOP,
+            method::DEVICE_TOOLS,
+            method::DEVICE_STOP,
+        ];
+        // Every `device.*` method is in this list (a new one must be classified here too).
+        let named: BTreeSet<&str> = all.into();
+        let consts: BTreeSet<String> = method_constants().into_values().filter(|v| v.starts_with("device.")).collect();
+        assert_eq!(consts, named.iter().map(|s| s.to_string()).collect());
+        for m in all {
             assert_eq!(access_of(m), Access::Person, "{m}");
             for who in [&agent, &orphan, &unverified] {
                 assert_eq!(check(m, who).unwrap_err().code, code::FORBIDDEN, "{m} {who:?}");

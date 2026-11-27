@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
 use mirante_ipc::types::{
-    method, ArchiveTask, AttachParams, AttachResult, DnaContextParams, GroupRef, ListParams, QueueRef, QueuedRef,
-    ShellAttach, ShellRef, SubscribeParams, TaskRef,
+    method, ArchiveTask, AttachParams, AttachResult, DeviceRef, DeviceStreamStop, DnaContextParams, GroupRef,
+    ListParams, QueueRef, QueuedRef, ShellAttach, ShellRef, SubscribeParams, TaskRef,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -370,6 +370,17 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::SHELL_RESIZE => out(hub.shell_resize(&params(p)?).map(|()| json!({}))),
         method::SHELL_CLOSE => out(hub.shell_close(&params::<ShellRef>(p)?.shell).map(|()| json!({}))),
         method::SHELL_LIST => out(hub.shell_list(&params::<TaskRef>(p)?.task)),
+        method::DEVICE_SETUP => out(hub.device_setup()),
+        method::DEVICE_LIST => out(hub.device_list()),
+        method::DEVICE_BOOT => out(hub.device_boot(&params::<DeviceRef>(p)?.udid).map(|()| json!({}))),
+        method::DEVICE_SHUTDOWN => out(hub.device_shutdown(&params::<DeviceRef>(p)?.udid).map(|()| json!({}))),
+        method::DEVICE_TOOL_INSTALL => out(hub.device_tool_install()),
+        method::DEVICE_TOOLS => out(Ok(hub.device_tool_views())),
+        method::DEVICE_STOP => out(hub.device_stop_server(&params::<DeviceRef>(p)?.udid).map(|()| json!({}))),
+        method::DEVICE_STREAM_START => out(hub.device_stream_start(&params(p)?)),
+        method::DEVICE_STREAM_STOP => {
+            out(hub.device_stream_stop(&params::<DeviceStreamStop>(p)?.stream).map(|()| json!({})))
+        }
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),
         method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, caller)),

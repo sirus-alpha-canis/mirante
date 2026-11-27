@@ -1,0 +1,54 @@
+{
+  "devices" : {
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-2" : [
+      {
+        "lastBootedAt" : "2026-11-20T10:00:00Z",
+        "dataPath" : "/Users/someone/Library/Developer/CoreSimulator/Devices/5B8E9D9C-0F0A-4A6B-9D0E-1C2B3A4D5E6F/data",
+        "dataPathSize" : 1067311104,
+        "logPath" : "/Users/someone/Library/Logs/CoreSimulator/5B8E9D9C-0F0A-4A6B-9D0E-1C2B3A4D5E6F",
+        "udid" : "5B8E9D9C-0F0A-4A6B-9D0E-1C2B3A4D5E6F",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+        "state" : "Booted",
+        "name" : "iPhone 16"
+      },
+      {
+        "dataPath" : "/Users/someone/Library/Developer/CoreSimulator/Devices/0C1D2E3F-4A5B-4C6D-8E9F-A0B1C2D3E4F5/data",
+        "dataPathSize" : 18284544,
+        "logPath" : "/Users/someone/Library/Logs/CoreSimulator/0C1D2E3F-4A5B-4C6D-8E9F-A0B1C2D3E4F5",
+        "udid" : "0C1D2E3F-4A5B-4C6D-8E9F-A0B1C2D3E4F5",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M2",
+        "state" : "Shutdown",
+        "name" : "iPad Air 11-inch (M2)"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-17-5" : [
+      {
+        "dataPath" : "/Users/someone/Library/Developer/CoreSimulator/Devices/A1B2C3D4-E5F6-4789-8ABC-DEF012345678/data",
+        "dataPathSize" : 18284544,
+        "logPath" : "/Users/someone/Library/Logs/CoreSimulator/A1B2C3D4-E5F6-4789-8ABC-DEF012345678",
+        "udid" : "A1B2C3D4-E5F6-4789-8ABC-DEF012345678",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15",
+        "state" : "Booted",
+        "name" : "iPhone 15"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.watchOS-11-2" : [
+      {
+        "dataPath" : "/Users/someone/Library/Developer/CoreSimulator/Devices/11111111-2222-4333-8444-555555555555/data",
+        "dataPathSize" : 18284544,
+        "logPath" : "/Users/someone/Library/Logs/CoreSimulator/11111111-2222-4333-8444-555555555555",
+        "udid" : "11111111-2222-4333-8444-555555555555",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.Apple-Watch-Series-10-46mm",
+        "state" : "Shutdown",
+        "name" : "Apple Watch Series 10 (46mm)"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-16-4" : [
+
+    ]
+  }
+}

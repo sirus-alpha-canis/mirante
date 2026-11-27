@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
 pub mod attachments;
+pub mod devices;
 pub mod dna;
 pub(crate) mod evidence;
 pub mod files;
@@ -412,6 +413,8 @@ pub struct Hub {
     pub(crate) attachments: Mutex<attachments::Registry>,
     /// A person's own shells beside their tasks (see [`shells`]): never live sessions.
     pub(crate) shells: Mutex<shells::Registry>,
+    /// serve-sims streaming iOS simulators to the person's side pane (see [`devices`]).
+    pub(crate) devices: devices::Shared,
 }
 
 /// Removes `<home>/sessions/<task>/` (MCP config, skill bundles, agent logs) of a task that
@@ -667,6 +670,7 @@ impl Hub {
             rules_homes: None,
             attachments: Mutex::default(),
             shells: Mutex::default(),
+            devices: devices::Shared::default(),
         };
         Ok((hub, rx))
     }
@@ -1194,6 +1198,7 @@ impl Hub {
         // opened meanwhile sees `Archiving` and ends itself (`Hub::shell_open`).
         let removed = self.check_checkouts(&task).and_then(|()| {
             self.close_shells_of(&task.id);
+            self.release_device_streams_of(&task.id);
             self.remove_checkouts(&task)
         });
         let mut st = self.lock();
