@@ -1,5 +1,5 @@
 // The desktop shell's attack surface, pinned: a CSP with no remote origins or eval, and
-// capabilities limited to notifications, opening github.com and localhost pages and the folder picker. Widening either
+// capabilities limited to notifications, opening github.com and localhost pages, the native picker and event listening (Finder drops). Widening either
 // must be a deliberate edit of this test.
 import { describe, expect, it } from "vitest";
 import capabilities from "../src-tauri/capabilities/default.json";
@@ -68,7 +68,7 @@ describe("Tauri security baseline", () => {
     expect(shell).toContain(".on_new_window(|_, _| NewWindowResponse::Deny)");
   });
 
-  it("grants only notifications, opening github.com and localhost URLs, and the folder picker", () => {
+  it("grants only notifications, opening github.com and localhost URLs, the native picker and event listening", () => {
     // Notifications: exactly the three commands the plugin's \`window.Notification\` shim
     // calls (is_permission_granted, request_permission, notify), and register_listener so a
     // click on a task's notification opens it (\`onAction\`); not the plugin's default set
@@ -82,6 +82,10 @@ describe("Tauri security baseline", () => {
       "opener:allow-open-url",
       // The native "Choose…" folder picker (Add project): `open` only, no save/ask/message.
       "dialog:allow-open",
+      // Finder drops (attachments): Tauri's drag-drop events reach the webview as events, so
+      // it may listen (and stop). The shell emits no events of its own (checked below).
+      "core:event:allow-listen",
+      "core:event:allow-unlisten",
     ]);
     const opener = capabilities.permissions.find((p) => typeof p !== "string");
     // github.com pages, and a local dev server on an explicit port (1 to 5 digits, then the
@@ -94,9 +98,13 @@ describe("Tauri security baseline", () => {
       allow: [{ url: "https://github.com/*" }, ...local("localhost"), ...local("127.0.0.1")],
     });
     expect(capabilities.windows).toEqual(["main"]);
-    // The picker is asked for one folder, never files or several.
-    expect(picker).toContain("directory: true");
-    expect(picker).toContain("multiple: false");
+    // The picker is asked for one folder (Add project), or for files (attach), never both.
+    const opens = [...picker.matchAll(/open\(\{([^}]*)\}\)/g)].map((m) => m[1].replace(/, title:.*$/, "").trim());
+    expect(opens).toEqual(["directory: true, multiple: false", "directory: false, multiple: true"]);
+    // The only event listened to is the webview's drag-drop (paths), and nothing is emitted.
+    expect(picker).toContain("getCurrentWebview()\n      .onDragDropEvent(");
+    expect(picker).not.toMatch(/\blisten\(/);
+    expect(shell).not.toMatch(/\.emit(_to)?\(/);
     // No filesystem plugin is registered (the dialog crate depends on it, the app does not use it).
     expect(shell).not.toContain("tauri_plugin_fs");
   });

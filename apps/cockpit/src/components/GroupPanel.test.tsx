@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { GroupView, Synthesis, TaskGroup, TaskView } from "../lib/protocol";
@@ -56,6 +56,23 @@ describe("GroupPanel", () => {
     await userEvent.type(within(two).getByLabelText("Message to this task"), "use the new API");
     await userEvent.click(within(two).getByRole("button", { name: "Steer" }));
     expect(h.calls.filter(([m]) => m === "message.send")).toEqual([["message.send", { task: "c2", text: "use the new API", mode: "steer" }]]);
+  });
+
+  it("a screenshot pasted into a child's steer box goes to that child with the message", async () => {
+    const h = setup({
+      "attachment.put": { id: "s1", path: "/m/sessions/c2/attachments/1-shot.png", name: "shot.png", kind: "image", bytes: 1, redacted: 0 },
+      "message.send": { delivered: "steer", queued: 0 },
+    });
+    const two = card("mirante/fix-login--2-codex");
+    fireEvent.paste(within(two).getByLabelText("Message to this task"), {
+      clipboardData: { files: [new File([new Uint8Array([1])], "shot.png", { type: "image/png" })], getData: () => "" },
+    });
+    await within(two).findByText("shot.png");
+    await waitFor(() => expect(h.calls).toContainEqual(["attachment.put", { task: "c2", name: "shot.png", b64: "AQ==" }]));
+    await waitFor(() => expect(within(two).getByRole("button", { name: "Steer" })).toBeEnabled());
+    await userEvent.click(within(two).getByRole("button", { name: "Steer" }));
+    expect(h.calls.filter(([m]) => m === "message.send")).toEqual([["message.send", { task: "c2", text: "", mode: "steer", attachments: ["s1"] }]]);
+    await waitFor(() => expect(within(two).queryByText("shot.png")).toBeNull());
   });
 
   it("Open goes to the child's Detail; Terminal and Diff open it in the side pane", async () => {

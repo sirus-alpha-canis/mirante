@@ -8,6 +8,7 @@ import { App, NOTIFY_BATCH_MS, STATUS_POLL_MS, visibleTasks } from "./App";
 import { THEME_KEY } from "./lib/theme";
 import { ev, snapshot, task } from "./test/fixtures";
 import { makeEnv } from "./test/env";
+import { type DragDrop, handleDragDrop } from "./lib/drop";
 
 const mod = /Mac/.test(navigator.platform) ? { metaKey: true } : { ctrlKey: true };
 
@@ -656,6 +657,20 @@ describe("App", () => {
     act(() => h2.load([task("a", { status: "needs_you", agent: "codex" })]));
     act(() => click!("a"));
     expect(screen.getByRole("main", { name: "Task goal of a" })).toBeInTheDocument();
+  });
+
+  it("Finder drops are listened to while the app is mounted (routed to the composer under the cursor)", () => {
+    const off = vi.fn();
+    let fn: ((e: DragDrop) => void) | null = null;
+    const h2 = makeEnv({ "daemon.status": STATUS, "message.list_queued": [] });
+    h2.env.onDragDrop = (f) => {
+      fn = f;
+      return off;
+    };
+    const r = render(<App env={h2.env} />);
+    expect(fn).toBe(handleDragDrop);
+    r.unmount();
+    expect(off).toHaveBeenCalled();
   });
 
   describe("launch", () => {

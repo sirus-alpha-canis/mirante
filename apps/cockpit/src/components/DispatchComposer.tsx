@@ -52,6 +52,7 @@ import {
 } from "../lib/protocol";
 import { type Project, repoName } from "../store/select";
 import { PressureHint, SendArrow, useAutoGrow } from "./composer";
+import { AttachButton, AttachmentTray, type AttItem, uploadHeld, useAttachments, useDropZone } from "./attachments";
 import type { State } from "../store/state";
 
 /** What the form holds besides the goal: attached context, an edited branch, a repo picked
@@ -236,6 +237,21 @@ export function DispatchComposer(props: {
   // The draft as it is now, for the moment the create returns (the user may keep typing).
   const latest = useRef(props.value);
   latest.current = props.value;
+  // Files pasted, dropped or picked for the goal: held here (there is no task yet), uploaded
+  // to the new task after task.create and sent with session.start.
+  const att = useAttachments(null, setError);
+  const zone = useRef<HTMLFormElement>(null);
+  const dropOn = useDropZone(zone, att.addPaths);
+  /** Uploads `held` to the new task `v`; the ids for session.start (a refusal is named). */
+  const attachTo = async (v: TaskView, held: AttItem[]) => {
+    if (held.length === 0) return {};
+    const { ids, problems } = await uploadHeld(rpc, v.id, held);
+    if (problems.length) {
+      const line = t("att.notAttached", { branch: v.branch, error: problems.join("; ") });
+      setError((cur) => (cur ? `${cur}\n${line}` : line));
+    }
+    return ids.length ? { attachments: ids } : {};
+  };
 
   // The repo: picked here, else the rail's selection, else the first project. A new rail
   // selection takes over from what was picked here.
@@ -433,6 +449,7 @@ export function DispatchComposer(props: {
     const taken = target.repos ? takenIn(target.repos, target.repo) : takenIn([target.repo]);
     for (const g of groupBranches(cockpit.getState())) taken.add(g);
     const prefix = auto ? nextFreeBranch(branchFromGoal(shared), taken) : target.branch;
+    const held = att.items;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -464,9 +481,12 @@ export function DispatchComposer(props: {
         props.onChange("");
         setForm((f) => ({ ...f, edited: null, refs: [], checked: null }));
       }
+      att.clear(held.map((i) => i.key));
       props.onDispatched?.(made[0].v.id);
       for (const { v, goal } of made) {
-        rpc<StartResult>(M.sessionStart, { task: v.id, prompt: goal }).catch((e) => {
+        // Each child gets its own copy (attachments live in the task's folder).
+        const extra = await attachTo(v, held);
+        rpc<StartResult>(M.sessionStart, { task: v.id, prompt: goal, ...extra }).catch((e) => {
           const line = t("dispatch.childNotStarted", { branch: v.branch, error: message(e) });
           setError((cur) => (cur ? `${cur}\n${line}` : line));
         });
@@ -480,6 +500,7 @@ export function DispatchComposer(props: {
   };
 
   const send = async (target: Target, renames: boolean, sent: string) => {
+    const held = att.items;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -493,9 +514,11 @@ export function DispatchComposer(props: {
         props.onChange("");
         setForm((f) => ({ ...f, edited: null, refs: [], checked: null }));
       }
+      att.clear(held.map((i) => i.key));
       props.onDispatched?.(v.id);
+      const extra = await attachTo(v, held);
       // Boot can take up to 45 s; progress arrives as events, so do not wait here.
-      rpc<StartResult>(M.sessionStart, { task: v.id, prompt: target.goal }).catch((e) =>
+      rpc<StartResult>(M.sessionStart, { task: v.id, prompt: target.goal, ...extra }).catch((e) =>
         setError(t("dispatch.notStarted", { branch: made, error: e instanceof Error ? e.message : String(e) })),
       );
     } catch (e) {
@@ -613,10 +636,11 @@ export function DispatchComposer(props: {
         </button>
       </span>
     );
-  const sendable = !busy && hasGoal && live;
+  const sendable = !busy && hasGoal && live && !att.uploading;
   return (
     <form
-      className="composer dispatch"
+      ref={zone}
+      className={`composer dispatch${dropOn ? " drop-on" : ""}`}
       aria-label={t("dispatch.form")}
       onSubmit={(e) => {
         e.preventDefault();
@@ -642,7 +666,8 @@ export function DispatchComposer(props: {
         </ul>
       )}
       {/* One rounded field: the goal grows from one line; the send arrow sits inside it. */}
-      <div className="composer-field">
+      <div className={`composer-field${att.items.length ? " has-tray" : ""}`}>
+        <AttachmentTray att={att} />
         <label htmlFor="dispatch" className="sr-only">
           {t("dispatch.goal")}
         </label>
@@ -657,6 +682,9 @@ export function DispatchComposer(props: {
             props.onChange(e.target.value);
           }}
           onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+          onPaste={(e) => {
+            if (att.paste(e)) e.preventDefault();
+          }}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onKeyDown={onKey}
@@ -678,6 +706,7 @@ export function DispatchComposer(props: {
       {sugg && <OptionList id={listId} label={t("dispatch.suggestions")} items={sugg.items} active={active} optionId={optionId} onPick={pick} />}
       {/* The context as plain-text tokens: each opens its picker. */}
       <div className="composer-tokens" role="group" aria-label={t("dispatch.options")}>
+        <AttachButton att={att} />
         <ContextPicker repo={targetGroup ? null : targetRepo} onAttach={attach} attached={refs} />
         <AgentPicker value={agent} onPick={pickAgent} />
         <span className="sep" aria-hidden="true">

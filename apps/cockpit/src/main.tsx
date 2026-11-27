@@ -1,6 +1,7 @@
 // xterm's own stylesheet (the Terminal tab renders unstyled without it), then ours.
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { StrictMode } from "react";
@@ -34,6 +35,24 @@ const env: Env = {
   pickFolder: async () => {
     const picked = await open({ directory: true, multiple: false, title: t("rail.pickerTitle") });
     return typeof picked === "string" ? picked : null;
+  },
+  // Attach files (the paperclip): several files, never a folder. The daemon copies them.
+  pickFiles: async () => {
+    const picked = await open({ directory: false, multiple: true, title: t("att.pickTitle") });
+    return Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+  },
+  // Finder drops: Tauri's own handler is on, so the webview gets paths, not File objects.
+  onDragDrop: (fn) => {
+    let off: (() => void) | null = null;
+    let gone = false;
+    void getCurrentWebview()
+      .onDragDropEvent((e) => fn(e.payload))
+      .then((u) => (gone ? u() : (off = u)))
+      .catch(() => {});
+    return () => {
+      gone = true;
+      off?.();
+    };
   },
   homeDir,
   pathKind,

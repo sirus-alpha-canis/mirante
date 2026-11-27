@@ -1185,3 +1185,47 @@ describe("fan-out from the composer", () => {
     expect(sent(h)).toEqual([]);
   });
 });
+
+describe("Home: attachments on a goal", () => {
+  const view = (id: string, name: string) => ({ id, path: `/m/sessions/new/attachments/1-${name}`, name, kind: "file", bytes: 10, redacted: 0 });
+
+  it("files picked before the task exists are held, uploaded after task.create and sent with session.start", async () => {
+    const h = setup({
+      "task.create": task("new", { branch: "mirante/fix" }),
+      "attachment.import": (p: Record<string, unknown>) => view(`id-${String(p.path).split("/").pop()}`, String(p.path).split("/").pop()!),
+      "attachment.put": view("id-shot", "shot.png"),
+      "session.start": { boot: "booting" },
+    });
+    (h.env.pickFiles as ReturnType<typeof vi.fn>).mockResolvedValue(["/Users/me/trace.har"]);
+    await userEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    await screen.findByText("trace.har");
+    fireEvent.paste(screen.getByLabelText("Goal"), { clipboardData: { files: [new File([new Uint8Array([1])], "shot.png", { type: "image/png" })], getData: () => "" } });
+    await screen.findByText("shot.png");
+    // Nothing uploaded yet: there is no task to hold them.
+    expect(sent(h).map((c) => c[0])).toEqual([]);
+    await userEvent.type(screen.getByLabelText("Goal"), "fix the login");
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toEqual(["task.create", "attachment.import", "attachment.put", "session.start"]));
+    expect(sent(h)[1][1]).toEqual({ task: "new", path: "/Users/me/trace.har" });
+    expect(sent(h)[2][1]).toMatchObject({ task: "new", name: "shot.png" });
+    expect(sent(h)[3][1]).toEqual({ task: "new", prompt: "fix the login", attachments: ["id-trace.har", "id-shot"] });
+    expect(screen.queryByRole("list", { name: "Attachments" })).toBeNull();
+  });
+
+  it("a file the daemon refuses is named; the session still starts with the rest", async () => {
+    const h = setup({
+      "task.create": task("new", { branch: "mirante/fix" }),
+      "attachment.import": (p: Record<string, unknown>) =>
+        String(p.path).endsWith("bad") ? rpcError(RpcCode.INVALID_PARAMS, "not a regular file") : view("ok", "good.txt"),
+      "session.start": { boot: "booting" },
+    });
+    (h.env.pickFiles as ReturnType<typeof vi.fn>).mockResolvedValue(["/Users/me/bad", "/Users/me/good.txt"]);
+    await userEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    await screen.findByText("good.txt");
+    await userEvent.type(screen.getByLabelText("Goal"), "fix");
+    await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
+    await waitFor(() => expect(sent(h).map((c) => c[0])).toContain("session.start"));
+    expect(sent(h).find(([m]) => m === "session.start")?.[1]).toEqual({ task: "new", prompt: "fix", attachments: ["ok"] });
+    expect(await screen.findByText(/Not attached to mirante\/fix: Could not attach bad: not a regular file/)).toBeInTheDocument();
+  });
+});

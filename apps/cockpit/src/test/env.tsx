@@ -38,6 +38,7 @@ export function makeEnv(answers: Record<string, Answer> = {}) {
     restartDaemon: vi.fn(async () => {}),
     notify: vi.fn(),
     pickFolder: vi.fn(async () => null),
+    pickFiles: vi.fn(async (): Promise<string[]> => []),
     homeDir: vi.fn(async () => "/Users/me"),
     pathKind: vi.fn(async () => "dir" as const),
     // A folder is a repository unless a test says otherwise.

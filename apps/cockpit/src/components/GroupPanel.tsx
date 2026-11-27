@@ -16,6 +16,7 @@ import { pendingPerms } from "../store/select";
 import { StatusPill } from "./Badges";
 import { PermissionCard } from "./PermissionCard";
 import { usePane } from "./paneContext";
+import { AttachButton, AttachmentTray, useAttachments, useDropZone } from "./attachments";
 
 const selectColumns = (s: State) => inboxOf(s).columns;
 const NO_IDS: string[] = [];
@@ -39,16 +40,24 @@ const ChildCard = memo(function ChildCard(props: { id: string; self: boolean; ex
   const [text, setText] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const inFlight = useRef(false);
+  const att = useAttachments(props.id, setNote);
+  const zone = useRef<HTMLFormElement>(null);
+  const dropOn = useDropZone(zone, att.addPaths, !props.self && !!task?.live);
   if (!task || !col) return null;
+  const canSend = (msg: string) => !att.uploading && (msg.trim().length > 0 || att.ids.length > 0);
   const steer = async () => {
     const msg = text;
-    if (!msg.trim() || inFlight.current || !live) return;
+    if (!canSend(msg) || inFlight.current || !live) return;
     inFlight.current = true;
+    const sent = att.items.filter((i) => i.status === "ready");
+    const ids = att.ids;
     try {
-      const r = await rpc<SendResult>(M.messageSend, { task: props.id, text: msg, mode: "steer" });
+      const r = await rpc<SendResult>(M.messageSend, { task: props.id, text: msg, mode: "steer", ...(ids.length ? { attachments: ids } : {}) });
       setText((cur) => (cur === msg ? "" : cur));
+      att.clear(sent.map((i) => i.key));
       setNote(r.delivered === "steer" ? t("composer.sentNow") : t("composer.queued", { n: r.queued ?? "?" }));
     } catch (e) {
+      if (att.stale(e)) return;
       const err = e instanceof DaemonError ? e : null;
       setNote(err?.code === RpcCode.NEEDS_YOU ? t("composer.answerFirst") : message(e));
     } finally {
@@ -97,7 +106,8 @@ const ChildCard = memo(function ChildCard(props: { id: string; self: boolean; ex
       </div>
       {!props.self && task.live && (
         <form
-          className="child-steer"
+          ref={zone}
+          className={`child-steer${dropOn ? " drop-on" : ""}`}
           onSubmit={(e) => {
             e.preventDefault();
             void steer();
@@ -106,8 +116,18 @@ const ChildCard = memo(function ChildCard(props: { id: string; self: boolean; ex
           <label className="sr-only" htmlFor={`steer-${task.id}`}>
             {t("group.steerLabel")}
           </label>
-          <input id={`steer-${task.id}`} value={text} onChange={(e) => setText(e.target.value)} placeholder={t("group.steerPlaceholder")} />
-          <button type="submit" className="btn btn-small" disabled={!text.trim() || !live}>
+          <AttachmentTray att={att} />
+          <input
+            id={`steer-${task.id}`}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onPaste={(e) => {
+              if (att.paste(e)) e.preventDefault();
+            }}
+            placeholder={t("group.steerPlaceholder")}
+          />
+          <AttachButton att={att} disabled={!live} className="btn btn-small btn-ghost" />
+          <button type="submit" className="btn btn-small" disabled={!canSend(text) || !live}>
             {t("group.steer")}
           </button>
           {note && (

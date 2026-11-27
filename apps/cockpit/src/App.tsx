@@ -11,6 +11,7 @@ import { UpdateBanner } from "./components/Restart";
 import { daemonState, StatusLine } from "./components/StatusLine";
 import { dismissSplash } from "./lib/splash";
 import { type Env, EnvContext } from "./env";
+import { handleDragDrop } from "./lib/drop";
 import { type ComposerForm, EMPTY_FORM } from "./components/DispatchComposer";
 import { type Lang, LANGS, LangContext, loadLang, saveLang, setLang, t as tr, tn, useT } from "./lib/i18n";
 import { notificationsFor, shouldNotify } from "./lib/notify";
@@ -402,6 +403,8 @@ export function App({ env: given }: { env: Env }) {
   );
   // A click on a task's notification opens it.
   useEffect(() => env.onNoteClick?.(openWhereAnswered), [env, openWhereAnswered]);
+  // Files dropped from Finder go to the composer (or terminal) under the cursor.
+  useEffect(() => env.onDragDrop?.(handleDragDrop), [env]);
   // Focus mode: the next task that needs the person, on the tab where it is answered.
   const next = nextNeeding(needing, mode === "detail" ? taskId : null);
   const goNext = useCallback(() => {

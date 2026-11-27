@@ -1057,6 +1057,19 @@ const en = {
   "card.spawnMany": "Its agent proposed {n} sub-tasks",
   "card.spawnReview": "Review",
   "sessions.summariesHelp": "Off by default. With Claude, a thread offers \"Summarize with Claude\": each run is your click and costs ≈ $0.01–0.03 of your Claude usage (headless, no tools, no MCP, no hooks). Codex is not offered: it cannot run without tools.",
+  "att.tray": "Attachments",
+  "att.pick": "Attach files",
+  "att.pickTitle": "Attach files",
+  "att.remove": "Remove {name}",
+  "att.uploading": "Attaching {name}",
+  "att.redactedOne": "1 secret removed",
+  "att.redactedMany": "{n} secrets removed",
+  "att.failed": "Could not attach {name}: {error}",
+  "att.tooBig": "{name} is too big to paste (over 12 MB): drop it here or pick it with the paperclip",
+  "att.tooMany": "At most {max} attachments per message",
+  "att.reattach": "The daemon restarted: attach the files again",
+  "att.dropHere": "Drop to attach",
+  "att.notAttached": "Not attached to {branch}: {error}",
 } satisfies Record<string, string>;
 
 export type Key = keyof typeof en;
@@ -2102,6 +2115,19 @@ const pt: Partial<Record<Key, string>> = {
   "card.spawnMany": "O agente propôs {n} subtarefas",
   "card.spawnReview": "Revisar",
   "sessions.summariesHelp": "Desligado por padrão. Com o Claude, a thread oferece \"Resumir com o Claude\": cada execução é um clique seu e custa ≈ US$ 0,01–0,03 do seu uso do Claude (sem interface, sem ferramentas, sem MCP, sem hooks). O Codex não é oferecido: ele não roda sem ferramentas.",
+  "att.tray": "Anexos",
+  "att.pick": "Anexar arquivos",
+  "att.pickTitle": "Anexar arquivos",
+  "att.remove": "Remover {name}",
+  "att.uploading": "Anexando {name}",
+  "att.redactedOne": "1 segredo removido",
+  "att.redactedMany": "{n} segredos removidos",
+  "att.failed": "Não foi possível anexar {name}: {error}",
+  "att.tooBig": "{name} é grande demais para colar (mais de 12 MB): solte-o aqui ou escolha-o pelo clipe",
+  "att.tooMany": "No máximo {max} anexos por mensagem",
+  "att.reattach": "O daemon reiniciou: anexe os arquivos de novo",
+  "att.dropHere": "Solte para anexar",
+  "att.notAttached": "Não anexado a {branch}: {error}",
 };
 
 export const DICTS: Record<Lang, Partial<Record<Key, string>>> = { en, pt };

@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { SendArrow, useAutoGrow } from "./composer";
+import { AttachButton, AttachmentTray, useAttachments, useDropZone } from "./attachments";
 import { useEnv, useLive } from "../env";
 import { onMac } from "../lib/shortcuts";
 import { useT } from "../lib/i18n";
@@ -28,6 +29,13 @@ export function MessageComposer({ t }: { t: TaskView }) {
   const [busy, setBusy] = useState(false);
   const box = useRef<HTMLTextAreaElement>(null);
   useAutoGrow(box, text);
+  // Pasted, dropped or picked files: uploaded to the task at once, sent with the next message.
+  const att = useAttachments(t.id, setNote);
+  const zone = useRef<HTMLDivElement>(null);
+  const dropOn = useDropZone(zone, att.addPaths, t.live);
+
+  /** Text, or at least one attachment (and none still uploading). */
+  const sendable = (msg: string) => !att.uploading && (msg.trim().length > 0 || att.ids.length > 0);
 
   const guarded = async (work: () => Promise<void>) => {
     if (inFlight.current) return;
@@ -43,11 +51,16 @@ export function MessageComposer({ t }: { t: TaskView }) {
 
   /** Sends `msg` (captured when the user acted); clears the box only if it still holds it. */
   const deliver = async (msg: string, mode: SendMode) => {
+    // The attachments as they are now: chips added while this send is on its way stay.
+    const sent = att.items.filter((i) => i.status === "ready");
+    const ids = att.ids;
     try {
-      const r = await rpc<SendResult>(M.messageSend, { task: t.id, text: msg, mode });
+      const r = await rpc<SendResult>(M.messageSend, { task: t.id, text: msg, mode, ...(ids.length ? { attachments: ids } : {}) });
       setText((cur) => (cur === msg ? "" : cur));
+      att.clear(sent.map((i) => i.key));
       setNote(r.delivered === "steer" ? tt("composer.sentNow") : tt("composer.queued", { n: r.queued ?? "?" }));
     } catch (e) {
+      if (att.stale(e)) return;
       const err = e instanceof DaemonError ? e : null;
       if (err?.unsupported) setFallback(true);
       setNote(err?.code === RpcCode.NEEDS_YOU ? tt("composer.answerFirst") : String(err?.message ?? e));
@@ -56,7 +69,7 @@ export function MessageComposer({ t }: { t: TaskView }) {
 
   const send = (mode: SendMode) => {
     const msg = text;
-    if (!msg.trim() || !live) return;
+    if (!sendable(msg) || !live) return;
     return guarded(async () => {
       setNote(null);
       setFallback(false);
@@ -66,7 +79,7 @@ export function MessageComposer({ t }: { t: TaskView }) {
 
   const interruptThenSend = () => {
     const msg = text;
-    if (!msg.trim()) return;
+    if (!sendable(msg)) return;
     return guarded(async () => {
       setFallback(false);
       setNote(null);
@@ -82,12 +95,13 @@ export function MessageComposer({ t }: { t: TaskView }) {
 
   if (!t.live) return <p className="muted small composer-off">{tt("composer.noLive")}</p>;
   // Nothing can be sent while the daemon is away.
-  const empty = !text.trim() || !live;
+  const empty = !sendable(text) || !live;
   const steerKey = mac ? "⌘↵" : "Ctrl+↵";
   const queueKey = mac ? "⌥↵" : "Alt+↵";
   return (
-    <div className="composer composer-msg">
-      <div className="composer-field">
+    <div className={`composer composer-msg${dropOn ? " drop-on" : ""}`} ref={zone}>
+      <div className={`composer-field${att.items.length ? " has-tray" : ""}`}>
+        <AttachmentTray att={att} />
         <label htmlFor={`msg-${t.id}`} className="sr-only">
           {tt("composer.label")}
         </label>
@@ -98,6 +112,9 @@ export function MessageComposer({ t }: { t: TaskView }) {
           value={text}
           placeholder={tt("composer.placeholder", { steer: steerKey, queue: queueKey })}
           onChange={(e) => setText(e.target.value)}
+          onPaste={(e) => {
+            if (att.paste(e)) e.preventDefault();
+          }}
           onKeyDown={(e) => {
             // Enter that confirms an IME composition (Japanese, Chinese…) is not a send.
             if (e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -122,6 +139,7 @@ export function MessageComposer({ t }: { t: TaskView }) {
         </button>
       </div>
       <div className="composer-tokens">
+        <AttachButton att={att} disabled={!live} />
         <span className="composer-hint" aria-hidden="true">
           {steerKey} {tt("hint.steer")}
         </span>

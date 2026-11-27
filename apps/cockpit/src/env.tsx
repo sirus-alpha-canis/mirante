@@ -1,5 +1,6 @@
 // What components need from the outside world, injected so tests can fake it.
 import { createContext, useContext } from "react";
+import type { DragDrop } from "./lib/drop";
 import type { Note } from "./lib/notify";
 import type { EditorId } from "./lib/daemon";
 import type { DaemonBinary, RepoScan } from "./lib/protocol";
@@ -22,6 +23,8 @@ export interface Env {
   notify(n: Note): void;
   /** The native folder picker (one folder); null when cancelled. */
   pickFolder(): Promise<string | null>;
+  /** The native file picker (several files, no folders); [] when cancelled. */
+  pickFiles(): Promise<string[]>;
   /** The user's home directory, as the app process sees it (for "~/…"). */
   homeDir(): Promise<string>;
   /** What is at an absolute path. */
@@ -34,6 +37,9 @@ export interface Env {
   openInEditor(task: string, path: string, line: number | null, editor: EditorId): Promise<void>;
   /** Calls `fn` with the task of a notification the person clicked; returns the unsubscribe. */
   onNoteClick?(fn: (taskId: string) => void): () => void;
+  /** Calls `fn` with each drag over the window and each drop from Finder (Tauri's drag-drop
+   * event: absolute paths); returns the unsubscribe. */
+  onDragDrop?(fn: (e: DragDrop) => void): () => void;
 }
 
 /** `store` with every call guarded: a read that throws is nothing stored, a write that
