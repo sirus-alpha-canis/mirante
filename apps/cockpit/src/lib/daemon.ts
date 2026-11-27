@@ -156,6 +156,16 @@ export async function daemonRestart(): Promise<void> {
   }
 }
 
+/** Attach files: the native picker, opened by the shell (`pick_attachments`), which grants each
+ * chosen path for one `attachment.import`. The chosen paths; none when cancelled or failed. */
+export async function pickAttachments(title: string): Promise<string[]> {
+  try {
+    return await invoke<string[]>("pick_attachments", { title });
+  } catch {
+    return [];
+  }
+}
+
 /** The user's home directory as the app process sees it (Tauri's path resolver). */
 export async function homeDir(): Promise<string> {
   return await invoke<string>("home_dir");

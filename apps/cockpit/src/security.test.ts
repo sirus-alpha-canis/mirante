@@ -7,6 +7,7 @@ import conf from "../src-tauri/tauri.conf.json";
 import shell from "../src-tauri/src/lib.rs?raw";
 import scanner from "../src-tauri/src/scan.rs?raw";
 import editorRs from "../src-tauri/src/editor.rs?raw";
+import grantsRs from "../src-tauri/src/grants.rs?raw";
 import picker from "./main.tsx?raw";
 import css from "./styles.css?raw";
 import page from "../index.html?raw";
@@ -98,9 +99,11 @@ describe("Tauri security baseline", () => {
       allow: [{ url: "https://github.com/*" }, ...local("localhost"), ...local("127.0.0.1")],
     });
     expect(capabilities.windows).toEqual(["main"]);
-    // The picker is asked for one folder (Add project), or for files (attach), never both.
+    // The webview's own picker is asked for one folder (Add project) only. Files to attach
+    // are picked through the shell's `pick_attachments` (see the attachment.import test).
     const opens = [...picker.matchAll(/open\(\{([^}]*)\}\)/g)].map((m) => m[1].replace(/, title:.*$/, "").trim());
-    expect(opens).toEqual(["directory: true, multiple: false", "directory: false, multiple: true"]);
+    expect(opens).toEqual(["directory: true, multiple: false"]);
+    expect(picker).toContain('pickFiles: () => pickAttachments(t("att.pickTitle"))');
     // The only event listened to is the webview's drag-drop (paths), and nothing is emitted.
     expect(picker).toContain("getCurrentWebview()\n      .onDragDropEvent(");
     expect(picker).not.toMatch(/\blisten\(/);
@@ -134,10 +137,32 @@ describe("Tauri security baseline", () => {
       // webview), and opening a task's file (see editor.rs and the test below).
       "editors_available",
       "open_in_editor",
+      // Attach files: the shell opens the native picker itself and grants what is chosen
+      // (only a title comes from the webview; see grants.rs).
+      "pick_attachments",
     ]);
     // Neither takes anything from the webview: the binary is the one the app resolves itself.
     expect(shell).toContain("async fn daemon_binary_build() -> Option<DaemonBinary>");
     expect(shell).toContain("async fn daemon_restart(app: AppHandle) -> Result<(), String>");
+  });
+
+  it("attachment.import takes only a path the person just dropped or picked (granted in Rust)", () => {
+    // Every rpc call goes through the grant check first; an import needs a live grant.
+    expect(shell).toMatch(/async fn rpc\(app: AppHandle, method: String, params: Value\)[^{]*\{\s*let c = app\.state::<Cockpit>\(\);\s*grants::check\(&c\.grants, &method, &params, Instant::now\(\)\)\?;/);
+    expect(grantsRs).toContain("if method != method::ATTACHMENT_IMPORT {");
+    expect(grantsRs).toContain("if grants.take(path, now) {");
+    // Grants come only from the native drop event and the shell's own picker: nothing the
+    // webview can call adds one (no command takes paths to grant).
+    const granted = [...shell.matchAll(/\.grants\.grant\(([^;]*)\);/g)].map((m) => m[1]);
+    expect(granted).toEqual(["paths.iter().cloned(), Instant::now()", "paths.iter().cloned(), Instant::now()"]);
+    expect(shell).toMatch(/WindowEvent::DragDrop\(DragDropEvent::Drop \{ paths, \.\. \}\) => \{\s*window\.state::<Cockpit>\(\)\.grants\.grant\(/);
+    expect(shell).toMatch(/async fn pick_attachments\(app: AppHandle, title: String\) -> Result<Vec<String>, String> \{[\s\S]*?\.blocking_pick_files\(\)[\s\S]*?\.grants\.grant\(paths/);
+    // One use each, for ten minutes at most.
+    expect(grantsRs).toContain("pub const TTL: Duration = Duration::from_secs(10 * 60);");
+    expect(grantsRs).toMatch(/pub fn take\([\s\S]*?g\.remove\(i\);/);
+    // The import itself is still in the bridge's allowlist (the daemon refuses its own home,
+    // credential folders and key files whatever the shell grants).
+    expect(bridgeRpc).toContain('"attachment.import"');
   });
 
   it("open_in_editor: a closed editor list, a daemon-checked path, no shell, no $EDITOR", () => {

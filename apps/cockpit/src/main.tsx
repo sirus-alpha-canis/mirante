@@ -8,7 +8,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { type Env, safeStorage } from "./env";
-import { daemonBinaryBuild, daemonRestart, daemonStart, editorsAvailable, homeDir, openInEditor, pathKind, rpc, scanRepos, subscribe } from "./lib/daemon";
+import { daemonBinaryBuild, daemonRestart, daemonStart, editorsAvailable, homeDir, openInEditor, pathKind, pickAttachments, rpc, scanRepos, subscribe } from "./lib/daemon";
 import { t } from "./lib/i18n";
 import { notify, onNotificationClick } from "./lib/notify";
 import { createCockpit } from "./store/cockpit";
@@ -36,12 +36,12 @@ const env: Env = {
     const picked = await open({ directory: true, multiple: false, title: t("rail.pickerTitle") });
     return typeof picked === "string" ? picked : null;
   },
-  // Attach files (the paperclip): several files, never a folder. The daemon copies them.
-  pickFiles: async () => {
-    const picked = await open({ directory: false, multiple: true, title: t("att.pickTitle") });
-    return Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
-  },
+  // Attach files (the paperclip): the shell opens the picker itself (several files, never a
+  // folder) and grants each chosen path for one `attachment.import`; a path the page names
+  // on its own is refused. The daemon copies them.
+  pickFiles: () => pickAttachments(t("att.pickTitle")),
   // Finder drops: Tauri's own handler is on, so the webview gets paths, not File objects.
+  // The shell grants the dropped paths from the native event (see src-tauri/src/grants.rs).
   onDragDrop: (fn) => {
     let off: (() => void) | null = null;
     let gone = false;

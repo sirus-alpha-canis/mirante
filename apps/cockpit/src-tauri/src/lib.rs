@@ -1,17 +1,20 @@
 //! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, three small
 //! path helpers for adding a project (the home directory, what is at a path, and the git
-//! checkouts in a folder: see `scan`), and "Open in editor" (see `editor`). No state of
-//! its own beyond the running stream and open attachments; the daemon owns everything.
+//! checkouts in a folder: see `scan`), "Open in editor" (see `editor`) and the file picker
+//! for attachments. No state of its own beyond the running stream, open terminal
+//! attachments and the paths the person just dropped or picked (see `grants`: only those
+//! may be imported); the daemon owns everything.
 //! The window never leaves the app's origin: links open in the browser through the opener
 //! plugin (github.com only, see `capabilities/default.json`), never in the window itself,
 //! and never in a window of their own: `window.open` / `target=_blank` are denied.
 mod editor;
+mod grants;
 mod scan;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use mirante_bridge::attach::{Attachments, Opened};
@@ -24,7 +27,8 @@ use serde_json::Value;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::window::Color;
-use tauri::{AppHandle, Manager, State, Theme, Url, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, DragDropEvent, Manager, State, Theme, Url, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_dialog::DialogExt;
 
 /// Vite's dev server (`build.devUrl` in `tauri.conf.json`), loaded only by `tauri dev`.
 const DEV_ORIGIN: (&str, u16) = ("127.0.0.1", 1420);
@@ -58,6 +62,8 @@ struct Cockpit {
     socket: PathBuf,
     stream: Mutex<Option<Stream>>,
     attachments: Attachments,
+    /// Paths the person dropped or picked just now: the only ones `attachment.import` takes.
+    grants: grants::Grants,
 }
 
 /// Terminal output for the frontend: raw bytes (an `ArrayBuffer` in the webview, no
@@ -74,9 +80,14 @@ fn joined<T>(r: Result<Result<T, BridgeError>, tauri::Error>) -> Result<T, Bridg
     r.map_err(|e| BridgeError::Protocol { message: e.to_string() })?
 }
 
+/// A daemon call (the bridge's allowlist applies). `attachment.import` must name a path the
+/// person dropped or picked just now ([`grants::check`]): page script cannot make the
+/// daemon read any other file.
 #[tauri::command]
 async fn rpc(app: AppHandle, method: String, params: Value) -> Result<Value, BridgeError> {
-    let socket = app.state::<Cockpit>().socket.clone();
+    let c = app.state::<Cockpit>();
+    grants::check(&c.grants, &method, &params, Instant::now())?;
+    let socket = c.socket.clone();
     joined(tauri::async_runtime::spawn_blocking(move || bridge_rpc::call(&socket, &method, params)).await)
 }
 
@@ -178,6 +189,21 @@ async fn daemon_restart(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || mirante_bridge::daemon::restart(&app.state::<Cockpit>().paths))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Attach files (the paperclip): the native picker, opened here (several files, never a
+/// folder), and each chosen path granted for one `attachment.import`. The webview gets the
+/// paths; it never names one itself. `title`: the picker's title (shown text only).
+#[tauri::command]
+async fn pick_attachments(app: AppHandle, title: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app.dialog().file().set_title(title).blocking_pick_files().unwrap_or_default();
+        let paths: Vec<PathBuf> = picked.into_iter().filter_map(|f| f.into_path().ok()).collect();
+        app.state::<Cockpit>().grants.grant(paths.iter().cloned(), Instant::now());
+        paths.into_iter().filter_map(|p| p.to_str().map(str::to_owned)).collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The user's home directory, for "~/…" typed in Add project.
@@ -316,7 +342,13 @@ pub fn run() {
             });
             Ok(())
         })
-        .manage(Cockpit { paths, socket, stream: Mutex::new(None), attachments: Attachments::default() })
+        .manage(Cockpit {
+            paths,
+            socket,
+            stream: Mutex::new(None),
+            attachments: Attachments::default(),
+            grants: grants::Grants::default(),
+        })
         .invoke_handler(tauri::generate_handler![
             rpc,
             subscribe,
@@ -331,12 +363,17 @@ pub fn run() {
             path_kind,
             scan_repos,
             editors_available,
-            open_in_editor
+            open_in_editor,
+            pick_attachments
         ])
-        .on_window_event(|window, event| {
-            if let WindowEvent::Destroyed = event {
-                window.state::<Cockpit>().attachments.close_all();
+        .on_window_event(|window, event| match event {
+            WindowEvent::Destroyed => window.state::<Cockpit>().attachments.close_all(),
+            // A Finder drop: the native event, before the webview hears of it. Its paths may
+            // be imported (once each, for a while); see `grants`.
+            WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
+                window.state::<Cockpit>().grants.grant(paths.iter().cloned(), Instant::now());
             }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running the Mirante cockpit");
