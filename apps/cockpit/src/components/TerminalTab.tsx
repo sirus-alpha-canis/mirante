@@ -12,6 +12,8 @@ import { detectPaths, fileUrlTarget, toWorktreeRel } from "../lib/paths";
 import type { FileView } from "../lib/protocol";
 import { usePane } from "./paneContext";
 import { M, type TaskView } from "../lib/protocol";
+import { type AttachmentView, baseName, pastedName, pathPaste, PUT_MAX, toBase64 } from "../lib/attachments";
+import { useDropZone } from "./attachments";
 
 /** Window size changes settle for this long before one `session.resize` goes out. */
 const RESIZE_DEBOUNCE_MS = 100;
@@ -160,6 +162,11 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
   /** Attaches again now (on a reset terminal); `when`: only if not attached, or attached
    * under another boot. Null while no terminal is open. */
   const kick = useRef<((when: "always" | "detached" | "boot") => void) | null>(null);
+  /** Files dropped from Finder: stored in the task's attachments, their paths typed in.
+   * Null while no terminal takes keys. */
+  const dropPaths = useRef<((paths: string[]) => void) | null>(null);
+  const wrap = useRef<HTMLDivElement>(null);
+  const dropOn = useDropZone(wrap, (paths) => dropPaths.current?.(paths), task.live && shown);
 
   useEffect(() => {
     if (active) setShown(true);
@@ -332,6 +339,50 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       pendingBytes += bytes.length;
       pump();
     };
+
+    // Attachments (as a terminal app does with a pasted image): a file pasted or dropped is
+    // stored in the task's attachments folder, then its stored path is typed in as a paste,
+    // so the agent's CLI sees a path it can open (Claude shows an image path as [Image #n]).
+    // In order; one that fails is named and the others still go. A plain text paste is xterm's.
+    const typePaths = async (uploads: (() => Promise<AttachmentView>)[], names: string[]) => {
+      const paths: string[] = [];
+      for (let i = 0; i < uploads.length; i++) {
+        try {
+          paths.push((await uploads[i]()).path);
+        } catch (e) {
+          if (!closed) setNote(t("att.failed", { name: names[i], error: e instanceof Error ? e.message : String(e) }));
+        }
+      }
+      if (closed || paths.length === 0) return;
+      send(new TextEncoder().encode(pathPaste(paths, !!term.modes?.bracketedPasteMode)));
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      const files = Array.from(e.clipboardData?.files ?? []);
+      if (files.length === 0) return;
+      // Ahead of xterm's own handler (capture), which would paste the text, if any.
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (!input) return;
+      const fit = files.filter((f) => {
+        if (f.size <= PUT_MAX) return true;
+        setNote(t("att.tooBig", { name: pastedName(f.name, f.type) }));
+        return false;
+      });
+      const names = fit.map((f) => pastedName(f.name, f.type));
+      void typePaths(
+        fit.map((f, i) => async () => rpc<AttachmentView>(M.attachmentPut, { task: task.id, name: names[i], b64: toBase64(new Uint8Array(await f.arrayBuffer())) })),
+        names,
+      );
+    };
+    el.addEventListener("paste", onPaste, true);
+    dropPaths.current = (paths) => {
+      if (closed || !input) return;
+      void typePaths(
+        paths.map((path) => () => rpc<AttachmentView>(M.attachmentImport, { task: task.id, path })),
+        paths.map(baseName),
+      );
+    };
+
     let listening = false;
     const listen = () => {
       if (listening) return;
@@ -457,6 +508,8 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     return () => {
       closed = true;
       kick.current = null;
+      dropPaths.current = null;
+      el.removeEventListener("paste", onPaste, true);
       if (resizeTimer !== null) clearTimeout(resizeTimer);
       if (ackTimer !== null) clearTimeout(ackTimer);
       if (retryTimer !== null) clearTimeout(retryTimer);
@@ -482,7 +535,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
 
   if (!task.live) return <p className="muted">{t("term.noLive")}</p>;
   return (
-    <div className="terminal-wrap">
+    <div className={`terminal-wrap${dropOn ? " drop-on" : ""}`} ref={wrap}>
       <div className="terminal" ref={host} role="region" aria-label={t("term.region", { branch: task.branch })} />
       {note && (
         <p className={`small terminal-overlay terminal-note${gone ? " terminal-note-action" : ""}`} role="status">

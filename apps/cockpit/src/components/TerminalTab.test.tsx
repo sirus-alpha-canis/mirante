@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type LinkHandler = {
@@ -35,6 +35,8 @@ const h = vi.hoisted(() => ({
   /** The link provider the terminal registered, and the text of its buffer's lines. */
   provider: null as null | { provideLinks(y: number, cb: (links: { text: string; range: unknown; activate(e: object, text: string): void }[] | undefined) => void): void },
   lines: [] as string[],
+  /** DECSET modes the program turned on (bracketed paste). */
+  modes: { bracketedPasteMode: false },
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -42,6 +44,9 @@ vi.mock("@xterm/xterm", () => ({
     rows = 30;
     cols = 100;
     unicode = h.unicode;
+    get modes() {
+      return h.modes;
+    }
     constructor(options: Record<string, unknown>) {
       h.options = options;
       h.term = this;
@@ -120,10 +125,11 @@ vi.mock("../lib/daemon", async (actual) => ({
 
 import { EnvContext } from "../env";
 import { DaemonError } from "../lib/daemon";
-import type { TaskView } from "../lib/protocol";
-import { makeEnv } from "../test/env";
+import { M, type TaskView } from "../lib/protocol";
+import { makeEnv, rpcError } from "../test/env";
 import { snapshot, task } from "../test/fixtures";
 import { fontsPending, TerminalTab } from "./TerminalTab";
+import { handleDragDrop } from "../lib/drop";
 import { type PaneApi, PaneContext } from "./paneContext";
 import css from "../styles.css?raw";
 
@@ -186,6 +192,7 @@ describe("TerminalTab", () => {
     h.options = null;
     h.provider = null;
     h.lines = [];
+    h.modes = { bracketedPasteMode: false };
     h.attachOpen.mockReset();
     h.attachWrite.mockReset();
     h.attachWrite.mockImplementation(async () => {});
@@ -217,6 +224,67 @@ describe("TerminalTab", () => {
     r.unmount();
     expect(h.attachClose).toHaveBeenCalledWith(4);
     expect(h.disposed).toBe(true);
+  });
+
+  describe("attachments", () => {
+    const png = (name = "shot.png") => new File([new Uint8Array([0x89, 0x50])], name, { type: "image/png" });
+    const stored = (p: Record<string, unknown>) => ({ id: "x", path: `/private/tmp/att/1-${p.name ?? "f"}`, name: p.name, kind: "image", bytes: 2, redacted: 0 });
+    const region = () => screen.getByRole("region", { name: "Terminal of feat/a" });
+    const ready = async (answers: Record<string, unknown> = {}) => {
+      h.attachOpen.mockResolvedValue({ id: 4, input: true });
+      const r = mount(task("a"), true, null, { [M.attachmentPut]: stored, ...answers });
+      await waitFor(() => expect(h.onData).not.toBeNull());
+      return r;
+    };
+
+    it("a pasted image is stored, then its path is typed in as one quoted word", async () => {
+      const r = await ready();
+      const went = fireEvent.paste(region(), { clipboardData: { files: [png("my shot.png")], getData: () => "" } });
+      expect(went).toBe(false); // xterm never pastes it as text
+      await waitFor(() => expect(sent()).toEqual([[4, "'/private/tmp/att/1-my shot.png'"]]));
+      expect(r.calls).toContainEqual([M.attachmentPut, { task: "a", name: "my shot.png", b64: "iVA=" }]);
+    });
+
+    it("inside the bracketed-paste markers when the program turned that mode on; several paths space-separated", async () => {
+      await ready();
+      h.modes = { bracketedPasteMode: true };
+      fireEvent.paste(region(), { clipboardData: { files: [png("a.png"), png("b.png")], getData: () => "" } });
+      await waitFor(() => expect(sent()).toEqual([[4, "\x1b[200~'/private/tmp/att/1-a.png' '/private/tmp/att/1-b.png'\x1b[201~"]]));
+    });
+
+    it("a plain text paste is xterm's as before", async () => {
+      const r = await ready();
+      const went = fireEvent.paste(region(), { clipboardData: { files: [], getData: () => "hello" } });
+      expect(went).toBe(true);
+      expect(r.calls.some(([m]) => m === M.attachmentPut)).toBe(false);
+    });
+
+    it("a file too big to paste says so and is not sent; a failed one is named and the rest still go", async () => {
+      const r = await ready({ [M.attachmentPut]: (p: Record<string, unknown>) => (p.name === "bad.png" ? rpcError(-32602, "not an image") : stored(p)) });
+      const big = png("big.png");
+      Object.defineProperty(big, "size", { value: 13 * 1024 * 1024 });
+      fireEvent.paste(region(), { clipboardData: { files: [big, png("bad.png"), png("ok.png")], getData: () => "" } });
+      await waitFor(() => expect(sent()).toEqual([[4, "'/private/tmp/att/1-ok.png'"]]));
+      expect(r.calls.filter(([m]) => m === M.attachmentPut).map(([, p]) => p.name)).toEqual(["bad.png", "ok.png"]);
+      expect(screen.getByRole("status")).toHaveTextContent("Could not attach bad.png: not an image");
+    });
+
+    it("a file dropped from Finder is imported into the task, then its stored path typed in", async () => {
+      const r = await ready({ [M.attachmentImport]: () => ({ id: "y", path: "/private/tmp/att/2-trace.har", name: "trace.har", kind: "file", bytes: 9, redacted: 3 }) });
+      act(() => handleDragDrop({ type: "drop", paths: ["/Users/me/Downloads/trace.har"], position: { x: 0, y: 0 } }));
+      await waitFor(() => expect(sent()).toEqual([[4, "'/private/tmp/att/2-trace.har'"]]));
+      expect(r.calls).toContainEqual([M.attachmentImport, { task: "a", path: "/Users/me/Downloads/trace.har" }]);
+    });
+
+    it("a read-only stream takes no pasted file", async () => {
+      h.attachOpen.mockResolvedValue({ id: 5, input: false });
+      const r = mount(task("a", { agent: "codex" }), true, null, { [M.attachmentPut]: stored });
+      await screen.findByRole("status");
+      fireEvent.paste(region(), { clipboardData: { files: [png()], getData: () => "" } });
+      await act(async () => {});
+      expect(r.calls.some(([m]) => m === M.attachmentPut)).toBe(false);
+      expect(h.attachWrite).not.toHaveBeenCalled();
+    });
   });
 
   it("the terminal is a labelled region", () => {

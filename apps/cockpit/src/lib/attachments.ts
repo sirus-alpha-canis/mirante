@@ -40,6 +40,15 @@ export function shellQuote(path: string): string {
   return `'${path.replace(/'/g, "'\\''")}'`;
 }
 
+/** What a terminal paste of stored `paths` types into the PTY: each path one shell word
+ * (control characters stripped, so a name cannot end the paste or press a key), separated by
+ * spaces, inside the bracketed-paste markers only when the program turned that mode on. */
+export function pathPaste(paths: string[], bracketed: boolean): string {
+  // eslint-disable-next-line no-control-regex
+  const words = paths.map((p) => shellQuote(p.replace(/[\u0000-\u001f\u007f-\u009f]/g, ""))).join(" ");
+  return bracketed ? `\x1b[200~${words}\x1b[201~` : words;
+}
+
 export function sizeText(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;

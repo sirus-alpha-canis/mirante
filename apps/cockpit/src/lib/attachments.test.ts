@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DaemonError } from "./daemon";
 import { RpcCode } from "./protocol";
-import { guessKind, isStaleAttachment, pastedName, previewOf, shellQuote, sizeText, toBase64 } from "./attachments";
+import { guessKind, isStaleAttachment, pastedName, pathPaste, previewOf, shellQuote, sizeText, toBase64 } from "./attachments";
 
 describe("attachments", () => {
   it("base64 is the standard alphabet, large inputs included", () => {
@@ -14,6 +14,13 @@ describe("attachments", () => {
     expect(shellQuote("/tmp/a b.png")).toBe("'/tmp/a b.png'");
     expect(shellQuote("/tmp/it's.png")).toBe("'/tmp/it'\\''s.png'");
     expect(shellQuote("/tmp/$(x)`y`;z")).toBe("'/tmp/$(x)`y`;z'");
+  });
+
+  it("a terminal paste of paths: quoted words, control characters gone, markers only in bracketed mode", () => {
+    expect(pathPaste(["/tmp/a b.png", "/tmp/it's.har"], false)).toBe("'/tmp/a b.png' '/tmp/it'\\''s.har'");
+    expect(pathPaste(["/tmp/a.png"], true)).toBe("\x1b[200~'/tmp/a.png'\x1b[201~");
+    // A name cannot close the paste early or press Enter.
+    expect(pathPaste(["/tmp/x\x1b[201~\r\nrm.png\x9b"], true)).toBe("\x1b[200~'/tmp/x[201~rm.png'\x1b[201~");
   });
 
   it("sizes read like a person writes them", () => {
