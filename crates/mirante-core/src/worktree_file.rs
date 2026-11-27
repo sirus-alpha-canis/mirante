@@ -22,9 +22,11 @@ pub struct Caps {
     pub text_max: usize,
     /// A larger image is [`Kind::TooLarge`].
     pub image_max: usize,
+    /// A PDF (by its magic) up to this size is read past `read_max`, for its page count.
+    pub pdf_max: usize,
 }
 
-pub const CAPS: Caps = Caps { read_max: 2 << 20, text_max: 1 << 20, image_max: 1 << 20 };
+pub const CAPS: Caps = Caps { read_max: 2 << 20, text_max: 1 << 20, image_max: 1 << 20, pdf_max: 20 << 20 };
 
 /// The longest path accepted, and the most levels in it.
 const PATH_MAX: usize = 4096;
@@ -54,9 +56,21 @@ pub type Result<T> = std::result::Result<T, FileError>;
 /// What a file is, as far as showing it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
-    Text { text: String, truncated: bool, lang: Option<&'static str> },
+    Text {
+        text: String,
+        truncated: bool,
+        lang: Option<&'static str>,
+    },
     Binary,
-    Image { mime: &'static str, bytes: Vec<u8> },
+    Image {
+        mime: &'static str,
+        bytes: Vec<u8>,
+    },
+    /// A PDF, by its magic bytes (`%PDF-`), whatever its name; `pages` when they could be
+    /// counted. Never rendered here: its bytes stay in the daemon.
+    Pdf {
+        pages: Option<u32>,
+    },
     TooLarge,
 }
 
@@ -136,16 +150,44 @@ pub fn read_in(root: &Path, segs: &[&str], caps: Caps) -> Result<FileRead> {
     if !entry.is_file() {
         return Err(FileError::NotFile(format!("{shown} is not a regular file")));
     }
-    if entry.size > caps.read_max as u64 {
+    // Past the read cap only a PDF is read (to its own cap), for its page count.
+    let max = if entry.size > caps.read_max as u64 { caps.pdf_max } else { caps.read_max };
+    if entry.size > max as u64 {
         return Ok(FileRead { size: entry.size, kind: Kind::TooLarge });
     }
-    let bytes = match dir.read_bytes(name, caps.read_max) {
+    let bytes = match dir.read_bytes(name, max) {
         Ok(b) => b,
         Err(SafeError::TooLarge(..)) => return Ok(FileRead { size: entry.size, kind: Kind::TooLarge }),
         Err(e) => return Err(from_safe(e, &shown)),
     };
     let size = bytes.len() as u64;
+    if size > caps.read_max as u64 && !is_pdf(&bytes) {
+        return Ok(FileRead { size, kind: Kind::TooLarge });
+    }
     Ok(FileRead { size, kind: sniff(bytes, name, caps) })
+}
+
+/// A PDF by its magic bytes.
+pub fn is_pdf(b: &[u8]) -> bool {
+    b.starts_with(b"%PDF-")
+}
+
+/// The pages of a PDF, counted from its `/Type /Page` objects (not `/Pages`); `None` when
+/// none are visible (they may be inside compressed object streams).
+pub fn pdf_pages(b: &[u8]) -> Option<u32> {
+    let mut n = 0u32;
+    let mut i = 0;
+    while let Some(at) = b[i..].windows(5).position(|w| w == b"/Type") {
+        let mut j = i + at + 5;
+        while j < b.len() && matches!(b[j], b' ' | b'\r' | b'\n' | b'\t') {
+            j += 1;
+        }
+        if b[j..].starts_with(b"/Page") && !b[j + 5..].first().is_some_and(|c| c.is_ascii_alphanumeric()) {
+            n = n.saturating_add(1);
+        }
+        i = j.max(i + at + 1);
+    }
+    (n > 0).then_some(n)
 }
 
 /// The image type of `b` by its magic bytes (never SVG, which is text that can run script).
@@ -165,6 +207,9 @@ pub fn image_mime(b: &[u8]) -> Option<&'static str> {
 
 /// What `bytes` (the file `name`) is: image, text or binary; see the module docs.
 pub fn sniff(bytes: Vec<u8>, name: &str, caps: Caps) -> Kind {
+    if is_pdf(&bytes) {
+        return Kind::Pdf { pages: pdf_pages(&bytes) };
+    }
     if let Some(mime) = image_mime(&bytes) {
         if bytes.len() > caps.image_max {
             return Kind::TooLarge;
@@ -315,6 +360,32 @@ mod tests {
         assert_eq!((big.size, big.kind), (3 << 20, Kind::TooLarge));
         assert_eq!(k("bad.txt"), Kind::Binary);
         assert!(matches!(k("x.svg"), Kind::Text { .. }));
+    }
+
+    #[test]
+    fn pdf_detected_by_magic_not_extension() {
+        let d = TempDir::new("wtf-pdf");
+        let w = |n: &str, b: &[u8]| std::fs::write(d.path().join(n), b).unwrap();
+        let pdf = b"%PDF-1.7\n1 0 obj << /Type /Pages /Count 2 >>\n2 0 obj << /Type /Page >>\n3 0 obj <</Type/Page/Parent 1 0 R>>\n%%EOF";
+        w("doc.bin", pdf);
+        w("fake.pdf", b"just text, not a pdf");
+        w("bare.pdf", b"%PDF-1.4\nstream compressed\n");
+        let k = |n: &str| read(d.path(), n).unwrap().kind;
+        assert_eq!(k("doc.bin"), Kind::Pdf { pages: Some(2) });
+        assert!(matches!(k("fake.pdf"), Kind::Text { .. }));
+        assert_eq!(k("bare.pdf"), Kind::Pdf { pages: None });
+        // Past the 2 MiB read cap a PDF is still read (to 20 MiB); another file is not.
+        let mut big = b"%PDF-1.5\n<< /Type /Page >>\n".to_vec();
+        big.resize(3 << 20, b' ');
+        w("big.pdf", &big);
+        assert_eq!(read(d.path(), "big.pdf").unwrap(), FileRead { size: 3 << 20, kind: Kind::Pdf { pages: Some(1) } });
+        let huge = std::fs::File::create(d.path().join("huge.pdf")).unwrap();
+        huge.set_len((20 << 20) + 1).unwrap();
+        assert_eq!(read(d.path(), "huge.pdf").unwrap().kind, Kind::TooLarge);
+        let mut bin = vec![0u8; 3 << 20];
+        bin[..5].copy_from_slice(b"%PDX-");
+        w("big.bin", &bin);
+        assert_eq!(read(d.path(), "big.bin").unwrap().kind, Kind::TooLarge);
     }
 
     #[test]

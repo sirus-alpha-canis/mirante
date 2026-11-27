@@ -126,7 +126,7 @@ fn serve(shared: Arc<Mutex<Shared>>, conn: UnixStream) {
         record(&shared, &req);
         match req.method.as_str() {
             method::EVENTS_SUBSCRIBE => return subscribe(&shared, req, writer, reader),
-            method::ATTACH => return attach(req, writer, reader),
+            method::ATTACH | method::SHELL_ATTACH => return attach(req, writer, reader),
             _ => {
                 let resp = match answer(&shared, &req.method, &req.params) {
                     Ok(v) => Response::ok(req.id, v),

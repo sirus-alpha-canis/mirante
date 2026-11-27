@@ -136,6 +136,13 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::ATTACHMENT_PUT, Access::Person),
     (method::ATTACHMENT_IMPORT, Access::Person),
     (method::ATTACHMENT_REMOVE, Access::Person),
+    // A person's own shells beside a task: a full shell in its worktree. Never an agent's
+    // (it would be a way out of its sandbox), not even for its own task.
+    (method::SHELL_OPEN, Access::Person),
+    (method::SHELL_ATTACH, Access::Person),
+    (method::SHELL_RESIZE, Access::Person),
+    (method::SHELL_CLOSE, Access::Person),
+    (method::SHELL_LIST, Access::Person),
 ];
 
 /// Who may call `m`: its [`ACCESS`] entry, or a person only when it has none.
@@ -270,6 +277,24 @@ mod tests {
             assert_eq!(access_of(m), Access::Person, "{m}");
             assert_eq!(check(m, &agent).unwrap_err().code, code::FORBIDDEN, "{m}");
             assert_eq!(check(m, &unverified).unwrap_err().code, code::FORBIDDEN, "{m}");
+            assert!(check(m, &Identity::Person).is_ok(), "{m}");
+        }
+    }
+
+    /// Shells are a person's: an agent (even for its own task) or an unverified caller never
+    /// opens, attaches to, resizes, closes or lists one.
+    #[test]
+    fn shells_are_a_persons_only() {
+        let agent = Identity::Agent { task: Some("t".into()) };
+        let orphan = Identity::Agent { task: None };
+        let unverified = Identity::Unverified("x".into());
+        for m in
+            [method::SHELL_OPEN, method::SHELL_ATTACH, method::SHELL_RESIZE, method::SHELL_CLOSE, method::SHELL_LIST]
+        {
+            assert_eq!(access_of(m), Access::Person, "{m}");
+            for who in [&agent, &orphan, &unverified] {
+                assert_eq!(check(m, who).unwrap_err().code, code::FORBIDDEN, "{m} {who:?}");
+            }
             assert!(check(m, &Identity::Person).is_ok(), "{m}");
         }
     }

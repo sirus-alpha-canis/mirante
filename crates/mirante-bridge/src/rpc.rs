@@ -112,6 +112,13 @@ pub const ALLOWED: &[&str] = &[
     method::ATTACHMENT_PUT,
     method::ATTACHMENT_IMPORT,
     method::ATTACHMENT_REMOVE,
+    // The person's own shells in the side pane: open one in the task's worktree, resize,
+    // close, list. Never `shell.attach`: it takes over the connection and is reached only
+    // through the shell's own Tauri command (`shell_attach_open`), like `attach`.
+    method::SHELL_OPEN,
+    method::SHELL_RESIZE,
+    method::SHELL_CLOSE,
+    method::SHELL_LIST,
 ];
 
 /// `session.start` waits for the agent to boot (up to 45 s in the daemon).
@@ -264,8 +271,13 @@ mod tests {
             "attachment.put",
             "attachment.import",
             "attachment.remove",
+            "shell.open",
+            "shell.resize",
+            "shell.close",
+            "shell.list",
         ];
         assert_eq!(ALLOWED, expected);
+        assert!(!ALLOWED.contains(&method::SHELL_ATTACH));
     }
 
     #[test]
@@ -273,6 +285,7 @@ mod tests {
         let d = TestDir::new();
         let fake = FakeDaemon::start(&d.path().join("d.sock"));
         let refused = [
+            method::SHELL_ATTACH,
             method::HOOK_EVENT,
             method::DAEMON_SHUTDOWN,
             method::DAEMON_KILL_ORPHAN,

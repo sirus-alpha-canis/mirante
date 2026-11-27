@@ -33,7 +33,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mirante_ipc::types::{method, AttachParams, AttachResult};
+use mirante_ipc::types::{method, AttachParams, AttachResult, ShellAttach};
 use mirante_ipc::Client;
 use serde::Serialize;
 
@@ -234,11 +234,19 @@ fn pump_output(
     }
 }
 
+/// What an attachment streams: a task's live agent terminal (`attach`), or a person's own
+/// shell beside a task (`shell.attach`). Same framing, flow control and re-attach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Task(String),
+    Shell(String),
+}
+
 /// Connects and attaches: the daemon's answer, the output reader (its replay first), the
 /// input writer (with `write_timeout`), and a clone of the socket for shutting it down.
 fn connect(
     socket: &Path,
-    task: &str,
+    target: &Target,
     rows: u16,
     cols: u16,
     write_timeout: Duration,
@@ -246,7 +254,10 @@ fn connect(
     let dis = |e: std::io::Error| BridgeError::Disconnected { message: e.to_string() };
     let mut c = Client::connect(socket).map_err(|e| BridgeError::Disconnected { message: e.to_string() })?;
     c.set_timeout(Some(std::time::Duration::from_secs(10))).map_err(dis)?;
-    let r: AttachResult = c.call(method::ATTACH, AttachParams { task: task.into(), rows, cols })?;
+    let r: AttachResult = match target {
+        Target::Task(task) => c.call(method::ATTACH, AttachParams { task: task.clone(), rows, cols })?,
+        Target::Shell(shell) => c.call(method::SHELL_ATTACH, ShellAttach { shell: shell.clone(), rows, cols })?,
+    };
     let (reader, writer) = c.into_raw();
     writer.set_write_timeout(Some(write_timeout)).map_err(dis)?;
     let control = writer.try_clone().map_err(dis)?;
@@ -263,16 +274,29 @@ impl Attachments {
         Attachments { next: AtomicU32::new(0), open: Arc::default(), write_timeout, stall_every }
     }
 
+    /// A task's live terminal ([`Attachments::open_target`] with [`Target::Task`]).
     pub fn open(
         &self,
         socket: &Path,
         task: &str,
         rows: u16,
         cols: u16,
+        on_output: impl FnMut(Vec<u8>) + Send + 'static,
+        on_end: impl FnOnce() + Send + 'static,
+    ) -> Result<Opened, BridgeError> {
+        self.open_target(socket, Target::Task(task.to_string()), rows, cols, on_output, on_end)
+    }
+
+    pub fn open_target(
+        &self,
+        socket: &Path,
+        target: Target,
+        rows: u16,
+        cols: u16,
         mut on_output: impl FnMut(Vec<u8>) + Send + 'static,
         on_end: impl FnOnce() + Send + 'static,
     ) -> Result<Opened, BridgeError> {
-        let (r, reader, writer, control) = connect(socket, task, rows, cols, self.write_timeout)?;
+        let (r, reader, writer, control) = connect(socket, &target, rows, cols, self.write_timeout)?;
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         // In the map before the reader runs, so its exit always finds the entry to remove.
         let flow = Arc::new(Flow::default());
@@ -287,11 +311,11 @@ impl Attachments {
         self.open.lock().unwrap().insert(id, a);
         let open = self.open.clone();
         let stall_every = self.stall_every;
-        let (socket, task, write_timeout) = (socket.to_path_buf(), task.to_string(), self.write_timeout);
-        // A fresh stream on the same task at the PTY's current size (0 x 0: keep it); the old
-        // one is shut, so the daemon drops its client.
+        let (socket, write_timeout) = (socket.to_path_buf(), self.write_timeout);
+        // A fresh stream on the same target at the PTY's current size (0 x 0: keep it); the
+        // old one is shut, so the daemon drops its client.
         let mut reattach = move || {
-            let (_, reader, w, c) = connect(&socket, &task, 0, 0, write_timeout).ok()?;
+            let (_, reader, w, c) = connect(&socket, &target, 0, 0, write_timeout).ok()?;
             let old = std::mem::replace(&mut *control.lock().unwrap(), c);
             let _ = old.shutdown(Shutdown::Both);
             *writer.lock().unwrap() = w;
@@ -408,6 +432,23 @@ mod tests {
         end_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(all.is_empty());
         assert!(all.write(o.id, b"x").is_err());
+    }
+
+    #[test]
+    fn a_shell_attaches_through_shell_attach_with_the_same_framing() {
+        let d = TestDir::new();
+        let fake = FakeDaemon::start(&d.path().join("d.sock"));
+        let all = Attachments::default();
+        let (tx, rx) = mpsc::channel();
+        let o = all
+            .open_target(&fake.socket, Target::Shell("s1".into()), 24, 80, move |b| tx.send(b).unwrap(), || {})
+            .unwrap();
+        assert_eq!(fake.calls()[0], ("shell.attach".to_string(), json!({"shell": "s1", "rows": 24, "cols": 80})));
+        read_until(&rx, b"fake terminal\r\n");
+        all.write(o.id, b"pwd\r").unwrap();
+        read_until(&rx, b"pwd\r");
+        all.close(o.id);
+        assert!(all.is_empty());
     }
 
     #[test]

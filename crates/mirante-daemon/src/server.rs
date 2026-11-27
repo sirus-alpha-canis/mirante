@@ -16,7 +16,7 @@ use std::time::Duration;
 use mirante_ipc::rpc::{code, read_line, write_line, Notification, Request, Response, RpcError};
 use mirante_ipc::types::{
     method, ArchiveTask, AttachParams, AttachResult, DnaContextParams, GroupRef, ListParams, QueueRef, QueuedRef,
-    SubscribeParams, TaskRef,
+    ShellAttach, ShellRef, SubscribeParams, TaskRef,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -260,6 +260,7 @@ fn handle_with(
         match req.method.as_str() {
             method::EVENTS_SUBSCRIBE => return subscribe(hub, req, writer, limits),
             method::ATTACH => return attach(hub, req, reader, writer, limits),
+            method::SHELL_ATTACH => return shell_attach(hub, req, reader, writer, limits),
             method::DAEMON_SHUTDOWN => {
                 write_line(&mut writer, &Response::ok(req.id, json!({})))?;
                 hub.shutdown();
@@ -365,6 +366,10 @@ fn dispatch_as(hub: &Hub, caller: &Caller, who: &Identity, m: &str, p: Value) ->
         method::ATTACHMENT_PUT => out(hub.attachment_put(params(p)?)),
         method::ATTACHMENT_IMPORT => out(hub.attachment_import(params(p)?)),
         method::ATTACHMENT_REMOVE => out(hub.attachment_remove(params(p)?).map(|()| json!({}))),
+        method::SHELL_OPEN => out(hub.shell_open(params(p)?)),
+        method::SHELL_RESIZE => out(hub.shell_resize(&params(p)?).map(|()| json!({}))),
+        method::SHELL_CLOSE => out(hub.shell_close(&params::<ShellRef>(p)?.shell).map(|()| json!({}))),
+        method::SHELL_LIST => out(hub.shell_list(&params::<TaskRef>(p)?.task)),
         method::DAEMON_KILL_ORPHAN => out(hub.kill_orphan(params(p)?)),
         method::DNA_STATUS => out(hub.dna_status(&params(p)?)),
         method::DNA_ENABLE => out(hub.dna_enable(&params(p)?, caller)),
@@ -440,7 +445,7 @@ fn subscribe(hub: &Hub, req: Request, mut writer: UnixStream, limits: Limits) ->
 fn attach(
     hub: &Hub,
     req: Request,
-    mut reader: BufReader<UnixStream>,
+    reader: BufReader<UnixStream>,
     mut writer: UnixStream,
     limits: Limits,
 ) -> io::Result<()> {
@@ -452,20 +457,60 @@ fn attach(
         Ok(x) => x,
         Err(e) => return write_line(&mut writer, &Response::err(Some(req.id), e.into())),
     };
+    let id = a.id;
+    let input = |bytes: &[u8]| driver.input(id, bytes).is_ok();
+    pipe(req.id, reader, writer, limits, (a.input, a.initial, a.output), input, || driver.detach(id))
+}
+
+/// `shell.attach`: the person's shell, as `attach` streams an agent's terminal.
+fn shell_attach(
+    hub: &Hub,
+    req: Request,
+    reader: BufReader<UnixStream>,
+    mut writer: UnixStream,
+    limits: Limits,
+) -> io::Result<()> {
+    let p: ShellAttach = match params(req.params) {
+        Ok(p) => p,
+        Err(e) => return write_line(&mut writer, &Response::err(Some(req.id), e)),
+    };
+    let s = match hub.shell_attach(&p) {
+        Ok(x) => x,
+        Err(e) => return write_line(&mut writer, &Response::err(Some(req.id), e.into())),
+    };
+    let (pty, sid) = (s.pty, s.id);
+    let input = |bytes: &[u8]| pty.write_within(bytes, hub::shells::INPUT_TIMEOUT).is_ok();
+    pipe(req.id, reader, writer, limits, (true, s.initial, s.output), input, || pty.unsubscribe(sid))
+}
+
+/// What an attach streams: whether it takes input, the replay, then the live output.
+type Stream = (bool, Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>);
+
+/// After an attach's answer: the replay, then the output to the client and its bytes to
+/// `input` (dropped when the stream takes none), until either side closes or `input`
+/// fails; then `detach` (which ends the output, so its pump ends too).
+fn pipe(
+    id: u64,
+    mut reader: BufReader<UnixStream>,
+    mut writer: UnixStream,
+    limits: Limits,
+    (takes_input, initial, output): Stream,
+    input: impl Fn(&[u8]) -> bool,
+    detach: impl FnOnce(),
+) -> io::Result<()> {
     // A client that stops reading is cut off, not left to block the output pump forever
     // (the driver's per-client queue is bounded, so the agent never waits on it).
     writer.set_write_timeout(Some(limits.stream_write_timeout))?;
-    write_line(&mut writer, &Response::ok(req.id, serde_json::to_value(AttachResult { input: a.input })?))?;
-    writer.write_all(&a.initial)?;
+    write_line(&mut writer, &Response::ok(id, serde_json::to_value(AttachResult { input: takes_input })?))?;
+    writer.write_all(&initial)?;
     let mut out = writer.try_clone()?;
-    let output = a.output;
     let pump = std::thread::spawn(move || {
         for chunk in output {
             if out.write_all(&chunk).is_err() {
                 break;
             }
         }
-        // Output ended (agent exited) or the client is gone: close both ways.
+        // Output ended (the process exited) or the client is gone: close both ways.
         let _ = out.shutdown(Shutdown::Both);
     });
     let mut buf = [0u8; 4096];
@@ -473,15 +518,15 @@ fn attach(
         match reader.read(&mut buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Ok(0) | Err(_) => break,
-            Ok(n) if a.input => {
-                if driver.input(a.id, &buf[..n]).is_err() {
+            Ok(n) if takes_input => {
+                if !input(&buf[..n]) {
                     break;
                 }
             }
             Ok(_) => {}
         }
     }
-    driver.detach(a.id);
+    detach();
     let _ = writer.shutdown(Shutdown::Both);
     let _ = pump.join();
     Ok(())
@@ -713,7 +758,7 @@ mod tests {
         let t = k.create(AgentKind::Claude, "own").task;
         let agent = Peer::spawn(&[(AGENT_ENV, &t.id)], k.dir.path());
         // These take over the connection; the socket test below covers them.
-        let streams = [method::EVENTS_SUBSCRIBE, method::ATTACH, method::DAEMON_SHUTDOWN];
+        let streams = [method::EVENTS_SUBSCRIBE, method::ATTACH, method::SHELL_ATTACH, method::DAEMON_SHUTDOWN];
         for (m, access) in ACCESS {
             if streams.contains(m) {
                 continue;
@@ -754,6 +799,11 @@ mod tests {
         assert!(call(method::DAEMON_STATUS, Value::Null).is_ok());
         assert_eq!(code_of(call(method::EVENTS_SUBSCRIBE, json!({}))), code::FORBIDDEN);
         assert_eq!(code_of(call(method::ATTACH, json!({"task": own.id, "rows": 24, "cols": 80}))), code::FORBIDDEN);
+        assert_eq!(code_of(call(method::SHELL_ATTACH, json!({"shell": "x", "rows": 24, "cols": 80}))), code::FORBIDDEN);
+        assert_eq!(
+            code_of(call(method::SHELL_OPEN, json!({"task": own.id, "n": 1, "rows": 24, "cols": 80}))),
+            code::FORBIDDEN
+        );
         assert_eq!(code_of(call(method::DAEMON_SHUTDOWN, json!({}))), code::FORBIDDEN);
         assert_eq!(code_of(call(method::TASK_LIST, Value::Null)), code::FORBIDDEN);
         assert_eq!(code_of(call(method::DNA_STATUS, json!({"repo": k.repo}))), code::FORBIDDEN);
@@ -877,6 +927,46 @@ mod tests {
         let calls = k.calls();
         assert!(calls.contains(&"input:yo".to_string()), "{calls:?}");
         assert!(calls.contains(&"detach:1".to_string()), "{calls:?}");
+    }
+
+    #[test]
+    fn shell_attach_streams_the_persons_shell_both_ways() {
+        let k = Kit::new();
+        k.hub.set_shell_program(std::path::Path::new("/bin/sh"));
+        let t = k.create(AgentKind::Claude, "a").task;
+        let (sock, _) = serve_kit(&k);
+        let call = |m: &str, p: Value| Client::connect(&sock).unwrap().call::<Value>(m, p);
+        let s = call(method::SHELL_OPEN, json!({"task": t.id, "n": 1, "rows": 24, "cols": 80})).unwrap();
+        let id = s["shell"].as_str().unwrap().to_string();
+        let mut c = Client::connect(&sock).unwrap();
+        let r: AttachResult = c.call(method::SHELL_ATTACH, json!({"shell": id, "rows": 24, "cols": 80})).unwrap();
+        assert!(r.input);
+        let (mut reader, mut writer) = c.into_raw();
+        writer.write_all(b"echo HEL\"\"LO_SHELL\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&got).contains("HELLO_SHELL") {
+            assert!(std::time::Instant::now() < deadline, "{:?}", String::from_utf8_lossy(&got));
+            let n = reader.read(&mut buf).unwrap();
+            assert!(n > 0, "the stream ended");
+            got.extend(&buf[..n]);
+        }
+        // Closing the shell ends the stream.
+        call(method::SHELL_CLOSE, json!({"shell": id})).unwrap();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => assert!(std::time::Instant::now() < deadline + std::time::Duration::from_secs(5)),
+            }
+        }
+        assert_eq!(call(method::SHELL_LIST, json!({"task": t.id})).unwrap(), json!([]));
+        // An unknown shell is refused before the stream.
+        let e = Client::connect(&sock)
+            .unwrap()
+            .call::<AttachResult>(method::SHELL_ATTACH, json!({"shell": id, "rows": 1, "cols": 1}));
+        assert!(matches!(e, Err(ClientError::Rpc(e)) if e.code == code::NOT_FOUND));
     }
 
     #[test]

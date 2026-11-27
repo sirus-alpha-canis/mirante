@@ -169,6 +169,20 @@ pub mod method {
     pub const ATTACHMENT_IMPORT: &str = "attachment.import";
     /// Deletes an attachment not sent yet ([`super::AttachmentRemove`] → `{}`). A person only.
     pub const ATTACHMENT_REMOVE: &str = "attachment.remove";
+    /// A person's own shell in a task's worktree, number `n` ([`super::ShellOpen`] →
+    /// [`super::ShellView`]). Not an agent session: never in the live sessions, never
+    /// resumed. A person only.
+    pub const SHELL_OPEN: &str = "shell.open";
+    /// Takes over the connection like `attach`, for a shell ([`super::ShellAttach`] →
+    /// [`super::AttachResult`], then raw bytes). A person only; the cockpit reaches it only
+    /// through its own Tauri command, never the bridge's allowlist.
+    pub const SHELL_ATTACH: &str = "shell.attach";
+    /// The shell's terminal changed size ([`super::ShellResize`]).
+    pub const SHELL_RESIZE: &str = "shell.resize";
+    /// Ends a shell and everything it started ([`super::ShellRef`]).
+    pub const SHELL_CLOSE: &str = "shell.close";
+    /// A task's running shells ([`super::TaskRef`] → `Vec<`[`super::ShellView`]`>`).
+    pub const SHELL_LIST: &str = "shell.list";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -1171,6 +1185,47 @@ pub struct AttachmentRemove {
     pub id: String,
 }
 
+/// `shell.open`: shell number `n` (1..=4) of `task`, started in its worktree (a workspace
+/// task: in `repo`'s worktree, by repo name; else the workspace folder).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellOpen {
+    pub task: String,
+    pub n: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// One running shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellView {
+    pub shell: String,
+    pub task: String,
+    pub n: u8,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRef {
+    pub shell: String,
+}
+
+/// `shell.attach`: 0 x 0 keeps the shell's size (a re-attach).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellAttach {
+    pub shell: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellResize {
+    pub shell: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 /// What an attachment is: an image (PNG, JPEG, GIF or WebP by its magic bytes) or any
 /// other file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1217,6 +1272,8 @@ pub enum FileKind {
     TooLarge,
     /// A file that may hold secrets, not read until the person reveals it.
     SecretHidden,
+    /// A PDF (by its magic bytes): its size and page count only, never its bytes.
+    Pdf,
 }
 
 /// An image file, for a `data:` URL.
@@ -1245,6 +1302,9 @@ pub struct FileView {
     /// The highlighter's language, from the file name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// A PDF's page count, when it could be counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
 }
 
 /// `daemon.settings` parameters: each one given is changed (and persisted).

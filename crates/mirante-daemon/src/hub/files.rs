@@ -272,6 +272,7 @@ impl Hub {
             truncated: false,
             image: None,
             lang: None,
+            pages: None,
         };
         if may_hold_secrets(&p.path) && !p.reveal {
             v.kind = FileKind::SecretHidden;
@@ -291,6 +292,10 @@ impl Hub {
                 if !p.stat {
                     v.image = Some(FileImage { mime: mime.into(), b64: wf::base64(&bytes) });
                 }
+            }
+            wf::Kind::Pdf { pages } => {
+                v.kind = FileKind::Pdf;
+                v.pages = pages;
             }
             wf::Kind::Binary => v.kind = FileKind::Binary,
             wf::Kind::TooLarge => v.kind = FileKind::TooLarge,
@@ -443,6 +448,19 @@ mod tests {
         assert_eq!(got, ["one/README.md", "two/README.md"]);
         let own = k.hub.task_files(&TaskFiles { task: t.id, query: "MIRANTE_WORK".into(), limit: None }).unwrap();
         assert_eq!(own, ["MIRANTE_WORKSPACE.md"]);
+    }
+
+    #[test]
+    fn task_file_names_a_pdf_by_its_magic_with_its_pages_and_never_its_bytes() {
+        let k = Kit::new();
+        let t = k.create(mirante_core::model::AgentKind::Claude, "wt").task;
+        let wt = std::fs::canonicalize(&t.worktree_path).unwrap();
+        std::fs::write(wt.join("spec.dat"), b"%PDF-1.7\n<< /Type /Page >>\n<< /Type /Page >>\n").unwrap();
+        let v = tf(&k, &t.id, "spec.dat", false).unwrap();
+        assert_eq!((v.kind, v.pages, &v.text, &v.image), (FileKind::Pdf, Some(2), &None, &None));
+        assert_eq!(v.abs, wt.join("spec.dat").to_string_lossy());
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!((json["kind"].as_str(), json["pages"].as_u64()), (Some("pdf"), Some(2)));
     }
 
     #[test]

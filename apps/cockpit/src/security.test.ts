@@ -122,6 +122,10 @@ describe("Tauri security baseline", () => {
       // Flow control: the terminal acks what it drew (an id and a byte count, nothing else).
       "attach_ack",
       "attach_close",
+      // The person's own shell in the side pane: the same stream as attach_open (writes,
+      // acks and close above take its id), for a shell id the daemon gave (shell.open).
+      // shell.attach is never in the bridge's allowlist.
+      "shell_attach_open",
       "daemon_start",
       // After an update: what the daemon binary on disk says it is (`--version`, no shell,
       // a time limit), and restarting the daemon (daemon.shutdown, then the same start as
@@ -137,6 +141,9 @@ describe("Tauri security baseline", () => {
       // webview), and opening a task's file (see editor.rs and the test below).
       "editors_available",
       "open_in_editor",
+      // "Open in Preview" for a task's PDF: the daemon resolves the path and must call it a
+      // PDF; /usr/bin/open -a Preview, cleared environment (see the test below).
+      "open_path_external",
       // Attach files: the shell opens the native picker itself and grants what is chosen
       // (only a title comes from the webview; see grants.rs).
       "pick_attachments",
@@ -177,7 +184,12 @@ describe("Tauri security baseline", () => {
     expect(shell).toContain('Command::new("/usr/bin/open")');
     expect(shell).toContain(".env_clear()");
     const commands = [...(shell + editorRs).matchAll(/Command::new\(([^)]*)\)/g)].map((m) => m[1]);
-    expect(commands).toEqual(['"/usr/bin/open"']);
+    expect(commands).toEqual(['"/usr/bin/open"', '"/usr/bin/open"']);
+    // open_path_external: task and relative path from the webview; the absolute path from
+    // the daemon's task.file (stat), refused unless it is a PDF, checked again, opened in Preview.
+    expect(shell).toContain("async fn open_path_external(app: AppHandle, task: String, path: String) -> Result<(), String>");
+    expect(shell).toMatch(/async fn open_path_external[\s\S]*?"stat": true[\s\S]*?bridge_rpc::call\(&socket, method::TASK_FILE, params\)[\s\S]*?pdf_abs\(&file\)\?[\s\S]*?recheck_file[\s\S]*?\.args\(\["-a", "Preview", "--", &abs\]\)\s*\.env_clear\(\)/);
+    expect(shell).toContain('if file.get("kind").and_then(Value::as_str) != Some("pdf") {');
     const code = editorRs.slice(0, editorRs.indexOf("#[cfg(test)]"));
     expect(code).not.toMatch(/std::process|env::var|"sh"|"-c"|bash/);
     // The editors, spelled out: nothing else parses.
@@ -279,7 +291,15 @@ describe("Tauri security baseline", () => {
       "ATTACHMENT_PUT",
       "ATTACHMENT_IMPORT",
       "ATTACHMENT_REMOVE",
+      "SHELL_OPEN",
+      "SHELL_RESIZE",
+      "SHELL_CLOSE",
+      "SHELL_LIST",
     ]);
+    // Never SHELL_ATTACH: it takes over the connection, through the shell's own command.
+    expect(block).not.toContain("SHELL_ATTACH");
+    expect(shell).toMatch(/async fn shell_attach_open\(\s*app: AppHandle,\s*shell: String,\s*rows: u16,\s*cols: u16,\s*on_msg: Channel<InvokeResponseBody>,?\s*\) -> Result<Opened, BridgeError>/);
+    expect(shell).toContain("Target::Shell(shell)");
     // Never the agent's orchestrator methods: proposing and reading children go through its
     // `mirante-orchestrator` MCP server; the cockpit only decides.
     expect(block).not.toContain("TASK_SPAWN_PROPOSE,");

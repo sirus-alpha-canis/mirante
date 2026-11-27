@@ -504,14 +504,14 @@ impl Hub {
 
     /// The task whose live session's terminal is `p`'s controlling terminal: started from
     /// the agent's session, even if it left the process tree and scrubbed its environment.
-    fn task_of_tty(&self, p: Proc) -> Option<String> {
+    pub(crate) fn task_of_tty(&self, p: Proc) -> Option<String> {
         let tty = proctree::controlling_tty(p.pid)?;
         let st = self.lock();
         st.live.iter().find(|(_, l)| l.driver.as_ref().and_then(|d| d.tty()) == Some(tty)).map(|(t, _)| t.clone())
     }
 
     /// The task whose live session's process tree holds `p` (its root or a descendant).
-    fn task_of_tree(&self, p: Proc) -> Option<String> {
+    pub(crate) fn task_of_tree(&self, p: Proc) -> Option<String> {
         let roots: Vec<(String, Proc)> = {
             let st = self.lock();
             st.live.iter().filter_map(|(t, l)| Some((t.clone(), l.driver.as_ref()?.root()?))).collect()

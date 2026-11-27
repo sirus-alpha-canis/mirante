@@ -36,6 +36,7 @@ pub mod queue;
 pub mod resume;
 pub mod rules;
 pub mod session;
+pub mod shells;
 pub mod skills;
 pub mod subagents;
 pub mod summary;
@@ -397,6 +398,8 @@ pub struct Hub {
     pub(crate) rules_homes: Option<crate::rules::Homes>,
     /// A person's attachments, by task (see [`attachments`]).
     pub(crate) attachments: Mutex<attachments::Registry>,
+    /// A person's own shells beside their tasks (see [`shells`]): never live sessions.
+    pub(crate) shells: Mutex<shells::Registry>,
 }
 
 /// Removes `<home>/sessions/<task>/` (MCP config, skill bundles, agent logs) of a task that
@@ -651,6 +654,7 @@ impl Hub {
             miner: Mutex::default(),
             rules_homes: None,
             attachments: Mutex::default(),
+            shells: Mutex::default(),
         };
         Ok((hub, rx))
     }
@@ -1170,6 +1174,8 @@ impl Hub {
             st.publish();
             t
         };
+        // The person's shells in its worktree end before the worktree goes.
+        self.close_shells_of(&task.id);
         let removed = self.remove_checkouts(&task);
         let mut st = self.lock();
         if let Err(e) = removed {

@@ -1,4 +1,5 @@
-//! Tauri shell of the cockpit: nine commands that forward to `mirante-bridge`, three small
+//! Tauri shell of the cockpit: ten commands that forward to `mirante-bridge` (one opens a
+//! person's own shell's stream), three small
 //! path helpers for adding a project (the home directory, what is at a path, and the git
 //! checkouts in a folder: see `scan`), "Open in editor" (see `editor`) and the file picker
 //! for attachments. No state of its own beyond the running stream, open terminal
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use mirante_bridge::attach::{Attachments, Opened};
+use mirante_bridge::attach::{Attachments, Opened, Target};
 use mirante_bridge::stream::{self, Stream, StreamMsg};
 use mirante_bridge::{rpc as bridge_rpc, BridgeError};
 use mirante_ipc::types::{method, DaemonBinary};
@@ -118,6 +119,39 @@ async fn attach_open(
             c.attachments.open(
                 &c.socket,
                 &task,
+                rows,
+                cols,
+                move |bytes| {
+                    let _ = out.send(output_msg(bytes));
+                },
+                move || {
+                    let _ = on_msg.send(end_msg());
+                },
+            )
+        })
+        .await,
+    )
+}
+
+/// A person's own shell beside a task (`shell.attach`): the same stream, writes, acks and
+/// close as `attach_open` (`attach_write` / `attach_ack` / `attach_close` take its id). The
+/// webview names a shell id the daemon gave it (`shell.open`); `shell.attach` itself is
+/// never in the bridge's allowlist.
+#[tauri::command]
+async fn shell_attach_open(
+    app: AppHandle,
+    shell: String,
+    rows: u16,
+    cols: u16,
+    on_msg: Channel<InvokeResponseBody>,
+) -> Result<Opened, BridgeError> {
+    joined(
+        tauri::async_runtime::spawn_blocking(move || {
+            let c = app.state::<Cockpit>();
+            let out = on_msg.clone();
+            c.attachments.open_target(
+                &c.socket,
+                Target::Shell(shell),
                 rows,
                 cols,
                 move |bytes| {
@@ -295,6 +329,46 @@ async fn open_in_editor(
     .map_err(|e| e.to_string())?
 }
 
+/// "Open in Preview" for a task's PDF: the webview names the task and a relative path; the
+/// daemon resolves and checks it (`task.file` with `stat`) and must call it a PDF; the path
+/// is checked again here, then opened with `/usr/bin/open -a Preview` (no shell, cleared
+/// environment). Nothing else is opened this way.
+#[tauri::command]
+async fn open_path_external(app: AppHandle, task: String, path: String) -> Result<(), String> {
+    let socket = app.state::<Cockpit>().socket.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let params = serde_json::json!({ "task": task, "path": path, "stat": true });
+        let file = bridge_rpc::call(&socket, method::TASK_FILE, params).map_err(|e| e.to_string())?;
+        let abs = pdf_abs(&file)?;
+        editor::recheck_file(std::path::Path::new(&abs))?;
+        let status = std::process::Command::new("/usr/bin/open")
+            .args(["-a", "Preview", "--", &abs])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("open exited with {status}"))
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The absolute path of a `task.file` answer that is a PDF; anything else is refused.
+fn pdf_abs(file: &Value) -> Result<String, String> {
+    if file.get("kind").and_then(Value::as_str) != Some("pdf") {
+        return Err("only a PDF opens in Preview".to_string());
+    }
+    let abs = file.get("abs").and_then(Value::as_str).ok_or("the daemon named no file")?;
+    if !abs.starts_with('/') {
+        return Err("the daemon named no absolute path".to_string());
+    }
+    Ok(abs.to_string())
+}
+
 pub fn run() {
     let paths = Paths::from_env().expect("cannot locate ~/.mirante (is HOME set?)");
     let socket = paths.socket();
@@ -356,6 +430,7 @@ pub fn run() {
             attach_write,
             attach_ack,
             attach_close,
+            shell_attach_open,
             daemon_start,
             daemon_binary_build,
             daemon_restart,
@@ -364,6 +439,7 @@ pub fn run() {
             scan_repos,
             editors_available,
             open_in_editor,
+            open_path_external,
             pick_attachments
         ])
         .on_window_event(|window, event| match event {
@@ -408,6 +484,20 @@ mod tests {
             "javascript:alert(1)",
         ] {
             assert!(!is_app_url(&url(bad), false), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_pdf_the_daemon_resolved_opens_in_preview() {
+        let ok = serde_json::json!({"kind": "pdf", "abs": "/w/a/spec.pdf"});
+        assert_eq!(pdf_abs(&ok), Ok("/w/a/spec.pdf".to_string()));
+        for bad in [
+            serde_json::json!({"kind": "text", "abs": "/w/a/x.sh"}),
+            serde_json::json!({"kind": "binary", "abs": "/w/a/app"}),
+            serde_json::json!({"kind": "pdf", "abs": "relative.pdf"}),
+            serde_json::json!({"kind": "pdf"}),
+        ] {
+            assert!(pdf_abs(&bad).is_err(), "{bad}");
         }
     }
 
