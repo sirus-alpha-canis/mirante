@@ -1,5 +1,6 @@
 // The side pane's tab strip: one tab per thing shown (× closes it), the "+" menu that adds
-// a surface (the person's own Terminal, a File through quick-open), and Split. ←/→ move
+// a surface (the person's own Terminal, a File through quick-open, a Browser on a local dev
+// server), and Split. ←/→ move
 // between tabs (WAI-ARIA tabs); the menu is a WAI-ARIA menu (↑/↓, Enter, Escape closes it
 // and focus goes back to "+").
 import { type KeyboardEvent, type ReactNode, useRef, useState } from "react";
@@ -7,7 +8,7 @@ import { useT } from "../lib/i18n";
 import { MAX_SHELLS, type PaneState } from "../lib/sidepane";
 import { useDismiss } from "../lib/useDismiss";
 
-export type AddSurface = "terminal" | "file";
+export type AddSurface = "terminal" | "file" | "browser";
 
 export function PaneTabs({
   pane,
@@ -120,6 +121,7 @@ function AddMenu({ canAddShell, onAdd }: { canAddShell: boolean; onAdd(what: Add
   const entries: { what: AddSurface; text: string; disabled: boolean }[] = [
     { what: "terminal", text: canAddShell ? t("pane.add.terminal") : t("pane.add.terminalFull", { n: MAX_SHELLS }), disabled: !canAddShell },
     { what: "file", text: t("pane.add.file"), disabled: false },
+    { what: "browser", text: t("pane.add.browser"), disabled: false },
   ];
   return (
     <span className="popover-wrap" ref={wrap}>

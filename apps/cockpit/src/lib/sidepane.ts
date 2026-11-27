@@ -2,6 +2,7 @@
 // tabs (and at most one split), and which tab shows. Per viewer, in this machine's storage
 // (the last 200 tasks); storage that refuses means a closed pane. Every field read back is
 // checked: a bad one is the default, a bad tab is dropped.
+import { checkLocalUrl } from "./localurl";
 
 export type PaneTarget =
   | { k: "file"; path: string; line?: number }
@@ -14,7 +15,9 @@ export type PaneTarget =
   | { k: "subagent"; id: string }
   | { k: "notes" }
   /** The person's own shell in this task's worktree, number `n` (1..MAX_SHELLS). */
-  | { k: "shell"; n: number };
+  | { k: "shell"; n: number }
+  /** A dev server on this machine (`checkLocalUrl`); "" while nothing is typed yet. */
+  | { k: "browser"; url: string };
 
 export interface PaneTab {
   id: string;
@@ -92,6 +95,11 @@ export function checkTarget(v: unknown): PaneTarget | null {
       return str(o.id, 64) ? { k: "subagent", id: o.id } : null;
     case "shell":
       return typeof o.n === "number" && Number.isInteger(o.n) && o.n >= 1 && o.n <= MAX_SHELLS ? { k: "shell", n: o.n } : null;
+    case "browser": {
+      if (o.url === "") return { k: "browser", url: "" };
+      const u = typeof o.url === "string" ? checkLocalUrl(o.url) : null;
+      return u?.ok ? { k: "browser", url: u.url } : null;
+    }
     default:
       return null;
   }
@@ -227,6 +235,12 @@ export function openTab(p: PaneState, target: PaneTarget, fresh = false): PaneSt
   }
   const id = newId(tabs);
   return { ...p, open: true, tabs: [...tabs, { id, t: target }], active: id };
+}
+
+/** Tab `id` shows `target` instead, in place (the Browser tab navigating). */
+export function retarget(p: PaneState, id: string, target: PaneTarget): PaneState {
+  if (!p.tabs.some((t) => t.id === id)) return p;
+  return { ...p, tabs: p.tabs.map((t) => (t.id === id ? { id, t: target } : t)) };
 }
 
 /** Closes tab `id`: the one beside it shows instead; a split with it ends. */

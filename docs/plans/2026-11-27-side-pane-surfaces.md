@@ -87,7 +87,7 @@
 
 ### Batch B — Browser
 - [x] 1. CSP `frame-src`; `security.test.ts` asserts the exact `frame-src` and that no capability has `remote`.
-- [ ] 2. `BrowserTab.tsx` + `lib/localurl.ts` (tests: refuses https, other hosts, userinfo, missing port, file:; exact sandbox flags).
+- [x] 2. `BrowserTab.tsx` + `lib/localurl.ts` (tests: refuses https, other hosts, userinfo, missing port, file:; exact sandbox flags).
 - [ ] 3. Framing-refused fallback; optional port suggestions.
 
 ### Batch C — Device (serve-sim)

@@ -1,5 +1,6 @@
 // The Detail's side pane: tabs (a worktree file, the Diff, Steps, another task's terminal,
-// a memory note, a skill, one of Claude's own agents, the person's own shell), one shown,
+// a memory note, a skill, one of Claude's own agents, the person's own shell, a Browser on a
+// local dev server), one shown,
 // or two side by side (Split). Its header names the shown tab and offers "Open in editor"
 // (files), Swap and Close; the tab strip below adds tabs ("+") and closes them. Bodies
 // reuse the views that exist elsewhere (FileView, DiffTab, NoteView, SkillPanel,
@@ -9,7 +10,9 @@ import { PaneContext } from "./paneContext";
 import { useEnv, useSelect } from "../env";
 import { useT } from "../lib/i18n";
 import { hintsFor, onMac } from "../lib/shortcuts";
-import { activeTarget, clampRatio, closeTab, focusTab, freeShell, openTab, type PaneState, type PaneTarget, toggleSplit } from "../lib/sidepane";
+import { localHost } from "../lib/localurl";
+import { activeTarget, clampRatio, closeTab, focusTab, freeShell, openTab, type PaneState, type PaneTarget, retarget, toggleSplit } from "../lib/sidepane";
+import { BrowserTab } from "./BrowserTab";
 import { type AddSurface, PaneTabs } from "./PaneTabs";
 import { closeShell, markFresh, ShellTab } from "./ShellTab";
 import type { TaskView } from "../lib/protocol";
@@ -47,6 +50,8 @@ function useTitle(target: PaneTarget | null): string {
       return t("pane.subagent", { id: target.id });
     case "shell":
       return t("pane.shell", { n: target.n });
+    case "browser":
+      return target.url || t("pane.browser");
   }
 }
 
@@ -54,6 +59,7 @@ function useTitle(target: PaneTarget | null): string {
 function TabLabel({ target }: { target: PaneTarget }) {
   const title = useTitle(target);
   if (target.k === "file") return <span title={title}>{target.path.split("/").pop()}</span>;
+  if (target.k === "browser" && target.url) return <span title={title}>{localHost(target.url)}</span>;
   return <span title={title}>{title}</span>;
 }
 
@@ -78,6 +84,8 @@ function tabName(t: ReturnType<typeof useT>, target: PaneTarget): string {
       return t("pane.subagent", { id: target.id });
     case "shell":
       return t("pane.shell", { n: target.n });
+    case "browser":
+      return target.url ? localHost(target.url) : t("pane.browser");
   }
 }
 
@@ -97,7 +105,24 @@ function OtherTerminal({ id }: { id: string }) {
 }
 
 /** One tab's view. */
-function Body({ task, target, version, steps, onOpenFile }: { task: TaskView; target: PaneTarget | null; version: number; steps: ReactNode; onOpenFile(path: string, line?: number): void }) {
+function Body({
+  task,
+  id,
+  target,
+  version,
+  steps,
+  onOpenFile,
+  onRetarget,
+}: {
+  task: TaskView;
+  /** The tab's id. */
+  id: string | null;
+  target: PaneTarget | null;
+  version: number;
+  steps: ReactNode;
+  onOpenFile(path: string, line?: number): void;
+  onRetarget(id: string, target: PaneTarget): void;
+}) {
   const t = useT();
   switch (target?.k) {
     case undefined:
@@ -123,6 +148,8 @@ function Body({ task, target, version, steps, onOpenFile }: { task: TaskView; ta
       return <SubagentPane key={`${task.id}:${target.id}`} taskId={task.id} id={target.id} />;
     case "shell":
       return <ShellTab key={`${task.id}:shell:${target.n}`} task={task} n={target.n} />;
+    case "browser":
+      return <BrowserTab key={`${task.id}:browser:${id}`} url={target.url} onNavigate={(url) => id && onRetarget(id, { k: "browser", url })} />;
     default:
       return <p className="muted small">{t("pane.unavailable")}</p>;
   }
@@ -201,6 +228,7 @@ export function SidePane({
   const second = pane.split ? (pane.tabs.find((x) => x.id === pane.split!.second)?.t ?? null) : null;
   const add = (what: AddSurface) => {
     if (what === "file") return onAddFile();
+    if (what === "browser") return onPane((p) => openTab(p, { k: "browser", url: "" }, true));
     const n = freeShell(pane);
     if (n === null) return;
     markFresh(task.id, n);
@@ -212,7 +240,9 @@ export function SidePane({
     if (tab?.t.k === "shell") closeShell(rpc, task.id, tab.t.n);
     onPane((p) => closeTab(p, id));
   };
-  const body = (tg: PaneTarget | null) => <Body task={task} target={tg} version={version} steps={steps} onOpenFile={onOpenFile} />;
+  const body = (id: string | null, tg: PaneTarget | null) => (
+    <Body task={task} id={id} target={tg} version={version} steps={steps} onOpenFile={onOpenFile} onRetarget={(tab, to) => onPane((p) => retarget(p, tab, to))} />
+  );
   return (
     <aside className="side-pane" aria-label={t("pane.label")}>
       <header className="side-pane-head">
@@ -246,16 +276,16 @@ export function SidePane({
       {pane.split && second ? (
         <div className={`side-pane-split side-pane-split-${pane.split.dir}`} ref={box}>
           <div className="side-pane-body" role="tabpanel" aria-labelledby={`pane-tab-${pane.active}`} style={{ flexBasis: `${pane.split.ratio * 100}%` }}>
-            {body(target)}
+            {body(pane.active, target)}
           </div>
           <SplitSeparator ratio={pane.split.ratio} dir={pane.split.dir} box={box} onRatio={(r) => onPane((p) => (p.split ? { ...p, split: { ...p.split, ratio: r } } : p))} />
           <div className="side-pane-body" role="tabpanel" aria-labelledby={`pane-tab-${pane.split.second}`}>
-            {body(second)}
+            {body(pane.split.second, second)}
           </div>
         </div>
       ) : (
         <div className="side-pane-body" role={target ? "tabpanel" : undefined} aria-labelledby={target ? `pane-tab-${pane.active}` : undefined}>
-          {body(target)}
+          {body(pane.active, target)}
         </div>
       )}
     </aside>

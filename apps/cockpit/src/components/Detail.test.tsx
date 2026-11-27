@@ -593,7 +593,7 @@ describe("Detail (V1 classic)", () => {
       await userEvent.click(screen.getByRole("button", { name: "Review layout" }));
       await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
       const menu = within(pane()!).getByRole("menu", { name: "Add to the side pane" });
-      expect(within(menu).getAllByRole("menuitem").map((m) => m.textContent)).toEqual(["Terminal", "File…"]);
+      expect(within(menu).getAllByRole("menuitem").map((m) => m.textContent)).toEqual(["Terminal", "File…", "Browser"]);
       await userEvent.click(within(menu).getByRole("menuitem", { name: "Terminal" }));
       expect(await within(pane()!).findByLabelText("Shell 1 of feat/a")).toHaveAttribute("data-shell", "s1");
       expect(h.calls).toContainEqual(["shell.open", { task: "a", n: 1, rows: 24, cols: 80 }]);
@@ -615,6 +615,22 @@ describe("Detail (V1 classic)", () => {
       fireEvent.keyDown(screen.getByRole("combobox", { name: "File name" }), { key: "Enter" });
       await waitFor(() => expect(within(pane()!).getByRole("tab", { name: "login.ts" })).toHaveAttribute("aria-selected", "true"));
       expect(tabs()).toHaveLength(3);
+    });
+
+    it("+ → Browser adds a blank Browser tab; the address it goes to is kept with the tab", async () => {
+      const h = setup();
+      act(() => togglePane());
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "Browser" }));
+      expect(tabs()).toEqual(["Browser"]);
+      await userEvent.type(within(pane()!).getByRole("textbox", { name: "Address" }), "localhost:5173{Enter}");
+      expect(pane()!.querySelector("iframe")).toHaveAttribute("src", "http://localhost:5173/");
+      expect(tabs()).toEqual(["localhost:5173"]);
+      expect(JSON.parse(h.env.storage.getItem("mirante.pane.a")!).tabs).toEqual([{ id: "t1", t: { k: "browser", url: "http://localhost:5173/" } }]);
+      // A second + → Browser adds another tab (the first one is no longer blank).
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "Browser" }));
+      expect(tabs()).toEqual(["localhost:5173", "Browser"]);
     });
 
     it("Escape closes the + menu and focus goes back to +", async () => {

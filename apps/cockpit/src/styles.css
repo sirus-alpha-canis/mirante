@@ -775,6 +775,12 @@ button.skill-chip:hover { color: var(--text); }
 .pane-shell { display: flex; flex-direction: column; gap: var(--s2); height: 100%; }
 .pane-shell-help { margin: 0; }
 .pane-shell .pane-terminal { flex: 1; }
+.browser-tab { display: flex; flex-direction: column; gap: var(--s2); height: 100%; min-height: 320px; padding-right: var(--s2); }
+.browser-bar { display: flex; align-items: center; gap: var(--s1); }
+.browser-address { flex: 1; min-width: 0; font-family: var(--mono); font-size: var(--fs-sm); }
+.browser-bad { margin: 0; color: var(--danger); }
+.browser-frame { flex: 1; width: 100%; min-height: 0; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
+.browser-refused { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s2); }
 .quick-open .quick-path { font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .quick-open .quick-hint { margin: var(--s2) var(--s3) 0; }
 .step-open { margin-left: var(--s1); padding: 0 4px; line-height: 1; }

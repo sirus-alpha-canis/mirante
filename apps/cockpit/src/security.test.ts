@@ -13,6 +13,7 @@ import picker from "./main.tsx?raw";
 import css from "./styles.css?raw";
 import page from "../index.html?raw";
 import bridgeRpc from "../../../crates/mirante-bridge/src/rpc.rs?raw";
+import browserTab from "./components/BrowserTab.tsx?raw";
 import { M } from "./lib/protocol";
 
 describe("Tauri security baseline", () => {
@@ -79,6 +80,16 @@ describe("Tauri security baseline", () => {
       expect(text, name).not.toMatch(/"remote"/);
     }
     expect(shell).not.toMatch(/add_capability|CapabilityBuilder|\.remote\(/);
+    // The Browser tab's one frame: the dev server's own origin, scripts and forms; no top
+    // navigation, popups or modals; no referrer; no feature (camera, mic…) delegated.
+    expect(browserTab.match(/<iframe/g)).toHaveLength(1);
+    expect(browserTab).toContain('sandbox="allow-scripts allow-forms allow-same-origin"');
+    expect(browserTab).toContain('referrerPolicy="no-referrer"');
+    expect(browserTab).toContain('allow=""');
+    expect(browserTab).not.toMatch(/allow-top-navigation|allow-popups|allow-modals|allow-downloads|allow-storage-access|allow-pointer-lock/);
+    // Only BrowserTab frames anything.
+    const sources = import.meta.glob(["./**/*.tsx", "!./**/*.test.tsx"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+    expect(Object.keys(sources).filter((n) => /<(iframe|webview|embed|object)[\s>]/.test(sources[n]))).toEqual(["./components/BrowserTab.tsx"]);
   });
 
   it("the dev policy only adds what Vite's dev server needs", () => {
