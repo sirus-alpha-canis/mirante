@@ -171,7 +171,11 @@ Direction "Observatório": surfaces instead of borders (a frame, a reading surfa
 a lift for what is active), in Vibely's palette: neutral greys, and color only for state
 from its semantic scales (amber needs you, blue working, green ready, red failed); no brand
 accent (red is the brand and "danger" only), type 12/13/15/20. The theme
-follows macOS (◐ cycles system → light → dark). A 36px top bar holds the mark (Home), where
+follows macOS (◐ cycles system → light → dark). The mark is Vibely's two-tone ribbon (used by
+permission of its owner; `src/assets/brand/`) beside "Mirante" in Nunito Sans; the launch splash
+draws both as paths (no font needed yet) and the ribbon draws in once from its centre (none
+with reduced motion). The app icon is rendered from the same master
+(`src-tauri/icons/source/`). A 36px top bar holds the mark (Home), where
 you are (Home › project › task), the views, the daemon's health dot, what needs you (click:
 ⌘J) and ⌘K; a 24px status line at the foot shows the daemon, system memory, what needs
 you and the keys of the current view. At the rail's foot, System memory and Sessions are

@@ -675,13 +675,14 @@ describe("App", () => {
       expect(document.getElementById("splash")).toBeNull();
     });
 
-    it("until the daemon first answers, the orbiting dots say it is connecting; then the view", () => {
+    it("until the daemon first answers, the ribbon mark says it is connecting; then the view", () => {
       const h = makeEnv({ "daemon.status": STATUS });
       render(<App env={h.env} />);
       const waiting = screen.getByRole("status", { name: "Connecting to the Mirante daemon…" });
       expect(waiting).toHaveAttribute("aria-live", "polite");
       expect(waiting).toHaveTextContent("Connecting to the Mirante daemon…");
-      expect(waiting.querySelector("svg .orb-sats")).not.toBeNull();
+      expect(waiting.querySelector("svg.ribbon .ribbon-front")).not.toBeNull();
+      expect(waiting.querySelector("svg.wordmark path")).not.toBeNull();
       // One message, not the banner too.
       expect(screen.queryByRole("status", { name: "Daemon connection" })).toBeNull();
       act(() => h.load([task("a", { repo_path: "/repos/shop" })]));
@@ -719,13 +720,13 @@ describe("App", () => {
   });
 
   describe("the brand is Home", () => {
-    it("the Orb-Dot mark and the wordmark are one Home button, pressed on Home; there is no separate Home tab", async () => {
+    it("the ribbon mark and the wordmark are one Home button, pressed on Home; there is no separate Home tab", async () => {
       setup();
       const home = screen.getByRole("button", { name: "Home" });
       expect(home).toHaveAttribute("aria-pressed", "true");
       expect(home).toHaveTextContent("Mirante");
-      // The launch splash's mark, still (no orbiting satellites in the bar).
-      expect(home.querySelector("svg.orb.orb-static")).not.toBeNull();
+      // The launch splash's mark, still (no draw-in in the bar), in its two tones.
+      expect(home.querySelector("svg.ribbon.ribbon-still:not(.ribbon-mono) .ribbon-front")).not.toBeNull();
       expect(within(screen.getByRole("navigation", { name: "Views" })).queryByRole("button", { name: /Home/ })).toBeNull();
       expect(screen.queryByRole("button", { name: /Home ⌘1|Home Ctrl\+1/ })).toBeNull();
       fireEvent.keyDown(window, { key: "g", ...mod });

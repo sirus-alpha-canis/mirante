@@ -2,11 +2,15 @@
 import { render } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OrbMark } from "../components/Splash";
+import { RibbonMark, Wordmark } from "../components/Splash";
+import ribbonSvg from "../assets/brand/ribbon.svg?raw";
+import ribbonMonoSvg from "../assets/brand/ribbon-mono.svg?raw";
+import iconSourceSvg from "../../src-tauri/icons/source/ribbon.svg?raw";
 import html from "../../index.html?raw";
 import boot from "../../public/theme-boot.js?raw";
 import { dismissSplash, SPLASH_FADE_MS } from "./splash";
 import { THEME_KEY } from "./theme";
+import css from "../styles.css?raw";
 import conf from "../../src-tauri/tauri.conf.json";
 import shell from "../../src-tauri/src/lib.rs?raw";
 
@@ -55,9 +59,32 @@ describe("index.html's splash", () => {
     expect(splash.getAttribute("aria-live")).toBe("polite");
     expect(splash.getAttribute("aria-label")).toBeTruthy();
     expect(splash.compareDocumentPosition(doc.getElementById("root")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // The orbiting dots (the Orb-Dot mark) and the wordmark.
-    expect(splash.querySelector("svg .orb-sats")).not.toBeNull();
-    expect(splash.textContent).toContain("Mirante");
+    expect(splash.getAttribute("aria-label")).toBe("Starting Mirante");
+    // The ribbon mark (back band, then the front over it) and the wordmark, both decorative.
+    const [ribbon, word] = [...splash.querySelectorAll("svg")];
+    expect(ribbon.getAttribute("class")).toBe("ribbon");
+    expect([...ribbon.querySelectorAll("path")].map((p) => p.getAttribute("class"))).toEqual(["ribbon-back", "ribbon-front"]);
+    expect(word.getAttribute("class")).toBe("wordmark");
+    for (const svg of [ribbon, word]) expect(svg.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("draws the wordmark as outlines: no text, no font needed before the app's load", () => {
+    const word = doc.querySelector("#splash svg.wordmark")!;
+    expect(word.querySelectorAll("text")).toHaveLength(0);
+    expect(word.querySelector("path")?.getAttribute("d")).toMatch(/^M[\d\s.MLHVQCZ-]+$/);
+    expect(doc.getElementById("splash")!.textContent!.trim()).toBe("");
+  });
+
+  it("animates once, our own draw-in: 120 to 600ms in all, nothing that loops", () => {
+    const anims = [...style.matchAll(/animation:\s*([^;]+);/g)].map((m) => m[1].trim()).filter((a) => a !== "none");
+    expect(anims.length).toBeGreaterThan(0);
+    const ms = (t: string) => (t.endsWith("ms") ? parseFloat(t) : parseFloat(t) * 1000);
+    for (const a of anims) {
+      expect(a, a).not.toMatch(/infinite/);
+      const [duration, delay = "0ms"] = a.match(/[\d.]+m?s/g)!;
+      expect(ms(duration), a).toBeGreaterThanOrEqual(120);
+      expect(ms(duration) + ms(delay), a).toBeLessThanOrEqual(600);
+    }
   });
 
   it("paints the theme's background (no white flash) and follows a pinned theme", () => {
@@ -88,14 +115,39 @@ describe("index.html's splash", () => {
 });
 
 describe("the app's waiting mark", () => {
-  it("is the launch splash's, shape for shape", () => {
-    const shapes = (svg: Element) =>
-      [...svg.querySelectorAll("*")].map((e) => [e.tagName.toLowerCase(), ...[...e.attributes].map((a) => `${a.name}=${a.value}`).sort()].join(" "));
-    const launch = new DOMParser().parseFromString(html, "text/html").querySelector("#splash svg")!;
-    const { container } = render(createElement(OrbMark));
+  const shapes = (svg: Element) =>
+    [...svg.querySelectorAll("*")].map((e) => [e.tagName.toLowerCase(), ...[...e.attributes].map((a) => `${a.name}=${a.value}`).sort()].join(" "));
+  const launch = (cls: string) => new DOMParser().parseFromString(html, "text/html").querySelector(`#splash svg.${cls}`)!;
+  const paths = (svg: Element) => [...svg.querySelectorAll("path")].map((p) => [p.getAttribute("d"), p.getAttribute("fill")]);
+
+  it("is the launch splash's, shape for shape: the ribbon and the wordmark", () => {
+    for (const [cls, el] of [["ribbon", createElement(RibbonMark)], ["wordmark", createElement(Wordmark)]] as const) {
+      const { container } = render(el);
+      const app = container.querySelector("svg")!;
+      expect(shapes(app), cls).toEqual(shapes(launch(cls)));
+      expect(app.getAttribute("viewBox"), cls).toBe(launch(cls).getAttribute("viewBox"));
+      expect(app.getAttribute("class"), cls).toBe(cls);
+    }
+  });
+
+  it("is the brand master's (assets/brand/ribbon.svg), in its two tones", () => {
+    const master = new DOMParser().parseFromString(ribbonSvg, "image/svg+xml").documentElement;
+    const { container } = render(createElement(RibbonMark));
     const app = container.querySelector("svg")!;
-    expect(shapes(app)).toEqual(shapes(launch));
-    expect(app.getAttribute("viewBox")).toBe(launch.getAttribute("viewBox"));
+    expect(paths(app)).toEqual(paths(master));
+    expect(paths(app).map(([, fill]) => fill)).toEqual(["#650C10", "#A8141B"]);
+    expect(app.getAttribute("viewBox")).toBe(master.getAttribute("viewBox"));
+    // The mono master is the same geometry.
+    const mono = new DOMParser().parseFromString(ribbonMonoSvg, "image/svg+xml").documentElement;
+    expect(paths(mono).map(([d]) => d)).toEqual(paths(master).map(([d]) => d));
+    // The app icon is rendered from the same master.
+    expect(iconSourceSvg).toBe(ribbonSvg);
+  });
+
+  it("still: no draw-in; mono: one colour (currentColor) for dark or tinted surfaces", () => {
+    const { container } = render(createElement(RibbonMark, { still: true, tone: "mono" }));
+    expect(container.querySelector("svg")).toHaveClass("ribbon", "ribbon-still", "ribbon-mono");
+    expect(css).toMatch(/\.ribbon-mono path \{[^}]*fill: currentColor/);
   });
 });
 

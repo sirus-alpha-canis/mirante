@@ -173,12 +173,10 @@ kbd { background: var(--panel-3); border-radius: var(--r-sm); padding: 0 4px; co
 .brand-home { display: inline-flex; align-items: center; gap: 6px; height: 28px; background: none; border: none; border-radius: var(--r); padding: 0 8px 0 5px; cursor: pointer; color: var(--muted); }
 .brand-word { font-weight: 600; letter-spacing: 0.01em; }
 .brand-home:hover, .brand-home[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
-.brand-home .orb { width: 18px; height: 18px; overflow: visible; flex: none; }
-.orb-static .orb-ring { fill: none; stroke: var(--splash-dot); stroke-width: 2; stroke-dasharray: 3 5; opacity: 0.45; }
-.orb-static .orb-sats { fill: var(--splash-dot); stroke: var(--splash-dot); }
-.orb-static .orb-sats line { stroke-width: 1; }
-.orb-static .orb-halo { fill: var(--splash-dot); opacity: 0.18; }
-.orb-static .orb-core { fill: var(--splash-core); }
+.brand-home .ribbon { width: 40px; height: 15.5px; flex: none; }
+/* The mono ribbon: one colour (the surface's text), the back band at 60% (Vibely's white mark). */
+.ribbon-mono path { fill: currentColor; }
+.ribbon-mono .ribbon-back { fill-opacity: 0.6; }
 .crumbs { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; padding: 0 var(--s1); list-style: none; color: var(--muted); white-space: nowrap; }
 .crumbs li { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .crumbs li + li::before { content: "›"; color: var(--faint); margin-right: 6px; }

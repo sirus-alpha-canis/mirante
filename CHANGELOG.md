@@ -15,6 +15,10 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 - **The UI font is Nunito Sans** (3.101, one variable woff2, SIL OFL 1.1), Vibely's open
   sans, in place of Inter; JetBrains Mono stays for code and the terminal. Still bundled,
   still no network fetch.
+- **The mark is Vibely's ribbon** (used by permission of its owner; the code license does not
+  cover it) beside "Mirante", in the top bar, the launch splash and the app icon. The splash
+  draws the wordmark as outlines and the ribbon draws in once (no motion with reduced
+  motion), instead of the orbiting Orb-Dot.
 
 ## [0.2.0] — 2026-11-16
 

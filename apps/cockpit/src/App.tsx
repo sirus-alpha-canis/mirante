@@ -6,7 +6,7 @@ import { Grid } from "./components/Grid";
 import { Home } from "./components/Home";
 import { RulesPage } from "./components/Rules";
 import { Skills } from "./components/Skills";
-import { OrbMark, Splash } from "./components/Splash";
+import { RibbonMark, Splash } from "./components/Splash";
 import { UpdateBanner } from "./components/Restart";
 import { daemonState, StatusLine } from "./components/StatusLine";
 import { dismissSplash } from "./lib/splash";
@@ -613,7 +613,7 @@ export function App({ env: given }: { env: Env }) {
                 title={`${t("nav.home")} (${hints.home})`}
                 onClick={goHome}
               >
-                <OrbMark still />
+                <RibbonMark still />
                 <span className="brand-word" aria-hidden="true">
                   Mirante
                 </span>

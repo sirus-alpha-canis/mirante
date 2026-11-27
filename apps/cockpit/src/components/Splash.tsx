@@ -1,20 +1,31 @@
-/** The Orb-Dot mark with its orbiting satellites: the launch splash's (index.html, whose
- * <style> holds these classes and their animation; still with reduced motion). `still`:
- * the same mark without motion (the top bar's, styled in styles.css). */
-export function OrbMark({ still = false }: { still?: boolean }) {
+// The marks. The ribbon is Vibely's (src/assets/brand/, used by permission of its owner; the
+// code license does not cover it). The wordmark is "Mirante" in Nunito Sans Bold (wght 700),
+// outlined to one path so the launch splash needs no font. index.html draws both with the
+// same shapes before any script runs (splash.test.ts keeps them identical).
+
+const RIBBON_BACK = "M672.883 281.562C633.223 275.994 570.222 224.3 522.038 176.956C505.976 158.299 473.401 120.482 471.597 118.474C458.21 102.623 428.484 86.5598 396.582 85.7421C364.68 86.5598 334.815 102.623 321.428 118.474C319.624 120.482 287.048 158.299 270.987 176.956C222.803 224.3 159.801 275.994 120.141 281.562C84.6691 286.543 67.4546 278.42 57.5999 269.568C53.2633 263.818 51.2384 256.806 50.7188 247.278C92.9344 258.087 110.991 241.688 222.556 114.384L274.413 57.3577C317.376 17.6419 359.037 2.86572 396.582 3.00092C434.127 2.86572 475.649 17.6419 518.612 57.3577L570.469 114.384C682.034 241.688 700.09 258.087 742.306 247.278C741.786 256.806 739.762 263.818 735.425 269.568C725.57 278.42 708.356 286.543 672.883 281.562Z";
+const RIBBON_FRONT = "M616.759 8.1366C541.742 10.5181 494.112 76.0092 442.91 164.124C426.396 192.544 410.359 202.822 396.189 203.043C382.018 202.822 365.982 192.544 349.468 164.124C298.266 76.0092 250.636 10.5181 175.619 8.1366C70.6731 4.80499 -62.8344 161.898 57.7074 270.175C54.0994 266.042 53.0489 260.543 51.9854 253.635C44.0475 202.077 102.119 85.2578 174.172 86.6815C174.654 86.691 175.136 86.7058 175.619 86.7259C204.263 87.9194 245.159 124.592 308.983 237.951C335.532 285.104 366.777 300.388 396.189 300.996C425.601 300.388 456.846 285.104 483.394 237.951C547.218 124.592 588.115 87.9194 616.759 86.7259C617.403 86.6991 618.045 86.6818 618.687 86.6738C687.886 85.7959 745.306 192.804 742.379 246.473C742.25 248.833 741.994 251.155 741.612 253.393C740.549 260.301 738.278 266.042 734.67 270.175C855.212 161.898 721.705 4.80499 616.759 8.1366Z";
+const WORDMARK = "M79 0V-705H186L452 -214H420L685 -705H790V0H674V-515H696L472 -107H397L171 -516H195V0ZM925 -594V-716H1065V-594ZM933 0V-489H1058V0ZM1188 0V-489H1310V-371H1300Q1314 -431 1355 -462.5Q1396 -494 1464 -499L1502 -502L1510 -396L1438 -389Q1377 -383 1346 -351.5Q1315 -320 1315 -263V0ZM1736 10Q1683 10 1641.5 -10.5Q1600 -31 1576.5 -66Q1553 -101 1553 -145Q1553 -199 1581 -230.5Q1609 -262 1672 -276Q1735 -290 1841 -290H1891V-218H1842Q1795 -218 1763 -214.5Q1731 -211 1711.5 -203.5Q1692 -196 1683.5 -183Q1675 -170 1675 -151Q1675 -118 1698 -97Q1721 -76 1762 -76Q1795 -76 1820.5 -91.5Q1846 -107 1861 -134Q1876 -161 1876 -196V-311Q1876 -361 1854 -383Q1832 -405 1780 -405Q1739 -405 1696 -392.5Q1653 -380 1609 -354L1573 -439Q1599 -457 1634.5 -470.5Q1670 -484 1709.5 -491.5Q1749 -499 1784 -499Q1856 -499 1902.5 -477Q1949 -455 1972 -410.5Q1995 -366 1995 -296V0H1878V-104H1886Q1879 -69 1858.5 -43.5Q1838 -18 1807 -4Q1776 10 1736 10ZM2122 0V-489H2244V-391H2233Q2255 -444 2301.5 -471.5Q2348 -499 2407 -499Q2466 -499 2504.1652173913044 -477.1521739130435Q2542.330434782609 -455.30434782608694 2561.1652173913044 -410.51630434782606Q2580 -365.7282608695652 2580 -298V0H2455V-292Q2455 -330 2445.5 -354Q2436 -378 2416.5 -389.5Q2397 -401 2367 -401Q2331 -401 2303.823529411765 -385.52Q2276.6470588235293 -370.04 2261.823529411765 -341.6Q2247 -313.15999999999997 2247 -275V0ZM2931 10Q2833 10 2785 -39Q2737 -88 2737 -182V-395H2643V-489H2737V-635H2862V-489H3010V-395H2862V-189Q2862 -141 2883 -117Q2904 -93 2951 -93Q2965 -93 2980 -96.5Q2995 -100 3011 -104L3030 -12Q3012 -2 2984.5 4Q2957 10 2931 10ZM3327 10Q3244 10 3184 -21Q3124 -52 3091.5 -109Q3059 -166 3059 -244Q3059 -320 3090.5 -377Q3122 -434 3177.5 -466.5Q3233 -499 3304 -499Q3374 -499 3424 -469Q3474 -439 3501.5 -384Q3529 -329 3529 -253V-216H3160V-288H3441L3425 -273Q3425 -341 3395 -377.5Q3365 -414 3309 -414Q3267 -414 3237.5 -394.5Q3208 -375 3192.5 -339.5Q3177 -304 3177 -255V-248Q3177 -193 3194 -157Q3211 -121 3245 -103Q3279 -85 3329 -85Q3370 -85 3411 -97.5Q3452 -110 3486 -137L3521 -53Q3486 -24 3433 -7Q3380 10 3327 10Z";
+
+/** The two-tone ribbon (back band #650C10, the front over it #A8141B). Its draw-in is the
+ * launch splash's (index.html's <style>; none with reduced motion). `still`: no draw-in (the
+ * top bar's). `tone="mono"`: one colour, currentColor, the back at 60% (for a dark or tinted
+ * surface where the reds would not hold). */
+export function RibbonMark({ still = false, tone = "brand" }: { still?: boolean; tone?: "brand" | "mono" }) {
+  const cls = ["ribbon", still && "ribbon-still", tone === "mono" && "ribbon-mono"].filter(Boolean).join(" ");
   return (
-    <svg className={still ? "orb orb-static" : "orb"} viewBox="0 0 80 80" aria-hidden="true">
-      <circle className="orb-ring" cx="40" cy="40" r="28" />
-      <g className="orb-sats">
-        <line x1="40" y1="40" x2="40" y2="12" opacity="0.25" />
-        <line x1="40" y1="40" x2="68" y2="46" opacity="0.15" />
-        <line x1="40" y1="40" x2="14" y2="58" opacity="0.12" />
-        <circle cx="40" cy="12" r="3" stroke="none" />
-        <circle cx="68" cy="46" r="2.5" stroke="none" opacity="0.7" />
-        <circle cx="14" cy="58" r="2.5" stroke="none" opacity="0.5" />
-      </g>
-      <circle className="orb-halo" cx="40" cy="40" r="10" />
-      <circle className="orb-core" cx="40" cy="40" r="5" />
+    <svg className={cls} viewBox="10 3 772.4 298" aria-hidden="true">
+      <path className="ribbon-back" fill="#650C10" d={RIBBON_BACK} />
+      <path className="ribbon-front" fill="#A8141B" d={RIBBON_FRONT} />
+    </svg>
+  );
+}
+
+/** "Mirante", outlined (currentColor). */
+export function Wordmark() {
+  return (
+    <svg className="wordmark" viewBox="79 -716 3450 726" aria-hidden="true">
+      <path fill="currentColor" d={WORDMARK} />
     </svg>
   );
 }
@@ -23,8 +34,8 @@ export function OrbMark({ still = false }: { still?: boolean }) {
 export function Splash({ text }: { text: string }) {
   return (
     <div className="splash splash-inline" role="status" aria-live="polite" aria-label={text}>
-      <OrbMark />
-      <span className="splash-word">Mirante</span>
+      <RibbonMark />
+      <Wordmark />
       <p className="splash-note">{text}</p>
     </div>
   );
