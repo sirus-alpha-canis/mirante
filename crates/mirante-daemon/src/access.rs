@@ -130,6 +130,12 @@ pub const ACCESS: &[(&str, Access)] = &[
     (method::SKILL_REPO_ORIGIN, Access::Person),
     // Reads the person's own agent configuration (home folder): never an agent's.
     (method::RULES_LAYERS, Access::Person),
+    // A person's attachments: bytes they pasted, files they dropped or picked (any path
+    // they name, read by the daemon). Never an agent's: it would copy files into a place
+    // another session reads, or read paths the agent's sandbox does not reach.
+    (method::ATTACHMENT_PUT, Access::Person),
+    (method::ATTACHMENT_IMPORT, Access::Person),
+    (method::ATTACHMENT_REMOVE, Access::Person),
 ];
 
 /// Who may call `m`: its [`ACCESS`] entry, or a person only when it has none.
@@ -252,6 +258,20 @@ mod tests {
         let unverified = Identity::Unverified("x".into());
         assert_eq!(check(method::RULES_LAYERS, &unverified).unwrap_err().code, code::FORBIDDEN);
         assert!(check(method::RULES_LAYERS, &Identity::Person).is_ok());
+    }
+
+    /// Attachments are a person's: an agent (even for its own task) or an unverified caller
+    /// never stores, imports or removes one.
+    #[test]
+    fn attachments_are_a_persons_only() {
+        let agent = Identity::Agent { task: Some("t".into()) };
+        let unverified = Identity::Unverified("x".into());
+        for m in [method::ATTACHMENT_PUT, method::ATTACHMENT_IMPORT, method::ATTACHMENT_REMOVE] {
+            assert_eq!(access_of(m), Access::Person, "{m}");
+            assert_eq!(check(m, &agent).unwrap_err().code, code::FORBIDDEN, "{m}");
+            assert_eq!(check(m, &unverified).unwrap_err().code, code::FORBIDDEN, "{m}");
+            assert!(check(m, &Identity::Person).is_ok(), "{m}");
+        }
     }
 
     #[test]

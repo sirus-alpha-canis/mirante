@@ -793,6 +793,9 @@ export const M = {
   skillReview: "skill.review",
   skillAction: "skill.action",
   rulesLayers: "rules.layers",
+  attachmentPut: "attachment.put",
+  attachmentImport: "attachment.import",
+  attachmentRemove: "attachment.remove",
 } as const;
 
 /** `task.file`: what the daemon read (`FileView`). */

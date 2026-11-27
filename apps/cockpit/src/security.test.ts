@@ -243,6 +243,9 @@ describe("Tauri security baseline", () => {
       "TASK_SPAWN_PROPOSALS",
       "TASK_SPAWN_REVIEW",
       "RULES_LAYERS",
+      "ATTACHMENT_PUT",
+      "ATTACHMENT_IMPORT",
+      "ATTACHMENT_REMOVE",
     ]);
     // Never the agent's orchestrator methods: proposing and reading children go through its
     // `mirante-orchestrator` MCP server; the cockpit only decides.

@@ -2,6 +2,7 @@
 //! task (agent process + status engine), serves the Unix socket, and turns hook events,
 //! transcript lines and Codex notifications into persisted status, turns and permissions.
 pub mod access;
+pub mod attachments;
 pub mod diff;
 pub mod driver;
 pub mod hub;

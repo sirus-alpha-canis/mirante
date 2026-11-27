@@ -159,6 +159,16 @@ pub mod method {
     /// Every instruction layer an agent session reads, in load order, for a checkout or a
     /// task ([`super::RulesParams`] → [`super::RulesView`]). Read-only; a person only.
     pub const RULES_LAYERS: &str = "rules.layers";
+    /// Bytes a person pasted (an image, a long text) stored as a task's attachment, HAR and
+    /// text files redacted ([`super::AttachmentPut`] → [`super::AttachmentView`]). A person
+    /// only.
+    pub const ATTACHMENT_PUT: &str = "attachment.put";
+    /// A file a person dropped or picked, copied into the task's attachments (a regular file,
+    /// never a symlink, never inside Mirante's home; redacted like `attachment.put`)
+    /// ([`super::AttachmentImport`] → [`super::AttachmentView`]). A person only.
+    pub const ATTACHMENT_IMPORT: &str = "attachment.import";
+    /// Deletes an attachment not sent yet ([`super::AttachmentRemove`] → `{}`). A person only.
+    pub const ATTACHMENT_REMOVE: &str = "attachment.remove";
     /// Notification carrying one `mirante_core::model::Event`.
     pub const EVENT: &str = "event";
     /// A repo's memory: enabled, counts, HEAD ([`super::DnaRef`] → [`super::DnaStatus`]).
@@ -1127,6 +1137,50 @@ pub struct TaskFiles {
     /// Default 30, at most 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+/// `attachment.put`: `name` is the file's name as the person's clipboard gave it (only its
+/// sanitised basename is kept), `b64` its bytes in standard base64.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentPut {
+    pub task: String,
+    pub name: String,
+    pub b64: String,
+}
+
+/// `attachment.import`: an absolute path the person dropped or picked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentImport {
+    pub task: String,
+    pub path: String,
+}
+
+/// `attachment.remove`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentRemove {
+    pub task: String,
+    pub id: String,
+}
+
+/// What an attachment is: an image (PNG, JPEG, GIF or WebP by its magic bytes) or any
+/// other file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+    File,
+}
+
+/// A stored attachment. `path` is absolute (what the agent reads); `name` the sanitised
+/// name shown; `bytes` the stored size; `redacted` how many secrets were removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentView {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub kind: AttachmentKind,
+    pub bytes: u64,
+    pub redacted: u32,
 }
 
 /// `task.file` parameters: `path` is relative to where the agent runs (the worktree, or a

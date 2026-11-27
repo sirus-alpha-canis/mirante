@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 
 use crate::driver::{Driver, DriverError, DriverEvent, DriverFactory};
 
+pub mod attachments;
 pub mod dna;
 pub(crate) mod evidence;
 pub mod files;
@@ -394,6 +395,8 @@ pub struct Hub {
     /// `rules.layers`: where the agents' files are (tests point it at a fake home; else
     /// the daemon's environment, read per call).
     pub(crate) rules_homes: Option<crate::rules::Homes>,
+    /// A person's attachments, by task (see [`attachments`]).
+    pub(crate) attachments: Mutex<attachments::Registry>,
 }
 
 /// Removes `<home>/sessions/<task>/` (MCP config, skill bundles, agent logs) of a task that
@@ -647,6 +650,7 @@ impl Hub {
             skill_sigs: Mutex::default(),
             miner: Mutex::default(),
             rules_homes: None,
+            attachments: Mutex::default(),
         };
         Ok((hub, rx))
     }

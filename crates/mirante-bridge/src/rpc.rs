@@ -105,6 +105,13 @@ pub const ALLOWED: &[&str] = &[
     // the daemon picks the files from the agent's known locations, never a path the caller
     // names, and masks secrets).
     method::RULES_LAYERS,
+    // Attachments in the composers: bytes the person pasted (`attachment.put`), a file they
+    // dropped or picked (`attachment.import`: unlike `skill.add`'s folder, the daemon copies
+    // one regular file, never a symlink, never inside Mirante's home, HAR and text redacted,
+    // into the task's attachments folder), and removing one not sent yet.
+    method::ATTACHMENT_PUT,
+    method::ATTACHMENT_IMPORT,
+    method::ATTACHMENT_REMOVE,
 ];
 
 /// `session.start` waits for the agent to boot (up to 45 s in the daemon).
@@ -254,6 +261,9 @@ mod tests {
             "task.spawn_proposals",
             "task.spawn_review",
             "rules.layers",
+            "attachment.put",
+            "attachment.import",
+            "attachment.remove",
         ];
         assert_eq!(ALLOWED, expected);
     }
