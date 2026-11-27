@@ -211,6 +211,13 @@ More detail, including the fake daemon for UI work without agents:
   files pass the same redaction. In the **Terminal** tab, ⌘V of an image or a drop types the
   stored file's path, as a terminal does. Files live in the task's folder under
   `~/.mirante/sessions/` and go when the task is archived.
+- **Side pane (⌘\\).** Tabs beside the task (up to eight, remembered per task; **Split**
+  shows two). **+** adds a **Terminal**: your own login shell in the task's worktree (up to
+  four per task), separate from the agent's; Mirante never types into it, closing its tab
+  ends it, and archiving the task or stopping the daemon ends it too (it does not come back
+  after a daemon restart: the tab says so, with **Restart**). **+ → File…** opens a file
+  through quick-open in a new tab. A PDF shows its size and pages with **Open in Preview**.
+  The `mirante` CLI run from inside a worktree counts as an agent (worktrees are agent-written).
 - **Grid (⌘G)** shows every agent at once.
 - **Brain (⌘B)** is the repo memory graph and its review queue.
 - **Skills (⌘L)** lists the skill library and its proposals.

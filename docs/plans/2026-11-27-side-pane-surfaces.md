@@ -67,13 +67,23 @@
 - [ ] S3: MJPEG bandwidth/CPU at 30 fps through a Tauri Channel.
 
 ### Batch A — "+" menu, tabs, Terminal, File
-- [ ] 1. `lib/sidepane.ts` tabs/split/migration (tests: migrates single target, drops bad tabs, caps at 8, split ratio clamps).
-- [ ] 2. `SidePane.tsx` + new `PaneTabs.tsx`: tab strip, "+" menu, split (tests: + opens each surface, tabs persist per task, Escape closes menu).
-- [ ] 3. Daemon `hub/shells.rs`, `mirante-ipc` types, `ACCESS` (tests: `shell_env_has_no_agent_markers`, `shell_is_not_a_live_session`, `archive_kills_shells`, `fifth_shell_refused`, `$SHELL not in /etc/shells falls back`, `shells_are_a_persons_only`).
-- [ ] 4. `shell.attach` server stream; bridge `attach.rs` `Target::{Task,Shell}`; Tauri commands pinned in `security.test.ts`.
-- [ ] 5. `TerminalTab` `source` prop + "Shell ended / Restart".
-- [ ] 6. File tabs + PDF `Kind` (`pdf_detected_by_magic_not_extension`); pinned `open_path_external` with a daemon-resolved path.
-- [ ] 7. i18n `pane.add.*`, `shell.*` (en, pt).
+- [x] 1. `lib/sidepane.ts` tabs/split/migration (tests: migrates single target, drops bad tabs, caps at 8, split ratio clamps).
+- [x] 2. `SidePane.tsx` + new `PaneTabs.tsx`: tab strip, "+" menu, split (tests: + opens each surface, tabs persist per task, Escape closes menu).
+- [x] 3. Daemon `hub/shells.rs`, `mirante-ipc` types, `ACCESS` (tests: `shell_env_has_no_agent_markers`, `shell_is_not_a_live_session`, `archive_kills_shells`, `fifth_shell_refused`, `$SHELL not in /etc/shells falls back`, `shells_are_a_persons_only`).
+- [x] 4. `shell.attach` server stream; bridge `attach.rs` `Target::{Task,Shell}`; Tauri commands pinned in `security.test.ts`.
+- [x] 5. `TerminalTab` `source` prop + "Shell ended / Restart".
+- [x] 6. File tabs + PDF `Kind` (`pdf_detected_by_magic_not_extension`); pinned `open_path_external` with a daemon-resolved path.
+- [x] 7. i18n `pane.add.*`, `shell.*` (en, pt).
+
+**As built (Batch A, 2026-11-27):**
+- *Pane model* (`lib/sidepane.ts`): `PaneState {open, width, tabs, active, split, swapped}`; the old `target` field is gone (`activeTarget(p)` reads it). Helpers `openTab` (same target → focus its tab, a file's line updated; else reuse the shown tab unless it is a shell or `fresh`; past 8 the oldest tab that is neither shown, beside nor a shell goes), `closeTab`, `focusTab` (the split's second clicked → they swap), `toggleSplit` (active + next/previous), `freeShell`, `clampRatio` (20..80%). Tab ids are `t<n>`.
+- *"+" menu* (`PaneTabs.tsx`) has **Terminal** and **File…** only; Browser and Device join in Batches B and C. Keyboard: ↓ opens it, ↑/↓ move, Escape closes (shared `useDismiss`) and focus returns to "+". Tabs: WAI-ARIA tablist with ←/→/Home/End, × per tab. Split: one button, row direction only from the UI (the model keeps `col`).
+- *Daemon* (`hub/shells.rs`): `shell.open {task, n, repo?, rows, cols}` — the plan's `{task, repo?, rows, cols}` gained `n` (1..4) so a cockpit that restarts finds its tab's shell again through `shell.list` (`ShellView {shell, task, n, cwd}`). A workspace task's shell starts in the workspace folder, or in `repo`'s worktree when named (the cockpit does not offer the repo choice yet). Exited shells are pruned lazily (list/open/attach). `Hub::identify` is unchanged; `task_of_tree` / `task_of_tty` became `pub(crate)` only so the test `shell_is_not_a_live_session` can call them. The env scrub removes every `MIRANTE_*`, `MIRANTE_TASK`/`MIRANTE_TASK_ID`/`MIRANTE_SESSION_ID` (even when the daemon has none), `NESTED_SESSION_ENV` and `SCRUB_PREFIXES`; credentials stay (it is the person's shell). Shutdown ends shells first (`close_all_shells`).
+- *Stream*: `server.rs` shares one `pipe()` between `attach` and `shell.attach` (detach before joining the output pump). Bridge `attach::Target::{Task, Shell}` with `open_target`; `open` stays for tasks. Tauri `shell_attach_open(shell, rows, cols, on_msg)`; writes/acks/close reuse `attach_write/ack/close`. `shell.open/resize/close/list` are in the bridge allowlist; `shell.attach` is not (both pinned in `rpc.rs` and `security.test.ts`).
+- *TerminalTab* takes `source: {kind:"task"} | {kind:"shell", shell, n, onEnd}`. A shell's stream ending calls `onEnd` (no re-attach loop, no boot/connection kicks); files pasted or dropped into a shell are not stored as attachments (a text paste is xterm's). `ShellTab.tsx` lists, then attaches to a running shell, starts one only for a tab just added with "+" (`markFresh`), else shows "Shell ended" + Restart. Closing a shell's tab calls `shell.close`.
+- *PDF*: `worktree_file::Kind::Pdf {pages}` by `%PDF-` (read past the 2 MiB cap up to `pdf_max` 20 MiB; page count from `/Type /Page` objects, `None` when compressed). IPC `FileKind::Pdf` + `FileView.pages`. Tauri `open_path_external(task, path)` asks `task.file {stat}`, refuses anything the daemon does not call a PDF, re-checks the path, runs `/usr/bin/open -a Preview -- <abs>` with a cleared environment.
+- *Not done in Batch A*: memguard does not report shells as `kind: shell` yet (shells are outside `live`, so they are never hibernated); suggested in Batch C's memguard step.
+- Tests: daemon `hub::shells` (8, incl. the six the plan names, `$SHELL` fallback as `shell_not_in_etc_shells_falls_back`), `access::shells_are_a_persons_only`, `server::shell_attach_streams_the_persons_shell_both_ways`, `files::task_file_names_a_pdf…`; core `pdf_detected_by_magic_not_extension`; bridge `a_shell_attaches_through_shell_attach…`; Tauri `only_a_pdf_the_daemon_resolved_opens_in_preview`; cockpit sidepane (6 new), Detail side pane (5 new), TerminalTab shell source (2), FileView PDF/SVG (2). Founder checklist: `docs/dogfood/side-pane-surfaces.md`.
 
 ### Batch B — Browser
 - [ ] 1. CSP `frame-src`; `security.test.ts` asserts the exact `frame-src` and that no capability has `remote`.

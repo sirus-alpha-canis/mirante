@@ -6,6 +6,17 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Added
+
+- **Side pane tabs and a "+" menu.** The side pane keeps tabs per task (up to eight, and
+  one split side by side); a pane saved before tabs comes back as one tab. **+ → Terminal**
+  opens your own login shell in the task's worktree (`$SHELL` when `/etc/shells` lists it,
+  else zsh; up to four per task). It is not an agent session: no agent markers in its
+  environment, never in the live sessions, never resumed; closing its tab, archiving the
+  task or stopping the daemon ends it with everything it started. **+ → File…** quick-opens
+  a file into a new tab (an open file focuses its tab). A PDF (by its `%PDF-` bytes, up to
+  20 MB) shows its size and page count with **Open in Preview**; SVG stays text.
+
 ## [0.3.0] — 2026-11-27
 
 ### Added
