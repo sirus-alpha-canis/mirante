@@ -145,7 +145,9 @@ pub fn check_mode(response: &Value) -> Result<(), String> {
 
 /// The images a message names in its attachment lines (`[Attached image "<name>": <path>]`,
 /// written by the hub): only files directly in `dir` (the task's attachments folder) that
-/// are regular files now, so a line typed to look like one never hands Codex another path.
+/// are regular files now and start like an image (PNG, JPEG, GIF, WebP: the hub's own
+/// check), so a line typed to look like one never hands Codex another path or a file that
+/// is no image.
 pub fn local_images(text: &str, dir: &Path) -> Vec<String> {
     const OPEN: &str = "[Attached image \"";
     text.lines()
@@ -153,10 +155,28 @@ pub fn local_images(text: &str, dir: &Path) -> Vec<String> {
             let rest = &line[line.find(OPEN)? + OPEN.len()..];
             let path = rest.split_once("\": ")?.1.strip_suffix(']')?;
             let p = Path::new(path);
-            let regular = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
-            (p.parent() == Some(dir) && regular).then(|| path.to_string())
+            (p.parent() == Some(dir) && starts_like_an_image(p)).then(|| path.to_string())
         })
         .collect()
+}
+
+/// Whether `p` is a regular file (not followed when a symlink) whose first bytes are an
+/// image's magic ([`crate::attachments::is_image`]).
+fn starts_like_an_image(p: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(p)
+    else {
+        return false;
+    };
+    if !f.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut head = Vec::with_capacity(16);
+    f.take(16).read_to_end(&mut head).is_ok() && crate::attachments::is_image(&head)
 }
 
 /// A message's `input` items: its text, then one `localImage` item per image (Codex 0.167
@@ -1567,6 +1587,9 @@ mod tests {
         std::fs::write(&log, b"ok").unwrap();
         let outside = d.path().join("elsewhere.png");
         std::fs::write(&outside, b"\x89PNG\r\n\x1a\n").unwrap();
+        // In the folder, named like an image, but text; and a symlink to the image.
+        std::fs::write(dir.join("3-fake.png"), b"not an image").unwrap();
+        std::os::unix::fs::symlink(&img, dir.join("4-link.png")).unwrap();
         let s = |p: &Path| p.to_string_lossy().into_owned();
         (d, dir.clone(), s(&img), s(&log), s(&outside))
     }
@@ -1587,6 +1610,11 @@ mod tests {
         let only = mirante_core::delivery::label_operator(&format!("[Attached image \"shot.png\": {img}]"));
         assert_eq!(local_images(&only, &dir), std::slice::from_ref(&img));
         assert!(local_images("[Attached image \"a\": /nowhere]", &dir).is_empty());
+        // A non-image in the folder, a symlink, the log under an image line: no item.
+        for f in ["3-fake.png", "4-link.png", "2-app.log"] {
+            let line = format!("[Attached image \"{f}\": {}]", dir.join(f).display());
+            assert!(local_images(&line, &dir).is_empty(), "{f}");
+        }
         let p = turn_start_params("th", Some("skills"), "t", std::slice::from_ref(&img), "c", &json!({}));
         assert_eq!(
             p["input"],
