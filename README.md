@@ -204,6 +204,13 @@ More detail, including the fake daemon for UI work without agents:
   the live terminal. **Diff** shows the task's changes. **Memory** shows the repo notes
   relevant to the task, the notes its branch puts at risk, and what it proposed. The
   composer's arrow steers now (⌘↵); ⌥-click or ⌥↵ queues for the turn end.
+- **Attachments.** Paste a screenshot (⌘V), drop files from Finder or pick them with the
+  paperclip, in the goal field, the message composer and a group child's steer box. The
+  agent gets each file's path (Codex also gets images as images). A `.har` has its cookies,
+  auth headers and tokens removed before it is stored, and the chip says how many; text
+  files pass the same redaction. In the **Terminal** tab, ⌘V of an image or a drop types the
+  stored file's path, as a terminal does. Files live in the task's folder under
+  `~/.mirante/sessions/` and go when the task is archived.
 - **Grid (⌘G)** shows every agent at once.
 - **Brain (⌘B)** is the repo memory graph and its review queue.
 - **Skills (⌘L)** lists the skill library and its proposals.

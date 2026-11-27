@@ -6,6 +6,20 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+### Added
+
+- **Attachments: paste, drop and pick images and files.** In the goal field, the message
+  composer and a group child's steer box: ⌘V of a screenshot or a file, a drop from Finder,
+  or the paperclip. Each file shows as a chip (a thumbnail for an image, its size, ×
+  to remove). The daemon stores it in the task's own folder (mode 0600; an image up to 10
+  MB, any other file up to 25 MB, 20 per message) and the agent gets its path as an
+  operator-supplied line; Codex also gets each image as a `localImage` input, and Claude may
+  read that one folder. **A `.har` is redacted before it is stored** (cookies, auth and
+  session headers, credential query parameters, tokens anywhere), as are text files; the
+  chip says "N secrets removed". In the **Terminal** tab a pasted or dropped file is stored
+  the same way and its quoted path typed in (inside bracketed paste when the program asked
+  for it). After a daemon restart the chips clear and ask you to attach again.
+
 ### Changed
 
 - **The cockpit takes Vibely's palette** (neutral greys; the state colours from Vibely's
