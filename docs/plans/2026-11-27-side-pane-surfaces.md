@@ -86,7 +86,7 @@
 - Tests: daemon `hub::shells` (8, incl. the six the plan names, `$SHELL` fallback as `shell_not_in_etc_shells_falls_back`), `access::shells_are_a_persons_only`, `server::shell_attach_streams_the_persons_shell_both_ways`, `files::task_file_names_a_pdf…`; core `pdf_detected_by_magic_not_extension`; bridge `a_shell_attaches_through_shell_attach…`; Tauri `only_a_pdf_the_daemon_resolved_opens_in_preview`; cockpit sidepane (6 new), Detail side pane (5 new), TerminalTab shell source (2), FileView PDF/SVG (2). Founder checklist: `docs/dogfood/side-pane-surfaces.md`.
 
 ### Batch B — Browser
-- [ ] 1. CSP `frame-src`; `security.test.ts` asserts the exact `frame-src` and that no capability has `remote`.
+- [x] 1. CSP `frame-src`; `security.test.ts` asserts the exact `frame-src` and that no capability has `remote`.
 - [ ] 2. `BrowserTab.tsx` + `lib/localurl.ts` (tests: refuses https, other hosts, userinfo, missing port, file:; exact sandbox flags).
 - [ ] 3. Framing-refused fallback; optional port suggestions.
 

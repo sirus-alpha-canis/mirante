@@ -1,4 +1,5 @@
-// The desktop shell's attack surface, pinned: a CSP with no remote origins or eval, and
+// The desktop shell's attack surface, pinned: a CSP with no remote origins or eval (frames: only a
+// dev server on localhost or 127.0.0.1), and
 // capabilities limited to notifications, opening github.com and localhost pages, the native picker and event listening (Finder drops). Widening either
 // must be a deliberate edit of this test.
 import { describe, expect, it } from "vitest";
@@ -26,7 +27,13 @@ describe("Tauri security baseline", () => {
     expect(directive("default-src")).toBe("default-src 'self'");
     expect(directive("script-src")).toBe("script-src 'self'");
     expect(directive("connect-src")).toBe("connect-src ipc: http://ipc.localhost");
-    expect(csp).not.toMatch(/unsafe-eval|https?:\/\/(?!ipc\.localhost)|\*/);
+    // Outside frame-src (below), no remote origin and no wildcard anywhere.
+    const rest = csp
+      .split(";")
+      .map((d) => d.trim())
+      .filter((d) => !d.startsWith("frame-src "))
+      .join("; ");
+    expect(rest).not.toMatch(/unsafe-eval|https?:\/\/(?!ipc\.localhost)|\*/);
     expect(directive("object-src")).toBe("object-src 'none'");
     // Fonts are the app's own files (bundled, never a font CDN).
     expect(directive("font-src")).toBe("font-src 'self'");
@@ -50,6 +57,28 @@ describe("Tauri security baseline", () => {
     expect(bundled).toEqual(["Nunito Sans", "JetBrains Mono", "JetBrains Mono"]);
     for (const [name, text] of [["styles.css", css], ["index.html", page]] as const) expect(text, name).not.toMatch(/\bInter\b/);
     expect(page).toContain('font-family: "Nunito Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;');
+  });
+
+  it("frames show only a dev server on this machine (the Browser tab); nothing else frames", () => {
+    // frame-src also governs every navigation inside the frame, so a link to the internet
+    // never loads there. [::1] is not in it: CSP host sources cannot name an IPv6 literal.
+    expect(directive("frame-src")).toBe("frame-src http://localhost:* http://127.0.0.1:*");
+    expect(csp.match(/frame-src/g)).toHaveLength(1);
+    expect(csp).not.toMatch(/child-src|worker-src|navigate-to/);
+    expect(conf.app.security.devCsp).toContain("; frame-src http://localhost:* http://127.0.0.1:*;");
+  });
+
+  it("no capability is granted to a remote origin, so a framed dev server gets no IPC", () => {
+    // Tauri 2 answers an invoke from a page that is not the app (tauri://localhost, or the
+    // devUrl in dev) as Origin::Remote; only a capability with `remote.urls` allows one. A
+    // capability added from Rust would bypass this file: there is none.
+    const files = import.meta.glob("../src-tauri/capabilities/*", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+    expect(Object.keys(files)).toEqual(["../src-tauri/capabilities/default.json"]);
+    for (const [name, text] of Object.entries(files)) {
+      expect(JSON.parse(text), name).not.toHaveProperty("remote");
+      expect(text, name).not.toMatch(/"remote"/);
+    }
+    expect(shell).not.toMatch(/add_capability|CapabilityBuilder|\.remote\(/);
   });
 
   it("the dev policy only adds what Vite's dev server needs", () => {
