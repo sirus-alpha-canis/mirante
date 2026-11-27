@@ -140,6 +140,13 @@ describe("styles", () => {
       expect(css).not.toMatch(/\.thread-card \{[^}]*border-left: 3px solid var\(--work\)/);
     });
 
+    it("a Brain node's state paints its circle only: an unreviewed note's label is not stroked", () => {
+      for (const state of ["fresh", "stale", "unverifiable", "unreviewed"]) {
+        const sel = new RegExp(`^([^{}]*\\.node-${state}[^{}]*) \\{`, "m").exec(css)?.[1] ?? "";
+        expect(sel, state).toBe(`circle.node-${state}, .brain-node.node-${state} circle`);
+      }
+    });
+
     it("no gradients anywhere", () => {
       expect(css).not.toMatch(/gradient\(/);
     });

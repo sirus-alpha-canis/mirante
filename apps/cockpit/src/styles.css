@@ -584,10 +584,10 @@ textarea.dna-input { resize: vertical; font-family: var(--mono); font-size: var(
 .brain-node { cursor: pointer; }
 .brain-node:focus { outline: none; }
 .brain-node:focus-visible circle, .node-selected circle { stroke: var(--focus); stroke-width: 3; }
-.node-fresh, .brain-node.node-fresh circle { fill: var(--review); }
-.node-stale, .brain-node.node-stale circle { fill: var(--needs); }
-.node-unverifiable, .brain-node.node-unverifiable circle { fill: var(--faint); }
-.node-unreviewed, .brain-node.node-unreviewed circle { stroke: var(--muted); stroke-width: 2.5; stroke-dasharray: 3 2; fill-opacity: 0.35; }
+circle.node-fresh, .brain-node.node-fresh circle { fill: var(--review); }
+circle.node-stale, .brain-node.node-stale circle { fill: var(--needs); }
+circle.node-unverifiable, .brain-node.node-unverifiable circle { fill: var(--faint); }
+circle.node-unreviewed, .brain-node.node-unreviewed circle { stroke: var(--muted); stroke-width: 2.5; stroke-dasharray: 3 2; fill-opacity: 0.35; }
 .node-retired, .brain-node.node-retired { opacity: 0.4; }
 .node-ghost { fill: var(--panel); stroke: var(--faint); stroke-dasharray: 2 2; }
 .brain-node.node-hit circle { stroke: var(--work); stroke-width: 3; }
