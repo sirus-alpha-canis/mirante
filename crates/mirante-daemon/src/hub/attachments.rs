@@ -19,8 +19,10 @@ pub(crate) struct Known {
     view: AttachmentView,
     /// The stored file's name in the task's attachments folder.
     file: String,
-    /// A message or a goal carried it: it is no longer removable.
+    /// A message or a goal carrying it reached the agent: it is no longer removable.
     sent: bool,
+    /// How many queued messages carry it: not removable while one does.
+    queued: u32,
 }
 
 /// Attachments by task id, then by id.
@@ -89,7 +91,7 @@ impl Hub {
             bytes: s.bytes,
             redacted: p.redacted,
         };
-        let known = Known { view: view.clone(), file: s.file, sent: false };
+        let known = Known { view: view.clone(), file: s.file, sent: false, queued: 0 };
         reg.0.entry(task_id.to_string()).or_default().push(known);
         Ok(view)
     }
@@ -120,6 +122,12 @@ impl Hub {
         };
         if k.sent {
             return Err(HubError::Conflict(format!("attachment {} was sent: the agent may read it", k.view.name)));
+        }
+        if k.queued > 0 {
+            return Err(HubError::Conflict(format!(
+                "attachment {} is in a queued message: remove that message first",
+                k.view.name
+            )));
         }
         let file = k.file.clone();
         store::unlink(self.paths.home(), &task_id, &file).map_err(HubError::Invalid)?;
@@ -167,13 +175,39 @@ impl Hub {
         Ok(c)
     }
 
-    /// Attachments `ids` of task `task_id` were handed to a message or a goal: no longer
-    /// removable.
+    /// Attachments `ids` of task `task_id` were handed to the agent (a steered message, a
+    /// goal): no longer removable.
     pub(crate) fn mark_sent(&self, task_id: &str, ids: &[String]) {
         let mut reg = self.attachments.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(list) = reg.0.get_mut(task_id) {
             list.iter_mut().filter(|k| ids.contains(&k.view.id)).for_each(|k| k.sent = true);
         }
+    }
+
+    /// A queued message carrying `ids` joined (`held`) or left unsent (`!held`) the queue
+    /// of task `task_id`. One that is delivered keeps holding them (never removable again).
+    /// Called under the hub lock (the order is always hub, then registry).
+    pub(crate) fn hold_attachments(&self, task_id: &str, ids: &[String], held: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut reg = self.attachments.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(list) = reg.0.get_mut(task_id) {
+            for k in list.iter_mut().filter(|k| ids.contains(&k.view.id)) {
+                k.queued = if held { k.queued.saturating_add(1) } else { k.queued.saturating_sub(1) };
+            }
+        }
+    }
+
+    /// Drops task `task_id`'s attachments from the registry (archived: the files went with
+    /// its session dir).
+    pub(crate) fn forget_attachments(&self, task_id: &str) {
+        self.attachments.lock().unwrap_or_else(|p| p.into_inner()).0.remove(task_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_attachments(&self, task_id: &str) -> usize {
+        self.attachments.lock().unwrap_or_else(|p| p.into_inner()).0.get(task_id).map_or(0, Vec::len)
     }
 }
 
@@ -400,6 +434,36 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_message_holds_its_attachments_until_it_is_removed_unsent() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Claude, "feat/q").task;
+        // A running turn: queued messages wait for its end.
+        k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
+        let a =
+            k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "a.txt".into(), b64: b64(b"a") }).unwrap();
+        let mode = mirante_ipc::types::SendMode::Queue;
+        let m = |ids: Vec<String>| mirante_ipc::types::SendMessage {
+            task: t.id.clone(),
+            text: "x".into(),
+            mode,
+            attachments: ids,
+        };
+        let r = k.hub.send(m(vec![a.id.clone()])).unwrap();
+        assert_eq!(r.delivered, mirante_ipc::types::SendMode::Queue);
+        let r2 = k.hub.send(m(vec![a.id.clone()])).unwrap();
+        assert_eq!(r2.delivered, mirante_ipc::types::SendMode::Queue);
+        let remove = || k.hub.attachment_remove(AttachmentRemove { task: t.id.clone(), id: a.id.clone() });
+        assert!(matches!(remove(), Err(HubError::Conflict(m)) if m.contains("queued message")));
+        let q = k.hub.list_queued(&t.id).unwrap();
+        k.hub.remove_queued(&q[0].id).unwrap();
+        // The other queued message still holds it.
+        assert!(matches!(remove(), Err(HubError::Conflict(_))));
+        k.hub.remove_queued(&q[1].id).unwrap();
+        remove().unwrap();
+        assert!(!std::path::Path::new(&a.path).exists());
+    }
+
+    #[test]
     fn an_archived_task_takes_no_attachments() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "feat/arch").task;
@@ -407,8 +471,9 @@ mod tests {
         let dir = k.hub.paths().session_dir(&t.id).join("attachments");
         assert!(dir.exists());
         k.hub.archive_with(mirante_ipc::types::ArchiveTask { task: t.id.clone(), ..Default::default() }).unwrap();
-        // Archiving removed the session dir, attachments included.
+        // Archiving removed the session dir, attachments included, and the registry entry.
         assert!(!dir.exists());
+        assert_eq!(k.hub.known_attachments(&t.id), 0);
         let e = k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "a.txt".into(), b64: b64(b"x") });
         assert!(matches!(e, Err(HubError::Conflict(_))), "{e:?}");
     }

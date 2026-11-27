@@ -29,12 +29,20 @@ pub(crate) struct Queued {
     /// It may carry a thread's block when one is owed (a person's message, or the first
     /// prompt; never an agent's message or a synthesis request).
     pub(crate) context: bool,
+    /// The attachment ids it carries (held while it is queued; see `Hub::hold_attachments`).
+    pub(crate) attachments: Vec<String>,
 }
 
 impl Queued {
     /// A message nobody vouches for as the person's (a task's first prompt, an agent's).
     pub(crate) fn new(text: impl Into<String>) -> Queued {
-        Queued { id: mirante_core::model::new_id(), text: text.into(), operator: false, context: true }
+        Queued {
+            id: mirante_core::model::new_id(),
+            text: text.into(),
+            operator: false,
+            context: true,
+            attachments: Vec::new(),
+        }
     }
 
     /// A message from the person at the keyboard (`operator`), or from someone else.
@@ -112,7 +120,8 @@ impl Hub {
         Ok(st.queue_view(&task_id))
     }
 
-    /// Takes a message out of the queue (it is never delivered). Returns the queue.
+    /// Takes a message out of the queue (it is never delivered; its attachments are free
+    /// again). Returns the queue.
     pub fn remove_queued(&self, id: &str) -> Result<Vec<QueuedMessage>> {
         let mut st = self.lock();
         let task_id = st.queue_of(id)?;
@@ -122,6 +131,9 @@ impl Hub {
         if at < l.requeue_at {
             l.requeue_at -= 1;
         }
+        // Never delivered: its attachments are removable again (unless another message holds
+        // them or one was delivered with them).
+        self.hold_attachments(&task_id, &gone.attachments, false);
         st.event(
             Some(&task_id),
             "queue_changed",

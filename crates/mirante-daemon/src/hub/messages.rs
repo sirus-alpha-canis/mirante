@@ -109,11 +109,12 @@ impl Hub {
     ///
     /// `m.attachments` (a person's only): each one's line is appended to the text after the
     /// size check, which counts the person's own words only; the text may then be empty.
-    /// They are marked sent once the message was taken (steered or queued).
+    /// They are marked sent once the message was steered; a queued one holds them until it
+    /// is delivered (then they stay held) or removed from the queue (then they are free).
     pub fn send_by(&self, m: SendMessage, by: &str) -> Result<SendResult> {
         if m.attachments.is_empty() {
             check_message(&m.text)?;
-            return self.send_text(m, by);
+            return self.send_text(m, by, &[]);
         }
         if by != "person" {
             return Err(HubError::Invalid("only a person attaches files to a message".into()));
@@ -123,13 +124,17 @@ impl Hub {
         let carried = self.carry_attachments(&task_id, &m.attachments)?;
         let ids = m.attachments.clone();
         let text = carried.append_to(&m.text);
-        let r = self.send_text(SendMessage { text, attachments: Vec::new(), ..m }, by)?;
-        self.mark_sent(&task_id, &ids);
+        let r = self.send_text(SendMessage { text, attachments: Vec::new(), ..m }, by, &ids)?;
+        if r.delivered == SendMode::Steer {
+            self.mark_sent(&task_id, &ids);
+        }
         Ok(r)
     }
 
     /// [`Hub::send_by`] once the text is final (checked, attachment lines appended).
-    fn send_text(&self, m: SendMessage, by: &str) -> Result<SendResult> {
+    /// `attachments`: the ids it carries; a queued message holds them (not removable) until
+    /// it is taken out of the queue unsent ([`Hub::remove_queued`]).
+    fn send_text(&self, m: SendMessage, by: &str, attachments: &[String]) -> Result<SendResult> {
         // Only Mirante labels a message as the person's (spec §5): an agent's message that
         // carries the label would pass itself off as theirs.
         let operator = by == "person" || by == super::groups::BY_SYNTHESIS;
@@ -175,9 +180,12 @@ impl Hub {
             SendMode::Queue => ready && !paused && task.status == Status::Idle && l.queue.is_empty() && !l.delivering(),
         };
         if !now {
-            let q = super::queue::Queued::from_operator(m.text.clone(), operator, person);
+            let mut q = super::queue::Queued::from_operator(m.text.clone(), operator, person);
+            q.attachments = attachments.to_vec();
             let id = q.id.clone();
             l.queue.push_back(q);
+            // Under the hub lock, so a removal of this message cannot come first.
+            self.hold_attachments(&task.id, attachments, true);
             let position = l.queue.len();
             st.event(
                 Some(&task.id),

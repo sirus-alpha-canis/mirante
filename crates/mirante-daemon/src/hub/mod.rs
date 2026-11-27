@@ -1189,6 +1189,8 @@ impl Hub {
         if let Err(e) = remove_session_dir(&self.paths, &task.id) {
             st.log_error(Some(&task.id), "removing the archived task's session files", &e);
         }
+        // Its attachments went with the session dir.
+        self.forget_attachments(&task.id);
         if let Some(g) = &t.group_id {
             groups::archive_when_done(&mut st, g);
         }
