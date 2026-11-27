@@ -76,6 +76,7 @@ describe("ReviewQueue", () => {
     const c = await card("Proposal p1");
     await userEvent.click(within(c).getByRole("button", { name: "Reject" }));
     expect(h.calls.filter((x) => x[0] === "dna.review")).toEqual([]);
+    expect(within(c).getByRole("button", { name: "Reject proposal" })).toHaveClass("btn-danger");
     await userEvent.type(within(c).getByLabelText("Why (optional)"), "too task-specific");
     await userEvent.click(within(c).getByRole("button", { name: "Reject proposal" }));
     await waitFor(() =>

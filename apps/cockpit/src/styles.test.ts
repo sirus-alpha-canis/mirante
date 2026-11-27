@@ -83,6 +83,68 @@ describe("styles", () => {
     expect(css).not.toMatch(/#1c6b7a|#67bccb/i);
   });
 
+  describe("components in Vibely's language, at Mirante's density (Task 6)", () => {
+    /** The declarations of the first rule whose selector list is exactly `sel`. */
+    const rule = (sel: string) => {
+      const esc = sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`^${esc} \\{([^}]*)\\}`, "m").exec(css)?.[1] ?? "";
+    };
+
+    it("cards and dialogs are 12, everything else 8 or 4: no radius outside the tokens", () => {
+      expect(rule(".card, .tile")).toContain("border-radius: var(--r-lg)");
+      expect(rule(".palette")).toContain("border-radius: var(--r-lg)");
+      // Outside the token block a radius is a token, a circle or nothing (no pill radii).
+      const body = css.slice(css.indexOf("* { box-sizing"));
+      for (const m of body.matchAll(/border-radius: ([^;]+);/g)) expect(m[1], m[0]).toMatch(/^(var\(--r(-sm|-lg)?\)|50%|0)$/);
+    });
+
+    it("fields have a 1px border in the field line (Vibely's input), and the focus colour on focus", () => {
+      expect(tokens("--field-line").map((v) => v.toLowerCase())).toEqual(["#e5e5e5", "#3b3b3b", "#3b3b3b"]);
+      const fields = /^([^{}]*\.rail-filter[^{}]*) \{([^}]*)\}/m.exec(css);
+      expect(fields?.[2]).toContain("border: 1px solid var(--field-line)");
+      for (const sel of [".rail-filter", ".add-repo input", ".popover-search", ".brain-bar input", ".tasklist-tools input", ".dna-input", ".rules-pick select", ".dispatch-row select", ".queue-edit textarea", ".child-steer input"])
+        expect(fields?.[1], sel).toContain(sel);
+      expect(css).toMatch(/^\.rail-filter:focus,[^{]*\{ border-color: var\(--focus\)/m);
+    });
+
+    it("buttons: primary is neutral ink, secondary outlined, destructive the danger red", () => {
+      expect(rule(".btn-primary")).toMatch(/background: var\(--accent\); color: var\(--accent-text\)/);
+      expect(rule(".btn")).toContain("box-shadow: inset 0 0 0 1px var(--btn-line)");
+      expect(tokens("--btn-line").map((v) => v.toLowerCase())).toEqual(["#bbbbbb", "#3b3b3b", "#3b3b3b"]);
+      expect(rule(".btn-danger")).toMatch(/background: var\(--danger\); color: var\(--on-danger\)/);
+    });
+
+    it("state chips are tinted pairs: the state's text on its own tint", () => {
+      expect(rule(".pill-needs_you")).toMatch(/background: var\(--needs-bg\); color: var\(--needs\)/);
+      expect(rule(".pill-working")).toMatch(/background: var\(--work-bg\); color: var\(--work\)/);
+      expect(rule(".pill-review")).toMatch(/background: var\(--review-bg\); color: var\(--review\)/);
+      expect(rule(".tag-warn")).toMatch(/background: var\(--needs-bg\); color: var\(--needs\)/);
+      expect(rule(".tag-on")).toMatch(/background: var\(--review-bg\); color: var\(--review\)/);
+      // A row's pill is its dot alone: no tint behind it.
+      expect(rule(".row .pill")).toContain("background: none");
+    });
+
+    it("a floating note (toast) has the amber left stripe; an error toast the danger one", () => {
+      expect(css).toMatch(/\.detail-main \.composer \[role="status"\][^{]*\{[^}]*border-left: 3px solid var\(--needs\)/);
+      expect(css).toMatch(/\.detail-main \.composer \.error[^{]*\{[^}]*border-left: 3px solid var\(--danger\)/);
+    });
+
+    it("a dialog's overlay dims to 60% (Vibely's 80% is too heavy for a desktop tool)", () => {
+      expect(rule(".overlay")).toContain("background: rgb(0 0 0 / 0.6)");
+    });
+
+    it("a thread card's stripe is its thread's state, like any card", () => {
+      expect(rule(".thread-card-needs_you")).toContain("--stripe: var(--needs)");
+      expect(rule(".thread-card-working")).toContain("--stripe: var(--work)");
+      expect(rule(".thread-card-review")).toContain("--stripe: var(--review)");
+      expect(css).not.toMatch(/\.thread-card \{[^}]*border-left: 3px solid var\(--work\)/);
+    });
+
+    it("no gradients anywhere", () => {
+      expect(css).not.toMatch(/gradient\(/);
+    });
+  });
+
   it("muted and faint text stay readable (4.5:1) on the lift surface (keys, quiet chips, the send button)", () => {
     const lift = tokens("--panel-3");
     for (const name of ["--muted", "--faint"]) {

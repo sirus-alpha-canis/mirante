@@ -360,7 +360,7 @@ function RemoveConfirm(props: {
         {tn(asked.n, "rail.confirmOne", "rail.confirmMany", { name, live: asked.live })}
       </p>
       <div className="scan-actions">
-        <button className="btn btn-small btn-warn" disabled={busy !== null || tasks.length === 0} onClick={() => void archive()}>
+        <button className="btn btn-small btn-danger" disabled={busy !== null || tasks.length === 0} onClick={() => void archive()}>
           {tr("rail.archiveRemove")}
         </button>
         <button className="btn btn-small btn-ghost" disabled={busy !== null} title={tr("rail.hideTitle")} onClick={() => props.onHide(paths)}>

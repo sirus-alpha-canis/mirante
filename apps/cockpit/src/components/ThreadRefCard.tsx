@@ -53,7 +53,7 @@ export const ThreadRefCard = memo(function ThreadRefCard({
     }
   };
   return (
-    <article className="thread-card" aria-label={t("thread.card", { label })} data-thread={id}>
+    <article className={`thread-card${col ? ` thread-card-${col}` : ""}`} aria-label={t("thread.card", { label })} data-thread={id}>
       <span className="thread-card-mark" aria-hidden="true">
         ⑂
       </span>

@@ -87,7 +87,7 @@ function ProposalCard({ p, onDecided }: { p: ProposalView; onDecided(d: Decision
             value={note}
             onChange={(e) => setNote(e.target.value)}
           />
-          <button className="btn btn-small btn-warn" disabled={busy} onClick={() => decide(false)}>
+          <button className="btn btn-small btn-danger" disabled={busy} onClick={() => decide(false)}>
             {t("review.rejectProposal")}
           </button>
           <button className="btn btn-small" disabled={busy} onClick={() => setRejecting(false)}>

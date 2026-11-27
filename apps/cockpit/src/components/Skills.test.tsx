@@ -151,6 +151,7 @@ describe("Skills view", () => {
     const h = setup({ "skill.action": (p: Record<string, unknown>) => view({ ...LIST[1], status: p.action === "retire" ? "retired" : "active" }) });
     await userEvent.click(await screen.findByRole("button", { name: /cargo-tests-first/ }));
     const panel = await screen.findByRole("region", { name: "Skill cargo-tests-first" });
+    expect(within(panel).getByRole("button", { name: "Retire" })).toHaveClass("btn-danger");
     await userEvent.click(within(panel).getByRole("button", { name: "Retire" }));
     expect(h.calls).toContainEqual(["skill.action", { name: "cargo-tests-first", action: "retire", expect_hash: "h-cargo-tests-first-3" }]);
     await userEvent.clear(within(panel).getByLabelText("New scope"));

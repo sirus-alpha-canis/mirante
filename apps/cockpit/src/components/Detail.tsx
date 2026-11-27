@@ -256,7 +256,7 @@ function Actions({ t }: { t: TaskView }) {
       ) : confirmStop ? (
         <span role="group" aria-label={tt("detail.confirmStop")}>
           <span className="small">{tt("detail.stopQuestion")}</span>{" "}
-          <button className="btn btn-small btn-warn" disabled={busy} onClick={() => run(M.sessionStop)}>
+          <button className="btn btn-small btn-danger" disabled={busy} onClick={() => run(M.sessionStop)}>
             {tt("detail.stopSession")}
           </button>
           <button className="btn btn-small" onClick={() => setConfirmStop(false)}>
@@ -335,7 +335,7 @@ function ArchiveAction({ t }: { t: TaskView }) {
           </span>
         </>
       )}{" "}
-      <button className="btn btn-small btn-warn" disabled={busy || !live} onClick={() => void archive()}>
+      <button className="btn btn-small btn-danger" disabled={busy || !live} onClick={() => void archive()}>
         {children.length === 0 ? tt("detail.archiveTask") : tt("detail.archiveAll", { n: children.length + 1 })}
       </button>
       <button className="btn btn-small" disabled={busy} onClick={() => setAsking(false)}>

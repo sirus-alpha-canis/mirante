@@ -304,6 +304,8 @@ describe("Detail (V1 classic)", () => {
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("button", { name: "Stop the session" })).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    // The destructive answer is the danger button, not a warning.
+    expect(screen.getByRole("button", { name: "Stop the session" })).toHaveClass("btn-danger");
     await userEvent.click(screen.getByRole("button", { name: "Stop the session" }));
     expect(h.calls).toContainEqual(["session.stop", { task: "a" }]);
   });
@@ -317,6 +319,7 @@ describe("Detail (V1 classic)", () => {
     await userEvent.click(within(box).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("group", { name: "Confirm archive" })).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    expect(screen.getByRole("button", { name: "Archive the task" })).toHaveClass("btn-danger");
     await userEvent.click(screen.getByRole("button", { name: "Archive the task" }));
     expect(h.calls).toContainEqual(["task.archive", { task: "a", stop: true }]);
   });

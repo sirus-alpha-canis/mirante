@@ -375,6 +375,7 @@ describe("SkillProposals", () => {
     const h = setup({ "skill.proposals": [prop("j")], "skill.review": { ...prop("j"), status: "rejected" } });
     const c = await card("skill-j");
     await userEvent.click(within(c).getByRole("button", { name: "Reject" }));
+    expect(within(c).getByRole("button", { name: "Reject proposal" })).toHaveClass("btn-danger");
     await userEvent.type(within(c).getByLabelText("Why (optional)"), "too vague");
     await userEvent.click(within(c).getByRole("button", { name: "Reject proposal" }));
     expect(h.calls).toContainEqual(["skill.review", { id: "j", accept: false, note: "too vague" }]);

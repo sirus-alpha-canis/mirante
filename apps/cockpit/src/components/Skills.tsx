@@ -241,7 +241,7 @@ export function SkillPanel({ name, version, onChanged }: { name: string; version
             {t("skills.restore")}
           </button>
         ) : (
-          <button className="btn btn-small btn-warn" disabled={busy} onClick={() => act("retire")}>
+          <button className="btn btn-small btn-danger" disabled={busy} onClick={() => act("retire")}>
             {t("skills.retire")}
           </button>
         )}

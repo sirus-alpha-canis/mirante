@@ -43,6 +43,15 @@ describe("ThreadRefCard", () => {
     expect(h.api.open).toHaveBeenCalledWith("th");
   });
 
+  it("its stripe is the thread's state (blue working, amber needs you), never a fixed colour", () => {
+    const h = setup(thread({ status: "working" }));
+    const card = screen.getByRole("article", { name: "Thread: PR #123" });
+    expect(card).toHaveClass("thread-card-working");
+    act(() => h.env.cockpit.dispatch({ type: "task", view: thread({ status: "idle", needs_you: 1 }) }));
+    expect(card).toHaveClass("thread-card-needs_you");
+    expect(card).not.toHaveClass("thread-card-working");
+  });
+
   it("a resume that fails is shown and does not navigate", async () => {
     const h = setup(thread({ live: false, status: "ended" }), { "session.resume": { kind: "rpc", code: 2, message: "memory is tight" } });
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));

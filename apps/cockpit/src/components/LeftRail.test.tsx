@@ -135,7 +135,7 @@ describe("removing a project that has tasks", () => {
       "shop has 2 tasks (1 live). Remove it from Projects? Its tasks are archived (live sessions are stopped first); worktrees are removed, branches are kept.",
     );
     expect(confirm()).toHaveFocus();
-    expect(within(confirm()!).getByRole("button", { name: "Archive tasks and remove" })).toBeInTheDocument();
+    expect(within(confirm()!).getByRole("button", { name: "Archive tasks and remove" })).toHaveClass("btn-danger");
     escape();
     expect(confirm()).toBeNull();
     expect(x).toHaveFocus();

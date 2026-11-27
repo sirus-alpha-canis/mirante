@@ -526,7 +526,7 @@ function ProposalCard({ p, onDecided }: { p: SkillProposalView; onDecided(text: 
             {t("skillProp.why")}
           </label>
           <input id={`${ids}-note`} className="dna-input" placeholder={t("skillProp.why")} value={note} onChange={(e) => setNote(e.target.value)} />
-          <button className="btn btn-small btn-warn" disabled={busy} onClick={() => decide(false)}>
+          <button className="btn btn-small btn-danger" disabled={busy} onClick={() => decide(false)}>
             {t("skillProp.rejectProposal")}
           </button>
           <button className="btn btn-small" onClick={() => setRejecting(false)}>
