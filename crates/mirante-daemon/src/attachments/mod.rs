@@ -13,9 +13,10 @@
 //!   not text or not JSON is refused. At most [`MAX_PREPARING`] are prepared at once. The
 //!   original never lands in Mirante's home.
 //! - Import ([`read_source`]): the source is opened with `O_NOFOLLOW` (its last component
-//!   is never a symlink) and must be a regular file with a single link that is not inside
-//!   Mirante's home (checked on the opened descriptor's path); at most limit + 1 bytes are
-//!   read.
+//!   is never a symlink), `O_NOCTTY` and `O_NONBLOCK`, and must be a regular file with a
+//!   single link that is not inside Mirante's home (a task's worktree excepted), not in a
+//!   credential folder of the person's home and not a key file (checked on the given path
+//!   and on the opened descriptor's); at most limit + 1 bytes are read.
 pub mod redact;
 
 use std::borrow::Cow;
@@ -271,18 +272,99 @@ fn fd_path(f: &std::fs::File) -> std::io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
 }
 
+/// Folders and files under the person's home whose contents are credentials: never
+/// attached, whoever asks (compared without case: macOS folders are case-insensitive).
+const PRIVATE: [&str; 22] = [
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".config/gh",
+    ".kube",
+    ".docker/config.json",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".password-store",
+    "Library/Keychains",
+    "Library/Cookies",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Arc",
+    ".config/google-chrome",
+    ".mozilla",
+];
+
+/// File names that are private keys or certificates (compared without case).
+fn private_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [".pem", ".key", ".p12", ".pfx"].iter().any(|e| n.ends_with(e))
+        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| n.starts_with(k))
+}
+
+/// Whether `p` is inside (or is) `base`, without case.
+fn under(p: &Path, base: &Path) -> bool {
+    let (p, base) = (p.to_string_lossy().to_lowercase(), base.to_string_lossy().to_lowercase());
+    let base = base.trim_end_matches('/');
+    p == base || p.starts_with(&format!("{base}/"))
+}
+
+/// `base` as given and canonical (when it resolves).
+fn both(base: &Path) -> Vec<PathBuf> {
+    let mut v = vec![base.to_path_buf()];
+    if let Ok(c) = std::fs::canonicalize(base) {
+        if c != base {
+            v.push(c);
+        }
+    }
+    v
+}
+
+/// Why `path` (given or opened) may not be attached, if it may not: inside Mirante's home
+/// (except a task's worktree, `<home>/worktrees/`), a credential folder or file of the
+/// person's home ([`PRIVATE`]), or a key file by its name.
+fn refusal(path: &Path, home: &Path, user_home: Option<&Path>) -> Option<String> {
+    let shown = path.display();
+    if path.file_name().is_some_and(|n| private_name(&n.to_string_lossy())) {
+        return Some(format!("{shown} looks like a private key or certificate: it is never attached"));
+    }
+    let homes = both(home);
+    let in_home = homes.iter().any(|h| under(path, h));
+    let in_worktree = homes.iter().any(|h| under(path, &h.join("worktrees")));
+    if in_home && !in_worktree {
+        return Some(format!("{shown} is inside Mirante's own folder ({}): it is never attached", home.display()));
+    }
+    for uh in user_home.map(both).unwrap_or_default() {
+        if let Some(dir) = PRIVATE.iter().find(|d| under(path, &uh.join(d))) {
+            return Some(format!("{shown} is inside ~/{dir}, which holds credentials: it is never attached"));
+        }
+    }
+    None
+}
+
 /// Reads the file a person dropped or picked: `(its name, its bytes)`, at most `max` bytes.
 /// Refused: a relative path, a symlink (last component), anything but a regular file with
-/// a single link, and anything inside `home` (Mirante's own files).
-pub fn read_source(path: &str, home: &Path, max: usize) -> Result<(String, Vec<u8>), String> {
+/// a single link, anything inside `home` (Mirante's own files) but a task's worktree, and
+/// credential folders and key files of the person's home `user_home` (see [`refusal`]),
+/// by the given path and by the opened descriptor's. Opened with `O_NOCTTY | O_NONBLOCK`
+/// (a terminal never becomes the daemon's, a FIFO never blocks the open), checked with
+/// `fstat` before a byte is read.
+pub fn read_source(path: &str, home: &Path, user_home: Option<&Path>, max: usize) -> Result<(String, Vec<u8>), String> {
     let p = Path::new(path);
     if !p.is_absolute() {
         return Err(format!("{path} is not an absolute path"));
     }
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or(format!("{path} names no file"))?;
+    if let Some(why) = refusal(p, home, user_home) {
+        return Err(why);
+    }
     let f = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
         .open(p)
         .map_err(|e| match e.raw_os_error() {
             Some(libc::ELOOP) => format!("{path} is a symlink: attach the file it points to"),
@@ -296,10 +378,10 @@ pub fn read_source(path: &str, home: &Path, max: usize) -> Result<(String, Vec<u
         return Err(format!("{path} has other hard links: attach a copy of it"));
     }
     let real = fd_path(&f).map_err(|e| format!("{path}: {e}"))?;
-    let canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    if [&canon, &home.to_path_buf()].iter().any(|h| real.starts_with(h) || p.starts_with(h)) {
-        return Err(format!("{path} is inside Mirante's own folder ({}): it is never attached", home.display()));
+    if let Some(why) = refusal(&real, home, user_home) {
+        return Err(why);
     }
+    clear_nonblock(&f).map_err(|e| format!("{path}: {e}"))?;
     if meta.len() > max as u64 {
         return Err(format!("{name} is {}; at most {} is attached", size(meta.len()), size(max as u64)));
     }
@@ -309,6 +391,18 @@ pub fn read_source(path: &str, home: &Path, max: usize) -> Result<(String, Vec<u
         return Err(format!("{name} is larger than {}", size(max as u64)));
     }
     Ok((name, bytes))
+}
+
+/// Clears `O_NONBLOCK` on `f` (a regular file by now: reads block as usual).
+fn clear_nonblock(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = f.as_raw_fd();
+    // SAFETY: F_GETFL / F_SETFL on a descriptor this function borrows open.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// One stored attachment.
@@ -556,29 +650,117 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         let file = src.join("trace.har");
         std::fs::write(&file, b"{}").unwrap();
-        let (name, bytes) = read_source(file.to_str().unwrap(), &home, 100).unwrap();
+        let (name, bytes) = read_source(file.to_str().unwrap(), &home, None, 100).unwrap();
         assert_eq!((name.as_str(), bytes.as_slice()), ("trace.har", b"{}".as_slice()));
         // Too big: never more than limit + 1 bytes read.
         std::fs::write(src.join("big.log"), vec![b'x'; 101]).unwrap();
-        assert!(read_source(src.join("big.log").to_str().unwrap(), &home, 100).unwrap_err().contains("at most"));
+        assert!(read_source(src.join("big.log").to_str().unwrap(), &home, None, 100).unwrap_err().contains("at most"));
         // Relative, a symlink, a directory, a FIFO, a hard link.
-        assert!(read_source("drop/trace.har", &home, 100).unwrap_err().contains("absolute"));
+        assert!(read_source("drop/trace.har", &home, None, 100).unwrap_err().contains("absolute"));
         std::os::unix::fs::symlink(&file, src.join("link.har")).unwrap();
-        assert!(read_source(src.join("link.har").to_str().unwrap(), &home, 100).unwrap_err().contains("symlink"));
-        assert!(read_source(src.to_str().unwrap(), &home, 100).unwrap_err().contains("not a regular file"));
+        assert!(read_source(src.join("link.har").to_str().unwrap(), &home, None, 100).unwrap_err().contains("symlink"));
+        assert!(read_source(src.to_str().unwrap(), &home, None, 100).unwrap_err().contains("not a regular file"));
         let fifo = src.join("pipe");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         // SAFETY: plain mkfifo on a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert!(read_source(fifo.to_str().unwrap(), &home, 100).unwrap_err().contains("not a regular file"));
+        assert!(read_source(fifo.to_str().unwrap(), &home, None, 100).unwrap_err().contains("not a regular file"));
         std::fs::hard_link(&file, src.join("twin.har")).unwrap();
-        assert!(read_source(file.to_str().unwrap(), &home, 100).unwrap_err().contains("hard links"));
+        assert!(read_source(file.to_str().unwrap(), &home, None, 100).unwrap_err().contains("hard links"));
         // Inside Mirante's home: refused, through a symlinked parent too.
         let db = home.join("mirante.sqlite");
         std::fs::write(&db, b"db").unwrap();
-        assert!(read_source(db.to_str().unwrap(), &home, 100).unwrap_err().contains("Mirante's own folder"));
+        assert!(read_source(db.to_str().unwrap(), &home, None, 100).unwrap_err().contains("Mirante's own folder"));
         std::os::unix::fs::symlink(&home, d.path().join("alias")).unwrap();
         let via = d.path().join("alias/mirante.sqlite");
-        assert!(read_source(via.to_str().unwrap(), &home, 100).unwrap_err().contains("Mirante's own folder"));
+        assert!(read_source(via.to_str().unwrap(), &home, None, 100).unwrap_err().contains("Mirante's own folder"));
+    }
+
+    #[test]
+    fn a_task_s_worktree_is_attachable_but_not_through_a_link_into_the_rest_of_home() {
+        let d = TestDir::new();
+        let home = d.path().join("home");
+        let wt = home.join("worktrees/app/feat-x");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("err.log"), b"boom").unwrap();
+        let (name, bytes) = read_source(wt.join("err.log").to_str().unwrap(), &home, None, 100).unwrap();
+        assert_eq!((name.as_str(), bytes.as_slice()), ("err.log", b"boom".as_slice()));
+        // A folder in the worktree that links back into the home: refused by the real path.
+        std::fs::write(home.join("settings.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&home, wt.join("up")).unwrap();
+        let via = wt.join("up/settings.json");
+        assert!(read_source(via.to_str().unwrap(), &home, None, 100).unwrap_err().contains("Mirante's own folder"));
+        // `worktrees` itself is no prefix match for a sibling.
+        std::fs::create_dir_all(home.join("worktrees-old")).unwrap();
+        std::fs::write(home.join("worktrees-old/a.txt"), b"a").unwrap();
+        let sib = home.join("worktrees-old/a.txt");
+        assert!(read_source(sib.to_str().unwrap(), &home, None, 100).unwrap_err().contains("Mirante's own folder"));
+    }
+
+    #[test]
+    fn credential_folders_and_key_files_of_the_person_s_home_are_never_attached() {
+        let d = TestDir::new();
+        let home = d.path().join("mirante");
+        let user = d.path().join("user");
+        for (dir, file) in [
+            (".ssh", "config"),
+            (".aws", "credentials"),
+            (".config/gcloud", "application_default_credentials.json"),
+            (".kube", "config"),
+            (".docker", "config.json"),
+            ("Library/Keychains", "login.keychain-db"),
+            ("Library/Cookies", "Cookies.binarycookies"),
+            ("Library/Application Support/Google/Chrome/Default", "Cookies"),
+            ("Library/Application Support/Firefox/Profiles/x", "cookies.sqlite"),
+            ("Library/Application Support/Arc/User Data", "Login Data"),
+        ] {
+            std::fs::create_dir_all(user.join(dir)).unwrap();
+            let f = user.join(dir).join(file);
+            std::fs::write(&f, b"secret").unwrap();
+            let e = read_source(f.to_str().unwrap(), &home, Some(&user), 100).unwrap_err();
+            assert!(e.contains("holds credentials"), "{dir}/{file}: {e}");
+        }
+        // Without case (macOS), and through a symlinked parent (the real path is checked).
+        let e = read_source(user.join(".SSH/config").to_str().unwrap(), &home, Some(&user), 100);
+        assert!(e.unwrap_err().contains("never attached"));
+        std::os::unix::fs::symlink(user.join(".ssh"), d.path().join("keys")).unwrap();
+        let e = read_source(d.path().join("keys/config").to_str().unwrap(), &home, Some(&user), 100);
+        assert!(e.unwrap_err().contains("holds credentials"));
+        // Key files anywhere, by name.
+        std::fs::create_dir_all(user.join("Desktop")).unwrap();
+        for name in ["server.pem", "tls.KEY", "id_ed25519", "id_rsa.pub", "cert.p12"] {
+            let f = user.join("Desktop").join(name);
+            std::fs::write(&f, b"k").unwrap();
+            let e = read_source(f.to_str().unwrap(), &home, Some(&user), 100).unwrap_err();
+            assert!(e.contains("private key"), "{name}: {e}");
+        }
+        // Next to them, ordinary files are fine.
+        for name in ["keyboard.txt", "notes.md", ".docker-compose.yml"] {
+            let f = user.join("Desktop").join(name);
+            std::fs::write(&f, b"ok").unwrap();
+            assert!(read_source(f.to_str().unwrap(), &home, Some(&user), 100).is_ok(), "{name}");
+        }
+        std::fs::write(user.join(".docker/daemon.json"), b"{}").unwrap();
+        assert!(read_source(user.join(".docker/daemon.json").to_str().unwrap(), &home, Some(&user), 100).is_ok());
+    }
+
+    #[test]
+    fn the_source_is_opened_without_a_controlling_terminal_and_reads_block_again() {
+        let d = TestDir::new();
+        let home = d.path().join("home");
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let src = include_str!("mod.rs");
+        let open = &src[src.find("pub fn read_source").unwrap()..];
+        let open = &open[..open.find("fn clear_nonblock").unwrap()];
+        assert!(open.contains("libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY"), "the open flags changed");
+        assert!(open.contains("clear_nonblock(&f)"));
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&f).unwrap();
+        clear_nonblock(&file).unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: F_GETFL on an open descriptor.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        assert_eq!(read_source(f.to_str().unwrap(), &home, None, 100).unwrap().1, b"x");
     }
 }

@@ -104,7 +104,9 @@ impl Hub {
     /// `attachment.import`: a file the person dropped or picked, copied.
     pub fn attachment_import(&self, p: AttachmentImport) -> Result<AttachmentView> {
         let task_id = self.attachable(&p.task)?;
-        let (name, raw) = store::read_source(&p.path, self.paths.home(), MAX_FILE).map_err(HubError::Invalid)?;
+        let user_home = super::home_dir();
+        let (name, raw) = store::read_source(&p.path, self.paths.home(), user_home.as_deref(), MAX_FILE)
+            .map_err(HubError::Invalid)?;
         self.keep(&task_id, &name, raw)
     }
 
