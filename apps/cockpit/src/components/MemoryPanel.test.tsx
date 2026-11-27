@@ -253,6 +253,17 @@ describe("MemoryPanel", () => {
       expect(head()).toHaveAttribute("aria-expanded", "true");
     });
 
+    it("shows only the dot and the size (it fits the 240px rail); the full line is its tooltip and name", () => {
+      const h = makeEnv();
+      h.load([]);
+      renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("normal") }} />);
+      const shown = head().querySelector(".disclosure-summary");
+      expect(shown).toHaveAttribute("title", "normal · 7.0 GB free");
+      expect(shown?.querySelector(".summary-short")).toHaveTextContent(/^7\.0 GB$/);
+      expect(shown?.querySelector(".summary-short")).toHaveAttribute("aria-hidden", "true");
+      expect(head()).toHaveAccessibleName("System memory normal · 7.0 GB free");
+    });
+
     it("says it in Portuguese", () => {
       const h = makeEnv();
       h.load([]);
@@ -260,6 +271,8 @@ describe("MemoryPanel", () => {
       try {
         renderWith(h.env, <MemoryPanel status={{ ...status, memory: sys("elevated") }} />);
         expect(screen.getByRole("button", { name: /^Memória do sistema/ })).toHaveAccessibleName("Memória do sistema elevada · 7.0 GB livres");
+        expect(document.querySelector(".disclosure-summary")).toHaveAttribute("title", "elevada · 7.0 GB livres");
+        expect(document.querySelector(".summary-short")).toHaveTextContent(/^7\.0 GB$/);
       } finally {
         setLang("en");
       }

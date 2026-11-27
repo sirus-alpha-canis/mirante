@@ -27,6 +27,8 @@ export function Disclosure(props: {
   label?: string;
   /** The one line shown while closed. */
   summary: ReactNode;
+  /** The summary's tooltip (its full text, when the line shows a short form). */
+  summaryTitle?: string;
   className?: string;
   children: ReactNode;
 }) {
@@ -51,7 +53,7 @@ export function Disclosure(props: {
           {!open && props.summary ? (
             <>
               {" "}
-              <span className="disclosure-summary">{props.summary}</span>
+              <span className="disclosure-summary" title={props.summaryTitle}>{props.summary}</span>
             </>
           ) : null}
         </button>

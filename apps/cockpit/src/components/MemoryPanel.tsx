@@ -119,13 +119,16 @@ const noticeLine = (n: Notice) => `${n.branch ? `${n.branch}: ` : ""}${feedText(
 const LEVEL_DOT: Record<Pressure, string> = { normal: "dot-ready", elevated: "dot-needs", critical: "dot-danger", unknown: "dot-unknown" };
 
 /** The folded panel's one line: a dot coloured by the pressure level and "normal · 7.0 GB
- * free" (what the OS calls available, else the strict free pages of an older daemon). */
-export function memorySummary(status: DaemonStatus | null, sys: SystemMemory | null): { dot: string; text: string } {
-  if (!status) return { dot: "dot-unknown", text: tStatic("mem.sumUnknown") };
-  if (!sys) return { dot: "dot-unknown", text: tStatic("mem.sumNotAvailable") };
+ * free" (what the OS calls available, else the strict free pages of an older daemon).
+ * `short` is what fits the 240px rail beside the title (the dot carries the level). */
+export function memorySummary(status: DaemonStatus | null, sys: SystemMemory | null): { dot: string; text: string; short: string } {
+  if (!status) return { dot: "dot-unknown", text: tStatic("mem.sumUnknown"), short: tStatic("mem.sumUnknown") };
+  if (!sys) return { dot: "dot-unknown", text: tStatic("mem.sumNotAvailable"), short: tStatic("mem.sumNotAvailable") };
+  const free = size(sys.available ?? sys.free);
   return {
     dot: LEVEL_DOT[sys.level],
-    text: tStatic("mem.summary", { level: tStatic(`mem.level.${sys.level}` as Key), size: size(sys.available ?? sys.free) }),
+    text: tStatic("mem.summary", { level: tStatic(`mem.level.${sys.level}` as Key), size: free }),
+    short: free,
   };
 }
 
@@ -145,9 +148,11 @@ export function MemoryPanel({ status, onOpen }: { status: DaemonStatus | null; o
       className="memory"
       title={t("mem.heading")}
       label={t("mem.guard")}
+      summaryTitle={sum.text}
       summary={
         <>
-          <span className={`dot ${sum.dot}`} aria-hidden="true" /> {sum.text}
+          <span className={`dot ${sum.dot}`} aria-hidden="true" /> <span className="summary-short" aria-hidden="true">{sum.short}</span>
+          <span className="sr-only">{sum.text}</span>
         </>
       }
     >
