@@ -88,7 +88,7 @@
 ### Batch B — Browser
 - [x] 1. CSP `frame-src`; `security.test.ts` asserts the exact `frame-src` and that no capability has `remote`.
 - [x] 2. `BrowserTab.tsx` + `lib/localurl.ts` (tests: refuses https, other hosts, userinfo, missing port, file:; exact sandbox flags).
-- [ ] 3. Framing-refused fallback; optional port suggestions.
+- [x] 3. Framing-refused fallback; optional port suggestions (not built, see As built).
 
 ### Batch C — Device (serve-sim)
 - [ ] 1. `hub/devices.rs` + simctl JSON parsing (fixtures in `hub/testdata`, fake `xcrun` via env override; tests: `udid_must_be_listed`, `setup_reports_missing_node_xcode_runtime`, `non_arm64_reports_unsupported`).

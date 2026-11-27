@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { makeEnv, renderWith } from "../test/env";
@@ -12,6 +12,12 @@ function mount(url = "", self = "tauri://localhost") {
   return { ...h, ...r, onNavigate };
 }
 const frame = (c: HTMLElement) => c.querySelector("iframe");
+
+/** The frame loaded the dev server's page: cross-origin, so its document is not readable. */
+const loadedCrossOrigin = (f: HTMLIFrameElement) => {
+  Object.defineProperty(f, "contentDocument", { configurable: true, get: () => null });
+  fireEvent.load(f);
+};
 
 describe("BrowserTab", () => {
   it("with no address yet, asks for one and shows no frame", () => {
@@ -81,6 +87,28 @@ describe("BrowserTab", () => {
     expect(frame(container)).not.toBe(before);
     await userEvent.click(screen.getByRole("button", { name: "Open in browser" }));
     expect(env.openUrl).toHaveBeenCalledWith("http://localhost:3000/");
+  });
+
+  it("a server that refuses to be framed: says so and offers Open in browser", async () => {
+    const { container, env } = mount("http://localhost:3000/");
+    const f = frame(container)!;
+    // A refused frame stays an empty document of the app's own origin (readable here).
+    fireEvent.load(f);
+    expect(await screen.findByText("This server can't be shown here.")).toBeInTheDocument();
+    expect(frame(container)).toBeNull();
+    const open = screen.getAllByRole("button", { name: "Open in browser" });
+    await userEvent.click(open[open.length - 1]);
+    expect(env.openUrl).toHaveBeenCalledWith("http://localhost:3000/");
+    // Reload tries again.
+    await userEvent.click(screen.getByRole("button", { name: "Reload" }));
+    expect(frame(container)).not.toBeNull();
+  });
+
+  it("a page that loaded (cross-origin, unreadable) shows normally", () => {
+    const { container } = mount("http://localhost:3000/");
+    loadedCrossOrigin(frame(container)!);
+    expect(screen.queryByText("This server can't be shown here.")).toBeNull();
+    expect(frame(container)).not.toBeNull();
   });
 
   it("Open in browser that fails says so", async () => {

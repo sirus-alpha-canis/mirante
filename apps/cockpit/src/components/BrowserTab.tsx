@@ -5,6 +5,9 @@
 // with no top navigation, popups or modals, no referrer and no feature delegated (`allow=""`).
 // Tauri injects nothing into sub-frames and grants no remote origin, so the page gets no IPC.
 // Back is the address bar's own history: a cross-origin frame's history is not readable.
+// A server that refuses to be framed (X-Frame-Options, frame-ancestors) leaves the frame an
+// empty document the app can read; the dev server's own page never is (another origin), so
+// a readable document on load means "refused" and the tab offers Open in browser instead.
 import { type FormEvent, useState } from "react";
 import { useEnv } from "../env";
 import { type Key, useT } from "../lib/i18n";
@@ -42,12 +45,14 @@ export function BrowserTab({
   const [past, setPast] = useState<string[]>([]);
   const [load, setLoad] = useState(0);
   const [openFailed, setOpenFailed] = useState(false);
+  const [refused, setRefused] = useState(false);
 
   const go = (to: string, remember: boolean) => {
     if (remember && shown && shown !== to) setPast((p) => [...p, shown].slice(-50));
     setShown(to);
     setText(to);
     setBad(null);
+    setRefused(false);
     setLoad((n) => n + 1);
     onNavigate(to);
   };
@@ -63,6 +68,19 @@ export function BrowserTab({
     setPast((p) => p.slice(0, -1));
     go(prev, false);
   };
+  const reload = () => {
+    setRefused(false);
+    setLoad((n) => n + 1);
+  };
+  const loaded = (frame: HTMLIFrameElement) => {
+    let doc: Document | null = null;
+    try {
+      doc = frame.contentDocument;
+    } catch {
+      doc = null;
+    }
+    if (doc !== null) setRefused(true);
+  };
   const open = () => {
     if (!shown) return;
     setOpenFailed(false);
@@ -75,7 +93,7 @@ export function BrowserTab({
         <button type="button" className="btn btn-small btn-ghost" aria-label={t("browser.back")} title={t("browser.back")} disabled={past.length === 0} onClick={back}>
           ←
         </button>
-        <button type="button" className="btn btn-small btn-ghost" aria-label={t("browser.reload")} title={t("browser.reload")} disabled={!shown} onClick={() => setLoad((n) => n + 1)}>
+        <button type="button" className="btn btn-small btn-ghost" aria-label={t("browser.reload")} title={t("browser.reload")} disabled={!shown} onClick={reload}>
           ↻
         </button>
         <input
@@ -103,7 +121,15 @@ export function BrowserTab({
         </p>
       )}
       {openFailed && <p className="small browser-bad">{t("diff.browserFailed")}</p>}
-      {shown ? (
+      {shown && refused ? (
+        <div className="browser-refused">
+          <p className="small">{t("browser.refused")}</p>
+          <p className="muted small">{t("browser.refusedWhy")}</p>
+          <button type="button" className="btn btn-small" onClick={open}>
+            {t("browser.open")}
+          </button>
+        </div>
+      ) : shown ? (
         <iframe
           key={`${shown}#${load}`}
           className="browser-frame"
@@ -112,6 +138,7 @@ export function BrowserTab({
           sandbox="allow-scripts allow-forms allow-same-origin"
           referrerPolicy="no-referrer"
           allow=""
+          onLoad={(e) => loaded(e.currentTarget)}
         />
       ) : (
         <p className="muted small">{t("browser.empty")}</p>
