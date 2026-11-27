@@ -118,3 +118,29 @@ Applies to `.har`, and to any JSON file that parses as HAR (it has `log.entries`
     - These attachments are never "sent" in a message, so they stay in the daemon's registry until the task is archived (the files go with the session dir).
 - [x] 5. Docs: README feature line, CHANGELOG Unreleased, docs/dogfood/attachments.md checklist for the founder.
   - **As built:** README "Use → The app" has an **Attachments** line; CHANGELOG Unreleased has an **Added** entry; `docs/dogfood/attachments.md` lists the founder's checks (composer paste, `.har` drop and "N secrets removed", picker, remove, goal with an attachment, terminal ⌘V in a Claude session and a drop, Codex image, daemon-restart re-attach note). None of it was run by an agent.
+
+## As built — review fixes
+
+A security review of e0b467e..be6fb39 found nine issues. Each was checked, then fixed with a test.
+1. **Non-UTF-8 text was stored raw.** UTF-16 is transcoded, by its BOM or, without one, by its zero bytes. A UTF-8 BOM is dropped. Other bytes without NUL that look like text are read with `from_utf8_lossy`. Then the text is redacted. A `.har` that is not text is refused.
+2. **A HAR that does not parse fell back to plain-text redaction.** The BOM is stripped first. A `.har` that is not valid JSON is now refused, so it is never stored half-masked. JSON-looking text under another name gets `scan_mask`, a lenient pass that keeps the layout. It masks the value of a credential key, a `"value"` next to a credential `"name"`, and every value in a `"cookies"` list.
+   - Deviation: serde_json's `unbounded_depth` was not enabled. Without `serde_stacker`, a deeply nested file could overflow the daemon's stack. A real HAR is shallow; one deeper than serde's limit of 128 is refused.
+3. **Credential names were missing.**
+   - Now matched by substring: `passw`, `credential`, `apikey`, `signature`.
+   - Now matched as whole words (split on `-_.`, spaces and camelCase): `key`, `pass`, `pwd`, `sig`, `jwt`, `otp`, `pin`. So `api_key` and `apiKey` match, and `keyboard` doesn't.
+   - Added as exact header names: `x-goog-api-key`, `ocp-apim-subscription-key`.
+   - OAuth `code` and `code_verifier` count only as query or form parameters, because a JSON `"code"` is usually an error code.
+   - `postData.text` and `content.text` lose credential fields when they are form-encoded or JSON. A base64 body is decoded first; a binary one becomes `[binary body removed by Mirante]`.
+   - `redirectURL` and the `Location` / `Content-Location` / `Referer` headers lose credential parameters, in the query and in the fragment.
+   - Token redaction runs around the marks it inserts, so a mark is never mistaken for a value.
+4. **Webview script could import any file.**
+   - (a) The Tauri shell keeps a list of allowed paths (`src-tauri/src/grants.rs`). Paths come from the native `WindowEvent::DragDrop` drop and from the new `pick_attachments` command, which opens the native picker itself. The `rpc` command checks an `attachment.import` path against that list first. Each path works once, within 10 minutes, and at most 256 are kept. No command takes paths to grant. The paperclip uses `pick_attachments`; the webview's own `open()` is now only for the Add project folder.
+   - (b) The daemon refuses `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.kube`, `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.password-store`, `~/Library/Keychains`, `~/Library/Cookies` and the browser profile folders. It also refuses `*.pem`, `*.key`, `*.p12`, `*.pfx` and `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519*`. It checks the given path and the opened descriptor's path, ignoring case.
+5. **Peak memory.** At most two attachments are prepared at once (a semaphore). A HAR is stored compact, not pretty-printed. The 25 MB cap is unchanged.
+6. **Files in the task's own worktree were refused.** Files under `<home>/worktrees/` are now allowed. The rest of the home is still refused, including through a symlinked folder, because the real path is checked.
+7. **Opening a source could hang or attach a terminal.** The source is now opened with `O_NOCTTY` as well as `O_NONBLOCK`. `O_NONBLOCK` is cleared once `fstat` says it is a regular file.
+8. **The registry was never cleared.** Archiving a task now drops its registry entry. A steered message or a goal marks its attachments sent. A queued message instead holds them, with a count:
+   - they can't be removed while the message is queued, or after it is delivered;
+   - they can be removed again once the message is taken out of the queue unsent;
+   - a file that another queued message also carries stays held.
+9. **Codex accepted non-images as `localImage`.** `local_images` now checks the file's magic bytes (`is_image`), on a descriptor opened with `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`.
