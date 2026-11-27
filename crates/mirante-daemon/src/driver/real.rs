@@ -683,13 +683,13 @@ mod tests {
         let mut req = request(None);
         req.paths = Paths::new(&d.path().join("home"));
         req.task.group_path = Some("/".into());
-        req.read_only = vec![PathBuf::from("/Users/p/gol/docs")];
+        req.read_only = vec![PathBuf::from("/Users/p/work/docs")];
         let (settings, _) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(granted(&s), serde_json::json!(["Read(//Users/p/gol/docs/**)"]));
+        assert_eq!(granted(&s), serde_json::json!(["Read(//Users/p/work/docs/**)"]));
         let deny = s["permissions"]["deny"].as_array().unwrap();
-        assert!(deny.contains(&serde_json::json!("Read(//Users/p/gol/docs/**/.env)")), "{deny:?}");
-        assert!(deny.contains(&serde_json::json!("Read(//Users/p/gol/docs/**/.git/**)")), "{deny:?}");
+        assert!(deny.contains(&serde_json::json!("Read(//Users/p/work/docs/**/.env)")), "{deny:?}");
+        assert!(deny.contains(&serde_json::json!("Read(//Users/p/work/docs/**/.git/**)")), "{deny:?}");
         assert!(!s.to_string().contains("Read(//**)"));
     }
 
