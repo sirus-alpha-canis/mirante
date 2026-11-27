@@ -140,4 +140,11 @@ describe("styles", () => {
     expect(css).toMatch(/^\.link \{[^}]*overflow-wrap: anywhere/m);
     expect(css).toMatch(/^\.branch \{[^}]*overflow-wrap: anywhere/m);
   });
+
+  it("a folded rail summary that does not fit ends in an ellipsis, not a clipped letter", () => {
+    // text-overflow needs a block box: on a flex container the text is cut mid-glyph.
+    const rule = /^\.disclosure-summary \{([^}]*)\}/m.exec(css)?.[1] ?? "";
+    expect(rule).toMatch(/display: block/);
+    for (const d of ["min-width: 0", "overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"]) expect(rule).toContain(d);
+  });
 });
