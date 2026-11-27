@@ -179,8 +179,9 @@ folded to one line each (a level dot and "normal · 7.0 GB free"; "Auto-resume o
 off"): click a title to open it, and each stays as you left it. Tokens live at the top of `src/styles.css`;
 `styles.test.ts` checks their contrast (WCAG AA) in every theme.
 
-The UI is set in Inter and code and the terminal in JetBrains Mono (both SIL OFL 1.1),
-bundled with the app: `src/assets/fonts/` holds Inter 4.1 as one variable woff2 and
+The UI is set in Nunito Sans and code and the terminal in JetBrains Mono (both SIL OFL 1.1),
+bundled with the app: `src/assets/fonts/` holds Nunito Sans 3.101 as one variable woff2
+(weights 200–1000, subset to Latin and Latin Extended) and
 JetBrains Mono 2.304 as regular and bold woff2, each with its license, and `@font-face` in
 `src/styles.css` loads them (Vite fingerprints them into `dist/assets/`; the CSP's
 `font-src 'self'` allows nothing else). System fonts stay as the fallback. The terminal

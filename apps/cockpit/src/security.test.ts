@@ -43,6 +43,12 @@ describe("Tauri security baseline", () => {
     const faces = [...css.matchAll(/@font-face \{([^}]*)\}/g)].map((m) => m[1]);
     expect(faces.length).toBeGreaterThan(0);
     for (const f of faces) expect(f).toMatch(/src: url\("\.\/assets\/fonts\/[\w-]+\.woff2"\) format\("woff2"\);/);
+    // Every family named anywhere is a bundled one or a system fallback: Nunito Sans
+    // (the UI and the splash) and JetBrains Mono; Inter is gone.
+    const bundled = faces.map((f) => /font-family: "?([^";]+)"?;/.exec(f)?.[1]);
+    expect(bundled).toEqual(["Nunito Sans", "JetBrains Mono", "JetBrains Mono"]);
+    for (const [name, text] of [["styles.css", css], ["index.html", page]] as const) expect(text, name).not.toMatch(/\bInter\b/);
+    expect(page).toContain('font-family: "Nunito Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;');
   });
 
   it("the dev policy only adds what Vite's dev server needs", () => {

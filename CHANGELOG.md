@@ -12,6 +12,9 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
   semantic scales): "working" is blue now instead of cyan, needs-you amber, ready green,
   failed red. Radii are 4 / 8 / 12. Every text colour still passes WCAG AA in both themes.
   The product name stays Mirante.
+- **The UI font is Nunito Sans** (3.101, one variable woff2, SIL OFL 1.1), Vibely's open
+  sans, in place of Inter; JetBrains Mono stays for code and the terminal. Still bundled,
+  still no network fetch.
 
 ## [0.2.0] — 2026-11-16
 

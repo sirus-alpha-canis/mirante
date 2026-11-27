@@ -14,15 +14,16 @@
    Every text token passes WCAG AA (4.5:1) on the surfaces it is used on: styles.test.ts. */
 /* The app's own fonts (SIL OFL 1.1; see assets/fonts/*-OFL.txt and THIRD_PARTY_NOTICES.md).
    Vite fingerprints them into dist; the CSP allows fonts from the app only (font-src 'self').
-   Inter as one variable file; JetBrains Mono ships no variable woff2, so its two static
+   Nunito Sans as one variable file (wght 200-1000; subset to Latin and Latin Extended);
+   JetBrains Mono ships no variable woff2, so its two static
    weights: 400 and 700 (the terminal's bold). The --sans / --mono stacks keep the system
    fallbacks for the moment before they load (font-display: swap). */
 @font-face {
-  font-family: Inter;
+  font-family: "Nunito Sans";
   font-style: normal;
-  font-weight: 100 900;
+  font-weight: 200 1000;
   font-display: swap;
-  src: url("./assets/fonts/InterVariable.woff2") format("woff2");
+  src: url("./assets/fonts/NunitoSans-Variable.woff2") format("woff2");
 }
 @font-face {
   font-family: "JetBrains Mono";
@@ -64,7 +65,7 @@
   color-scheme: light;
 
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
-  --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sans: "Nunito Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --fs-sm: 12px;
   --fs: 13px;
   --fs-md: 15px;

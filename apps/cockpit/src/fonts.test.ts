@@ -13,16 +13,16 @@ const field = (face: string, name: string) => new RegExp(`${name}: ([^;]+);`).ex
 const files = faces.map((f) => /url\("\.\/([^"]+)"\)/.exec(f)?.[1] ?? "");
 
 describe("bundled fonts", () => {
-  it("declares Inter (one variable file) and JetBrains Mono (400 and 700), swapping in from the system stack", () => {
+  it("declares Nunito Sans (one variable file) and JetBrains Mono (400 and 700), swapping in from the system stack", () => {
     expect(faces.map((f) => [field(f, "font-family"), field(f, "font-weight"), field(f, "font-style"), field(f, "font-display")])).toEqual([
-      ["Inter", "100 900", "normal", "swap"],
+      ['"Nunito Sans"', "200 1000", "normal", "swap"],
       ['"JetBrains Mono"', "400", "normal", "swap"],
       ['"JetBrains Mono"', "700", "normal", "swap"],
     ]);
-    expect(files).toEqual(["assets/fonts/InterVariable.woff2", "assets/fonts/JetBrainsMono-Regular.woff2", "assets/fonts/JetBrainsMono-Bold.woff2"]);
+    expect(files).toEqual(["assets/fonts/NunitoSans-Variable.woff2", "assets/fonts/JetBrainsMono-Regular.woff2", "assets/fonts/JetBrainsMono-Bold.woff2"]);
     // The fallbacks stay.
     expect(css).toContain('--mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;');
-    expect(css).toContain('--sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;');
+    expect(css).toContain('--sans: "Nunito Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;');
   });
 
   it("each file is there and is woff2, its OFL next to it", () => {
@@ -36,7 +36,7 @@ describe("bundled fonts", () => {
     // Nothing bundled that no @font-face uses.
     expect(Object.keys(woff2).sort()).toEqual(files.map((f) => `./${f}`).sort());
     for (const [license, owner] of [
-      ["Inter-OFL.txt", "The Inter Project Authors"],
+      ["NunitoSans-OFL.txt", "The Nunito Sans Project Authors"],
       ["JetBrainsMono-OFL.txt", "The JetBrains Mono Project Authors"],
     ]) {
       const text = licenses[`./assets/fonts/${license}`];
@@ -50,7 +50,7 @@ describe("bundled fonts", () => {
     const out = await build({ root: new URL("..", import.meta.url).pathname, logLevel: "silent", build: { write: false, emptyOutDir: false } });
     const bundle = (Array.isArray(out) ? out[0] : out) as { output: { fileName: string; type: string; source?: string | Uint8Array }[] };
     const names = bundle.output.map((o) => o.fileName);
-    const emitted = ["InterVariable", "JetBrainsMono-Regular", "JetBrainsMono-Bold"].map((n) => names.find((f) => new RegExp(`^assets/${n}-[\\w-]+\\.woff2$`).test(f)));
+    const emitted = ["NunitoSans-Variable", "JetBrainsMono-Regular", "JetBrainsMono-Bold"].map((n) => names.find((f) => new RegExp(`^assets/${n}-[\\w-]+\\.woff2$`).test(f)));
     for (const f of emitted) expect(f).toBeDefined();
     const sheet = bundle.output.find((o) => o.fileName.endsWith(".css"));
     const text = String(sheet?.source ?? "");
