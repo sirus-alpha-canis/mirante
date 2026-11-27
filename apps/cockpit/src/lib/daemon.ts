@@ -92,6 +92,28 @@ export async function attachOpen(
   }
 }
 
+/** A person's own shell's stream (`shell_attach_open`): the same messages, writes, acks
+ * and close as a task's terminal (`attachWrite` / `attachAck` / `attachClose`). */
+export async function shellAttachOpen(
+  shell: string,
+  rows: number,
+  cols: number,
+  onData: (bytes: Uint8Array) => void,
+  onEnd: () => void,
+): Promise<Attached> {
+  const ch = new Channel<AttachMsg>();
+  ch.onmessage = (m) => {
+    if (m instanceof ArrayBuffer) onData(new Uint8Array(m));
+    else if (ArrayBuffer.isView(m)) onData(new Uint8Array(m.buffer, m.byteOffset, m.byteLength));
+    else if (m && m.type === "end") onEnd();
+  };
+  try {
+    return await invoke<Attached>("shell_attach_open", { shell, rows, cols, onMsg: ch });
+  } catch (e) {
+    throw toDaemonError(e);
+  }
+}
+
 /** The terminal drew `bytes` more of the attachment's output (the bridge's flow-control
  * window: with too much unacked it stops reading). Never rejects: an ack for a stream that
  * just ended has nothing to do. */
@@ -200,6 +222,16 @@ export async function editorsAvailable(): Promise<EditorId[]> {
 
 /** Opens a task's file in `editor`. The shell asks the daemon for the file's checked absolute
  * path (`task.file` with `stat`); the webview never names one. Rejects with a message. */
+/** "Open in Preview" for a task's PDF: the shell asks the daemon for the checked path
+ * (`task.file` with `stat`, which must call it a PDF). Rejects with a message. */
+export async function openPathExternal(task: string, path: string): Promise<void> {
+  try {
+    await invoke("open_path_external", { task, path });
+  } catch (e) {
+    throw e instanceof Error ? e : new Error(typeof e === "string" ? e : JSON.stringify(e));
+  }
+}
+
 export async function openInEditor(task: string, path: string, line: number | null, editor: EditorId): Promise<void> {
   try {
     await invoke("open_in_editor", { task, path, line, editor });

@@ -796,10 +796,22 @@ export const M = {
   attachmentPut: "attachment.put",
   attachmentImport: "attachment.import",
   attachmentRemove: "attachment.remove",
+  shellOpen: "shell.open",
+  shellResize: "shell.resize",
+  shellClose: "shell.close",
+  shellList: "shell.list",
 } as const;
 
+/** `shell.open` / `shell.list`: one of a person's own shells beside a task. */
+export interface ShellView {
+  shell: string;
+  task: string;
+  n: number;
+  cwd: string;
+}
+
 /** `task.file`: what the daemon read (`FileView`). */
-export type FileKind = "text" | "binary" | "image" | "too_large" | "secret_hidden";
+export type FileKind = "text" | "binary" | "image" | "too_large" | "secret_hidden" | "pdf";
 export interface FileView {
   path: string;
   abs: string;
@@ -809,6 +821,8 @@ export interface FileView {
   truncated?: boolean;
   image?: { mime: string; b64: string };
   lang?: string;
+  /** A PDF's page count, when the daemon could count them. */
+  pages?: number;
 }
 
 /** `rules.layers`: a file pulled in by an `@path` import (Claude), with its own imports. */

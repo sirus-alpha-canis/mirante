@@ -8,7 +8,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { type Env, safeStorage } from "./env";
-import { daemonBinaryBuild, daemonRestart, daemonStart, editorsAvailable, homeDir, openInEditor, pathKind, pickAttachments, rpc, scanRepos, subscribe } from "./lib/daemon";
+import { daemonBinaryBuild, daemonRestart, daemonStart, editorsAvailable, homeDir, openInEditor, openPathExternal, pathKind, pickAttachments, rpc, scanRepos, subscribe } from "./lib/daemon";
 import { t } from "./lib/i18n";
 import { notify, onNotificationClick } from "./lib/notify";
 import { createCockpit } from "./store/cockpit";
@@ -59,6 +59,7 @@ const env: Env = {
   scanRepos,
   editors: editorsAvailable,
   openInEditor,
+  openExternal: openPathExternal,
   onNoteClick: onNotificationClick,
 };
 

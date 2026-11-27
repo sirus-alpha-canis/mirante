@@ -45,6 +45,7 @@ export function makeEnv(answers: Record<string, Answer> = {}) {
     scanRepos: vi.fn(async (): Promise<RepoScan> => ({ root: "repo", repos: [], truncated: false })),
     editors: vi.fn(async (): Promise<EditorId[]> => ["vscode", "default"]),
     openInEditor: vi.fn(async () => {}),
+    openExternal: vi.fn(async () => {}),
   };
   return {
     env,

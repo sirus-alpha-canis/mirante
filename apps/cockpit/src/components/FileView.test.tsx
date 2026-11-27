@@ -75,6 +75,23 @@ describe("FileView", () => {
     expect(await screen.findByText(/Too large to show here \(3\.0 MiB\)/)).toBeInTheDocument();
   });
 
+  it("a PDF shows its pages and size and opens in Preview through the shell (never rendered)", async () => {
+    const { env, container } = mount({ path: "doc/spec.pdf", abs: "/w/doc/spec.pdf", size: 4096, kind: "pdf", pages: 12 }, "doc/spec.pdf");
+    expect(await screen.findByText(/PDF, 12 pages · 4\.0 KiB/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open in Preview" }));
+    expect(env.openExternal).toHaveBeenCalledWith("t1", "doc/spec.pdf");
+    expect(container.querySelector("embed, object, iframe, img")).toBeNull();
+    vi.mocked(env.openExternal).mockRejectedValueOnce(new Error("not a PDF"));
+    fireEvent.click(screen.getByRole("button", { name: "Open in Preview" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not open it: not a PDF");
+  });
+
+  it("an SVG is shown as text, never rendered", async () => {
+    const { container } = mount({ path: "a.svg", abs: "/w/a.svg", size: 30, kind: "text", text: "<svg onload=alert(1)></svg>" }, "a.svg");
+    await waitFor(() => expect(container.querySelector(".code-line")).not.toBeNull());
+    expect(container.querySelector("svg, img")).toBeNull();
+  });
+
   it("a read the daemon refuses says why", async () => {
     mount({ kind: "rpc", code: 2, message: "hosts is a symlink: not followed" }, "hosts");
     expect(await screen.findByText(/Could not read hosts: hosts is a symlink/)).toBeInTheDocument();

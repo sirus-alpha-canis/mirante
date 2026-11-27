@@ -35,6 +35,8 @@ export interface Env {
   editors(): Promise<EditorId[]>;
   /** Opens a task's worktree file (relative path) in an editor; rejects with a message. */
   openInEditor(task: string, path: string, line: number | null, editor: EditorId): Promise<void>;
+  /** Opens a task's PDF (relative path) in Preview; rejects with a message. */
+  openExternal(task: string, path: string): Promise<void>;
   /** Calls `fn` with the task of a notification the person clicked; returns the unsubscribe. */
   onNoteClick?(fn: (taskId: string) => void): () => void;
   /** Calls `fn` with each drag over the window and each drop from Finder (Tauri's drag-drop

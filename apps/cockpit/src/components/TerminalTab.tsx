@@ -6,7 +6,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import { useEnv, useSelect } from "../env";
 import { t, useT } from "../lib/i18n";
 import type { State } from "../store/state";
-import { attachAck, attachClose, attachOpen, attachWrite, DaemonError } from "../lib/daemon";
+import { attachAck, attachClose, attachOpen, attachWrite, DaemonError, shellAttachOpen } from "../lib/daemon";
 import { openableLink } from "../lib/links";
 import { detectPaths, fileUrlTarget, toWorktreeRel } from "../lib/paths";
 import type { FileView } from "../lib/protocol";
@@ -139,7 +139,19 @@ const selectLive = (s: State) => s.connection.state === "live";
  * daemon replays the screen on attach, so the terminal is reset first. Past the last wait
  * the note offers Reconnect.
  */
-function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolean }) {
+/** Where a terminal's stream comes from: the task's live agent (the default), or one of
+ * the person's own shells beside it (`shell.attach`). A shell's stream that ends is not
+ * attached again: the shell is gone (`onEnd` says so), and files dropped or pasted into it
+ * are not stored as attachments (a text paste is xterm's, as everywhere). */
+export type TermSource = { kind: "task" } | { kind: "shell"; shell: string; n: number; onEnd(): void };
+const TASK_SOURCE: TermSource = { kind: "task" };
+
+function TerminalView({ t: task, active = true, source = TASK_SOURCE }: { t: TaskView; active?: boolean; source?: TermSource }) {
+  const shellId = source.kind === "shell" ? source.shell : null;
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+  /** A shell runs whether or not the task's agent does. */
+  const runs = task.live || shellId !== null;
   const { rpc, openUrl } = useEnv();
   const t = useT();
   // File paths open in the Detail's side pane (none outside a task's Detail).
@@ -166,7 +178,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
    * Null while no terminal takes keys. */
   const dropPaths = useRef<((paths: string[]) => void) | null>(null);
   const wrap = useRef<HTMLDivElement>(null);
-  const dropOn = useDropZone(wrap, (paths) => dropPaths.current?.(paths), task.live && shown);
+  const dropOn = useDropZone(wrap, (paths) => dropPaths.current?.(paths), task.live && shown && shellId === null);
 
   useEffect(() => {
     if (active) setShown(true);
@@ -176,7 +188,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     setNote(null);
     setGone(false);
     setHovered(null);
-    if (!task.live || !shown || !host.current) return;
+    if (!runs || !shown || !host.current) return;
     const el = host.current;
     let closed = false;
     const term = new Terminal({
@@ -286,7 +298,8 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       if (closed || id === null) return;
       if (term.rows === told.rows && term.cols === told.cols) return;
       told = { rows: term.rows, cols: term.cols };
-      rpc(M.sessionResize, { task: task.id, rows: told.rows, cols: told.cols }).catch(() => {});
+      if (shellId !== null) rpc(M.shellResize, { shell: shellId, rows: told.rows, cols: told.cols }).catch(() => {});
+      else rpc(M.sessionResize, { task: task.id, rows: told.rows, cols: told.cols }).catch(() => {});
     };
     term.onResize(() => {
       if (resizeTimer !== null) clearTimeout(resizeTimer);
@@ -358,7 +371,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     };
     const onPaste = (e: ClipboardEvent) => {
       const files = Array.from(e.clipboardData?.files ?? []);
-      if (files.length === 0) return;
+      if (files.length === 0 || shellId !== null) return;
       // Ahead of xterm's own handler (capture), which would paste the text, if any.
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -376,7 +389,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     };
     el.addEventListener("paste", onPaste, true);
     dropPaths.current = (paths) => {
-      if (closed || !input) return;
+      if (closed || !input || shellId !== null) return;
       void typePaths(
         paths.map((path) => () => rpc<AttachmentView>(M.attachmentImport, { task: task.id, path })),
         paths.map(baseName),
@@ -413,6 +426,8 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
      * or offer Reconnect once they are used up. */
     const lost = (why: string | null) => {
       if (closed) return;
+      // A shell's stream ending is the shell ending: never attached again.
+      if (shellId !== null) return sourceRef.current.kind === "shell" ? sourceRef.current.onEnd() : undefined;
       if (failures >= REATTACH_MS.length) {
         setNote(why ?? t("term.lost"));
         setGone(true);
@@ -440,8 +455,8 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       if (again) term.reset();
       told = { rows: term.rows, cols: term.cols };
       const boot = bootRef.current;
-      attachOpen(
-        task.id,
+      const open = shellId !== null ? (r: number, c: number, d: (b: Uint8Array) => void, e: () => void) => shellAttachOpen(shellId, r, c, d, e) : (r: number, c: number, d: (b: Uint8Array) => void, e: () => void) => attachOpen(task.id, r, c, d, e);
+      open(
         told.rows,
         told.cols,
         (bytes) => {
@@ -498,7 +513,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     if (fonts) void fonts.then(start);
     else start();
     kick.current = (when) => {
-      if (closed || !fontsLoaded) return;
+      if (closed || !fontsLoaded || shellId !== null) return;
       if (when === "detached" && (id !== null || attaching || retryTimer !== null)) return;
       // Already attached under this boot (the terminal was opened after it began).
       if (when === "boot" && attachedBoot === bootRef.current) return;
@@ -519,7 +534,7 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
       term.dispose();
     };
     // `t` is the language's lookup: a language switch keeps the terminal.
-  }, [rpc, openUrl, task.id, task.live, shown]);
+  }, [rpc, openUrl, task.id, runs, shown, shellId]);
 
   // A new daemon (its sessions resumed) streams anew: attach at once. Back from a dropped
   // connection: attach if the stream is gone.
@@ -533,10 +548,15 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
     if (connected) kick.current?.("detached");
   }, [connected]);
 
-  if (!task.live) return <p className="muted">{t("term.noLive")}</p>;
+  if (!runs) return <p className="muted">{t("term.noLive")}</p>;
   return (
     <div className={`terminal-wrap${dropOn ? " drop-on" : ""}`} ref={wrap}>
-      <div className="terminal" ref={host} role="region" aria-label={t("term.region", { branch: task.branch })} />
+      <div
+        className="terminal"
+        ref={host}
+        role="region"
+        aria-label={source.kind === "shell" ? t("shell.region", { n: source.n, branch: task.branch }) : t("term.region", { branch: task.branch })}
+      />
       {note && (
         <p className={`small terminal-overlay terminal-note${gone ? " terminal-note-action" : ""}`} role="status">
           {note}
@@ -565,5 +585,10 @@ function TerminalView({ t: task, active = true }: { t: TaskView; active?: boolea
  * branch leaves the terminal alone. */
 export const TerminalTab = memo(
   TerminalView,
-  (a, b) => a.t.id === b.t.id && a.t.live === b.t.live && a.t.branch === b.t.branch && (a.active ?? true) === (b.active ?? true),
+  (a, b) =>
+    a.t.id === b.t.id &&
+    a.t.live === b.t.live &&
+    a.t.branch === b.t.branch &&
+    (a.active ?? true) === (b.active ?? true) &&
+    (a.source?.kind === "shell" ? a.source.shell : null) === (b.source?.kind === "shell" ? b.source.shell : null),
 );

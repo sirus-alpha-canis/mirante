@@ -23,7 +23,7 @@ import { SkillsChip } from "./SkillsChip";
 import { TerminalTab } from "./TerminalTab";
 import { TrustCard } from "./TrustCard";
 import { onMac, shortcutFor } from "../lib/shortcuts";
-import { clampWidth, loadPane, type PaneState, type PaneTarget, PANE_MAX, PANE_MIN, savePane } from "../lib/sidepane";
+import { clampWidth, loadPane, openTab, type PaneState, type PaneTarget, PANE_MAX, PANE_MIN, savePane } from "../lib/sidepane";
 import { SidePane } from "./SidePane";
 import { GroupPanel } from "./GroupPanel";
 import { SubagentLane } from "./SubagentLane";
@@ -452,7 +452,7 @@ export function Detail({
     (target: PaneTarget) => {
       // The task's own terminal is the main view, never the pane's.
       if (target.k === "terminal" && target.task === taskId) return setTab("Terminal");
-      setPane((p) => ({ ...p, open: true, target }));
+      setPane((p) => openTab(p, target));
     },
     [taskId, setPane],
   );
@@ -461,7 +461,8 @@ export function Detail({
     [taskId, openTarget],
   );
   const togglePane = useCallback(() => setPane((p) => ({ ...p, open: !p.open })), [setPane]);
-  const [quick, setQuick] = useState(false);
+  /** Quick-open: `pane` opens the file in the shown tab, `tab` in a new one ("+" → File…). */
+  const [quick, setQuick] = useState<false | "pane" | "tab">(false);
   const editor = useOpenInEditor(taskId);
   // Threads: "New thread from this" opens the dialog on that line; Continue opens a thread
   // with its composer focused (once, when its Detail shows).
@@ -484,8 +485,8 @@ export function Detail({
   );
   // ⌘\ (the pane) and ⌘P (quick-open) are this view's chords; the app leaves them here.
   // Off macOS the terminal keeps Ctrl chords, as with the app's own.
-  const keys = useRef({ togglePane, quickOpen: () => setQuick(true) });
-  keys.current = { togglePane, quickOpen: () => setQuick(true) };
+  const keys = useRef({ togglePane, quickOpen: () => setQuick("pane") });
+  keys.current = { togglePane, quickOpen: () => setQuick("pane") };
   useEffect(() => {
     const mac = onMac();
     const onKey = (e: globalThis.KeyboardEvent) => {
@@ -602,7 +603,7 @@ export function Detail({
               title={tt("pane.reviewTitle")}
               onClick={() => {
                 setTab("Terminal");
-                setPane((p) => ({ ...p, open: true, target: { k: "diff" } }));
+                setPane((p) => openTab(p, { k: "diff" }));
               }}
             >
               {tt("pane.review")}
@@ -672,7 +673,9 @@ export function Detail({
               <div className="pane-slot" style={{ flexBasis: `${pane.width}%` }}>
                 <SidePane
                   task={t}
-                  target={pane.target}
+                  pane={pane}
+                  onPane={setPane}
+                  onAddFile={() => setQuick("tab")}
                   version={turnsEnded(feed)}
                   steps={<StepsPanel taskId={t.id} feed={feed} />}
                   onOpenFile={paneApi.openFile}
@@ -691,7 +694,9 @@ export function Detail({
             </p>
           )}
           {quick && (
-            <QuickOpen taskId={t.id} onOpen={(path) => paneApi.openFile(path)} onOpenEditor={(path) => editor.open(path)} onClose={() => setQuick(false)} />
+            <QuickOpen
+              taskId={t.id}
+              onOpen={(path) => (quick === "tab" ? setPane((p) => openTab(p, { k: "file", path }, true)) : paneApi.openFile(path))} onOpenEditor={(path) => editor.open(path)} onClose={() => setQuick(false)} />
           )}
           {threadFrom && (
             <NewThreadDialog

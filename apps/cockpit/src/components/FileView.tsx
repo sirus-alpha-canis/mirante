@@ -1,7 +1,7 @@
 // One worktree file in the side pane, as the daemon read it (`task.file`): highlighted text
 // with line numbers, a Markdown preview (with its source a click away), an image, or what it
-// is when it cannot be shown (binary, too large, maybe secret until revealed). Every string
-// is a React text node.
+// is when it cannot be shown (binary, too large, maybe secret until revealed, a PDF with
+// "Open in Preview"). An SVG is text, never rendered. Every string is a React text node.
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useEnv } from "../env";
 import { highlight } from "../lib/highlight";
@@ -48,6 +48,36 @@ const Code = memo(function Code({ text, lang, line, path }: { text: string; lang
     </pre>
   );
 });
+
+/** A PDF: its size and pages, and "Open in Preview" (the shell opens only the path the
+ * daemon resolved, and only a PDF). Not rendered here. */
+function PdfNote({ taskId, path, size, pages }: { taskId: string; path: string; size: number; pages?: number }) {
+  const env = useEnv();
+  const t = useT();
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <div className="file-note">
+      <p>
+        {typeof pages === "number" ? t("file.pdfPages", { pages }) : t("file.pdfUnknown")} · {formatBytes(size)}
+      </p>
+      <button
+        type="button"
+        className="btn btn-small"
+        onClick={() => {
+          setError(null);
+          env.openExternal(taskId, path).catch((e: unknown) => setError(t("file.openFailed", { error: e instanceof Error ? e.message : String(e) })));
+        }}
+      >
+        {t("file.openPreview")}
+      </button>
+      {error && (
+        <p className="error small" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 /** `path` (worktree-relative) of task `taskId`, at `line` when given. */
 export function FileView({
@@ -115,6 +145,8 @@ export function FileView({
           {editor}
         </div>
       );
+    case "pdf":
+      return <PdfNote taskId={taskId} path={path} size={f.size} pages={f.pages} />;
     case "image":
       return f.image && IMAGE_MIMES.has(f.image.mime) && /^[A-Za-z0-9+/=]*$/.test(f.image.b64) ? (
         <div className="file-image">

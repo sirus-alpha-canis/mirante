@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   disposed: false,
   options: null as Record<string, unknown> | null,
   attachOpen: vi.fn(),
+  shellAttachOpen: vi.fn(),
   attachWrite: vi.fn(async (_id: number, _bytes: Uint8Array) => {}),
   attachClose: vi.fn(async (_id: number) => {}),
   attachAck: vi.fn(async (_id: number, _bytes: number) => {}),
@@ -118,6 +119,7 @@ vi.mock("@xterm/addon-webgl", () => ({
 vi.mock("../lib/daemon", async (actual) => ({
   ...(await actual<typeof import("../lib/daemon")>()),
   attachOpen: h.attachOpen,
+  shellAttachOpen: h.shellAttachOpen,
   attachWrite: h.attachWrite,
   attachClose: h.attachClose,
   attachAck: h.attachAck,
@@ -194,6 +196,7 @@ describe("TerminalTab", () => {
     h.lines = [];
     h.modes = { bracketedPasteMode: false };
     h.attachOpen.mockReset();
+    h.shellAttachOpen.mockReset();
     h.attachWrite.mockReset();
     h.attachWrite.mockImplementation(async () => {});
     h.attachClose.mockClear();
@@ -224,6 +227,64 @@ describe("TerminalTab", () => {
     r.unmount();
     expect(h.attachClose).toHaveBeenCalledWith(4);
     expect(h.disposed).toBe(true);
+  });
+
+  describe("a person's shell (source)", () => {
+    const mountShell = (t: TaskView, onEnd = vi.fn(), answers: Record<string, unknown> = {}) => {
+      const { env, calls } = makeEnv(answers);
+      const r = render(
+        <EnvContext.Provider value={env}>
+          <TerminalTab t={t} active source={{ kind: "shell", shell: "s9", n: 2, onEnd }} />
+        </EnvContext.Provider>,
+      );
+      return { ...r, calls, onEnd };
+    };
+
+    it("streams through shell.attach (not the agent's attach), types keys, resizes the shell", async () => {
+      h.shellAttachOpen.mockImplementation(async (_s: string, _r: number, _c: number, onData: (b: Uint8Array) => void) => {
+        onData(new TextEncoder().encode("$ "));
+        return { id: 7, input: true };
+      });
+      // A shell runs whether or not the task's agent does.
+      const r = mountShell(task("a", { live: false }));
+      await waitFor(() => expect(h.onData).not.toBeNull());
+      expect(h.shellAttachOpen.mock.calls[0].slice(0, 3)).toEqual(["s9", 30, 100]);
+      expect(h.attachOpen).not.toHaveBeenCalled();
+      expect(screen.getByRole("region", { name: "Shell 2 of feat/a" })).toBeInTheDocument();
+      expect(text(h.written[0])).toBe("$ ");
+      h.onData!("ls\r");
+      expect(sent()).toEqual([[7, "ls\r"]]);
+      vi.useFakeTimers();
+      try {
+        h.term!.rows = 40;
+        h.onResize!({ rows: 40, cols: 100 });
+        vi.advanceTimersByTime(200);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(r.calls).toContainEqual([M.shellResize, { shell: "s9", rows: 40, cols: 100 }]);
+      expect(r.calls.some(([m]) => m === M.sessionResize)).toBe(false);
+      r.unmount();
+      expect(h.attachClose).toHaveBeenCalledWith(7);
+    });
+
+    it("its stream ending is the shell ending: never attached again; a pasted file is not stored", async () => {
+      let end: (() => void) | null = null;
+      h.shellAttachOpen.mockImplementation(async (_s: string, _r: number, _c: number, _d: unknown, onEnd: () => void) => {
+        end = onEnd;
+        return { id: 8, input: true };
+      });
+      const r = mountShell(task("a"), vi.fn(), { [M.attachmentPut]: () => ({}) });
+      await waitFor(() => expect(h.onData).not.toBeNull());
+      const png = new File([new Uint8Array([0x89, 0x50])], "a.png", { type: "image/png" });
+      fireEvent.paste(screen.getByRole("region", { name: "Shell 2 of feat/a" }), { clipboardData: { files: [png], getData: () => "" } });
+      await act(async () => {});
+      expect(r.calls.some(([m]) => m === M.attachmentPut)).toBe(false);
+      act(() => end!());
+      expect(r.onEnd).toHaveBeenCalledTimes(1);
+      await new Promise((res) => setTimeout(res, 700));
+      expect(h.shellAttachOpen).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("attachments", () => {

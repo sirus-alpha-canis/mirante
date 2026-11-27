@@ -8,13 +8,14 @@ const term = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }));
 vi.mock("./TerminalTab", async () => {
   const { useEffect } = await import("react");
   return {
-    TerminalTab: ({ t, active }: { t: TaskView; active?: boolean }) => {
+    TerminalTab: ({ t, active, source }: { t: TaskView; active?: boolean; source?: { kind: string; shell?: string; n?: number } }) => {
       useEffect(() => {
         term.mounts++;
         return () => {
           term.unmounts++;
         };
       }, []);
+      if (source?.kind === "shell") return <div aria-label={`Shell ${source.n} of ${t.branch}`} data-shell={source.shell} />;
       return (
         <div aria-label={`Terminal of ${t.branch}`} data-active={String(active ?? true)}>
           terminal here
@@ -560,6 +561,141 @@ describe("Detail (V1 classic)", () => {
       expect(screen.getAllByLabelText("Terminal of feat/a")).toHaveLength(1);
     });
 
+    /** The daemon's shells, as shell.open / shell.list / shell.close keep them. */
+    const shells = () => {
+      const running: { shell: string; task: string; n: number; cwd: string }[] = [];
+      return {
+        running,
+        answers: {
+          "shell.open": (p: Record<string, unknown>) => {
+            const s = { shell: `s${running.length + 1}`, task: String(p.task), n: Number(p.n), cwd: "/wt/a" };
+            running.push(s);
+            return s;
+          },
+          "shell.list": (p: Record<string, unknown>) => running.filter((s) => s.task === p.task),
+          "shell.close": (p: Record<string, unknown>) => {
+            running.splice(running.findIndex((s) => s.shell === p.shell), 1);
+            return {};
+          },
+        },
+      };
+    };
+    const tabs = () => within(pane()!).getAllByRole("tab").map((t) => t.textContent);
+
+    it("+ opens each surface: Terminal starts the person's shell, File… quick-opens into a new tab", async () => {
+      const sh = shells();
+      const h = setup({
+        ...sh.answers,
+        "task.diff": DIFF,
+        "task.files": ["src/login.ts"],
+        "task.file": { path: "src/login.ts", abs: "/w/src/login.ts", size: 9, kind: "text", text: "const a = 1;", lang: "ts" },
+      });
+      await userEvent.click(screen.getByRole("button", { name: "Review layout" }));
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      const menu = within(pane()!).getByRole("menu", { name: "Add to the side pane" });
+      expect(within(menu).getAllByRole("menuitem").map((m) => m.textContent)).toEqual(["Terminal", "File…"]);
+      await userEvent.click(within(menu).getByRole("menuitem", { name: "Terminal" }));
+      expect(await within(pane()!).findByLabelText("Shell 1 of feat/a")).toHaveAttribute("data-shell", "s1");
+      expect(h.calls).toContainEqual(["shell.open", { task: "a", n: 1, rows: 24, cols: 80 }]);
+      expect(tabs()).toEqual(["Diff", "Shell 1"]);
+      // The main terminal is still the one agent terminal.
+      expect(screen.getAllByLabelText("Terminal of feat/a")).toHaveLength(1);
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "File…" }));
+      const input = screen.getByRole("combobox", { name: "File name" });
+      expect(await screen.findByRole("option", { name: "src/login.ts" })).toBeInTheDocument();
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(await within(pane()!).findByText("const")).toHaveClass("tk-kw");
+      expect(tabs()).toEqual(["Diff", "Shell 1", "login.ts"]);
+      // The same file again focuses its tab instead of a new one.
+      await userEvent.click(within(pane()!).getByRole("tab", { name: "Diff" }));
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "File…" }));
+      await screen.findByRole("option", { name: "src/login.ts" });
+      fireEvent.keyDown(screen.getByRole("combobox", { name: "File name" }), { key: "Enter" });
+      await waitFor(() => expect(within(pane()!).getByRole("tab", { name: "login.ts" })).toHaveAttribute("aria-selected", "true"));
+      expect(tabs()).toHaveLength(3);
+    });
+
+    it("Escape closes the + menu and focus goes back to +", async () => {
+      setup();
+      act(() => togglePane());
+      const plus = within(pane()!).getByRole("button", { name: "Add to the side pane" });
+      await userEvent.click(plus);
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+      expect(screen.getByRole("menuitem", { name: "Terminal" })).toHaveFocus();
+      await userEvent.keyboard("{ArrowDown}");
+      expect(screen.getByRole("menuitem", { name: "File…" })).toHaveFocus();
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(plus).toHaveFocus();
+      expect(plus).toHaveAttribute("aria-expanded", "false");
+      // The pane stays open (Escape was the menu's).
+      expect(pane()).not.toBeNull();
+    });
+
+    it("tabs persist per task; a shell tab that comes back reattaches, and after a daemon restart says it ended", async () => {
+      const sh = shells();
+      const h = makeEnv({ ...sh.answers, "task.diff": DIFF });
+      h.load([task("a", { status: "working" }), task("b", { status: "working" })]);
+      const r = renderWith(h.env, <Detail taskId="a" onSelect={() => {}} />);
+      act(() => togglePane());
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "Terminal" }));
+      await within(pane()!).findByLabelText("Shell 1 of feat/a");
+      r.rerender(wrap(h.env, <Detail taskId="b" onSelect={() => {}} />));
+      expect(pane()).toBeNull();
+      r.rerender(wrap(h.env, <Detail taskId="a" onSelect={() => {}} />));
+      expect(tabs()).toEqual(["Shell 1"]);
+      expect(await within(pane()!).findByLabelText("Shell 1 of feat/a")).toHaveAttribute("data-shell", "s1");
+      expect(h.calls.filter(([m]) => m === "shell.open")).toHaveLength(1);
+      expect(JSON.parse(h.env.storage.getItem("mirante.pane.a")!).tabs).toEqual([{ id: "t1", t: { k: "shell", n: 1 } }]);
+      // The daemon restarted: its shells are gone; the tab says so and Restart starts one.
+      sh.running.length = 0;
+      r.rerender(wrap(h.env, <Detail taskId="b" onSelect={() => {}} />));
+      r.rerender(wrap(h.env, <Detail taskId="a" onSelect={() => {}} />));
+      expect(await within(pane()!).findByText(/Shell ended\./)).toBeInTheDocument();
+      expect(h.calls.filter(([m]) => m === "shell.open")).toHaveLength(1);
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Restart" }));
+      expect(await within(pane()!).findByLabelText("Shell 1 of feat/a")).toHaveAttribute("data-shell", "s1");
+      expect(h.calls.filter(([m]) => m === "shell.open")).toHaveLength(2);
+    });
+
+    it("closing a shell's tab ends the shell; four shells at most", async () => {
+      const sh = shells();
+      setup(sh.answers);
+      act(() => togglePane());
+      for (let i = 1; i <= 4; i++) {
+        await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+        await userEvent.click(screen.getByRole("menuitem", { name: "Terminal" }));
+        await within(pane()!).findByLabelText(`Shell ${i} of feat/a`);
+      }
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      expect(screen.getByRole("menuitem", { name: "Terminal (all 4 open)" })).toBeDisabled();
+      await userEvent.keyboard("{Escape}");
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Close Shell 2" }));
+      await waitFor(() => expect(sh.running.map((s) => s.n)).toEqual([1, 3, 4]));
+      expect(tabs()).toEqual(["Shell 1", "Shell 3", "Shell 4"]);
+    });
+
+    it("Split shows two tabs side by side; its separator resizes by keyboard", async () => {
+      setup({ ...shells().answers, "task.diff": DIFF });
+      await userEvent.click(screen.getByRole("button", { name: "Review layout" }));
+      expect(within(pane()!).queryByRole("button", { name: "Split" })).toBeNull();
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Add to the side pane" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "Terminal" }));
+      await userEvent.click(within(pane()!).getByRole("tab", { name: "Diff" }));
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Split" }));
+      expect(within(pane()!).getAllByRole("tabpanel")).toHaveLength(2);
+      const sep = within(pane()!).getByRole("separator", { name: "Resize the split" });
+      expect(sep).toHaveAttribute("aria-valuenow", "50");
+      sep.focus();
+      await userEvent.keyboard("{ArrowRight}{ArrowRight}");
+      expect(sep).toHaveAttribute("aria-valuenow", "60");
+      await userEvent.click(within(pane()!).getByRole("button", { name: "Unsplit" }));
+      expect(within(pane()!).getAllByRole("tabpanel")).toHaveLength(1);
+    });
+
     it("⌘P quick-opens a file of the task into the pane; ⌘↵ opens it in the editor", async () => {
       const h = setup({
         "task.files": ["src/login.ts"],
@@ -626,7 +762,7 @@ describe("Detail: a fan-out group's member", () => {
     const panel = screen.getByRole("region", { name: "Fan-out fix login" });
     await userEvent.click(within(panel).getByRole("button", { name: "Diff beside" }));
     const pane = screen.getByRole("complementary", { name: "Side pane" });
-    expect(within(pane).getByText("Diff: the codex run")).toBeInTheDocument();
+    expect(within(pane).getByText("Diff: the codex run", { selector: ".side-pane-title" })).toBeInTheDocument();
     await waitFor(() => expect(h.calls).toContainEqual(["task.diff", { task: "b" }]));
   });
 });
