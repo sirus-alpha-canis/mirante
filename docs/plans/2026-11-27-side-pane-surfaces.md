@@ -63,7 +63,7 @@
 ## Batches
 ### Batch 0 — spikes (`docs/spikes/FINDINGS-surfaces.md`)
 - [ ] S1: serve-sim `--auth-token` covers loopback + helper port; exact control-WebSocket schema for the pinned version; `--ignore-scripts` still leaves a runnable helper.
-- [ ] S2: WKWebView iframe at `http://localhost` from `tauri://localhost`; `window.__TAURI_INTERNALS__` undefined inside; `invoke` from that origin refused; in-frame link to `https://example.com` blocked by `frame-src`.
+- [ ] S2: WKWebView iframe at `http://localhost` from `tauri://localhost`; `window.__TAURI_INTERNALS__` undefined inside; `invoke` from that origin refused; in-frame link to `https://example.com` blocked by `frame-src`. *(Static part done 2026-11-27, see Batch B As built; the live run is a founder check in `docs/dogfood/side-pane-surfaces.md` §D. `docs/spikes/FINDINGS-surfaces.md` not written: file creation was refused in the session.)*
 - [ ] S3: MJPEG bandwidth/CPU at 30 fps through a Tauri Channel.
 
 ### Batch A — "+" menu, tabs, Terminal, File
@@ -89,6 +89,15 @@
 - [x] 1. CSP `frame-src`; `security.test.ts` asserts the exact `frame-src` and that no capability has `remote`.
 - [x] 2. `BrowserTab.tsx` + `lib/localurl.ts` (tests: refuses https, other hosts, userinfo, missing port, file:; exact sandbox flags).
 - [x] 3. Framing-refused fallback; optional port suggestions (not built, see As built).
+
+**As built (Batch B, 2026-11-27):**
+- *CSP*: `frame-src http://localhost:* http://127.0.0.1:*` in `csp` and `devCsp`. **`[::1]` left out** (deviation from decision 5): a CSP host source cannot name an IPv6 literal, so the address bar refuses it too. `security.test.ts` pins the exact directive, that `capabilities/` holds only `default.json` with no `remote`, that `lib.rs` adds no capability, the frame's attributes, and that `BrowserTab.tsx` is the only component that frames.
+- *Address bar* (`lib/localurl.ts`, `checkLocalUrl(input, self)`): accepts `3000` and `localhost:3000/x` (http:// added), returns `URL`'s normalized href; refuses with a reason (`parse/scheme/host/port/userinfo/self`). `:80` counts as missing (URL drops it). `self` is `window.location.origin`: in a dev build the cockpit's own `http://127.0.0.1:1420` is refused (same-origin with `allow-same-origin` would reach the app).
+- *Pane*: `PaneTarget {k:"browser", url}` (`""` = nothing typed yet; a stored URL is re-checked, a bad one drops the tab); `retarget(p, id, target)` updates a tab in place as it navigates. "+" menu: Terminal, File…, Browser; a blank Browser tab already open is focused instead of a second. Tab name: `localhost:3000`.
+- *BrowserTab.tsx*: Back is the address bar's own history (a cross-origin frame's history is unreadable, so links clicked inside are not in it); Reload remounts the frame; Open in browser uses `openUrl` (the opener allowlist). Framing refused: on `load`, a readable `contentDocument` means it is not the dev server's page (that one is cross-origin) → "This server can't be shown here" + Open in browser. What WebKit shows for a port nobody listens on is unverified.
+- *Not built*: port suggestions from shell/agent output (optional).
+- *S2 statically* (Tauri 2.12.5 / wry 0.57.1 source): an invoke is `Origin::Local` only from the `tauri://` page, under `devUrl`/`frontendDist`, or a registered scheme (`is_local_url`); wry names a postMessage by the posting frame's URL, the `ipc://` protocol by its `Origin` header; with no `remote` capability a framed page gets nothing. Tauri's and the three plugins' init scripts are main-frame only, so the frame has no `__TAURI_INTERNALS__` or invoke key. The live S2 run (loads, no `__TAURI_INTERNALS__`, invoke refused, `https://example.com` blocked in-frame, mixed content) is the founder's: `docs/dogfood/side-pane-surfaces.md` §D.
+- Tests: cockpit `localurl` (7), `BrowserTab` (13), sidepane (2 new), Detail side pane (1 new, 1 updated), security (2 new).
 
 ### Batch C — Device (serve-sim)
 - [ ] 1. `hub/devices.rs` + simctl JSON parsing (fixtures in `hub/testdata`, fake `xcrun` via env override; tests: `udid_must_be_listed`, `setup_reports_missing_node_xcode_runtime`, `non_arm64_reports_unsupported`).

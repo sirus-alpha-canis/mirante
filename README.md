@@ -218,6 +218,9 @@ More detail, including the fake daemon for UI work without agents:
   after a daemon restart: the tab says so, with **Restart**). **+ → File…** opens a file
   through quick-open in a new tab. A PDF shows its size and pages with **Open in Preview**.
   The `mirante` CLI run from inside a worktree counts as an agent (worktrees are agent-written).
+  **+ → Browser** shows a dev server on this machine (`http://localhost` or `127.0.0.1` on an
+  explicit port, nothing else, inside the page too) in a sandboxed frame that gets no access
+  to Mirante; a server that refuses to be framed offers **Open in browser**.
 - **Grid (⌘G)** shows every agent at once.
 - **Brain (⌘B)** is the repo memory graph and its review queue.
 - **Skills (⌘L)** lists the skill library and its proposals.

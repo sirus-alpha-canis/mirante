@@ -16,6 +16,13 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
   task or stopping the daemon ends it with everything it started. **+ → File…** quick-opens
   a file into a new tab (an open file focuses its tab). A PDF (by its `%PDF-` bytes, up to
   20 MB) shows its size and page count with **Open in Preview**; SVG stays text.
+- **Side pane Browser tab.** **+ → Browser** shows a local dev server (`http://localhost` or
+  `127.0.0.1`, an explicit port; no https, other hosts, user or password, IPv6, or Mirante's
+  own page) in an iframe: sandboxed to the server's own origin (no popups, top navigation or
+  modals), no referrer, no delegated features, and the CSP's `frame-src` keeps every page
+  inside it on those hosts. Tauri grants no remote origin, so the page cannot call Mirante.
+  Back (the addresses typed), Reload, **Open in browser**; a server that refuses to be framed
+  says so. The address is remembered with the tab.
 
 ## [0.3.0] — 2026-11-27
 
