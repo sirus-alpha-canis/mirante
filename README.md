@@ -579,3 +579,11 @@ other projects), test first, one change per PR, and all the checks above must pa
 
 Apache License 2.0. See [`LICENSE`](LICENSE) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+### Trademark
+
+The Mirante app uses the Vibely ribbon mark by permission of its owner; the Apache-2.0
+license covers the code, not the mark. The mark lives in
+[`apps/cockpit/src/assets/brand/`](apps/cockpit/src/assets/brand/README.md) and the app icon
+in `apps/cockpit/src-tauri/icons/`; a fork that redistributes the app must replace them or get
+the owner's permission.

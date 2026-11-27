@@ -95,6 +95,16 @@ Every text/background pair is checked by `styles.test.ts`: 4.5:1 for text and 3:
 - Commit the master SVG and PNG under `apps/cockpit/src-tauri/icons/source/`.
 - Remove the ProjectDNA-based icons.
 
+**As built (Task 2):**
+- Nunito Sans **3.101** (name table; METADATA.pb carries upstream commit 058bd7a, no version), upright only, subset to Latin + Latin Extended by the founder (118,764 B; Inter was 352,240 B). Its wght axis is 200–1000 (default 200), so `@font-face` says `font-weight: 200 1000`. The subset drops the OFL name records (IDs 13/14); the license text sits next to the file and THIRD_PARTY_NOTICES says so. No Reserved Font Name.
+
+**As built (Batch B):**
+- Ribbon paths are Vibely's `vibely.svg` path data unchanged; only the shadow filter is dropped and the viewBox cropped to the shapes (`10 3 772.4 298`). Masters in `src/assets/brand/` (+ a README saying the mark is Vibely's, by permission, outside the code license).
+- The mark stays two-tone in dark too (the token map's choice; the front red carries the silhouette on #111111). `RibbonMark tone="mono"` (currentColor, back at 60%, as `vibelyWhite.svg`) exists but nothing uses it yet.
+- The wordmark is "Mirante" outlined with fontTools from the variable TTF instanced at wght 700 / wdth 100 / opsz 12 / YTLC 500, with GPOS pair kerning (r·a −5, t·e −5): one 2 KB path. Used in the launch splash and the in-app waiting splash; the top bar keeps "Mirante" as live text in Nunito Sans.
+- Splash motion: the ribbon draws in from its centre (clip-path, 420ms), the word fades up (300ms after 180ms); once, none with reduced motion. The old infinite orbit is gone.
+- App icon: `icons/source/render-icon.swift` (AppKit's own SVG support, offline) renders the master on #FFFFFF with a 10% margin (and a #111111 dark variant, source only), then `tauri icon`; only the five files `tauri.conf.json` lists are kept.
+
 ## Batch C — Components
 
 **Task 6: buttons, inputs, chips, cards, toasts, modals in Vibely's language, at Mirante density**

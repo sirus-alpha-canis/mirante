@@ -23,3 +23,12 @@ copyright in the font's name table.
   Copyright 2020 The JetBrains Mono Project Authors. SIL OFL 1.1
   (`JetBrainsMono-OFL.txt`). Source: https://github.com/JetBrains/JetBrainsMono
   (release v2.304).
+
+## Marks (not licensed under Apache-2.0)
+
+- **The Vibely ribbon mark** (`apps/cockpit/src/assets/brand/ribbon.svg`,
+  `ribbon-mono.svg`, inline in `apps/cockpit/index.html` and
+  `apps/cockpit/src/components/Splash.tsx`, and the app icon in
+  `apps/cockpit/src-tauri/icons/`) belongs to Vibely, its owner, and is used in the Mirante
+  app by permission. Mirante's license does not grant any right to use it.
+- The "Mirante" wordmark is set in Nunito Sans (above) and outlined to a path.
