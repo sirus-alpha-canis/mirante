@@ -95,6 +95,7 @@ impl Store {
                 std::fs::create_dir_all(dir)?;
             }
         }
+        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path)?;
@@ -163,6 +164,7 @@ impl Store {
 pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// `0600` on the database file and its existing `-wal` / `-shm` sidecars.
+#[cfg(unix)]
 fn make_private(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     for suffix in ["", "-wal", "-shm"] {
@@ -172,6 +174,12 @@ fn make_private(path: &Path) -> Result<()> {
             other => other?,
         }
     }
+    Ok(())
+}
+
+/// Windows has no mode bits: the database lives in the user's profile, private by its ACL.
+#[cfg(windows)]
+fn make_private(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -202,6 +210,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[test]
@@ -215,6 +224,7 @@ mod tests {
         assert_eq!(s.schema_version().unwrap(), 14);
     }
 
+    #[cfg(unix)]
     #[test]
     fn database_files_are_private_to_the_user() {
         use std::os::unix::fs::PermissionsExt;

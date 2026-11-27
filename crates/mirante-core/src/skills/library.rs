@@ -413,10 +413,13 @@ mod tests {
         assert_eq!(r.files[1], ("reference/guide.md".to_string(), b"Guide\n".to_vec()));
         assert_eq!(r.manifest, v.manifest);
         // Private, and no staging folder is left behind.
-        use std::os::unix::fs::PermissionsExt;
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&lib), 0o700);
-        assert_eq!(mode(&lib.join("a/v1/SKILL.md")), 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&lib), 0o700);
+            assert_eq!(mode(&lib.join("a/v1/SKILL.md")), 0o600);
+        }
         let names: Vec<String> = std::fs::read_dir(lib.join("a"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into())
@@ -488,6 +491,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlinked_skill_dir_or_hardlinked_file_is_refused() {
         let (_home, lib) = lib_dir();
         let outside = TempDir::new("skills-out");

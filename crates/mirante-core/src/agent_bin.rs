@@ -15,6 +15,7 @@
 //! is not on PATH the agent's PATH gets that directory first ([`child_path`]): nvm keeps
 //! `node` next to it.
 use std::fmt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -94,8 +95,21 @@ impl Lookup {
     }
 }
 
+#[cfg(unix)]
 pub fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows has no execute bit: a regular file whose extension is listed in `PATHEXT`
+/// (`.COM;.EXE;.BAT;.CMD` when it is unset), compared without case.
+#[cfg(windows)]
+pub fn is_executable(p: &Path) -> bool {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let listed = pathext.split(';').any(|x| x.strip_prefix('.').is_some_and(|x| x.eq_ignore_ascii_case(ext)));
+    listed && std::fs::metadata(p).is_ok_and(|m| m.is_file())
 }
 
 pub fn is_shim_dir(dir: &Path) -> bool {
@@ -210,7 +224,28 @@ pub fn child_path(bin: &Path, path_var: Option<&str>) -> Option<String> {
     std::env::join_paths(parts).ok().and_then(|s| s.into_string().ok())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn is_executable_follows_pathext() {
+        let d = TempDir::new("agent-pathext");
+        for name in ["claude.exe", "codex.CMD", "notes.txt", "claude"] {
+            std::fs::write(d.path().join(name), "x").unwrap();
+        }
+        assert!(is_executable(&d.path().join("claude.exe")));
+        assert!(is_executable(&d.path().join("codex.CMD")));
+        assert!(!is_executable(&d.path().join("notes.txt")));
+        assert!(!is_executable(&d.path().join("claude")));
+        assert!(!is_executable(&d.path().join("missing.exe")));
+        std::fs::create_dir(d.path().join("dir.exe")).unwrap();
+        assert!(!is_executable(&d.path().join("dir.exe")));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
