@@ -2959,7 +2959,12 @@ pub(crate) mod tests {
     }
 
     fn start(k: &Kit, task: &str) {
-        k.hub.start_session(mirante_ipc::types::StartSession { task: task.into(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(
+                mirante_ipc::types::StartSession { task: task.into(), prompt: None, attachments: Vec::new() },
+                false,
+            )
+            .unwrap();
     }
 
     fn strs(v: &[&str]) -> Vec<String> {
@@ -3006,7 +3011,10 @@ pub(crate) mod tests {
         k.emit(crate::driver::DriverEvent::NativeId("th-1".into()));
         let resume = |k: &Kit| {
             k.emit(crate::driver::DriverEvent::Exited { code: Some(0) });
-            let r = k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, true);
+            let r = k.hub.start_session(
+                mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() },
+                true,
+            );
             assert!(r.unwrap().resumed);
             assert_eq!(spawned(k), None, "nothing injected again");
             let mut w = k.factory.withdrawn.lock().unwrap().last().cloned().unwrap();
@@ -3064,7 +3072,10 @@ pub(crate) mod tests {
             k.emit(crate::driver::DriverEvent::NativeId(format!("nat-{}", agent.as_str())));
             k.emit(crate::driver::DriverEvent::Exited { code: Some(0) });
             let before = k.payloads("skill.injected").len();
-            let r = k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, true);
+            let r = k.hub.start_session(
+                mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() },
+                true,
+            );
             assert!(r.unwrap().resumed);
             assert_eq!(spawned(&k).is_some(), again, "{agent:?}");
             assert_eq!(k.payloads("skill.injected").len(), before + usize::from(again), "{agent:?}");

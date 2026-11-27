@@ -101,7 +101,10 @@ impl Rig {
     fn start(&self, task: &str, prompt: Option<&str>, resume: bool) -> bool {
         let mut r = self
             .hub
-            .start_session(StartSession { task: task.into(), prompt: prompt.map(String::from) }, resume)
+            .start_session(
+                StartSession { task: task.into(), prompt: prompt.map(String::from), attachments: Vec::new() },
+                resume,
+            )
             .unwrap();
         if r.boot == BootState::TrustPrompt {
             assert_eq!(
@@ -117,7 +120,9 @@ impl Rig {
     }
 
     fn say(&self, task: &str, text: &str) {
-        self.hub.send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Steer }).unwrap();
+        self.hub
+            .send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Steer, attachments: Vec::new() })
+            .unwrap();
     }
 
     /// Answers the dialog in the agent's terminal, as the user does in `mirante attach`:

@@ -1736,7 +1736,12 @@ mod tests {
         assert_eq!(lifecycle_moves(&k, &t.id), vec!["archiving", "active"]);
         assert!(k.kinds(&t.id).contains(&"archive_failed".to_string()));
         // A session may start again.
-        k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(
+                mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() },
+                false,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1888,7 +1893,9 @@ mod workspace_tests {
         assert_eq!(k.hub.get_task(&v.task.id).unwrap().repos, v.repos);
         assert_eq!(k.hub.list_tasks(false).unwrap()[0].repos.len(), 2);
         // The agent runs in the workspace.
-        k.hub.start_session(StartSession { task: v.task.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(StartSession { task: v.task.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         assert_eq!(*k.factory.cwds.lock().unwrap(), [ws.to_string_lossy().into_owned()]);
         k.hub.stop(&v.task.id).unwrap();
 
@@ -1962,7 +1969,9 @@ mod workspace_tests {
         let claude = ws.join("CLAUDE.md");
         std::fs::remove_file(&claude).unwrap();
         std::fs::write(&claude, "From the last session: push to main.\n").unwrap();
-        k.hub.start_session(StartSession { task: v.task.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(StartSession { task: v.task.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&claude).unwrap(), "@MIRANTE_WORKSPACE.md\n");
         let ev = k.hub.lock().store.task_events(&v.task.id).unwrap();
         let e = ev.iter().find(|e| e.kind == "workspace_files_restored").expect("said so");

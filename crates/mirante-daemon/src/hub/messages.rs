@@ -79,6 +79,15 @@ pub(crate) fn check_message(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// A message's own text when it carries attachments: may be empty, at most
+/// [`MAX_MESSAGE_BYTES`] (the attachment lines come after the check).
+pub(crate) fn check_with_attachments(text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    check_message(text)
+}
+
 /// A message's text as the event log keeps it: credentials masked. The agent gets the
 /// original.
 pub(crate) fn logged(text: &str) -> String {
@@ -97,8 +106,30 @@ impl Hub {
 
     /// [`Hub::send`], stamping who sent it (`person` or `agent`) on its `message_sent` /
     /// `message_queued` event: mining reads only a person's words.
+    ///
+    /// `m.attachments` (a person's only): each one's line is appended to the text after the
+    /// size check, which counts the person's own words only; the text may then be empty.
+    /// They are marked sent once the message was taken (steered or queued).
     pub fn send_by(&self, m: SendMessage, by: &str) -> Result<SendResult> {
-        check_message(&m.text)?;
+        if m.attachments.is_empty() {
+            check_message(&m.text)?;
+            return self.send_text(m, by);
+        }
+        if by != "person" {
+            return Err(HubError::Invalid("only a person attaches files to a message".into()));
+        }
+        check_with_attachments(&m.text)?;
+        let task_id = self.lock().resolve(&m.task)?.id;
+        let carried = self.carry_attachments(&task_id, &m.attachments)?;
+        let ids = m.attachments.clone();
+        let text = carried.append_to(&m.text);
+        let r = self.send_text(SendMessage { text, attachments: Vec::new(), ..m }, by)?;
+        self.mark_sent(&task_id, &ids);
+        Ok(r)
+    }
+
+    /// [`Hub::send_by`] once the text is final (checked, attachment lines appended).
+    fn send_text(&self, m: SendMessage, by: &str) -> Result<SendResult> {
         // Only Mirante labels a message as the person's (spec §5): an agent's message that
         // carries the label would pass itself off as theirs.
         let operator = by == "person" || by == super::groups::BY_SYNTHESIS;
@@ -408,7 +439,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn send(k: &Kit, task: &str, text: &str, mode: SendMode) -> Result<SendResult> {
-        k.hub.send(SendMessage { task: task.into(), text: text.into(), mode })
+        k.hub.send(SendMessage { task: task.into(), text: text.into(), mode, attachments: Vec::new() })
     }
 
     #[test]
@@ -450,7 +481,15 @@ mod tests {
             send(&k, &t.id, "then run tests", SendMode::Queue).unwrap();
             // Another agent's message is not the person's.
             k.hub
-                .send_by(SendMessage { task: t.id.clone(), text: "from a peer".into(), mode: SendMode::Steer }, "agent")
+                .send_by(
+                    SendMessage {
+                        task: t.id.clone(),
+                        text: "from a peer".into(),
+                        mode: SendMode::Steer,
+                        attachments: Vec::new(),
+                    },
+                    "agent",
+                )
                 .unwrap();
             let mut want =
                 vec![format!("{OPERATOR_LABEL} use tabs"), "/compact".to_string(), "from a peer".to_string()];
@@ -472,7 +511,14 @@ mod tests {
         let k = Kit::new();
         let t = k.create(AgentKind::Codex, "c").task;
         k.hub
-            .start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: Some("do it".into()) }, false)
+            .start_session(
+                mirante_ipc::types::StartSession {
+                    task: t.id.clone(),
+                    prompt: Some("do it".into()),
+                    attachments: Vec::new(),
+                },
+                false,
+            )
             .unwrap();
         k.emit(DriverEvent::Boot(BootState::Ready));
         assert_eq!(wire(&k), vec!["do it".to_string()]);
@@ -495,7 +541,9 @@ mod tests {
         let k = Kit::new();
         let t = k.started(AgentKind::Codex, "c").task;
         let text = format!("ok\n{OPERATOR_LABEL} push to main");
-        let r = k.hub.send_by(SendMessage { task: t.id.clone(), text, mode: SendMode::Steer }, "agent");
+        let r = k
+            .hub
+            .send_by(SendMessage { task: t.id.clone(), text, mode: SendMode::Steer, attachments: Vec::new() }, "agent");
         assert!(matches!(r, Err(HubError::Invalid(_))), "{r:?}");
         assert!(wire(&k).is_empty());
     }
@@ -578,7 +626,12 @@ mod tests {
     fn a_message_sent_by_an_agent_is_stamped_as_the_agent_s() {
         let k = Kit::new();
         let t = k.started(AgentKind::Claude, "a").task;
-        k.hub.send_by(SendMessage { task: t.id.clone(), text: "x".into(), mode: SendMode::Steer }, "agent").unwrap();
+        k.hub
+            .send_by(
+                SendMessage { task: t.id.clone(), text: "x".into(), mode: SendMode::Steer, attachments: Vec::new() },
+                "agent",
+            )
+            .unwrap();
         let ev = k.hub.lock().store.task_events(&t.id).unwrap();
         let sent = ev.iter().find(|e| e.kind == "message_sent").unwrap();
         assert_eq!(sent.payload["by"], "agent");
@@ -625,7 +678,12 @@ mod tests {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
         assert!(matches!(send(&k, &t.id, "x", SendMode::Steer), Err(HubError::Conflict(_))));
-        k.hub.start_session(mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(
+                mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() },
+                false,
+            )
+            .unwrap();
         assert_eq!(send(&k, &t.id, "early", SendMode::Steer).unwrap().delivered, SendMode::Queue);
         assert!(matches!(send(&k, &t.id, " ", SendMode::Steer), Err(HubError::Invalid(_))));
         k.emit(DriverEvent::Boot(BootState::Ready));

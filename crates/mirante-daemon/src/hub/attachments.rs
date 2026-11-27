@@ -30,7 +30,6 @@ pub(crate) struct Registry(HashMap<String, Vec<Known>>);
 /// What a message carries for its attachments: the text lines (one each) and the images'
 /// absolute paths (Codex also gets them as `localImage` items).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)] // carried by messages and goals in the delivery change
 pub(crate) struct Carried {
     pub(crate) lines: Vec<String>,
     pub(crate) images: Vec<String>,
@@ -38,7 +37,6 @@ pub(crate) struct Carried {
 
 impl Carried {
     /// `text` with the lines after it (after a blank line), or the lines alone.
-    #[allow(dead_code)] // carried by messages and goals in the delivery change
     pub(crate) fn append_to(&self, text: &str) -> String {
         if self.lines.is_empty() {
             return text.to_string();
@@ -53,7 +51,6 @@ impl Carried {
 }
 
 /// The line a message carries for `v`.
-#[allow(dead_code)] // carried by messages and goals in the delivery change
 pub(crate) fn line(v: &AttachmentView) -> String {
     match v.kind {
         AttachmentKind::Image => format!("[Attached image \"{}\": {}]", v.name, v.path),
@@ -130,10 +127,10 @@ impl Hub {
         Ok(())
     }
 
-    /// The lines (and image paths) for attachments `ids` of task `task_id`, marked sent.
-    /// Refused, nothing marked: more than [`MAX_PER_MESSAGE`], an id twice, or an id this
-    /// task does not have (another task's, a removed one's, one from before a restart).
-    #[allow(dead_code)] // carried by messages and goals in the delivery change
+    /// The lines (and image paths) for attachments `ids` of task `task_id`. Refused: more
+    /// than [`MAX_PER_MESSAGE`], an id twice, or an id this task does not have (another
+    /// task's, a removed one's, one from before a restart). Nothing is marked sent: the
+    /// caller does that once the message was taken ([`Hub::mark_sent`]).
     pub(crate) fn carry_attachments(&self, task_id: &str, ids: &[String]) -> Result<Carried> {
         if ids.is_empty() {
             return Ok(Carried::default());
@@ -144,8 +141,8 @@ impl Hub {
                 ids.len()
             )));
         }
-        let mut reg = self.attachments.lock().unwrap_or_else(|p| p.into_inner());
-        let list = reg.0.entry(task_id.to_string()).or_default();
+        let reg = self.attachments.lock().unwrap_or_else(|p| p.into_inner());
+        let list = reg.0.get(task_id).map_or(&[][..], Vec::as_slice);
         let mut at = Vec::with_capacity(ids.len());
         for id in ids {
             let i = list
@@ -159,14 +156,22 @@ impl Hub {
         }
         let mut c = Carried::default();
         for i in at {
-            let k = &mut list[i];
-            k.sent = true;
+            let k = &list[i];
             c.lines.push(line(&k.view));
             if k.view.kind == AttachmentKind::Image {
                 c.images.push(k.view.path.clone());
             }
         }
         Ok(c)
+    }
+
+    /// Attachments `ids` of task `task_id` were handed to a message or a goal: no longer
+    /// removable.
+    pub(crate) fn mark_sent(&self, task_id: &str, ids: &[String]) {
+        let mut reg = self.attachments.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(list) = reg.0.get_mut(task_id) {
+            list.iter_mut().filter(|k| ids.contains(&k.view.id)).for_each(|k| k.sent = true);
+        }
     }
 }
 
@@ -271,6 +276,8 @@ mod tests {
         assert!(matches!(e, Err(HubError::NotFound(_))));
         let c = k.hub.carry_attachments(&t.id, std::slice::from_ref(&b.id)).unwrap();
         assert_eq!(c.lines, [format!("[Attached file \"b.txt\" (5 B): {}]", b.path)]);
+        // Carried lines alone do not make it sent; a taken message does.
+        k.hub.mark_sent(&t.id, std::slice::from_ref(&b.id));
         let e = k.hub.attachment_remove(AttachmentRemove { task: t.id.clone(), id: b.id.clone() });
         assert!(matches!(e, Err(HubError::Conflict(_))));
         assert!(std::path::Path::new(&b.path).exists());
@@ -309,6 +316,85 @@ mod tests {
         assert!(k.hub.carry_attachments(&t.id, &[img.id.clone(), img.id.clone()]).is_err());
         let many = vec![img.id.clone(); MAX_PER_MESSAGE + 1];
         assert!(k.hub.carry_attachments(&t.id, &many).unwrap_err().to_string().contains("at most 20"));
+    }
+
+    fn wire(k: &Kit) -> Vec<String> {
+        k.factory.driver.wire.lock().unwrap().clone()
+    }
+
+    fn send(k: &Kit, task: &str, text: &str, ids: Vec<String>) -> Result<mirante_ipc::types::SendResult> {
+        let mode = mirante_ipc::types::SendMode::Steer;
+        k.hub.send(mirante_ipc::types::SendMessage { task: task.into(), text: text.into(), mode, attachments: ids })
+    }
+
+    #[test]
+    fn a_message_carries_its_attachments_lines_after_the_person_s_words() {
+        use mirante_core::delivery::label_operator;
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "feat/msg").task;
+        let img =
+            k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "s.png".into(), b64: b64(PNG) }).unwrap();
+        let txt =
+            k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "n.txt".into(), b64: b64(b"hi") }).unwrap();
+        send(&k, &t.id, "what is this?", vec![img.id.clone(), txt.id.clone()]).unwrap();
+        let want = format!("what is this?\n\n{}\n{}", line(&img), line(&txt));
+        assert_eq!(wire(&k), [label_operator(&want)]);
+        // Claude's typist takes the same text (one bracketed paste).
+        assert!(crate::driver::paste::typed_message(&label_operator(&want)).is_ok());
+        // Sent: no longer removable.
+        let e = k.hub.attachment_remove(AttachmentRemove { task: t.id.clone(), id: img.id.clone() });
+        assert!(matches!(e, Err(HubError::Conflict(_))), "{e:?}");
+        // Attachments alone: no text needed. Through the socket's dispatch, too.
+        let more =
+            k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "m.txt".into(), b64: b64(b"m") }).unwrap();
+        dispatch(
+            &k.hub,
+            "message.send",
+            json!({ "task": t.id, "text": "", "mode": "steer", "attachments": [more.id] }),
+        )
+        .unwrap();
+        assert_eq!(wire(&k)[1], label_operator(&line(&more)));
+    }
+
+    #[test]
+    fn a_message_with_bad_attachments_is_refused_whole_and_the_size_check_counts_words_only() {
+        let k = Kit::new();
+        let t = k.started(AgentKind::Codex, "feat/bad").task;
+        let a =
+            k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "a.txt".into(), b64: b64(b"a") }).unwrap();
+        assert!(matches!(send(&k, &t.id, "x", vec!["nope".into()]), Err(HubError::Invalid(_))));
+        let big = "y".repeat(crate::hub::messages::MAX_MESSAGE_BYTES + 1);
+        assert!(matches!(send(&k, &t.id, &big, vec![a.id.clone()]), Err(HubError::Invalid(_))));
+        assert!(wire(&k).is_empty());
+        // Refused: still removable.
+        let full = "y".repeat(crate::hub::messages::MAX_MESSAGE_BYTES);
+        send(&k, &t.id, &full, vec![a.id.clone()]).unwrap();
+        assert!(wire(&k)[0].len() > crate::hub::messages::MAX_MESSAGE_BYTES);
+        // Without attachments an empty text is still refused; an agent never attaches.
+        assert!(matches!(send(&k, &t.id, " ", vec![]), Err(HubError::Invalid(_))));
+        let m = mirante_ipc::types::SendMessage {
+            task: t.id.clone(),
+            text: "x".into(),
+            mode: mirante_ipc::types::SendMode::Steer,
+            attachments: vec![a.id.clone()],
+        };
+        assert!(matches!(k.hub.send_by(m, "agent"), Err(HubError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_goal_carries_its_attachments_and_may_be_attachments_only() {
+        let k = Kit::new();
+        let t = k.create(AgentKind::Codex, "feat/goal").task;
+        let img =
+            k.hub.attachment_put(AttachmentPut { task: t.id.clone(), name: "s.png".into(), b64: b64(PNG) }).unwrap();
+        let start =
+            mirante_ipc::types::StartSession { task: t.id.clone(), prompt: None, attachments: vec!["nope".into()] };
+        assert!(matches!(k.hub.start_session(start, false), Err(HubError::Invalid(_))));
+        dispatch(&k.hub, "session.start", json!({ "task": t.id, "prompt": "", "attachments": [img.id] })).unwrap();
+        k.emit(crate::driver::DriverEvent::Boot(mirante_ipc::types::BootState::Ready));
+        assert_eq!(wire(&k), [line(&img)]);
+        let e = k.hub.attachment_remove(AttachmentRemove { task: t.id.clone(), id: img.id.clone() });
+        assert!(matches!(e, Err(HubError::Conflict(_))), "{e:?}");
     }
 
     #[test]

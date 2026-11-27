@@ -427,7 +427,9 @@ mod tests {
         let v = hub2.get_task(&t.id).unwrap();
         assert_eq!((v.task.status, v.live, v.needs_you), (Status::Ended, false, 0));
         assert_eq!(hub2.get_task(&idle.id).unwrap().task.status, Status::Idle);
-        let res = hub2.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        let res = hub2
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true)
+            .unwrap();
         assert!(res.resumed);
         assert_eq!(k.factory.resumes.lock().unwrap().last().cloned().flatten().as_deref(), Some("nat-1"));
     }
@@ -561,7 +563,8 @@ mod tests {
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
         for text in ["first", "second"] {
-            let m = SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Queue };
+            let m =
+                SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new() };
             assert_eq!(k.hub.send(m).unwrap().delivered, SendMode::Queue);
         }
         // The turn ends: "first" goes out, "second" waits for the next turn end.
@@ -585,7 +588,8 @@ mod tests {
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
         for text in ["one", "two", "three", "two"] {
-            let m = SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Queue };
+            let m =
+                SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new() };
             k.hub.send(m).unwrap();
         }
         let ids: Vec<String> = k.hub.list_queued(&t.id).unwrap().into_iter().map(|q| q.id).collect();

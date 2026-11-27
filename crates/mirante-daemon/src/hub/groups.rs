@@ -257,8 +257,10 @@ impl Hub {
             Some(_) => {}
         }
         if let Some(child) = into {
-            let sent =
-                self.send_by(SendMessage { task: child.id, text: text.clone(), mode: SendMode::Queue }, BY_SYNTHESIS)?;
+            let sent = self.send_by(
+                SendMessage { task: child.id, text: text.clone(), mode: SendMode::Queue, attachments: Vec::new() },
+                BY_SYNTHESIS,
+            )?;
             return Ok(Synthesis { text, expect, task: None, sent: Some(sent) });
         }
         let first = first.expect("siblings are children");
@@ -496,7 +498,9 @@ mod tests {
         let a = child(&k, &g, AgentKind::Claude, "x").unwrap();
         let b = child(&k, &g, AgentKind::Codex, "x").unwrap();
         // Live: refused, nothing archived.
-        k.hub.start_session(StartSession { task: a.task.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(StartSession { task: a.task.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         let e = k.hub.group_archive(&g.id).unwrap_err();
         assert!(e.to_string().contains(&a.task.branch) && e.to_string().contains("nothing was archived"), "{e}");
         k.hub.stop(&a.task.id).unwrap();
@@ -662,7 +666,9 @@ mod tests {
         assert!(pv.text.contains("answer of b") && !pv.text.contains("answer of a"), "{}", pv.text);
         // Not live: says how to resume, nothing queued.
         assert!(k.hub.group_synthesize(req(false, Some(pv.expect.clone()))).is_err());
-        k.hub.start_session(StartSession { task: a.task.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(StartSession { task: a.task.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         let sent = k.hub.group_synthesize(req(false, Some(pv.expect))).unwrap();
         assert!(sent.sent.is_some());
         let ev = k.hub.lock().store.task_events(&a.task.id).unwrap();

@@ -230,7 +230,10 @@ impl Hub {
             }
         };
         let (started, start_error) = if r.start.unwrap_or(true) {
-            match self.start_session(StartSession { task: child.task.id.clone(), prompt: Some(goal) }, false) {
+            match self.start_session(
+                StartSession { task: child.task.id.clone(), prompt: Some(goal), attachments: Vec::new() },
+                false,
+            ) {
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(e.to_string())),
             }
@@ -395,7 +398,9 @@ pub(crate) mod tests {
         // The live session keeps its config: it applies from the next one.
         assert_eq!((v.orchestration, v.orchestrator_live), (true, Some(false)));
         k.hub.stop(&t.task.id).unwrap();
-        k.hub.start_session(StartSession { task: t.task.id.clone(), prompt: None }, true).unwrap();
+        k.hub
+            .start_session(StartSession { task: t.task.id.clone(), prompt: None, attachments: Vec::new() }, true)
+            .unwrap();
         assert_eq!(k.hub.get_task(&t.task.id).unwrap().orchestrator_live, Some(true));
         let given = k.factory.orchestrators.lock().unwrap().clone();
         assert_eq!(given, [None, Some(PathBuf::from("/opt/m/mirante-mcp"))]);
@@ -411,7 +416,9 @@ pub(crate) mod tests {
         let e = k.hub.orchestrate(&dna::Caller::Person, Orchestrate { task: th.task.id.clone(), enabled: true });
         assert!(matches!(&e, Err(HubError::Core(_))), "{e:?}");
         assert!(e.unwrap_err().to_string().contains("one level deep"));
-        k.hub.start_session(StartSession { task: th.task.id.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(StartSession { task: th.task.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         assert_eq!(k.factory.orchestrators.lock().unwrap().clone(), [None]);
         assert!(k.hub.orchestrator_server_for(&th.task).is_none());
         assert!(k.hub.orchestrator_server_for(&parent.task).is_some());

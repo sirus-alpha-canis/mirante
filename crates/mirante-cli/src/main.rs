@@ -1057,7 +1057,7 @@ fn run(cmd: Cmd) -> Res {
                 notice(&format!("starting {} on {}…", v.task.agent.as_str(), v.task.branch));
                 let r: StartResult = c.call(
                     method::SESSION_START,
-                    StartSession { task: v.task.id.clone(), prompt: Some(goal.clone()) },
+                    StartSession { task: v.task.id.clone(), prompt: Some(goal.clone()), attachments: Vec::new() },
                 )?;
                 boot_flow(&mut c, r, trust)?;
             }
@@ -1097,8 +1097,10 @@ fn run(cmd: Cmd) -> Res {
             )?;
             println!("created {} on {} ({})", render::short(&v.task.id), v.task.branch, v.task.cwd());
             notice(&format!("starting {}…", agent.as_str()));
-            let r: StartResult =
-                c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal) })?;
+            let r: StartResult = c.call(
+                method::SESSION_START,
+                StartSession { task: v.task.id.clone(), prompt: Some(goal), attachments: Vec::new() },
+            )?;
             boot_flow(&mut c, r, trust)?;
         }
         Cmd::New { repo, agent, branch, base, title, goal, trust, repos, group: None } => {
@@ -1146,8 +1148,10 @@ fn run(cmd: Cmd) -> Res {
                 }
             }
             notice(&format!("starting {} (its first launch can take a while)…", agent.as_str()));
-            let r: StartResult =
-                c.call(method::SESSION_START, StartSession { task: v.task.id.clone(), prompt: Some(goal) })?;
+            let r: StartResult = c.call(
+                method::SESSION_START,
+                StartSession { task: v.task.id.clone(), prompt: Some(goal), attachments: Vec::new() },
+            )?;
             boot_flow(&mut c, r, trust)?;
         }
         Cmd::Ls { all } => {
@@ -1166,7 +1170,8 @@ fn run(cmd: Cmd) -> Res {
         Cmd::Attach { task } => attach(&paths, &task)?,
         Cmd::Say { task, text, queue } => {
             let mode = if queue { SendMode::Queue } else { SendMode::Steer };
-            let r: SendResult = client(&paths)?.call(method::MESSAGE_SEND, SendMessage { task, text, mode })?;
+            let r: SendResult = client(&paths)?
+                .call(method::MESSAGE_SEND, SendMessage { task, text, mode, attachments: Vec::new() })?;
             match r.delivered {
                 SendMode::Steer => println!("sent now"),
                 SendMode::Queue => println!("queued (#{} in line, delivered when the turn ends)", r.queued),
@@ -1197,13 +1202,15 @@ fn run(cmd: Cmd) -> Res {
         }
         Cmd::Resume { task, trust, fresh: true } => {
             let mut c = client(&paths)?;
-            let r: StartResult = c.call(method::SESSION_START, StartSession { task, prompt: None })?;
+            let r: StartResult =
+                c.call(method::SESSION_START, StartSession { task, prompt: None, attachments: Vec::new() })?;
             println!("starting a fresh conversation (the earlier one is not resumed)");
             boot_flow(&mut c, r, trust)?;
         }
         Cmd::Resume { task, trust, fresh: false } => {
             let mut c = client(&paths)?;
-            let r: StartResult = c.call(method::SESSION_RESUME, StartSession { task, prompt: None })?;
+            let r: StartResult =
+                c.call(method::SESSION_RESUME, StartSession { task, prompt: None, attachments: Vec::new() })?;
             if !r.resumed {
                 println!("note: no native session id was recorded; this is a fresh conversation");
             }

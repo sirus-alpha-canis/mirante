@@ -180,7 +180,10 @@ mod tests {
     }
 
     fn queue(k: &Kit, task: &str, text: &str) -> String {
-        let r = k.hub.send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Queue }).unwrap();
+        let r = k
+            .hub
+            .send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new() })
+            .unwrap();
         assert_eq!(r.delivered, SendMode::Queue);
         k.hub.list_queued(task).unwrap().last().unwrap().id.clone()
     }

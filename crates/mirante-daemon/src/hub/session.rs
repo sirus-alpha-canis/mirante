@@ -647,12 +647,29 @@ pub(crate) enum Launch {
 impl Hub {
     /// Starts (or, with `resume`, resumes) the task's agent. Fails with a conflict while a
     /// session is live (the per-task lock). Waits until the agent leaves `Booting`.
-    pub fn start_session(&self, req: StartSession, resume: bool) -> Result<StartResult> {
+    ///
+    /// `req.attachments`: each one's line is appended to the first message after its size
+    /// check (the prompt may then be empty); marked sent once the session started.
+    pub fn start_session(&self, mut req: StartSession, resume: bool) -> Result<StartResult> {
         if let Some(p) = req.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
             super::messages::check_message(p)?;
         }
+        let ids = std::mem::take(&mut req.attachments);
+        let task_id = if ids.is_empty() {
+            None
+        } else {
+            let id = self.lock().resolve(&req.task)?.id;
+            let carried = self.carry_attachments(&id, &ids)?;
+            req.prompt = Some(carried.append_to(req.prompt.as_deref().unwrap_or("")));
+            Some(id)
+        };
         match self.launch(req, resume, false)? {
-            Launch::Started(r) => Ok(r),
+            Launch::Started(r) => {
+                if let Some(id) = task_id {
+                    self.mark_sent(&id, &ids);
+                }
+                Ok(r)
+            }
             Launch::Refused(why) => Err(HubError::Conflict(why.to_string())),
         }
     }
@@ -1283,7 +1300,9 @@ impl super::testkit::Kit {
     /// Created, started and booted (`Ready`), with no prompt queued.
     pub fn started(&self, agent: AgentKind, branch: &str) -> TaskView {
         let t = self.create(agent, branch);
-        self.hub.start_session(StartSession { task: t.task.id.clone(), prompt: None }, false).unwrap();
+        self.hub
+            .start_session(StartSession { task: t.task.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         self.emit(DriverEvent::Boot(BootState::Ready));
         self.hub.get_task(&t.task.id).unwrap()
     }
@@ -1400,7 +1419,9 @@ mod tests {
         *k.factory.mcp_bin.lock().unwrap() = Some(bin.clone());
         let t = k.create(AgentKind::Claude, "mem").task;
         let cycle = || {
-            k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+            k.hub
+                .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+                .unwrap();
             k.hub.stop(&t.id).unwrap();
             k.factory.mcps.lock().unwrap().last().cloned().expect("spawned")
         };
@@ -1557,7 +1578,7 @@ mod tests {
         k.emit(DriverEvent::NativeId("nat-mode".into()));
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "auto"}));
         k.hub.stop(&t.id).unwrap();
-        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true).unwrap();
         assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("auto"));
         let last = k.hub.lock().store.task_events(&t.id).unwrap().into_iter().rfind(|e| e.kind == "permission_mode");
         assert_eq!(last.unwrap().payload["source"], "resume");
@@ -1565,11 +1586,11 @@ mod tests {
         assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode.as_deref(), Some("default"));
         // Manual last time: nothing carried over; a fresh start never carries anything.
         k.hub.stop(&t.id).unwrap();
-        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true).unwrap();
         assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode, None);
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "acceptEdits"}));
         k.hub.stop(&t.id).unwrap();
-        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false).unwrap();
         assert_eq!(k.hub.get_task(&t.id).unwrap().permission_mode, None);
     }
 
@@ -1624,10 +1645,17 @@ mod tests {
     fn start_takes_the_per_task_lock_and_boot_ready_delivers_the_first_prompt() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: Some("do it".into()) }, false).unwrap();
+        let r = k
+            .hub
+            .start_session(
+                StartSession { task: t.id.clone(), prompt: Some("do it".into()), attachments: Vec::new() },
+                false,
+            )
+            .unwrap();
         assert_eq!(r.boot, BootState::Booting);
         assert!(!r.resumed);
-        let again = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false);
+        let again =
+            k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false);
         assert!(matches!(again, Err(HubError::Conflict(_))));
         assert_eq!(k.hub.get_task(&t.id).unwrap().queued, 1);
         k.emit(DriverEvent::Boot(BootState::Ready));
@@ -1732,7 +1760,10 @@ mod tests {
         let v = k.hub.get_task(&t.id).unwrap();
         assert_eq!((v.task.status, v.live, v.needs_you), (Status::Ended, false, 0));
         assert!(k.kinds(&t.id).contains(&"permission_expired".to_string()));
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        let r = k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true)
+            .unwrap();
         assert!(r.resumed);
         assert_eq!(k.factory.resumes.lock().unwrap().last().cloned().flatten().as_deref(), Some("nat-9"));
         assert_eq!(status(&k, &t.id), Status::Idle);
@@ -1743,7 +1774,10 @@ mod tests {
         let k = Kit::new();
         let t = k.started(AgentKind::Claude, "a").task;
         k.emit(DriverEvent::Exited { code: None });
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        let r = k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true)
+            .unwrap();
         assert!(!r.resumed);
     }
 
@@ -1752,17 +1786,23 @@ mod tests {
         let k = Kit::new();
         let t = k.create(AgentKind::Codex, "a").task;
         k.factory.fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).is_err());
+        assert!(k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .is_err());
         assert_eq!(status(&k, &t.id), Status::Ended);
         k.factory.fail.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert!(k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).is_ok());
+        assert!(k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .is_ok());
     }
 
     #[test]
     fn trust_is_only_answered_when_the_prompt_is_open() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
-        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false).unwrap();
         assert!(matches!(k.hub.trust(TrustAnswer { task: t.id.clone(), accept: true }), Err(HubError::Conflict(_))));
         k.emit(DriverEvent::Boot(BootState::TrustPrompt));
         assert_eq!(k.hub.get_task(&t.id).unwrap().needs_you, 1);
@@ -1778,7 +1818,10 @@ mod tests {
     fn trust_on_a_fresh_start_is_not_reported_as_resumed() {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        let r = k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         assert!(!r.resumed);
         k.emit(DriverEvent::NativeId("7c4d2e92".into()));
         k.emit(DriverEvent::Boot(BootState::TrustPrompt));
@@ -1819,7 +1862,9 @@ mod tests {
         *k.factory.spawn_gate.lock().unwrap() = Some((entered_tx, release_rx));
         let hub = k.hub.clone();
         let id = t.id.clone();
-        let launch = std::thread::spawn(move || hub.start_session(StartSession { task: id, prompt: None }, false));
+        let launch = std::thread::spawn(move || {
+            hub.start_session(StartSession { task: id, prompt: None, attachments: Vec::new() }, false)
+        });
         entered.recv().unwrap();
         // The agent is being spawned: shutdown waits for it instead of exiting under it.
         let hub = k.hub.clone();
@@ -1828,7 +1873,8 @@ mod tests {
         assert!(!down.is_finished(), "shutdown returned while an agent was being spawned");
         // No new session starts while the daemon goes down.
         let other = k.create(AgentKind::Codex, "d").task;
-        let r = k.hub.start_session(StartSession { task: other.id.clone(), prompt: None }, false);
+        let r =
+            k.hub.start_session(StartSession { task: other.id.clone(), prompt: None, attachments: Vec::new() }, false);
         assert!(matches!(&r, Err(HubError::Conflict(m)) if m.contains("shutting down")), "{r:?}");
         release.send(()).unwrap();
         down.join().unwrap();
@@ -2120,7 +2166,7 @@ mod tests {
         let hub = k.hub.clone();
         let id = t.id.clone();
         let starter = std::thread::spawn(move || {
-            hub.start_session(StartSession { task: id, prompt: None }, false).map(|r| r.boot)
+            hub.start_session(StartSession { task: id, prompt: None, attachments: Vec::new() }, false).map(|r| r.boot)
         });
         entered.recv().unwrap();
         let v = k.hub.stop(&t.id).unwrap();
@@ -2131,7 +2177,10 @@ mod tests {
         assert_eq!(k.calls(), vec!["stop".to_string()]);
         assert_eq!(k.hub.status().live_sessions, 0);
         // The per-task lock is free again.
-        assert!(k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).is_ok());
+        assert!(k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .is_ok());
     }
 
     #[test]
@@ -2139,7 +2188,7 @@ mod tests {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
         k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Archiving).unwrap();
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false);
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false);
         assert!(matches!(r, Err(HubError::Conflict(_))), "{:?}", r.err());
         assert!(matches!(k.hub.archive(&t.id), Err(HubError::Conflict(_))));
         k.hub.lock().store.transition_lifecycle(&t.id, Lifecycle::Active).unwrap();
@@ -2152,7 +2201,7 @@ mod tests {
         let t = k.started(AgentKind::Claude, "a").task;
         let old = k.hub.lock().live[&t.id].session_id.clone();
         k.hub.stop(&t.id).unwrap();
-        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false).unwrap();
         k.emit(DriverEvent::Boot(BootState::Ready));
         let new = k.hub.lock().live[&t.id].session_id.clone();
         assert_ne!(old, new);
@@ -2272,8 +2321,22 @@ mod tests {
         let k = Kit::new();
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
-        k.hub.send(SendMessage { task: t.id.clone(), text: "steer me".into(), mode: SendMode::Steer }).unwrap();
-        k.hub.send(SendMessage { task: t.id.clone(), text: "later".into(), mode: SendMode::Queue }).unwrap();
+        k.hub
+            .send(SendMessage {
+                task: t.id.clone(),
+                text: "steer me".into(),
+                mode: SendMode::Steer,
+                attachments: Vec::new(),
+            })
+            .unwrap();
+        k.hub
+            .send(SendMessage {
+                task: t.id.clone(),
+                text: "later".into(),
+                mode: SendMode::Queue,
+                attachments: Vec::new(),
+            })
+            .unwrap();
         k.emit(DriverEvent::DeliveryAborted { text: "steer me".into(), reason: "a dialog appeared".into() });
         {
             let st = k.hub.lock();
@@ -2297,9 +2360,23 @@ mod tests {
         let t = k.started(AgentKind::Claude, "a").task;
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
         for text in ["one", "two", "three"] {
-            k.hub.send(SendMessage { task: t.id.clone(), text: text.into(), mode: SendMode::Steer }).unwrap();
+            k.hub
+                .send(SendMessage {
+                    task: t.id.clone(),
+                    text: text.into(),
+                    mode: SendMode::Steer,
+                    attachments: Vec::new(),
+                })
+                .unwrap();
         }
-        k.hub.send(SendMessage { task: t.id.clone(), text: "later".into(), mode: SendMode::Queue }).unwrap();
+        k.hub
+            .send(SendMessage {
+                task: t.id.clone(),
+                text: "later".into(),
+                mode: SendMode::Queue,
+                attachments: Vec::new(),
+            })
+            .unwrap();
         for text in ["one", "two", "three"] {
             k.emit(DriverEvent::DeliveryAborted { text: text.into(), reason: "hold".into() });
         }
@@ -2337,13 +2414,16 @@ mod tests {
         k.emit(DriverEvent::NativeId("thr-gone".into()));
         k.hub.stop(&t.id).unwrap();
         *k.factory.fail_with.lock().unwrap() = Some(DriverError::NativeGone("no rollout found for thr-gone".into()));
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true);
+        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true);
         assert!(matches!(r, Err(HubError::Driver(DriverError::NativeGone(_)))), "{r:?}");
         assert_eq!(kinds_payloads(&k, &t.id, "resume_failed").len(), 1);
         assert_eq!(k.hub.status().live_sessions, 0);
         // The user chooses a fresh start explicitly.
         *k.factory.fail_with.lock().unwrap() = None;
-        let fresh = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).unwrap();
+        let fresh = k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         assert!(!fresh.resumed);
         assert_eq!(k.factory.resumes.lock().unwrap().last().cloned(), Some(None));
     }
@@ -2414,7 +2494,9 @@ mod tests {
         let (release, release_rx) = std::sync::mpsc::channel();
         *k.factory.spawn_gate.lock().unwrap() = Some((entered_tx, release_rx));
         let (hub, id) = (k.hub.clone(), t.id.clone());
-        let starter = std::thread::spawn(move || hub.start_session(StartSession { task: id, prompt: None }, false));
+        let starter = std::thread::spawn(move || {
+            hub.start_session(StartSession { task: id, prompt: None, attachments: Vec::new() }, false)
+        });
         entered.recv().unwrap();
         // The hook beats the spawn: no driver to tell yet.
         k.hook(&t.id, json!({"hook_event_name": "SessionStart", "session_id": "nat-1", "source": "startup"}));
@@ -2428,7 +2510,9 @@ mod tests {
     fn a_closed_dialog_redelivers_the_requeued_message() {
         let k = Kit::new();
         let t = k.started(AgentKind::Claude, "a").task;
-        k.hub.send(SendMessage { task: t.id.clone(), text: "go".into(), mode: SendMode::Queue }).unwrap();
+        k.hub
+            .send(SendMessage { task: t.id.clone(), text: "go".into(), mode: SendMode::Queue, attachments: Vec::new() })
+            .unwrap();
         assert_eq!(k.calls(), vec!["send:go".to_string()]);
         k.emit(DriverEvent::DeliveryAborted { text: "go".into(), reason: "dialog: a dialog is open".into() });
         assert_eq!(k.calls().len(), 1, "nothing is retried while the dialog is up");
@@ -2444,7 +2528,10 @@ mod tests {
         k.hook(&t.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "work"}));
         *k.factory.driver.send_error.lock().unwrap() =
             Some(DriverError::NotNow("hold: a permission request is pending".into()));
-        let e = k.hub.send(SendMessage { task: t.id.clone(), text: "x".into(), mode: SendMode::Steer }).unwrap_err();
+        let e = k
+            .hub
+            .send(SendMessage { task: t.id.clone(), text: "x".into(), mode: SendMode::Steer, attachments: Vec::new() })
+            .unwrap_err();
         let rpc: mirante_ipc::rpc::RpcError = e.into();
         assert_eq!(rpc.code, mirante_ipc::rpc::code::CONFLICT);
         assert!(rpc.message.starts_with("hold"), "{}", rpc.message);
@@ -2478,12 +2565,18 @@ mod tests {
         let k = Kit::new();
         let t = k.create(AgentKind::Claude, "a").task;
         *k.factory.emit_then_fail.lock().unwrap() = Some(DriverEvent::NativeId("nat-never".into()));
-        assert!(k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, false).is_err());
+        assert!(k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, false)
+            .is_err());
         k.drain();
         let conv = k.hub.lock().store.latest_conversation(&t.id).unwrap().unwrap();
         assert_eq!(conv.native_session_id, None);
         *k.factory.emit_then_fail.lock().unwrap() = None;
-        let r = k.hub.start_session(StartSession { task: t.id.clone(), prompt: None }, true).unwrap();
+        let r = k
+            .hub
+            .start_session(StartSession { task: t.id.clone(), prompt: None, attachments: Vec::new() }, true)
+            .unwrap();
         assert!(!r.resumed, "nothing to resume: the process never ran");
     }
 }

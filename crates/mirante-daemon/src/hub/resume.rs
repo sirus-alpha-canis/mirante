@@ -382,7 +382,11 @@ impl Hub {
                     }
                     return resumed;
                 }
-                let r = self.launch(StartSession { task: task_id.clone(), prompt: None }, true, true);
+                let r = self.launch(
+                    StartSession { task: task_id.clone(), prompt: None, attachments: Vec::new() },
+                    true,
+                    true,
+                );
                 let mut st = self.lock();
                 let (kind, payload) = match r {
                     // Memory tightened between the wait and the launch: wait again.
@@ -695,7 +699,7 @@ mod tests {
         k.hub.shutdown();
         let (hub, r) = restarted(&k);
         assert_eq!(r.resume, vec![t.clone()]);
-        hub.start_session(StartSession { task: t.clone(), prompt: None }, true).unwrap();
+        hub.start_session(StartSession { task: t.clone(), prompt: None, attachments: Vec::new() }, true).unwrap();
         hub.stop(&t).unwrap();
         assert_eq!(hub.run_auto_resume(&r.resume, false), Vec::<String>::new());
         assert!(!hub.get_task(&t).unwrap().live);
@@ -711,7 +715,7 @@ mod tests {
         let t = live_with_native(&k, "a", "nat-a");
         k.hub.shutdown();
         let (hub, r) = restarted(&k);
-        hub.start_session(StartSession { task: t.clone(), prompt: None }, true).unwrap();
+        hub.start_session(StartSession { task: t.clone(), prompt: None, attachments: Vec::new() }, true).unwrap();
         assert!(hub.run_auto_resume(&r.resume, false).is_empty());
         assert!(kinds_with(&hub, &t, "session.auto_resume_failed").is_empty());
         assert_eq!(kinds_with(&hub, &t, "session.auto_resume_skipped").len(), 1);
@@ -725,11 +729,13 @@ mod tests {
         k.hub.shutdown();
         let (hub, _r) = restarted(&k);
         hub.lock().mem.paused = true;
-        let got = hub.launch(StartSession { task: t.clone(), prompt: None }, true, true).unwrap();
+        let got =
+            hub.launch(StartSession { task: t.clone(), prompt: None, attachments: Vec::new() }, true, true).unwrap();
         assert!(matches!(got, super::super::session::Launch::Refused(MEMORY_TIGHT)), "{got:?}");
         assert!(!hub.get_task(&t).unwrap().live);
         hub.lock().mem.paused = false;
-        let got = hub.launch(StartSession { task: t.clone(), prompt: None }, true, true).unwrap();
+        let got =
+            hub.launch(StartSession { task: t.clone(), prompt: None, attachments: Vec::new() }, true, true).unwrap();
         assert!(matches!(got, super::super::session::Launch::Started(_)), "{got:?}");
         let launches = kinds_with(&hub, &t, "session_launch");
         assert_eq!(launches.last().unwrap()["auto_resume"], true, "{launches:?}");

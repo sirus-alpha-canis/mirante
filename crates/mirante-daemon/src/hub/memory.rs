@@ -302,7 +302,7 @@ impl Hub {
             }
             task.id
         };
-        self.start_session(StartSession { task: task_id, prompt: None }, true)
+        self.start_session(StartSession { task: task_id, prompt: None, attachments: Vec::new() }, true)
     }
 
     /// Orphan processes (parent gone, inside Mirante's worktrees), orphan checkouts, and
@@ -462,11 +462,18 @@ mod tests {
         let v = k.hub.status().memory.unwrap();
         assert_eq!((v.level.as_str(), v.paused, v.pausing), ("elevated", false, Some(PausePolicy::Off)));
         assert_eq!(k.hub.status().pause_new_sessions_under_pressure, Some(PausePolicy::Off));
-        let m = mirante_ipc::types::SendMessage { task: t.clone(), text: "next".into(), mode: SendMode::Queue };
+        let m = mirante_ipc::types::SendMessage {
+            task: t.clone(),
+            text: "next".into(),
+            mode: SendMode::Queue,
+            attachments: Vec::new(),
+        };
         k.hub.send(m).unwrap();
         assert!(k.calls().contains(&"send:next".to_string()), "{:?}", k.calls());
         let other = k.create(AgentKind::Claude, "b").task.id;
-        k.hub.start_session(StartSession { task: other.clone(), prompt: None }, false).unwrap();
+        k.hub
+            .start_session(StartSession { task: other.clone(), prompt: None, attachments: Vec::new() }, false)
+            .unwrap();
         assert!(kinds(&k, None).contains(&"memory.offer_hibernate".to_string()));
         assert!(!kinds(&k, None).contains(&"memory.paused".to_string()));
         // Critical too: still nothing paused.
@@ -503,7 +510,7 @@ mod tests {
         }
         assert!(k.hub.status().memory.unwrap().paused);
         let other = k.create(AgentKind::Claude, "b").task.id;
-        let r = k.hub.start_session(StartSession { task: other, prompt: None }, false);
+        let r = k.hub.start_session(StartSession { task: other, prompt: None, attachments: Vec::new() }, false);
         assert!(matches!(r, Err(HubError::Conflict(ref m)) if m.contains("memory")), "{r:?}");
         // Turned off while it lasts: the next tick resumes.
         k.hub
@@ -551,11 +558,16 @@ mod tests {
         }
         assert!(k.hub.status().memory.unwrap().paused);
         // Queued while paused: held even though the agent is idle.
-        let m = mirante_ipc::types::SendMessage { task: t.clone(), text: "next".into(), mode: SendMode::Queue };
+        let m = mirante_ipc::types::SendMessage {
+            task: t.clone(),
+            text: "next".into(),
+            mode: SendMode::Queue,
+            attachments: Vec::new(),
+        };
         assert_eq!(k.hub.send(m).unwrap().delivered, SendMode::Queue);
         assert!(k.calls().iter().all(|c| !c.starts_with("send:")));
         let other = k.create(AgentKind::Claude, "b").task.id;
-        let r = k.hub.start_session(StartSession { task: other, prompt: None }, false);
+        let r = k.hub.start_session(StartSession { task: other, prompt: None, attachments: Vec::new() }, false);
         assert!(matches!(r, Err(HubError::Conflict(ref m)) if m.contains("memory")), "{r:?}");
         assert!(kinds(&k, None).contains(&"memory.offer_hibernate".to_string()));
         s.set_system(sys(Pressure::Normal));

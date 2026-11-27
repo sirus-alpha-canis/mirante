@@ -143,19 +143,55 @@ pub fn check_mode(response: &Value) -> Result<(), String> {
     ))
 }
 
+/// The images a message names in its attachment lines (`[Attached image "<name>": <path>]`,
+/// written by the hub): only files directly in `dir` (the task's attachments folder) that
+/// are regular files now, so a line typed to look like one never hands Codex another path.
+pub fn local_images(text: &str, dir: &Path) -> Vec<String> {
+    const OPEN: &str = "[Attached image \"";
+    text.lines()
+        .filter_map(|line| {
+            let rest = &line[line.find(OPEN)? + OPEN.len()..];
+            let path = rest.split_once("\": ")?.1.strip_suffix(']')?;
+            let p = Path::new(path);
+            let regular = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
+            (p.parent() == Some(dir) && regular).then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// A message's `input` items: its text, then one `localImage` item per image (Codex 0.167
+/// `UserInput`: `{"type": "localImage", "path": …}`), so the model sees each image and the
+/// text still names its path.
+fn message_items(text: &str, images: &[String]) -> Vec<Value> {
+    let mut items = vec![json!({ "type": "text", "text": text })];
+    items.extend(images.iter().map(|p| json!({ "type": "localImage", "path": p })));
+    items
+}
+
+/// `turn/steer` parameters for the running turn `turn`.
+pub fn steer_params(thread: &str, turn: &str, text: &str, images: &[String], client_id: &str) -> Value {
+    json!({
+        "threadId": thread,
+        "expectedTurnId": turn,
+        "input": message_items(text, images),
+        "clientUserMessageId": client_id,
+    })
+}
+
 /// `turn/start` parameters: the input plus the mode again (the sandbox policy exactly as
 /// the thread response reported it, so the user's writable roots / network setting stay).
 /// `prefix` (the session's skills, on a new thread's first turn) is a text item before
-/// the message.
+/// the message; `images` follow it as `localImage` items.
 pub fn turn_start_params(
     thread: &str,
     prefix: Option<&str>,
     text: &str,
+    images: &[String],
     client_id: &str,
     sandbox_policy: &Value,
 ) -> Value {
     let mut input: Vec<Value> = prefix.map(|p| json!({ "type": "text", "text": p })).into_iter().collect();
-    input.push(json!({ "type": "text", "text": text }));
+    input.extend(message_items(text, images));
     json!({
         "threadId": thread,
         "input": input,
@@ -647,6 +683,9 @@ struct Shared {
     /// thread's withdrawals (the factory decides which); taken by that start, put back if
     /// it was refused.
     first_turn: Option<String>,
+    /// The task's attachments folder: images a message names there also go as
+    /// `localImage` items ([`local_images`]).
+    attachments: Option<PathBuf>,
 }
 
 impl Shared {
@@ -901,14 +940,16 @@ fn client_message_id() -> String {
 /// back to the hub's queue (`DeliveryAborted`).
 fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, timeout: Duration) {
     let client_id = client_message_id();
-    let (thread, turn, sandbox) = {
+    let (thread, turn, sandbox, images) = {
         let mut s = lock(shared);
         s.unconfirmed.insert(client_id.clone(), text.to_string());
-        (s.thread_id.clone().unwrap_or_default(), s.engine.turn_id().map(str::to_string), s.sandbox_policy.clone())
+        let images = s.attachments.as_deref().map(|d| local_images(text, d)).unwrap_or_default();
+        let turn = s.engine.turn_id().map(str::to_string);
+        (s.thread_id.clone().unwrap_or_default(), turn, s.sandbox_policy.clone(), images)
     };
     let start = || -> Result<(), CallError> {
         let prefix = lock(shared).first_turn.take();
-        let params = turn_start_params(&thread, prefix.as_deref(), text, &client_id, &sandbox);
+        let params = turn_start_params(&thread, prefix.as_deref(), text, &images, &client_id, &sandbox);
         let r = match conn.request("turn/start", params, timeout) {
             // Certainly not delivered: the next start carries the skills instead.
             Err(e) if !matches!(e, CallError::Timeout(_) | CallError::AfterWrite(_)) => {
@@ -942,12 +983,7 @@ fn send_now(conn: &RpcConn, shared: &Mutex<Shared>, sink: &Sink, text: &str, tim
     };
     let r = match turn {
         Some(t) => {
-            let p = json!({
-                "threadId": thread,
-                "expectedTurnId": t,
-                "input": [{ "type": "text", "text": text }],
-                "clientUserMessageId": client_id,
-            });
+            let p = steer_params(&thread, &t, text, &images, &client_id);
             match conn.request("turn/steer", p, timeout) {
                 Err(CallError::Rpc { message, .. }) if !lock(shared).engine.turn_open() => {
                     sink.emit(DriverEvent::Step(json!({ "type": "steer_fell_back", "error": message })));
@@ -987,6 +1023,12 @@ pub struct ChildEnv<'a> {
 }
 
 impl CodexDriver {
+    /// The task's attachments folder: from now on, an image a message names there also
+    /// goes to Codex as a `localImage` item.
+    pub fn set_attachments_dir(&self, dir: PathBuf) {
+        lock(&self.shared).attachments = Some(dir);
+    }
+
     /// Spawns `codex app-server` in `cwd` in its own process group, stderr appended to
     /// `stderr_log`, and connects (see [`CodexDriver::connect`]).
     pub fn spawn(
@@ -1082,6 +1124,7 @@ impl CodexDriver {
             reap_due: None,
             abandoned_open: HashSet::new(),
             first_turn,
+            attachments: None,
         }));
         let ctx = Arc::new(Ctx {
             shared: shared.clone(),
@@ -1511,6 +1554,69 @@ mod tests {
             "item": {"type": "userMessage", "id": "u2", "clientId": client_id, "content": [{"type": "text", "text": msg}]}}));
         let ok = next_event(&rx, |e| matches!(e, DriverEvent::Step(v) if v["type"] == "message_confirmed"));
         assert_eq!(ok, DriverEvent::Step(json!({"type": "message_confirmed", "text": msg})));
+    }
+
+    /// An attachments folder with an image and a text file in it, and an image elsewhere.
+    fn attachment_files() -> (mirante_ipc::test_dir::TestDir, PathBuf, String, String, String) {
+        let d = mirante_ipc::test_dir::TestDir::new();
+        let dir = d.path().join("sessions/t1/attachments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("1-shot.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+        let log = dir.join("2-app.log");
+        std::fs::write(&log, b"ok").unwrap();
+        let outside = d.path().join("elsewhere.png");
+        std::fs::write(&outside, b"\x89PNG\r\n\x1a\n").unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        (d, dir.clone(), s(&img), s(&log), s(&outside))
+    }
+
+    #[test]
+    fn local_images_are_the_attachment_lines_naming_images_in_the_task_folder_only() {
+        let (_d, dir, img, log, outside) = attachment_files();
+        let text = format!(
+            "{} look\n\n[Attached image \"shot.png\": {img}]\n[Attached file \"app.log\" (2 B): {log}]\n\
+             [Attached image \"x.png\": {outside}]\n[Attached image \"y.png\": {}/../t1/attachments/1-shot.png]\n\
+             [Attached image \"gone.png\": {}/9-gone.png]",
+            mirante_core::delivery::OPERATOR_LABEL,
+            dir.display(),
+            dir.display()
+        );
+        assert_eq!(local_images(&text, &dir), std::slice::from_ref(&img));
+        // The label on the same line (a message of attachments only) is no obstacle.
+        let only = mirante_core::delivery::label_operator(&format!("[Attached image \"shot.png\": {img}]"));
+        assert_eq!(local_images(&only, &dir), std::slice::from_ref(&img));
+        assert!(local_images("[Attached image \"a\": /nowhere]", &dir).is_empty());
+        let p = turn_start_params("th", Some("skills"), "t", std::slice::from_ref(&img), "c", &json!({}));
+        assert_eq!(
+            p["input"],
+            json!([{"type": "text", "text": "skills"}, {"type": "text", "text": "t"}, {"type": "localImage", "path": img}])
+        );
+        let p = steer_params("th", "tu", "t", &[], "c");
+        assert_eq!(p["input"], json!([{"type": "text", "text": "t"}]));
+    }
+
+    #[test]
+    fn an_attached_image_goes_as_a_local_image_item_in_turn_start_and_steer() {
+        let (_d, dir, img, _, outside) = attachment_files();
+        let (d, mut fake, rx, _) = setup(None);
+        d.set_attachments_dir(dir);
+        let first = format!("see\n\n[Attached image \"shot.png\": {img}]");
+        d.send(&first).unwrap();
+        let start = fake.expect("turn/start");
+        assert_eq!(
+            start["params"]["input"],
+            json!([{"type": "text", "text": first}, {"type": "localImage", "path": img}])
+        );
+        fake.reply(&start, json!({"turn": {"id": "tu-1", "items": [], "status": "inProgress"}}));
+        next_event(&rx, |e| matches!(e, DriverEvent::Status { .. }));
+        let again = format!("and\n[Attached image \"shot.png\": {img}]\n[Attached image \"x.png\": {outside}]");
+        d.send(&again).unwrap();
+        let steer = fake.expect("turn/steer");
+        assert_eq!(
+            steer["params"]["input"],
+            json!([{"type": "text", "text": again}, {"type": "localImage", "path": img}])
+        );
     }
 
     #[test]

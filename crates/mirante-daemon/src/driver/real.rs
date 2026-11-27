@@ -142,6 +142,11 @@ pub fn write_claude_config(req: &SpawnRequest, hook: &Path) -> std::io::Result<(
     // Claude runs in manual mode).
     let (read, deny) = read_only_rules(&req.read_only);
     allow.extend(read);
+    // The person's attachments for this task (made now, so a file attached mid-session is
+    // covered): read without asking. Only that folder, never the rest of Mirante's home.
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let attachments = crate::attachments::task_dir(req.paths.home(), &req.task.id).map_err(std::io::Error::other)?;
+    allow.extend(read_only_rules(&[attachments.path().to_path_buf()]).0);
     let mcp = if servers_of(req).any() {
         let path = dir.join("mcp.json");
         let json = mcp_json(servers_of(req), &req.task.id, req.paths.home());
@@ -448,9 +453,17 @@ impl RealFactory {
             req.resume.as_deref(),
             ChildEnv { remove: &env_remove, set: &env_set, args: &extra_args, first_turn },
             &log,
-            sink,
+            sink.clone(),
             CodexTiming::default(),
         )?;
+        // Images the person attached also go as `localImage` items (Codex's sandbox reads
+        // anywhere; app-server itself reads the image).
+        match crate::attachments::task_dir(req.paths.home(), &req.task.id) {
+            Ok(dir) => d.set_attachments_dir(dir.path().to_path_buf()),
+            Err(e) => {
+                sink.emit(DriverEvent::Step(serde_json::json!({ "type": "attachments_unavailable", "error": e })))
+            }
+        }
         // Codex holds its stderr for the whole session: the log is cut while it runs too.
         watch_stderr_log(log, Arc::downgrade(&d));
         Ok(d)
@@ -637,6 +650,31 @@ mod tests {
         assert!(codex_mcp_args(mem(Path::new("/x\ny/mirante-mcp")), "t1", Path::new("/h")).is_err());
     }
 
+    /// The settings' allow rules but the task's attachments folder's (every Claude session
+    /// has that one; see `claude_reads_its_task_s_attachments_and_nothing_else_of_home`).
+    fn granted(s: &serde_json::Value) -> serde_json::Value {
+        let all = s["permissions"]["allow"].as_array().unwrap();
+        serde_json::Value::Array(
+            all.iter().filter(|r| !r.as_str().unwrap().ends_with("/attachments/**)")).cloned().collect(),
+        )
+    }
+
+    #[test]
+    fn claude_reads_its_task_s_attachments_and_nothing_else_of_home() {
+        let d = TestDir::new();
+        let mut req = request(None);
+        req.paths = Paths::new(&d.path().join("home"));
+        let (settings, _) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
+        let dir = std::fs::canonicalize(req.paths.session_dir("task-1").join("attachments")).unwrap();
+        assert!(dir.is_dir());
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let rule = format!("Read(/{}/**)", dir.display());
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow, &[serde_json::json!(rule)]);
+        let home = std::fs::canonicalize(req.paths.home()).unwrap();
+        assert!(!allow.iter().any(|r| r == &serde_json::json!(format!("Read(/{}/**)", home.display()))));
+    }
+
     /// Review I2: a workspace task's group folder never becomes one Read rule; its
     /// read-only repos are named one by one, their credential files denied.
     #[test]
@@ -648,7 +686,7 @@ mod tests {
         req.read_only = vec![PathBuf::from("/Users/p/gol/docs")];
         let (settings, _) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(s["permissions"]["allow"], serde_json::json!(["Read(//Users/p/gol/docs/**)"]));
+        assert_eq!(granted(&s), serde_json::json!(["Read(//Users/p/gol/docs/**)"]));
         let deny = s["permissions"]["deny"].as_array().unwrap();
         assert!(deny.contains(&serde_json::json!("Read(//Users/p/gol/docs/**/.env)")), "{deny:?}");
         assert!(deny.contains(&serde_json::json!("Read(//Users/p/gol/docs/**/.git/**)")), "{deny:?}");
@@ -664,7 +702,7 @@ mod tests {
         let (settings, mcp) = write_claude_config(&req, hook).unwrap();
         assert_eq!(mcp, None);
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(s["permissions"]["allow"], serde_json::json!([]));
+        assert_eq!(granted(&s), serde_json::json!([]));
 
         req.mcp = Some(PathBuf::from("/opt/m/mirante-mcp"));
         let (settings, mcp) = write_claude_config(&req, hook).unwrap();
@@ -677,7 +715,7 @@ mod tests {
         assert_eq!(m["mcpServers"]["mirante-memory"]["env"]["MIRANTE_HOME"], d.path().join("home").to_str().unwrap());
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
-            s["permissions"]["allow"],
+            granted(&s),
             serde_json::json!(["mcp__mirante-memory__memory_search", "mcp__mirante-memory__memory_get"])
         );
 
@@ -894,7 +932,7 @@ mod tests {
         assert_eq!(m["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mirante-skills"]);
         assert_eq!(m["mcpServers"]["mirante-skills"]["args"], serde_json::json!(["--surface", "skills"]));
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(s["permissions"]["allow"], serde_json::json!([]));
+        assert_eq!(granted(&s), serde_json::json!([]));
         // Both on: one file, two servers; only memory's read tools are pre-allowed.
         req.mcp = req.skills_mcp.clone();
         let (settings, mcp) = write_claude_config(&req, Path::new("/opt/m/mirante-hook")).unwrap();
@@ -932,7 +970,7 @@ mod tests {
         assert_eq!(m["mcpServers"]["mirante-orchestrator"]["args"], serde_json::json!(["--surface", "orchestrator"]));
         let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
-            s["permissions"]["allow"],
+            granted(&s),
             serde_json::json!(["mcp__mirante-orchestrator__task_children", "mcp__mirante-orchestrator__task_result"])
         );
         assert!(!s.to_string().contains("task_spawn"), "{s}");

@@ -785,6 +785,11 @@ pub struct StartSession {
     /// First message, delivered as soon as the agent is ready.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Attachment ids of this task (`attachment.put` / `attachment.import`), each appended
+    /// to the first message as a line naming its absolute path (the prompt may then be
+    /// empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,6 +813,10 @@ pub struct SendMessage {
     pub task: String,
     pub text: String,
     pub mode: SendMode,
+    /// Attachment ids of this task, each appended to the text as a line naming its absolute
+    /// path (the text may then be empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

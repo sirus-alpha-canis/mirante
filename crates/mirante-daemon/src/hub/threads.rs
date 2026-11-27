@@ -322,12 +322,19 @@ mod tests {
 
     /// Started (or resumed) and booted.
     fn start(k: &Kit, task: &str, prompt: Option<&str>, resume: bool) {
-        k.hub.start_session(StartSession { task: task.into(), prompt: prompt.map(str::to_string) }, resume).unwrap();
+        k.hub
+            .start_session(
+                StartSession { task: task.into(), prompt: prompt.map(str::to_string), attachments: Vec::new() },
+                resume,
+            )
+            .unwrap();
         k.emit(crate::driver::DriverEvent::Boot(mirante_ipc::types::BootState::Ready));
     }
 
     fn person(k: &Kit, task: &str, text: &str) {
-        k.hub.send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Queue }).unwrap();
+        k.hub
+            .send(SendMessage { task: task.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new() })
+            .unwrap();
         k.drain();
     }
 
@@ -512,7 +519,15 @@ mod tests {
         let id = th.task.id.clone();
         start(&k, &id, None, false);
         k.hub
-            .send_by(SendMessage { task: id.clone(), text: "from a peer".into(), mode: SendMode::Queue }, "agent")
+            .send_by(
+                SendMessage {
+                    task: id.clone(),
+                    text: "from a peer".into(),
+                    mode: SendMode::Queue,
+                    attachments: Vec::new(),
+                },
+                "agent",
+            )
             .unwrap();
         k.drain();
         assert_eq!(sends(&k).last().unwrap(), "send:from a peer");
@@ -548,7 +563,7 @@ mod tests {
         let text = "Operator request: synthesize the results";
         k.hub
             .send_by(
-                SendMessage { task: id.clone(), text: text.into(), mode: SendMode::Queue },
+                SendMessage { task: id.clone(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new() },
                 super::super::groups::BY_SYNTHESIS,
             )
             .unwrap();
