@@ -913,8 +913,8 @@ impl Hub {
     pub fn attach(&self, p: AttachParams) -> Result<(Arc<dyn Driver>, Attachment)> {
         let (task_id, session_id, driver) = self.live_driver(&p.task)?;
         let driver = driver.ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
-        // 0 x 0: keep the PTY's size (a client re-attaching); else at least 10 x 40.
-        let (rows, cols) = if p.rows == 0 || p.cols == 0 { (0, 0) } else { (p.rows.max(10), p.cols.max(40)) };
+        // 0 x 0: keep the PTY's size (a client re-attaching); else clamped (`term_size`).
+        let (rows, cols) = if p.rows == 0 || p.cols == 0 { (0, 0) } else { super::term_size(p.rows, p.cols) };
         let a = driver.attach(rows, cols)?;
         let mut st = self.lock();
         // Audit the session's first attach only: a view that comes back re-attaches, and an
@@ -935,7 +935,8 @@ impl Hub {
     pub fn resize(&self, p: ResizeParams) -> Result<()> {
         let (_, _, driver) = self.live_driver(&p.task)?;
         let driver = driver.ok_or_else(|| HubError::Conflict("agent still starting".into()))?;
-        Ok(driver.resize(p.rows.max(10), p.cols.max(40))?)
+        let (rows, cols) = super::term_size(p.rows, p.cols);
+        Ok(driver.resize(rows, cols)?)
     }
 
     fn live_driver(&self, reference: &str) -> Result<LiveRef> {
@@ -1944,6 +1945,12 @@ mod tests {
         k.hub.attach(AttachParams { task: t.id.clone(), rows: 1, cols: 1 }).unwrap();
         let calls = k.calls();
         assert!(calls.contains(&"attach:0x0".to_string()) && calls.contains(&"attach:10x40".to_string()), "{calls:?}");
+        // An absurd size is clamped from above too, on attach and on resize.
+        k.hub.attach(AttachParams { task: t.id.clone(), rows: u16::MAX, cols: u16::MAX }).unwrap();
+        k.hub.resize(ResizeParams { task: t.id.clone(), rows: 60000, cols: 60000 }).unwrap();
+        let calls = k.calls();
+        assert!(calls.contains(&"attach:500x1000".to_string()), "{calls:?}");
+        assert!(calls.contains(&"resize:500x1000".to_string()), "{calls:?}");
     }
 
     /// The cockpit re-attaches whenever a terminal view comes back: the audit keeps the

@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use mirante_core::claude_launch::{AGENT_ENV, NESTED_SESSION_ENV, SCRUB_PREFIXES, SESSION_ENV, TASK_ENV};
+use mirante_core::claude_launch::{AGENT_ENV, NESTED_SESSION_ENV, SCRUB_PREFIXES, SESSION_ENV, TASK_ENV, TERMINAL_ENV};
 use mirante_core::model::Lifecycle;
 use mirante_ipc::types::{ShellAttach, ShellOpen, ShellResize, ShellView};
 
-use super::{Hub, HubError, Result};
+use super::{term_size, Hub, HubError, Result};
 use crate::driver::pty::{PtyProcess, PtySpec};
 
 /// Shells one task may have at once.
@@ -48,6 +48,10 @@ pub(crate) struct Registry {
     shells: HashMap<String, Shell>,
     /// Tests: the program to run instead of the person's shell.
     pub(crate) program: Option<PathBuf>,
+    /// Tests: run once by `shell.open` between its checks and its insert (the race window).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_check: Option<Box<dyn FnOnce(&Hub) + Send>>,
 }
 
 impl Registry {
@@ -66,17 +70,27 @@ pub fn pick_shell(env_shell: Option<&str>, etc_shells: &str) -> PathBuf {
     }
 }
 
+/// Terminal multiplexers and emulators the daemon may have been started from: the shell is
+/// in the cockpit's terminal, not in theirs (a `TMUX` left over makes `tmux` commands act on
+/// the person's other session).
+pub const MULTIPLEXER_ENV: [&str; 2] = ["TERM_PROGRAM", "STY"];
+/// Prefixes of the same (zellij sets several).
+pub const MULTIPLEXER_PREFIXES: [&str; 1] = ["ZELLIJ"];
+
 /// Whether the daemon's variable `key` stays out of a person's shell: agent markers, every
-/// `MIRANTE_*`, a parent agent's session variables and terminal-wrapper integrations.
+/// `MIRANTE_*`, a parent agent's session variables, terminal-wrapper integrations and the
+/// terminal multiplexer the daemon was started from.
 pub fn scrubbed(key: &str) -> bool {
     key.starts_with("MIRANTE_")
         || [AGENT_ENV, TASK_ENV, SESSION_ENV].contains(&key)
         || NESTED_SESSION_ENV.contains(&key)
-        || SCRUB_PREFIXES.iter().any(|p| key.starts_with(p))
+        || TERMINAL_ENV.contains(&key)
+        || MULTIPLEXER_ENV.contains(&key)
+        || SCRUB_PREFIXES.iter().chain(MULTIPLEXER_PREFIXES.iter()).any(|p| key.starts_with(p))
 }
 
 /// The shell's spawn: a login shell (`-l`) in `cwd`, without the scrubbed variables of
-/// `daemon_env`, as an `xterm-256color` terminal.
+/// `daemon_env`, as an `xterm-256color` terminal of a clamped size ([`term_size`]).
 pub fn shell_spec(
     program: &Path,
     cwd: &Path,
@@ -90,14 +104,15 @@ pub fn shell_spec(
             env_remove.push(k.to_string());
         }
     }
+    let (rows, cols) = term_size(rows, cols);
     PtySpec {
         program: program.to_path_buf(),
         args: vec!["-l".into()],
         cwd: cwd.to_path_buf(),
         env_remove,
         env_set: vec![("TERM".into(), "xterm-256color".into()), ("COLORTERM".into(), "truecolor".into())],
-        rows: rows.max(10),
-        cols: cols.max(40),
+        rows,
+        cols,
     }
 }
 
@@ -123,8 +138,8 @@ impl Hub {
         self.shells().program = Some(program.to_path_buf());
     }
 
-    /// Where shell `p` of its task starts: the task's worktree (checked against a swap), a
-    /// workspace task's repo worktree, or the workspace folder.
+    /// Where shell `p` of its task starts: the task's worktree, a workspace task's repo
+    /// worktree, or the workspace folder, each checked against a swap.
     fn shell_cwd(&self, p: &ShellOpen) -> Result<(String, PathBuf)> {
         let (t, repos) = {
             let st = self.lock();
@@ -137,7 +152,13 @@ impl Hub {
         };
         let cwd = match (&t.workspace_path, &p.repo) {
             (None, _) => self.checked_worktree(&t).map_err(HubError::Conflict)?,
-            (Some(ws), None) => PathBuf::from(ws),
+            (Some(ws), None) => match self.worktrees.real_path(Path::new(ws)) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return Err(HubError::Conflict(format!("the workspace folder of task {} is gone", t.branch)))
+                }
+                Err(e) => return Err(HubError::Conflict(e.to_string())),
+            },
             (Some(_), Some(name)) => {
                 let r = self.checked_repos(&t, &repos).map_err(HubError::Conflict)?;
                 let r = r
@@ -160,6 +181,45 @@ impl Hub {
             return Err(HubError::Conflict("the daemon is shutting down".into()));
         }
         let (task, cwd) = self.shell_cwd(&p)?;
+        #[cfg(test)]
+        {
+            let hook = self.shells().after_check.take();
+            if let Some(f) = hook {
+                f(self);
+            }
+        }
+        let v = self.spawn_shell(&p, task.clone(), cwd)?;
+        // An archive or a shutdown may have begun since the checks, and closed the task's
+        // shells before this one was in the registry: it sets the lifecycle (the flag) under
+        // the state lock before closing them, so either this re-check sees it, or the close
+        // came after the insert and found the shell.
+        let gone = {
+            let st = self.lock();
+            if self.is_shutting_down() {
+                Some("the daemon is shutting down".to_string())
+            } else {
+                match st.store.get_task(&task) {
+                    Ok(t) if matches!(t.lifecycle, Lifecycle::Archived | Lifecycle::Archiving) => {
+                        Some(format!("task {} is archived", t.branch))
+                    }
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                }
+            }
+        };
+        if let Some(why) = gone {
+            let s = self.shells().shells.remove(&v.shell);
+            if let Some(s) = s {
+                s.pty.kill_tree(KILL_GRACE);
+            }
+            return Err(HubError::Conflict(why));
+        }
+        Ok(v)
+    }
+
+    /// Starts and registers shell `p.n` of `task` in `cwd` (refused while that number runs
+    /// or past [`MAX_PER_TASK`]).
+    fn spawn_shell(&self, p: &ShellOpen, task: String, cwd: PathBuf) -> Result<ShellView> {
         let mut reg = self.shells();
         reg.prune();
         let mine: Vec<&Shell> = reg.shells.values().filter(|s| s.task == task).collect();
@@ -207,7 +267,8 @@ impl Hub {
     pub fn shell_attach(&self, p: &ShellAttach) -> Result<ShellStream> {
         let pty = self.shell_pty(&p.shell)?;
         if p.rows > 0 && p.cols > 0 {
-            pty.resize(p.rows.max(10), p.cols.max(40)).map_err(|e| HubError::Invalid(e.to_string()))?;
+            let (rows, cols) = term_size(p.rows, p.cols);
+            pty.resize(rows, cols).map_err(|e| HubError::Invalid(e.to_string()))?;
         }
         let (id, initial, output) = pty.attach();
         Ok(ShellStream { pty, id, initial, output })
@@ -215,7 +276,8 @@ impl Hub {
 
     pub fn shell_resize(&self, p: &ShellResize) -> Result<()> {
         let pty = self.shell_pty(&p.shell)?;
-        pty.resize(p.rows.max(10), p.cols.max(40)).map_err(|e| HubError::Invalid(e.to_string()))
+        let (rows, cols) = term_size(p.rows, p.cols);
+        pty.resize(rows, cols).map_err(|e| HubError::Invalid(e.to_string()))
     }
 
     /// `shell.close`: ends the shell and everything it started.
@@ -420,6 +482,134 @@ mod tests {
         k.hub.shutdown();
         assert!(pty.wait_exit(Duration::from_secs(5)));
         assert!(open(&k, &t.id, 1).is_err());
+    }
+
+    #[test]
+    fn terminal_multiplexer_vars_are_scrubbed() {
+        let env = [
+            "TMUX",
+            "TMUX_PANE",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "STY",
+            "ZELLIJ",
+            "ZELLIJ_SESSION_NAME",
+            "ZELLIJ_PANE_ID",
+            "TERM",
+        ];
+        let spec = shell_spec(Path::new("/bin/zsh"), Path::new("/w"), 30, 100, env.iter().map(|s| s.to_string()));
+        for k in &env[..8] {
+            assert!(spec.env_remove.iter().any(|x| x == k), "{k} is not removed");
+        }
+        // TERM is set, not inherited.
+        assert!(!spec.env_remove.iter().any(|x| x == "TERM"));
+    }
+
+    #[test]
+    fn terminal_size_is_clamped_both_ways() {
+        let big = shell_spec(Path::new("/bin/zsh"), Path::new("/w"), u16::MAX, u16::MAX, std::iter::empty());
+        assert_eq!((big.rows, big.cols), (super::super::MAX_ROWS, super::super::MAX_COLS));
+        let small = shell_spec(Path::new("/bin/zsh"), Path::new("/w"), 1, 1, std::iter::empty());
+        assert_eq!((small.rows, small.cols), (10, 40));
+        let k = kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        let s =
+            k.hub.shell_open(ShellOpen { task: t.id.clone(), n: 1, repo: None, rows: u16::MAX, cols: 9999 }).unwrap();
+        let pty = k.hub.shell_pty(&s.shell).unwrap();
+        assert_eq!(pty.size(), (500, 1000));
+        k.hub.shell_resize(&ShellResize { shell: s.shell.clone(), rows: 1, cols: 1 }).unwrap();
+        assert_eq!(pty.size(), (10, 40));
+        k.hub.shell_resize(&ShellResize { shell: s.shell.clone(), rows: 60000, cols: 60000 }).unwrap();
+        assert_eq!(pty.size(), (500, 1000));
+        k.hub.shell_attach(&ShellAttach { shell: s.shell.clone(), rows: 2000, cols: 2000 }).unwrap();
+        assert_eq!(pty.size(), (500, 1000));
+        k.hub.close_all_shells();
+    }
+
+    /// Review: an open that checked the task before an archive began, and inserts its shell
+    /// after the archive closed the task's shells, must not leave that shell running.
+    #[test]
+    fn an_open_racing_an_archive_leaves_no_shell() {
+        let k = kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        let id = t.id.clone();
+        k.hub.shells().after_check = Some(Box::new(move |h: &Hub| {
+            h.archive(&id).unwrap();
+        }));
+        let r = open(&k, &t.id, 1);
+        assert!(matches!(r, Err(HubError::Conflict(_))), "{r:?}");
+        assert!(k.hub.shells().shells.is_empty(), "the shell outlived the archive");
+        assert_eq!(k.hub.get_task(&t.id).unwrap().task.lifecycle, Lifecycle::Archived);
+    }
+
+    /// The same for a daemon shutdown that began between the check and the insert.
+    #[test]
+    fn an_open_racing_shutdown_leaves_no_shell() {
+        let k = kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        k.hub.shells().after_check = Some(Box::new(|h: &Hub| h.shutdown()));
+        let r = open(&k, &t.id, 1);
+        assert!(matches!(r, Err(HubError::Conflict(_))), "{r:?}");
+        assert!(k.hub.shells().shells.is_empty(), "the shell outlived the shutdown");
+    }
+
+    /// Review: an archive refused for uncommitted work leaves the person's shells running.
+    #[test]
+    fn a_refused_archive_keeps_the_shells() {
+        let k = kit();
+        let t = k.create(AgentKind::Claude, "a").task;
+        let s = open(&k, &t.id, 1).unwrap();
+        std::fs::write(Path::new(&t.worktree_path).join("wip.txt"), "unsaved\n").unwrap();
+        assert!(k.hub.archive(&t.id).is_err());
+        let pty = k.hub.shell_pty(&s.shell).expect("the shell is still there");
+        assert!(!pty.wait_exit(Duration::from_millis(300)), "the shell died with the refused archive");
+        assert_eq!(k.hub.shell_list(&t.id).unwrap(), vec![s]);
+        k.hub.close_all_shells();
+    }
+
+    /// Review: the workspace folder is the agent's working directory and is checked against
+    /// a swap like every other cwd.
+    #[test]
+    fn a_swapped_workspace_folder_is_refused() {
+        let k = kit();
+        let g = k.dir.path().join("grp");
+        for name in ["one", "two"] {
+            let r = g.join(name);
+            std::fs::create_dir_all(&r).unwrap();
+            let git = |args: &[&str]| {
+                let ok = std::process::Command::new("git").arg("-C").arg(&r).args(args).output().unwrap();
+                assert!(ok.status.success(), "git {args:?}");
+            };
+            git(&["init", "-q", "-b", "main"]);
+            std::fs::write(r.join("README.md"), "x\n").unwrap();
+            git(&["add", "."]);
+            git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        }
+        let g = std::fs::canonicalize(&g).unwrap();
+        let t = k
+            .hub
+            .create_task(mirante_ipc::types::CreateTask {
+                group: None,
+                repo: g.to_string_lossy().into_owned(),
+                repos: ["one", "two"].iter().map(|n| g.join(n).to_string_lossy().into_owned()).collect(),
+                agent: AgentKind::Claude,
+                branch: "ws".into(),
+                base: None,
+                goal: "g".into(),
+                title: None,
+            })
+            .unwrap()
+            .task;
+        let ws = PathBuf::from(t.workspace_path.clone().unwrap());
+        // Unswapped, the folder opens.
+        let s = open(&k, &t.id, 1).unwrap();
+        k.hub.shell_close(&s.shell).unwrap();
+        let elsewhere = k.dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::rename(&ws, k.dir.path().join("ws.moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &ws).unwrap();
+        let r = open(&k, &t.id, 1);
+        assert!(matches!(r, Err(HubError::Conflict(_))), "opened through the swap: {r:?}");
     }
 
     #[test]

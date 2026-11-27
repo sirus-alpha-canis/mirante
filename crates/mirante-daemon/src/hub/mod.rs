@@ -249,6 +249,18 @@ pub struct Subscription {
 /// How long a delivery to an idle agent blocks the next one if no turn shows up.
 pub(crate) const DELIVERY_GRACE: Duration = Duration::from_secs(30);
 
+/// The largest terminal a client may ask for (rows): a bigger one would only cost memory
+/// (the mirror grid and its scrollback are sized by it).
+pub const MAX_ROWS: u16 = 500;
+/// The widest terminal a client may ask for (columns).
+pub const MAX_COLS: u16 = 1000;
+
+/// A client's terminal size as the PTY gets it: at least 10 x 40, at most
+/// [`MAX_ROWS`] x [`MAX_COLS`].
+pub(crate) fn term_size(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.clamp(10, MAX_ROWS), cols.clamp(40, MAX_COLS))
+}
+
 /// Who raised a Claude permission dialog and about which tool call (`tool_use_id`, from the
 /// payload or borrowed from the matching `PreToolUse`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -984,6 +996,18 @@ impl Hub {
         }
     }
 
+    /// The checks [`Hub::remove_checkouts`] makes, removing nothing (a workspace task: its
+    /// repos, the agent's own files in its folder, swapped folders).
+    pub(crate) fn check_checkouts(&self, task: &Task) -> std::result::Result<(), CoreError> {
+        match &task.workspace_path {
+            Some(ws) => {
+                let repos = self.lock().store.task_repos(&task.id)?;
+                workspace::check_removable(&self.worktrees, Path::new(ws), &repos)
+            }
+            None => self.worktrees.check_clean(Path::new(&task.worktree_path)),
+        }
+    }
+
     /// Removes `task`'s checkouts: its worktree, or every worktree of a workspace task and
     /// its folder (refused before anything goes when any of them holds uncommitted work).
     /// Branches are kept.
@@ -1122,16 +1146,7 @@ impl Hub {
         }
         let mut dirty = Vec::new();
         for t in tasks {
-            // The same checks `archive` makes, removing nothing (a workspace task: its repos,
-            // the agent's own files in its folder, swapped folders).
-            let clean = match &t.workspace_path {
-                Some(ws) => {
-                    let repos = self.lock().store.task_repos(&t.id)?;
-                    workspace::check_removable(&self.worktrees, Path::new(ws), &repos)
-                }
-                None => self.worktrees.check_clean(Path::new(&t.worktree_path)),
-            };
-            match clean {
+            match self.check_checkouts(t) {
                 Ok(()) => {}
                 Err(CoreError::DirtyWorktree { .. } | CoreError::DirtyWorkspace { .. }) => dirty.push(t.branch.clone()),
                 Err(e) => return Err(e.into()),
@@ -1174,9 +1189,13 @@ impl Hub {
             st.publish();
             t
         };
-        // The person's shells in its worktree end before the worktree goes.
-        self.close_shells_of(&task.id);
-        let removed = self.remove_checkouts(&task);
+        // The person's shells in its worktree end before the worktree goes, and only once
+        // it can go (an archive refused for uncommitted work leaves them running). A shell
+        // opened meanwhile sees `Archiving` and ends itself (`Hub::shell_open`).
+        let removed = self.check_checkouts(&task).and_then(|()| {
+            self.close_shells_of(&task.id);
+            self.remove_checkouts(&task)
+        });
         let mut st = self.lock();
         if let Err(e) = removed {
             let undo = st.store.transition_lifecycle(&task.id, Lifecycle::Active);
