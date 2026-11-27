@@ -7,18 +7,22 @@
 //! - Kinds: an image is PNG, JPEG, GIF or WebP by its magic bytes (never its extension), at
 //!   most [`MAX_IMAGE`] bytes; any other file at most [`MAX_FILE`]. A task holds at most
 //!   [`MAX_TASK_BYTES`] of them.
-//! - Redaction ([`redact`]): a HAR loses its credentials; any other UTF-8 text goes through
-//!   `redact_counted`; binary files and images are stored as they are. The original never
-//!   lands in Mirante's home.
+//! - Redaction ([`redact`]): a HAR loses its credentials; any other text (UTF-8, UTF-16 by
+//!   its mark or its zero bytes, other text-looking bytes read lossily) goes through
+//!   `redact_counted`; binary files and images are stored as they are, and a `.har` that is
+//!   not text or not JSON is refused. At most [`MAX_PREPARING`] are prepared at once. The
+//!   original never lands in Mirante's home.
 //! - Import ([`read_source`]): the source is opened with `O_NOFOLLOW` (its last component
 //!   is never a symlink) and must be a regular file with a single link that is not inside
 //!   Mirante's home (checked on the opened descriptor's path); at most limit + 1 bytes are
 //!   read.
 pub mod redact;
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use mirante_core::safedir::SafeDir;
 use mirante_ipc::types::AttachmentKind;
@@ -72,12 +76,94 @@ pub fn is_image(bytes: &[u8]) -> bool {
         || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
 }
 
-/// Text Mirante redacts: UTF-8 without NUL, not a PDF or a zip.
-fn as_text(bytes: &[u8]) -> Option<&str> {
-    if bytes.contains(&0) || bytes.starts_with(b"%PDF-") || bytes.starts_with(b"PK\x03\x04") {
+/// The bytes as text Mirante redacts, or `None` (binary: stored as it is). Not a PDF or a
+/// zip. UTF-16 by its byte-order mark (or, without one, by its zero bytes) is transcoded;
+/// a UTF-8 mark is dropped; UTF-8 is read as it is. Other bytes without NUL that look like
+/// text (few control characters: Latin-1, a log with a stray byte) are read lossily, so
+/// what was valid comes through and is redacted. `har`: a `.har` is text or refused.
+fn as_text<'a>(bytes: &'a [u8], har: bool) -> Result<Option<Cow<'a, str>>, String> {
+    let binary = || if har { Err("it is not text, so it cannot be a HAR".to_string()) } else { Ok(None) };
+    if bytes.starts_with(b"%PDF-") || bytes.starts_with(b"PK\x03\x04") {
+        return binary();
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return Ok(Some(Cow::Owned(utf16(rest, false))));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return Ok(Some(Cow::Owned(utf16(rest, true))));
+    }
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if bytes.contains(&0) {
+        return match utf16_without_mark(bytes) {
+            Some(be) => Ok(Some(Cow::Owned(utf16(bytes, be)))),
+            None => binary(),
+        };
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Ok(Some(Cow::Borrowed(s)));
+    }
+    let control = bytes.iter().filter(|b| **b < 0x20 && !b"\t\n\r\x0c\x1b".contains(b)).count();
+    if har || control <= bytes.len() / 100 {
+        return Ok(Some(String::from_utf8_lossy(bytes)));
+    }
+    binary()
+}
+
+/// UTF-16 code units of `bytes` (`be`: big-endian) as a string, unpaired ones replaced.
+fn utf16(bytes: &[u8], be: bool) -> String {
+    let units =
+        bytes.as_chunks::<2>().0.iter().map(|c| if be { u16::from_be_bytes(*c) } else { u16::from_le_bytes(*c) });
+    char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+}
+
+/// Whether `bytes` (they hold NUL) look like UTF-16 text without a mark: of their first
+/// 4 KiB, most odd bytes are zero and almost no even ones (little-endian, ASCII-heavy
+/// text), or the reverse (big-endian). `Some(big_endian)`.
+fn utf16_without_mark(bytes: &[u8]) -> Option<bool> {
+    let head = &bytes[..bytes.len().min(4096) & !1];
+    let pairs = head.len() / 2;
+    if pairs == 0 {
         return None;
     }
-    std::str::from_utf8(bytes).ok()
+    let even = head.iter().step_by(2).filter(|b| **b == 0).count();
+    let odd = head.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+    let most = |z: usize| z * 10 >= pairs * 7;
+    let few = |z: usize| z * 20 <= pairs;
+    match (most(odd) && few(even), most(even) && few(odd)) {
+        (true, _) => Some(false),
+        (_, true) => Some(true),
+        _ => None,
+    }
+}
+
+/// How many attachments are prepared at once: a HAR is parsed into a tree several times
+/// its size, so two at most (a third waits).
+const MAX_PREPARING: usize = 2;
+
+static PREPARING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// A place among the [`MAX_PREPARING`]; freed when dropped.
+struct Permit;
+
+impl Permit {
+    fn take() -> Permit {
+        let (m, cv) = &PREPARING;
+        let mut n = m.lock().unwrap_or_else(|p| p.into_inner());
+        while *n >= MAX_PREPARING {
+            n = cv.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        *n += 1;
+        Permit
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let (m, cv) = &PREPARING;
+        let mut n = m.lock().unwrap_or_else(|p| p.into_inner());
+        *n -= 1;
+        cv.notify_one();
+    }
 }
 
 /// What is stored for an attachment named `name` with `raw` bytes.
@@ -106,11 +192,12 @@ pub fn prepare(name: &str, raw: Vec<u8>) -> Result<Prepared, String> {
     if raw.len() > MAX_FILE {
         return Err(format!("{name} is {}; a file may be at most {}", size(raw.len() as u64), size(MAX_FILE as u64)));
     }
-    let Some(text) = as_text(&raw) else {
+    let har = name.to_ascii_lowercase().ends_with(".har");
+    let _permit = Permit::take();
+    let Some(text) = as_text(&raw, har).map_err(|e| format!("{name}: {e}"))? else {
         return Ok(Prepared { bytes: raw, kind: AttachmentKind::File, redacted: 0 });
     };
-    let har = name.to_ascii_lowercase().ends_with(".har");
-    let (out, redacted) = redact::redact_text(text, har);
+    let (out, redacted) = redact::redact_text(&text, har).map_err(|e| format!("{name}: {e}"))?;
     Ok(Prepared { bytes: out.into_bytes(), kind: AttachmentKind::File, redacted })
 }
 
@@ -340,6 +427,71 @@ mod tests {
         assert_eq!((p.bytes, p.redacted), (pdf, 0));
         let bin = vec![0u8, 1, 2, 3];
         assert_eq!(prepare("x.bin", bin.clone()).unwrap().bytes, bin);
+    }
+
+    fn utf16_bytes(s: &str, be: bool, mark: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if mark {
+            out.extend_from_slice(if be { &[0xFE, 0xFF] } else { &[0xFF, 0xFE] });
+        }
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&if be { u.to_be_bytes() } else { u.to_le_bytes() });
+        }
+        out
+    }
+
+    #[test]
+    fn utf16_latin1_and_bom_text_is_redacted_never_stored_raw() {
+        let token = format!("{}{}_{}", "gh", "p", "A9s8D7f6G5h4J3k2L1q0W9e8R7t6Y5u4I3o2");
+        let line = format!("Authorization: Bearer {token}\n");
+        for (be, mark) in [(false, true), (true, true), (false, false), (true, false)] {
+            let p = prepare("app.log", utf16_bytes(&line, be, mark)).unwrap();
+            let out = String::from_utf8(p.bytes).unwrap();
+            assert!(!out.contains(&token) && out.starts_with("Authorization:"), "{be} {mark}: {out}");
+            assert!(p.redacted >= 1);
+        }
+        // Latin-1 (invalid UTF-8, no NUL): read lossily, then redacted.
+        let mut latin1 = b"caf\xe9 ".to_vec();
+        latin1.extend_from_slice(line.as_bytes());
+        let p = prepare("app.log", latin1).unwrap();
+        assert!(!String::from_utf8(p.bytes).unwrap().contains(&token));
+        // A UTF-8 mark is dropped.
+        let p = prepare("a.txt", format!("\u{feff}{line}").into_bytes()).unwrap();
+        let out = String::from_utf8(p.bytes).unwrap();
+        assert!(!out.contains(&token) && out.starts_with("Authorization:"), "{out}");
+        // A UTF-16 HAR is read as a HAR.
+        let har = format!(
+            "{{\"log\":{{\"entries\":[{{\"request\":{{\"headers\":[{{\"name\":\"Cookie\",\"value\":\"sid={token}\"}}]}}}}]}}}}"
+        );
+        let p = prepare("trace.har", utf16_bytes(&har, false, true)).unwrap();
+        let out = String::from_utf8(p.bytes).unwrap();
+        assert!(!out.contains(&token) && out.contains(redact::MARK), "{out}");
+        // A .har that is binary, or text that is not JSON, is refused; other binary is kept.
+        assert!(prepare("trace.har", vec![0u8, 1, 2, 0, 0, 7]).unwrap_err().contains("not text"));
+        assert!(prepare("trace.har", b"\x01\x02\x03 not json".to_vec()).unwrap_err().contains("not valid JSON"));
+        assert_eq!(prepare("x.bin", vec![0u8, 1, 2, 0, 0, 7]).unwrap().bytes, [0u8, 1, 2, 0, 0, 7]);
+        let mostly_control: Vec<u8> = (0..200u8).map(|i| if i % 3 == 0 { 0x01 } else { 0xC3 }).collect();
+        assert_eq!(prepare("x.bin", mostly_control.clone()).unwrap().bytes, mostly_control);
+    }
+
+    #[test]
+    fn at_most_two_attachments_are_prepared_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let now = std::sync::Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let (peak, now) = (peak.clone(), now.clone());
+                std::thread::spawn(move || {
+                    let _p = Permit::take();
+                    peak.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, SeqCst);
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert!(peak.load(SeqCst) <= MAX_PREPARING);
     }
 
     #[test]
