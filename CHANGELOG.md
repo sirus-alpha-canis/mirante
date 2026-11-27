@@ -6,6 +6,8 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-27
+
 ### Added
 
 - **Attachments: paste, drop and pick images and files.** In the goal field, the message
@@ -48,6 +50,11 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
 
 - **Brain: an unreviewed note's label is readable again**; the dashed ring's stroke no longer
   runs over its text.
+- **`mirante daemon stop` returns once the daemon is gone**, so a `stop` followed by `start`
+  no longer races the old daemon.
+- **The cockpit no longer locks up on a slow machine**: a clock hook re-rendered in a loop.
+- A session's process tree is killed completely on stop (the count is taken before the
+  group signal).
 
 ## [0.2.0] — 2026-11-16
 
@@ -351,6 +358,7 @@ signed releases.
 - A daemon that exits during startup is reported with the end of its log, not
   "No such file or directory (os error 2)".
 
-[Unreleased]: https://github.com/sirus-alpha-canis/mirante/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sirus-alpha-canis/mirante/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sirus-alpha-canis/mirante/releases/tag/v0.3.0
 [0.2.0]: https://github.com/sirus-alpha-canis/mirante/releases/tag/v0.2.0
 [0.1.0]: https://github.com/sirus-alpha-canis/mirante/releases/tag/v0.1.0
