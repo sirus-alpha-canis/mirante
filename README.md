@@ -195,6 +195,11 @@ More detail, including the fake daemon for UI work without agents:
 - **Home** is an inbox across all projects: what needs you first, then what is ready to
   review, then what is working. The Mirante logo at the top left (or **⌘1**) brings you
   back to it. **⌘J** jumps to the next task that needs you.
+- **Look.** Vibely's palette and ribbon mark (by permission; see [Trademark](#trademark)),
+  set in Nunito Sans. Colour means state only: amber needs you, blue working, green ready,
+  red failed or destructive. The primary button is neutral ink, the rest are outlined, and
+  state labels are tinted chips. Light and dark follow macOS (◐ in the top bar cycles
+  system → light → dark). More in [`apps/cockpit/README.md`](apps/cockpit/README.md#look).
 - **Detail.** Each task has four tabs. **Steps** shows tool steps summed up. **Terminal** is
   the live terminal. **Diff** shows the task's changes. **Memory** shows the repo notes
   relevant to the task, the notes its branch puts at risk, and what it proposed. The

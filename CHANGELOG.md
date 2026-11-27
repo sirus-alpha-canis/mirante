@@ -19,6 +19,21 @@ crate and the app share one version. How a release is cut: [RELEASING.md](RELEAS
   cover it) beside "Mirante", in the top bar, the launch splash and the app icon. The splash
   draws the wordmark as outlines and the ribbon draws in once (no motion with reduced
   motion), instead of the orbiting Orb-Dot.
+- **Components in Vibely's language, at Mirante's density**: the primary button stays
+  neutral ink and the others are outlined; destructive answers (Stop the session, Archive,
+  Archive tasks and remove, Retire, Reject proposal) are red; fields get a 1px border; state
+  pills and state labels are tinted chips; cards and dialogs are rounded 12; floating notes
+  get an amber left stripe (errors a red one); dialogs dim the window to 60%. No gradients.
+- **A thread card's stripe is its thread's state** (amber needs you, blue working, green
+  ready) instead of always blue.
+- **The folded System memory line** in the rail shows the level dot and the size ("7.2 GB");
+  the full line ("normal · 7.2 GB free") is its tooltip and what VoiceOver reads. It no
+  longer gets cut off at the rail's width.
+
+### Fixed
+
+- **Brain: an unreviewed note's label is readable again**; the dashed ring's stroke no longer
+  runs over its text.
 
 ## [0.2.0] — 2026-11-16
 

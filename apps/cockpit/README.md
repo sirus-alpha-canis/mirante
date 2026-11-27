@@ -170,7 +170,13 @@ agents, then the Projects (filtered as you type; ↑/↓, Enter or Tab picks, Es
 Direction "Observatório": surfaces instead of borders (a frame, a reading surface, cards,
 a lift for what is active), in Vibely's palette: neutral greys, and color only for state
 from its semantic scales (amber needs you, blue working, green ready, red failed); no brand
-accent (red is the brand and "danger" only), type 12/13/15/20. The theme
+accent (red is the brand and "danger" only), type 12/13/15/20. Components speak Vibely's
+language at Mirante's density (26px buttons, 30px rows): the primary button is neutral ink,
+the others are outlined, a destructive answer (Stop the session, Archive, Retire, Reject) is
+the danger red; fields have a 1px border with the label above or beside, never floating;
+state pills and state labels are tinted chips (the state's text on its own tint); cards and
+dialogs are rounded 12, the rest 8 or 4; a floating note has Vibely's amber left stripe (an
+error the red one); a dialog dims the window to 60%; no gradients. The theme
 follows macOS (◐ cycles system → light → dark). The mark is Vibely's two-tone ribbon (used by
 permission of its owner; `src/assets/brand/`) beside "Mirante" in Nunito Sans; the launch splash
 draws both as paths (no font needed yet) and the ribbon draws in once from its centre (none
@@ -179,8 +185,8 @@ with reduced motion). The app icon is rendered from the same master
 you are (Home › project › task), the views, the daemon's health dot, what needs you (click:
 ⌘J) and ⌘K; a 24px status line at the foot shows the daemon, system memory, what needs
 you and the keys of the current view. At the rail's foot, System memory and Sessions are
-folded to one line each (a level dot and "normal · 7.0 GB free"; "Auto-resume on · Pause
-off"): click a title to open it, and each stays as you left it. Tokens live at the top of `src/styles.css`;
+folded to one line each (a level dot and "7.0 GB", the full "normal · 7.0 GB free" in its
+tooltip and spoken name; "Auto-resume on · Pause off"): click a title to open it, and each stays as you left it. Tokens live at the top of `src/styles.css`;
 `styles.test.ts` checks their contrast (WCAG AA) in every theme.
 
 The UI is set in Nunito Sans and code and the terminal in JetBrains Mono (both SIL OFL 1.1),

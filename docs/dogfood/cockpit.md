@@ -139,6 +139,42 @@ no window of its own). Keep `mirante watch` open in a terminal the first day to 
 - [ ] Every action above works with the keyboard alone (Tab, Enter, arrows in tabs and ⌘K).
 - [ ] VoiceOver reads card titles, permission groups and the connection banner.
 
+### Visual identity (Vibely look, 2026-11-27)
+
+The look and the mark come from Vibely (`docs/plans/2026-11-25-vibely-visual-identity.md`);
+the name stays Mirante. Eyeball each line in light and in dark (◐ in the top bar).
+
+- [ ] The top bar's ribbon is two-tone (dark red back band, red front) in light **and** dark,
+      beside "Mirante" in Nunito Sans. The launch splash draws the ribbon in once from its
+      centre; with Reduce motion on (System Settings → Accessibility → Display) it does not
+      move.
+- [ ] The Dock icon is the ribbon on white, not the old Orb-Dot.
+- [ ] Colour means state only: amber needs you, blue working (no cyan left anywhere), green
+      ready, red failed or destructive. Card stripes, the state pill on a card, the Grid
+      tiles, the thread cards in a conversation, the Brain's nodes and the status line agree.
+- [ ] Buttons: the primary one is black ink in light, white in dark; the others are outlined
+      (a thin grey border, no fill); hover fills them lightly. Stop the session, Archive the
+      task / Archive all, Archive tasks and remove (rail), Retire (skill) and Reject proposal
+      are solid red. Hibernate now and Interrupt and send stay amber.
+- [ ] Fields (rail filter, Add a repository, Brain search, the task list's search, Rules'
+      project picker, memory and skill review notes, the dispatch selects) have a thin
+      border; it turns dark grey (light) or light grey (dark) when focused. The label is above
+      or beside the field, never inside it. Tell us if the border is too faint to find a field.
+- [ ] State labels are small tinted chips: a card's state ("Needs you", "Working", "Ready for review"),
+      "not reviewed by a person", "refused", "redacted", "Learning on", "verified". A working row on
+      Home keeps a bare dot.
+- [ ] Cards and dialogs (⌘K, ⌘P, New thread) have rounder corners (12) than buttons and
+      fields (8); a dialog dims the window behind it, but not to black.
+- [ ] A floating note over the composer (a queued message, a sent one) has an amber stripe on
+      its left; a floating error a red one.
+- [ ] The rail at its default width: the folded **System memory** line reads "● 7.2 GB"
+      (no "normal · 7.…" cut-off); hovering it shows "normal · 7.2 GB free"; VoiceOver reads
+      the full line. Same in Portuguese ("normal · 7.2 GB livres").
+- [ ] Nothing truncates that used to fit (Nunito Sans is wider than Inter): rail names, chips,
+      the status line, Detail's header buttons. The terminal is unchanged (JetBrains Mono on
+      graphite).
+- [ ] No gradients anywhere; the side pane's separator is a plain line that thickens on hover.
+
 ## I. Carried over from the Plan 2b run (by hand)
 
 From "Left for the founder to try by hand" in `2026-11-07-plan-2b-results.md`; do them with

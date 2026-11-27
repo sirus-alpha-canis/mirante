@@ -1,5 +1,7 @@
 # Plan: Vibely visual identity for the Mirante cockpit
 
+> **Status: done (2026-11-27).** All batches built; see the As-built notes.
+
 > **For agentic workers:** use superpowers:subagent-driven-development. One committing agent at a time. Commit author for this repo: `Pedro Cândido <32328995+pedrincandido@users.noreply.github.com>` (already set in the local git config).
 
 **Goal:** the cockpit takes Vibely's look and logo. The product name stays **Mirante**: the CLI, binaries, `~/.mirante`, `MIRANTE_*`, the repo and the Homebrew formula are unchanged.
@@ -128,6 +130,23 @@ Every text/background pair is checked by `styles.test.ts`: 4.5:1 for text and 3:
 - Run a contrast spot-check.
 - Write a dogfood checklist section for the founder to eyeball.
 - Update the README and the cockpit README where they describe the look, plus the CHANGELOG (Unreleased → Changed).
+
+**As built (Batch C, Tasks 6–7) — done 2026-11-27:**
+- Buttons: `.btn` is Vibely's "outlined" (transparent, `box-shadow: inset 0 0 0 1px var(--btn-line)`, so no layout shift), `.btn-primary` neutral ink at weight 700, new `.btn-danger` (`--danger` on `--on-danger`, 700) for the destructive answers: Stop the session, Archive the task / Archive all, Archive tasks and remove (rail), Retire (skill), Reject proposal (memory and skills). Hibernate now, Interrupt and send and Move to client keep `.btn-warn` (cautious, not destructive). Ghost, segmented and run-line buttons drop the outline.
+- Fields: one shared rule (rail filter, Add a repository, popover search, Brain search, task-list search, review notes, Rules / dispatch / pause selects, queue edit, child steer, spawn edit, thread notes and dialog, editor select, token input): `1px solid var(--field-line)` on `--panel-2`, `border-color: var(--focus)` on focus; the composer's inset line uses it too.
+- **Deviation:** two tokens not in the map, named after Vibely's: `--field-line` (borderSecondary: #E5E5E5 light / #3B3B3B dark) and `--btn-line` (cardBorder2: #BBBBBB / #3B3B3B). The map's `--line` is #2A2A2A in dark, which on #1E1E1E fields (1.1:1) disappears. Neither border reaches 3:1 non-text contrast (fields 1.26 / 1.49, buttons 1.84 / 1.55): they are Vibely's values; every button still has its text and every field its label. Founder call if fields read too faint.
+- Chips: the state pill is a tinted chip (`*-bg` + `*`, `--r-sm`); idle/archived on `--panel-3`; a Home working row keeps the bare dot. `.tag-warn` and `.tag-on` are tinted chips; other `.tag`s stay plain text. `.badge` and the top bar's needs badge lose their 999px radius (`--r-sm` / `--r`).
+- Radius: cards, tiles, memory proposals, the fan-out group panel and the subagent lane `--r-lg` (12); `styles.test.ts` now refuses any `border-radius` outside `--r-sm/--r/--r-lg`, 50% or 0.
+- Toasts: the floating composer note has a 3px `--needs` left stripe; floating errors (composer, Detail header) a `--danger` one. The dialog overlay is `rgb(0 0 0 / 0.6)`. No gradients (`styles.test.ts`); the side pane separator's 1px `linear-gradient` became a `::before` line.
+- Task 7: a thread card's stripe follows its thread's column (`thread-card-needs_you/working/review`; was always `--work`), its ⑂ mark is muted. Legends, Brain nodes, Grid tiles, child cards and the status line already took the state tokens; no i18n string names a colour. Brain node state selectors now target circles only (`circle.node-x, .brain-node.node-x circle`): the unreviewed dash stroke was also stroking the node's label (unreadable in both themes; found in the screenshots).
+- Founder fix: the folded System memory line shows the dot and the size ("7.2 GB"); the full "normal · 7.2 GB free" / "normal · 7.2 GB livres" is the summary's tooltip and the button's accessible name (`Disclosure` gained `summaryTitle`). The mark stays two-tone in dark.
+
+**As built (Batch D, Task 8) — done 2026-11-27:**
+- Release app rebuilt (`pnpm tauri build --bundles app`); vitest, typecheck, build, src-tauri cargo test + clippy `-D warnings` and `smoke.sh` pass.
+- Screenshots: the isolated bundle (debug app copied as `dev.mirante.cockpit.shots`, ad-hoc signed, `MIRANTE_HOME` under `/tmp`, fake daemon) rendered only while the screen was unlocked; the session's screen was locked for most of the run (WebKit paints nothing then), so the real-app window shots are Home (light, dark) and Detail (dark). The full set (Home, Grid, Brain, Skills, Rules, Detail with the Review layout, the Archive confirm, a permission card, ⌘K, light and dark) was taken from the same frontend in headless Chrome against the same fake daemon (rpc and event stream proxied over HTTP; a scratch harness, not committed). Chrome is not the app's WebKit: fonts and colours match, native selects differ.
+- The fake daemon answers `{}` to `task.diff` and `rules.layers`, and the app then goes blank in the Diff pane and Rules (an unguarded `merge_base.slice` / `summary.instruction_files`); the harness supplied demo answers for those two, and a pending permission (the fake's `permission.list` is empty). The fan-out Children panel needs group members the fake does not have: not shown. Follow-ups, not this plan: fake answers for both methods, and an error boundary so one bad answer does not blank the window.
+- Contrast spot-check of the new pairs (WCAG): danger button text 7.2 / 6.2 (hover 6.0 / 5.1), primary 16.7 / 18.1, tinted chips 5.5–7.7, warn hover 4.7 / 5.9; all ≥ 4.5. Borders: see the deviation above.
+- Dogfood: `docs/dogfood/cockpit.md` § H "Visual identity". README (The app → Look), the cockpit README's Look, and CHANGELOG Unreleased → Changed.
 
 ## Risks
 
